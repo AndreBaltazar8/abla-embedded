@@ -81,8 +81,9 @@ same bit positions as IRQ enable masks and require no hidden mutable arrays.
 `pmic-ip5306` covers the original M5Stack boost/charger PMIC, including its
 coarse battery gauge, charge controls, completed-charge detection, and low-load
 keep-on mode. `charger-aw32001` builds the AW32001 charger used with the
-RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object and
-preserving its paired BQ27220 fuel gauge as the next independent device layer.
+RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object. The
+same example initializes its paired BQ27220 fuel gauge and reads signed battery
+current and voltage through an allocation-free driver.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
