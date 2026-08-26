@@ -16,7 +16,8 @@ in `src/esp32`.
 ## Requirements
 
 - the sibling `ablac` checkout with `abla/unsafe/mmio` support
-- ESP-IDF 6.0.2 (the helper defaults to the cached checkout documented below)
+- ESP-IDF 6.0.2 with ESP32 Xtensa and ESP32-C6 RISC-V toolchains (the helper
+  defaults to the cached checkout documented below)
 - CMake, Ninja, and the other ESP-IDF host tools (provided by `shell.nix`)
 - PlatformIO only for the optional Arduino compatibility builds
 - Espressif's LLVM toolchain 21.1.3 (or set `ABLA_ESP_LLVM_ROOT`)
@@ -41,6 +42,8 @@ make imu
 make power-monitor
 make pmic-axp192
 make pmic-axp2101
+make pmic-ip5306
+make charger-aw32001
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -75,6 +78,11 @@ samples its battery, VBUS, system, thermistor, die-temperature, charge-state,
 and IRQ registers. Its allocation-free driver also exposes ALDO/BLDO/DLDO,
 charging, ADC, power-key, IRQ, and shutdown controls. IRQ snapshots use the
 same bit positions as IRQ enable masks and require no hidden mutable arrays.
+`pmic-ip5306` covers the original M5Stack boost/charger PMIC, including its
+coarse battery gauge, charge controls, completed-charge detection, and low-load
+keep-on mode. `charger-aw32001` builds the AW32001 charger used with the
+RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object and
+preserving its paired BQ27220 fuel gauge as the next independent device layer.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.

@@ -1,7 +1,7 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu power-monitor pmic-axp192 pmic-axp2101 i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu power-monitor pmic-axp192 pmic-axp2101 pmic-ip5306 charger-aw32001 i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
 	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-rtc-rx8130 upload-rtc-powerhub upload-io-expander clean
 
@@ -62,6 +62,14 @@ pmic-axp192:
 pmic-axp2101:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example pmic-axp2101'
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/pmic-axp2101 build'
+
+pmic-ip5306:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example pmic-ip5306'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/pmic-ip5306 build'
+
+charger-aw32001:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example charger-aw32001'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/charger-aw32001 build'
 
 i2s-tone:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2s-tone'
