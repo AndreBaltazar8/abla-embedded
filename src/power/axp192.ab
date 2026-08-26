@@ -1,0 +1,231 @@
+import "abla/float"
+import "../esp32/i2c_idf6.ab"
+import "./axp192_logic.ab"
+
+val axp192AdcRate25Hz = 0
+val axp192AdcRate50Hz = 64
+val axp192AdcRate100Hz = 128
+val axp192AdcRate200Hz = 192
+
+// The complete driver is the ESP-IDF I2C device handle in one allocation-free
+// nominal scalar. Rail configuration lives in the PMIC registers themselves.
+type Axp192 = int
+
+trusted fun axp192(
+    bus: I2cBus,
+    address: int = 52,
+    frequency: int = 400000
+): Axp192 = Axp192(
+    if (bus.valid()) bus.device(address, frequency) & 4294967295 else 0
+)
+
+fun Axp192.valid(): bool = (this & 4294967295) != 0
+fun Axp192.device(): I2cDevice = I2cDevice(this & 4294967295)
+
+trusted fun Axp192.begin(): bool {
+    if (!this.valid()) return false
+    val identity = this.device().readRegister8Checked(3)
+    identity.valid() && identity.value() == 3
+}
+
+trusted fun Axp192.close(): bool = this.valid() && this.device().close()
+
+trusted fun Axp192.setDcdc(channel: int, voltageMillivolts: int): bool {
+    if (!this.valid() || channel < 0 || channel > 2) return false
+    val maximum = if (channel == 1) 63 else 127
+    val code = axp192DcdcCode(voltageMillivolts, maximum)
+    val register = if (channel == 0) 38 else if (channel == 1) 35 else 39
+    val enableBit = if (channel == 0) 1 else if (channel == 1) 16 else 2
+    this.device().writeRegister8(register, if (code < 0) 0 else code) &&
+        this.device().updateRegister8(
+            18, enableBit, if (code < 0) 0 else enableBit
+        )
+}
+
+trusted fun Axp192.setDcdc1(voltageMillivolts: int): bool =
+    this.setDcdc(0, voltageMillivolts)
+
+trusted fun Axp192.setDcdc2(voltageMillivolts: int): bool =
+    this.setDcdc(1, voltageMillivolts)
+
+trusted fun Axp192.setDcdc3(voltageMillivolts: int): bool =
+    this.setDcdc(2, voltageMillivolts)
+
+trusted fun Axp192.setLdo(channel: int, voltageMillivolts: int): bool {
+    if (!this.valid() || (channel != 0 && channel != 2 && channel != 3)) {
+        return false
+    }
+    val code = axp192LdoCode(voltageMillivolts)
+    val voltageRegister = if (channel == 0) 145 else 40
+    val current = this.device().readRegister8Checked(voltageRegister)
+    if (!current.valid()) return false
+    val encoded = if (channel == 3) {
+        (current.value() & 240) | (if (code < 0) 0 else code)
+    } else {
+        (current.value() & 15) | ((if (code < 0) 0 else code) << 4)
+    }
+    if (!this.device().writeRegister8(voltageRegister, encoded)) return false
+    if (channel == 0) return this.device().updateRegister8(
+        144, 7, if (code < 0) 7 else 2
+    )
+    val enableBit = 1 << channel
+    this.device().updateRegister8(
+        18, enableBit, if (code < 0) 0 else enableBit
+    )
+}
+
+trusted fun Axp192.setLdo0(voltageMillivolts: int): bool =
+    this.setLdo(0, voltageMillivolts)
+
+trusted fun Axp192.setLdo2(voltageMillivolts: int): bool =
+    this.setLdo(2, voltageMillivolts)
+
+trusted fun Axp192.setLdo3(voltageMillivolts: int): bool =
+    this.setLdo(3, voltageMillivolts)
+
+trusted fun Axp192.setGpio(pin: int, high: bool): bool {
+    if (!this.valid() || pin < 0 || pin > 4) return false
+    if (pin < 3) {
+        val register = if (pin == 0) 144 else if (pin == 1) 146 else 147
+        return this.device().updateRegister8(
+            register, 7, if (high) 6 else 5
+        )
+    }
+    val outputBit = if (pin == 3) 1 else 2
+    val modeMask = if (pin == 3) 131 else 140
+    val modeValue = if (pin == 3) 129 else 132
+    this.device().updateRegister8(
+        150, outputBit, if (high) outputBit else 0
+    ) && this.device().updateRegister8(149, modeMask, modeValue)
+}
+
+trusted fun Axp192.setBatteryCharge(enabled: bool): bool =
+    this.valid() && this.device().updateRegister8(
+        51, 128, if (enabled) 128 else 0
+    )
+
+trusted fun Axp192.setChargeCurrent(maxMilliamps: int): bool =
+    this.valid() && maxMilliamps >= 0 && this.device().updateRegister8(
+        51, 15, axp192ChargeCurrentCode(maxMilliamps)
+    )
+
+trusted fun Axp192.setChargeVoltage(maxMillivolts: int): bool =
+    this.valid() && maxMillivolts >= 0 && this.device().updateRegister8(
+        51, 96, axp192ChargeVoltageCode(maxMillivolts) << 5
+    )
+
+trusted fun Axp192.powerOff(): bool =
+    this.valid() && this.device().updateRegister8(50, 128, 128)
+
+trusted fun Axp192.setAdcEnabled(enabled: bool): bool =
+    this.valid() && this.device().writeRegister8(130, if (enabled) 255 else 0)
+
+trusted fun Axp192.setAdcRate(rate: int): bool =
+    this.valid() && (rate & 63) == 0 && rate >= 0 && rate <= 192 &&
+        this.device().updateRegister8(132, 192, rate)
+
+trusted fun Axp192.setExtenEnabled(enabled: bool): bool =
+    this.valid() && this.device().updateRegister8(
+        18, 64, if (enabled) 64 else 0
+    )
+
+trusted fun Axp192.setBackupEnabled(enabled: bool): bool =
+    this.valid() && this.device().updateRegister8(
+        53, 128, if (enabled) 128 else 0
+    )
+
+trusted fun Axp192.statusBit(register: int, mask: int): bool {
+    if (!this.valid()) return false
+    val status = this.device().readRegister8Checked(register)
+    status.valid() && (status.value() & mask) != 0
+}
+
+trusted fun Axp192.charging(): bool = this.statusBit(0, 4)
+trusted fun Axp192.acinPresent(): bool = this.statusBit(0, 128)
+trusted fun Axp192.vbusPresent(): bool = this.statusBit(0, 32)
+trusted fun Axp192.batteryPresent(): bool = this.statusBit(1, 32)
+trusted fun Axp192.extenEnabled(): bool = this.statusBit(18, 64)
+
+trusted fun Axp192.powerKeyPress(): int {
+    if (!this.valid()) return 0
+    val status = this.device().readRegister8Checked(70)
+    if (!status.valid()) return 0
+    val selected = status.value() & 3
+    if (selected != 0) this.device().writeRegister8(70, selected)
+    selected
+}
+
+trusted fun Axp192.read12(register: int): I2cWordResult {
+    if (!this.valid()) return I2cWordResult(0)
+    val word = this.device().readRegister16BigEndianChecked(register)
+    if (!word.valid()) return I2cWordResult(0)
+    I2cWordResult(65536 | axp192Register12(word.value()))
+}
+
+trusted fun Axp192.read13(register: int): I2cWordResult {
+    if (!this.valid()) return I2cWordResult(0)
+    val word = this.device().readRegister16BigEndianChecked(register)
+    if (!word.valid()) return I2cWordResult(0)
+    I2cWordResult(65536 | axp192Register13(word.value()))
+}
+
+trusted fun Axp192.batteryLevel(): int {
+    if (!this.valid()) return -1
+    val packed = this.device().readRegister32BigEndianChecked(120)
+    if (!packed.valid()) return -1
+    val value = packed.value()
+    val voltage = ((value >>> 24) << 4) | ((value >>> 16) & 255)
+    val discharge = (((value >>> 8) & 255) << 5) | (value & 255)
+    axp192BatteryLevel(voltage, discharge)
+}
+
+trusted fun Axp192.acinVoltage(): f64 {
+    val raw = this.read12(86)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.0017 else 0.0
+}
+
+trusted fun Axp192.acinCurrentMilliamps(): f64 {
+    val raw = this.read12(88)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.625 else 0.0
+}
+
+trusted fun Axp192.vbusVoltage(): f64 {
+    val raw = this.read12(90)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.0017 else 0.0
+}
+
+trusted fun Axp192.vbusCurrentMilliamps(): f64 {
+    val raw = this.read12(92)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.375 else 0.0
+}
+
+trusted fun Axp192.internalTemperatureCelsius(): f64 {
+    val raw = this.read12(94)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.1 - 144.7 else 0.0
+}
+
+trusted fun Axp192.batteryPower(): f64 {
+    if (!this.valid()) return 0.0
+    val raw = this.device().readRegister24BigEndianChecked(112)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.00055 else 0.0
+}
+
+trusted fun Axp192.batteryVoltage(): f64 {
+    val raw = this.read12(120)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.0011 else 0.0
+}
+
+trusted fun Axp192.batteryChargeCurrentMilliamps(): f64 {
+    val raw = this.read13(122)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.5 else 0.0
+}
+
+trusted fun Axp192.batteryDischargeCurrentMilliamps(): f64 {
+    val raw = this.read13(124)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.5 else 0.0
+}
+
+trusted fun Axp192.apsVoltage(): f64 {
+    val raw = this.read12(126)
+    if (raw.valid()) f64FromInt(raw.value()) * 0.0014 else 0.0
+}

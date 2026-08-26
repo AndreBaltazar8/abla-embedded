@@ -39,6 +39,7 @@ make rtc-powerhub
 make io-expander
 make imu
 make power-monitor
+make pmic-axp192
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -64,6 +65,10 @@ ESP-IDF firmwares and do not depend on Arduino.
 `power-monitor` probes INA226 and INA3221 monitors and exercises calibrated
 bus-voltage, shunt-voltage, current, and power reads. Both drivers retain their
 configuration in one allocation-free scalar rather than a heap-backed object.
+`pmic-axp192` probes the classic M5Stack AXP192 PMIC and reads battery, input,
+system-rail, and temperature telemetry without changing rail configuration.
+The reusable allocation-free driver also exposes DCDC/LDO/GPIO, charging, ADC,
+backup, external-rail, power-key, and shutdown controls.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
