@@ -59,7 +59,7 @@ make upload-blink
 ```
 
 The public handles are nominal scalar values where the hardware identity fits
-in a machine word. For example, `Pin`, `SerialPort`, `RgbLed`, `WifiStation`,
+in a machine word. For example, `Pin`, `SerialPort`, `RgbLed`, `ButtonState`, `WifiStation`,
 `I2sPins`, `I2sDevice`, `NativeBuffer`, and `TlsClient` keep distinct types
 during checking but lower to ordinary integers. Extension methods use `this`
 directly; there is no wrapper object or `.value` field.

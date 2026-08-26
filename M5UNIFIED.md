@@ -37,7 +37,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | --- | --- | --- |
 | Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Atom Echo explicit profile only |
 | Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Atom Echo internal/external I2C, Port A, RGB, and power workaround |
-| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Raw `Pin`; firmware-local debounce/hold |
+| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Packed pure `ButtonState` covers GPIO behavior; PMIC/expander/touch sources pending |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
 | SPI | Shared bus/device configuration needed by displays and SD | Not implemented |
 | Display | Built-in and external displays, drawing, brightness, rotation | Not implemented; belongs in an Abla display layer informed by M5GFX |
