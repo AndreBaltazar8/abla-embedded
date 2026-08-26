@@ -44,7 +44,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Touch | Multi-point state, hold, drag/flick, touch-button mapping | Not implemented |
 | Speaker | I2S/DAC/buzzer output, tone, raw PCM/WAV, volume, mixing, board enable callbacks | Blocking raw I2S output; Atom Echo local tone and streamed speech hardware-verified on IDF 6 |
 | Microphone | I2S/PDM/ADC capture, mono/stereo conversion, sample-rate conversion | Blocking PDM capture; Atom Echo record-and-echo hardware-verified on IDF 6 |
-| LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | One RGB LED value |
+| LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | M5PM1 packed RGB, Paper Mono, and PowerHub backends are allocation-free and build-verified with common method names; RMT strip transport pending |
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | All distinct upstream classes have allocation-free register drivers and independently buildable examples; PY32 PMIC is only a deprecated alias for M5PM1 |
 | RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
