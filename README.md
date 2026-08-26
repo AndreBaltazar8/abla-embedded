@@ -7,8 +7,11 @@ it imports.
 
 The ESP32 target emits Xtensa objects directly through LLVM. There is no
 generated C and no handwritten C/C++ shim between an Abla application and the
-linker. Stable hardware operations such as GPIO and UART are implemented with
-volatile MMIO in Abla. Complex vendor services currently call their native ABI:
+linker. The shared `Register8`, `Register16`, `Register32`, and `Register64`
+types are zero-storage views over volatile MMIO. Classic ESP32 GPIO direction,
+levels, pulls, open-drain mode, and drive strength are implemented entirely in
+Abla on top of those views; UART also uses direct volatile MMIO. Complex vendor
+services currently call their native ABI:
 the ESP-IDF I2C, SPI and I2S DMA drivers, Wi-Fi initialization/PHY/MAC
 libraries, TLS, and sleep support. Those boundaries are deliberately visible
 in `src/esp32`.
@@ -156,6 +159,7 @@ directly; there is no wrapper object or `.value` field.
 ```abla
 val led = pin(27)
 led.output()
+led.setDriveStrength(2)
 led.write(true)
 
 val audio = i2s(0, i2sPins(19, 33, 22, 23), 16000)

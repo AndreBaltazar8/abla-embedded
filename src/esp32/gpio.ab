@@ -1,9 +1,5 @@
-import "abla/unsafe/mmio"
-
-// Pad muxing and input-enable details differ across ESP32 family members. The
-// mode transition uses the ESP-IDF ABI; steady-state reads/writes remain direct
-// atomic MMIO below.
-trusted noescape extern:"c" fun gpio_set_direction(pin: i32, mode: i32): i32
+import "../register.ab"
+import "./gpio_esp32_logic.ab"
 
 // ESP32 GPIO register map. Writes use the atomic W1TS/W1TC registers so two
 // cores can operate unrelated pins without a read-modify-write race.
@@ -18,14 +14,27 @@ val esp32GpioEnable1Set = esp32GpioBase + 48
 val esp32GpioEnable1Clear = esp32GpioBase + 52
 val esp32GpioInput = esp32GpioBase + 60
 val esp32GpioInput1 = esp32GpioBase + 64
+val esp32GpioPinConfigBase = esp32GpioBase + 136
 val esp32GpioOutputSelectBase = esp32GpioBase + 1328
 val esp32GpioOutputSignal = 256
+val esp32IoMuxBase = 1072992256
+val esp32IoMuxInputEnable = 512
+val esp32IoMuxPullDown = 128
+val esp32IoMuxPullUp = 256
+val esp32IoMuxDriveMask = 3072
+val esp32IoMuxFunctionMask = 28672
+val esp32IoMuxGpioFunction = 8192
+val esp32GpioPadOpenDrain = 4
+val esp32GpioOutputFunctionMask = 1023
+val esp32GpioOutputEnableSelect = 1024
+val esp32GpioOutputEnableInvert = 2048
 
 type Pin = int
 
 fun pin(number: int): Pin = Pin(number)
 fun Pin.number(): int = this
 
+@inline
 trusted fun esp32PinMask(number: int): int {
     var mask = 1
     var bit = if (number < 32) number else number - 32
@@ -36,12 +45,74 @@ trusted fun esp32PinMask(number: int): int {
     mask
 }
 
+@inline
+trusted fun esp32PinIoMux(number: int): Register32 =
+    register32(esp32IoMuxBase + esp32IoMuxOffset(number))
+
+@inline
+trusted fun esp32PinConfig(number: int): Register32 =
+    register32(esp32GpioPinConfigBase + number * 4)
+
+@inline
+trusted fun esp32PinOutputSelect(number: int): Register32 =
+    register32(esp32GpioOutputSelectBase + number * 4)
+
+@inline
+trusted fun Pin.selectGpioFunction(inputEnabled: bool): void {
+    val input = if (inputEnabled) esp32IoMuxInputEnable else 0
+    esp32PinIoMux(this).update(
+        esp32IoMuxFunctionMask | esp32IoMuxInputEnable,
+        esp32IoMuxGpioFunction | input
+    )
+    return
+}
+
+@inline
+trusted fun Pin.setOpenDrain(enabled: bool): void {
+    if (esp32GpioValid(this)) {
+        if (enabled) esp32PinConfig(this).setBits(esp32GpioPadOpenDrain)
+        else esp32PinConfig(this).clearBits(esp32GpioPadOpenDrain)
+    }
+    return
+}
+
+@inline
+trusted fun Pin.setPull(up: bool, down: bool): void {
+    if (esp32GpioValid(this)) {
+        val value = (if (up) esp32IoMuxPullUp else 0) |
+            (if (down) esp32IoMuxPullDown else 0)
+        esp32PinIoMux(this).update(
+            esp32IoMuxPullUp | esp32IoMuxPullDown,
+            value
+        )
+    }
+    return
+}
+
+trusted fun Pin.pullUp(): void = this.setPull(true, false)
+trusted fun Pin.pullDown(): void = this.setPull(false, true)
+trusted fun Pin.floating(): void = this.setPull(false, false)
+
+@inline
+trusted fun Pin.setDriveStrength(strength: int): bool {
+    if (!esp32GpioOutputValid(this) || strength < 0 || strength > 3) {
+        return false
+    }
+    esp32PinIoMux(this).update(
+        esp32IoMuxDriveMask,
+        strength << 10
+    )
+    true
+}
+
+@inline
 trusted fun Pin.output(): void {
-    if (this >= 0 && this < 34) {
-        gpio_set_direction(this, 2)
-        // Route the pin's output matrix to the ordinary GPIO signal.
-        mmioStoreU32(
-            esp32GpioOutputSelectBase + this * 4,
+    if (esp32GpioOutputValid(this)) {
+        this.selectGpioFunction(false)
+        this.setOpenDrain(false)
+        // Disconnect peripheral output and let the GPIO latch drive the pad.
+        esp32PinOutputSelect(this).update(
+            esp32GpioOutputFunctionMask,
             esp32GpioOutputSignal
         )
         if (this < 32) {
@@ -52,9 +123,17 @@ trusted fun Pin.output(): void {
     }
 }
 
+@inline
 trusted fun Pin.input(): void {
-    if (this >= 0 && this < 40) {
-        gpio_set_direction(this, 1)
+    if (esp32GpioValid(this)) {
+        this.selectGpioFunction(true)
+        this.setOpenDrain(false)
+        // Force output-enable control to the GPIO enable latch before
+        // clearing it, matching ESP-IDF's direction transition.
+        esp32PinOutputSelect(this).update(
+            esp32GpioOutputEnableSelect | esp32GpioOutputEnableInvert,
+            esp32GpioOutputEnableSelect
+        )
         if (this < 32) {
             mmioStoreU32(esp32GpioEnableClear, esp32PinMask(this))
         } else {
@@ -63,8 +142,16 @@ trusted fun Pin.input(): void {
     }
 }
 
+@inline
+trusted fun Pin.openDrainOutput(): void {
+    this.output()
+    this.setOpenDrain(true)
+    return
+}
+
+@inline
 trusted fun Pin.write(level: bool): void {
-    if (this >= 0 && this < 34) {
+    if (esp32GpioOutputValid(this)) {
         val mask = esp32PinMask(this)
         if (this < 32) {
             mmioStoreU32(
@@ -80,13 +167,13 @@ trusted fun Pin.write(level: bool): void {
     }
 }
 
+@inline
 trusted fun Pin.read(): bool {
     var value = 0
-    if (this >= 0 && this < 40) {
+    if (esp32GpioValid(this)) {
         value = mmioLoadU32(
             if (this < 32) esp32GpioInput else esp32GpioInput1
         )
     }
-    val mask = esp32PinMask(this)
-    (value & mask) != 0
+    esp32GpioValid(this) && (value & esp32PinMask(this)) != 0
 }
