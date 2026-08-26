@@ -42,8 +42,8 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | SPI | Shared bus/device configuration needed by displays and SD | Not implemented |
 | Display | Built-in and external displays, drawing, brightness, rotation | Not implemented; belongs in an Abla display layer informed by M5GFX |
 | Touch | Multi-point state, hold, drag/flick, touch-button mapping | Not implemented |
-| Speaker | I2S/DAC/buzzer output, tone, raw PCM/WAV, volume, mixing, board enable callbacks | Blocking raw I2S output; Atom Echo slot/ABI fix under hardware validation |
-| Microphone | I2S/PDM/ADC capture, mono/stereo conversion, sample-rate conversion | Blocking PDM capture; corrected IDF 6 ABI under hardware validation |
+| Speaker | I2S/DAC/buzzer output, tone, raw PCM/WAV, volume, mixing, board enable callbacks | Blocking raw I2S output; Atom Echo local tone and streamed speech hardware-verified on IDF 6 |
+| Microphone | I2S/PDM/ADC capture, mono/stereo conversion, sample-rate conversion | Blocking PDM capture; Atom Echo record-and-echo hardware-verified on IDF 6 |
 | LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | One RGB LED value |
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | Not implemented |
@@ -95,13 +95,12 @@ Deprecated aliases such as Atom Echo map to their canonical board identity
 
 ## Validation order
 
-1. Atom Echo speaker and microphone end-to-end hardware proof.
-2. Generic I2C/SPI plus button state machines, because most remaining devices
-   depend on them.
-3. RTC, IMU, PMIC, IO-expander, LED, SD, and power drivers.
-4. Speaker/microphone feature parity beyond blocking PCM.
-5. Display/touch foundations and representative M5GFX controller ports.
-6. Static board profiles, detection as an optional module, examples, size and
+1. Generic SPI, because most remaining display and storage devices depend on it
+   (I2C and the GPIO button state machine are complete foundations).
+2. RTC, IMU, PMIC, IO-expander, LED, SD, and power drivers.
+3. Speaker/microphone feature parity beyond blocking PCM.
+4. Display/touch foundations and representative M5GFX controller ports.
+5. Static board profiles, detection as an optional module, examples, size and
    instruction audits.
 
 The connected Atom Echo is the reference hardware for the first stage. Its
