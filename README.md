@@ -33,6 +33,7 @@ make serial
 make i2c-scan
 make spi-jedec
 make rtc-pcf8563
+make io-expander
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -47,7 +48,8 @@ ESP-IDF is installed somewhere other than
 `~/.cache/abla-embedded/esp-idf-v6.0.2`. `spi-jedec` demonstrates a single
 chip-select-preserving command/read transaction against an external SPI flash.
 `rtc-pcf8563` reads and validates an external PCF8563 RTC over I2C.
-Both are direct `app_main` ESP-IDF firmwares and do not depend on Arduino.
+`io-expander` probes M5IOE1 and PI4IOE5V6408 devices and configures one input.
+All three are direct `app_main` ESP-IDF firmwares and do not depend on Arduino.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
@@ -67,7 +69,7 @@ make upload-blink
 
 The public handles are nominal scalar values where the hardware identity fits
 in a machine word. For example, `Pin`, `SerialPort`, `RgbLed`, `ButtonState`, `WifiStation`,
-`I2cBus`, `I2cDevice`, `SpiPins`, `SpiBus`, `SpiDevice`, `I2sPins`,
+`GpioButton`, `I2cBus`, `I2cDevice`, `SpiPins`, `SpiBus`, `SpiDevice`, `I2sPins`,
 `I2sDevice`, `NativeBuffer`, and `TlsClient` keep distinct types
 during checking but lower to ordinary integers. Extension methods use `this`
 directly; there is no wrapper object or `.value` field.
