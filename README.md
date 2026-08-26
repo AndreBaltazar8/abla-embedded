@@ -1,16 +1,16 @@
 # Abla Embedded
 
 Abla Embedded is the low-level, board-neutral home for firmware written in
-Abla. Application code uses the same names (`pin`, `Clock`, `Serial`,
-`I2sDevice`, `WifiStation`, `TlsClient`) while a project chooses the platform
-implementation it imports.
+Abla. Application code uses the same names (`Pin`, `SerialPort`, `I2sDevice`,
+`WifiStation`, `TlsClient`) while a project chooses the platform implementation
+it imports.
 
 The ESP32 target emits Xtensa objects directly through LLVM. There is no
 generated C and no handwritten C/C++ shim between an Abla application and the
 linker. Stable hardware operations such as GPIO and UART are implemented with
 volatile MMIO in Abla. Complex vendor services currently call their native ABI:
 the ESP-IDF I2S DMA driver, Wi-Fi initialization/PHY/MAC libraries, TLS, and
-sleep support. Those boundaries are deliberately visible in `src/esp32/sdk`.
+sleep support. Those boundaries are deliberately visible in `src/esp32`.
 
 ## Requirements
 
@@ -30,6 +30,7 @@ make setup
 make blink
 make serial
 make i2s-tone
+make wifi-connect
 ```
 
 `make setup` installs the checksum-pinned x86-64 Linux Espressif LLVM release
@@ -38,8 +39,9 @@ equivalent toolchains and set `ABLA_ESP_LLVM_ROOT` and `IDF_PATH`.
 
 `make blink` uses Espressif's official `idf.py` workflow. Set `IDF_PATH` when
 ESP-IDF is installed somewhere other than
-`~/.cache/abla-embedded/esp-idf-v6.0.2`. The serial and I2S examples currently
-also exercise the optional Arduino/PlatformIO compatibility integration.
+`~/.cache/abla-embedded/esp-idf-v6.0.2`. The serial, I2S, and Wi-Fi examples
+currently also exercise the optional Arduino/PlatformIO compatibility
+integration. Edit the placeholder credentials before flashing `wifi-connect`.
 
 Each target first compiles an `.ab` entry to an Xtensa ELF object. The preferred
 ESP32 integration is the ESP-IDF project in `examples/blink`; it links that

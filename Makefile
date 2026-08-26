@@ -1,8 +1,8 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2s-tone upload-blink upload-serial \
-	upload-i2s-tone clean
+.PHONY: setup check blink serial i2s-tone wifi-connect upload-blink \
+	upload-serial upload-i2s-tone upload-wifi-connect clean
 
 setup:
 	./tools/setup
@@ -22,6 +22,10 @@ i2s-tone:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2s-tone'
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/i2s-tone'
 
+wifi-connect:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example wifi-connect'
+	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/wifi-connect'
+
 upload-blink: blink
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/blink flash'
 
@@ -31,7 +35,11 @@ upload-serial: serial
 upload-i2s-tone: i2s-tone
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/i2s-tone -t upload'
 
+upload-wifi-connect: wifi-connect
+	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/wifi-connect -t upload'
+
 clean:
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/blink -t clean || true'
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/serial -t clean || true'
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/i2s-tone -t clean || true'
+	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/wifi-connect -t clean || true'

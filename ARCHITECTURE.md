@@ -39,9 +39,13 @@ Persistent regions use `nativeStaticAllocate`, which becomes zero-initialized
 BSS rather than a runtime allocation. `NativeBuffer` packs the address and
 capacity into one checked nominal scalar, and `TlsClient` is likewise a scalar
 handle over statically constructed client storage.
+The buffer's checked little-endian 16/32-bit operations use byte lanes, so
+packet fields remain safe even when a wire-format offset is not word-aligned.
 The TLS storage constants match the selected target ABI (`sizeof` 96 for
 Arduino 2 `WiFiClientSecure`, 100 for Arduino 3 `NetworkClientSecure`) and the
 LLVM globals retain stronger-than-required eight-byte alignment.
+The clock boundary is profile-specific too: Arduino 2's newlib returns a
+32-bit `time_t`, while ESP-IDF 6's picolibc returns it in a 64-bit lane.
 
 ## Native boundary
 
