@@ -47,6 +47,11 @@ LLVM globals retain stronger-than-required eight-byte alignment.
 The clock boundary is profile-specific too: Arduino 2's newlib returns a
 32-bit `time_t`, while ESP-IDF 6's picolibc returns it in a 64-bit lane.
 
+M5Stack support is a board-profile layer over these primitives. Profiles expose
+logical built-ins such as `buttonA`, `rgbLed`, and `audio` while remaining
+nominal scalars. Known-target builds select a profile explicitly instead of
+linking M5Unified's runtime board probing and C++ object graph.
+
 ## Native boundary
 
 | Area | Current implementation | Why |

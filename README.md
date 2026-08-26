@@ -31,6 +31,7 @@ make blink
 make serial
 make i2s-tone
 make wifi-connect
+make atom-echo
 ```
 
 `make setup` installs the checksum-pinned x86-64 Linux Espressif LLVM release
@@ -42,6 +43,9 @@ ESP-IDF is installed somewhere other than
 `~/.cache/abla-embedded/esp-idf-v6.0.2`. The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
+`atom-echo` demonstrates a statically selected M5Stack board profile with
+built-in button and RGB LED access. See `M5UNIFIED.md` for how these profiles
+relate to M5Unified.
 
 Each target first compiles an `.ab` entry to an Xtensa ELF object. The preferred
 ESP32 integration is the ESP-IDF project in `examples/blink`; it links that
