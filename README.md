@@ -133,9 +133,15 @@ currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
 `radio-mac-registers` is a build-only, opt-in classic-ESP32 object proving that
 interrupt, RX DMA/filter, TX queue/PLCP, and MAC-time operations lower directly
-to volatile MMIO with no vendor radio ABI. It neither links a firmware image
-nor initializes or transmits on the radio. See `RADIO.md` for the exact current
-boundary and provenance.
+to volatile MMIO with no vendor radio ABI. It also emits a separate native ESP
+DMA descriptor object so ownership publication can be inspected independently.
+The build also emits classic ESP32 radio power/clock/reset leaves; none of the
+three objects performs initialization merely by being linked.
+The target neither links a firmware image nor initializes or transmits on the
+radio. See `RADIO.md` for the exact current boundary and provenance.
+The default ESP32 surface also includes zero-storage DMA handles and the native
+12-byte ESP peripheral-DMA descriptor layout. Descriptor mutation is trusted
+because callers must supply DMA-capable internal memory.
 `atom-echo` demonstrates a statically selected M5Stack board profile with
 built-in button and RGB LED access. See `M5UNIFIED.md` for how these profiles
 relate to M5Unified.

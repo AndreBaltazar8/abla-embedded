@@ -4,12 +4,24 @@ The long-term target is a Wi-Fi path whose implementation is Abla source, not
 an application binding to Espressif's precompiled `libnet80211`, `libpp`,
 `libcore`, `libphy`, or `libcoexist` archives. That target is not complete yet.
 
-The first opt-in slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
+The common `src/esp32/dma_descriptor.ab` module implements the native 12-byte
+ESP peripheral-DMA descriptor layout with ordered volatile ownership transfer.
+It is reusable by radio, I2S, SPI, camera, and other DMA-backed drivers.
+
+The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
+power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
+Power-on is split around the documented 10-microsecond delay because Abla does
+not yet expose a target-native CPU cycle counter. Shared-clock ownership must
+also be serialized by the caller; the framework does not silently add global
+state or pretend that PHY initialization is complete.
+
+The first MAC slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
 the classic ESP32 MAC register operations for interrupt causes, RX DMA list
 control, four-interface BSSID/receiver filtering, five TX queues, PLCP
 parameters, and the MAC timer. Importing it has no hardware side effect, and it
-is intentionally absent from the default package entry until clock/reset, PHY,
-calibration, interrupt routing, and safe DMA ownership are implemented.
+is intentionally absent from the default package entry until native delay,
+shared-clock ownership, PHY/calibration, interrupt routing, and bounded DMA
+ring ownership are implemented.
 
 The register topology was independently expressed from these permissively
 licensed source references:
@@ -31,8 +43,9 @@ measured on owned hardware.
 
 The remaining dependency order is:
 
-1. peripheral clock/reset and interrupt routing;
-2. DMA descriptor ownership and RX/TX rings;
+1. native cycle delay, interrupt-safe shared-clock ownership, and interrupt
+   routing;
+2. bounded RX/TX ring ownership on top of the implemented descriptors;
 3. open 802.11 management, authentication, association, and data framing;
 4. hardware crypto plus WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
