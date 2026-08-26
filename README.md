@@ -32,6 +32,7 @@ make blink
 make serial
 make i2c-scan
 make spi-jedec
+make sd-card
 make rtc-pcf8563
 make rtc-rx8130
 make rtc-powerhub
@@ -50,6 +51,8 @@ equivalent toolchains and set `ABLA_ESP_LLVM_ROOT` and `IDF_PATH`.
 ESP-IDF is installed somewhere other than
 `~/.cache/abla-embedded/esp-idf-v6.0.2`. `spi-jedec` demonstrates a single
 chip-select-preserving command/read transaction against an external SPI flash.
+`sd-card` initializes an SDHC/SDSC card and reads its first raw 512-byte block
+using an SDSPI protocol implementation written in Abla.
 `rtc-pcf8563` reads and validates an external PCF8563 RTC over I2C.
 `rtc-rx8130` reads and validates an external RX8130 RTC over I2C.
 `rtc-powerhub` reads and validates the M5Stack PowerHub RTC protocol.
@@ -98,6 +101,11 @@ if (buttonA.wasPressed()) led.write(true)
 and transient events into one 64-bit scalar. Its timestamp is modulo 2^22
 milliseconds, so it must be updated at least once per roughly 70 minutes; a
 normal firmware loop updates it many times per second.
+
+Every M5Unified board ID also exposes raw connector topology through `portA()`
+to `portE()`, `sdPins()`, `rgbLedPin()`, `powerHoldPin()`, and `mBusPin(1..30)`.
+These return `Pin` values (with `Pin(-1)` for absent hardware), so higher-level
+drivers consume the same lowest-level representation on every board.
 
 Trusted driver code can use `nativeStackAllocate` for short-lived SDK structs
 and native-width loads/stores. LLVM lowers these to stack allocation and direct

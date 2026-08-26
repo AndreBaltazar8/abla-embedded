@@ -1,0 +1,267 @@
+import "./spi_idf6.ab"
+import "./task.ab"
+import "./sdk/buffer.ab"
+import "./sd_spi_logic.ab"
+import "abla/unsafe/memory"
+
+// The low 32 bits are the ESP-IDF SPI device handle. Bit 32 records block
+// addressing (SDHC/SDXC). No card object or protocol state is heap allocated.
+type SdSpiCard = int
+
+val sdSpiKeepChipSelect = 256
+
+fun sdSpiCardValue(device: SpiDevice, highCapacity: bool): SdSpiCard =
+    SdSpiCard((device & 4294967295) | (if (highCapacity) 1 << 32 else 0))
+
+fun SdSpiCard.valid(): bool = (this & 4294967295) != 0
+fun SdSpiCard.device(): SpiDevice = SpiDevice(this & 4294967295)
+fun SdSpiCard.highCapacity(): bool = (this & (1 << 32)) != 0
+
+trusted fun sdSpiFill(buffer: NativeBuffer, value: int): void {
+    var index = 0
+    while (index < buffer.capacity()) {
+        buffer.store(index, value)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun sdSpiClockByte(
+    device: SpiDevice,
+    keepSelected: bool
+): int {
+    val transmit = nativeBufferAt(nativeStackAllocate(1), 1)
+    val receive = nativeBufferAt(nativeStackAllocate(1), 1)
+    transmit.store(0, 255)
+    var flags = 0
+    if (keepSelected) flags = sdSpiKeepChipSelect
+    var result = -1
+    if (device.transferWithFlags(
+        transmit, receive, 1, flags
+    )) result = receive.load(0)
+    result
+}
+
+trusted fun sdSpiFinishSelection(device: SpiDevice): void {
+    sdSpiClockByte(device, false)
+    return
+}
+
+// The caller owns the SPI bus and keeps chip select asserted across the
+// command frame, variable-length R1 wait, and optional trailing response.
+trusted fun sdSpiCommandSelected(
+    device: SpiDevice,
+    command: int,
+    argument: int,
+    trailingBytes: int,
+    trailing: NativeBuffer,
+    keepSelectedAfter: bool
+): int {
+    if (!device.valid() || trailingBytes < 0 ||
+        trailingBytes > trailing.capacity()) return -1
+    val frame = nativeBufferAt(nativeStackAllocate(6), 6)
+    val ignored = nativeBufferAt(nativeStackAllocate(6), 6)
+    frame.store(0, 64 | (command & 63))
+    frame.store(1, argument >>> 24)
+    frame.store(2, argument >>> 16)
+    frame.store(3, argument >>> 8)
+    frame.store(4, argument)
+    frame.store(5, sdSpiCommandCrc(command))
+    if (!device.transferWithFlags(
+        frame, ignored, 6, sdSpiKeepChipSelect
+    )) {
+        sdSpiFinishSelection(device)
+        return -1
+    }
+
+    var response = -1
+    var attempts = 0
+    while (response < 0 && attempts < 8) {
+        val value = sdSpiClockByte(device, true)
+        if (sdSpiR1Available(value)) response = value
+        attempts = attempts + 1
+    }
+    if (response < 0) {
+        sdSpiFinishSelection(device)
+        return -1
+    }
+
+    if (trailingBytes > 0) {
+        val transmit = nativeBufferAt(nativeStackAllocate(trailingBytes), trailingBytes)
+        sdSpiFill(transmit, 255)
+        var flags = 0
+        if (keepSelectedAfter) flags = sdSpiKeepChipSelect
+        if (!device.transferWithFlags(
+            transmit, trailing, trailingBytes, flags
+        )) {
+            sdSpiFinishSelection(device)
+            return -1
+        }
+    } else if (!keepSelectedAfter) sdSpiFinishSelection(device)
+    response
+}
+
+trusted fun sdSpiCommand(
+    device: SpiDevice,
+    command: int,
+    argument: int,
+    trailingBytes: int,
+    trailing: NativeBuffer
+): int {
+    if (!device.acquire()) return -1
+    val response = sdSpiCommandSelected(
+        device, command, argument, trailingBytes, trailing, false
+    )
+    device.release()
+    response
+}
+
+trusted fun sdSpiInitialize(bus: SpiBus, chipSelectPin: int): SdSpiCard {
+    if (!bus.valid() || chipSelectPin < 0) return SdSpiCard(0)
+
+    // SD cards require at least 74 clocks with CS high before CMD0. A second
+    // device without a CS signal supplies exactly those clocks on the bus.
+    val clockDevice = bus.device(-1, 400000)
+    if (!clockDevice.valid()) return SdSpiCard(0)
+    val clocks = nativeBufferAt(nativeStackAllocate(10), 10)
+    val clockInput = nativeBufferAt(nativeStackAllocate(10), 10)
+    sdSpiFill(clocks, 255)
+    val clocked = clockDevice.transfer(clocks, clockInput, 10)
+    clockDevice.close()
+    if (!clocked) return SdSpiCard(0)
+
+    val device = bus.device(chipSelectPin, 400000)
+    if (!device.valid()) return SdSpiCard(0)
+    val response = nativeBufferAt(nativeStackAllocate(4), 4)
+    var idle = false
+    var attempts = 0
+    while (!idle && attempts < 16) {
+        idle = sdSpiCommand(device, 0, 0, 0, response) == 1
+        attempts = attempts + 1
+    }
+    if (!idle) {
+        device.close()
+        return SdSpiCard(0)
+    }
+
+    val command8 = sdSpiCommand(device, 8, 426, 4, response)
+    val version2 = command8 == 1 && response.load(2) == 1 &&
+        response.load(3) == 170
+    var ready = false
+    attempts = 0
+    while (!ready && attempts < 1000) {
+        val application = sdSpiCommand(device, 55, 0, 0, response)
+        if (application == 0 || application == 1) {
+            ready = sdSpiCommand(
+                device, 41, if (version2) 1073741824 else 0, 0, response
+            ) == 0
+        }
+        if (!ready) taskDelay(1)
+        attempts = attempts + 1
+    }
+    if (!ready) {
+        device.close()
+        return SdSpiCard(0)
+    }
+
+    var highCapacity = false
+    if (version2 && sdSpiCommand(device, 58, 0, 4, response) == 0) {
+        highCapacity = (response.load(0) & 64) != 0
+    }
+    if (!highCapacity && sdSpiCommand(device, 16, 512, 0, response) != 0) {
+        device.close()
+        return SdSpiCard(0)
+    }
+
+    device.close()
+    val fastDevice = bus.device(chipSelectPin, 20000000)
+    if (!fastDevice.valid()) return SdSpiCard(0)
+    sdSpiCardValue(fastDevice, highCapacity)
+}
+
+trusted fun SdSpiCard.close(): bool =
+    this.valid() && this.device().close()
+
+fun SdSpiCard.blockArgument(block: int): int =
+    sdSpiBlockArgument(this.highCapacity(), block)
+
+trusted fun SdSpiCard.readBlock(block: int, destination: NativeBuffer): bool {
+    if (!this.valid() || block < 0 || destination.capacity() < 512) return false
+    val device = this.device()
+    if (!device.acquire()) return false
+    val empty = nativeBufferAt(0, 0)
+    val response = sdSpiCommandSelected(
+        device, 17, this.blockArgument(block), 0, empty, true
+    )
+    var token = -1
+    var attempts = 0
+    while (response == 0 && token < 0 && attempts < 250) {
+        val value = sdSpiClockByte(device, true)
+        if (sdSpiReadToken(value)) token = value
+        else if (value >= 0 && value != 255) attempts = 250
+        else taskDelay(1)
+        attempts = attempts + 1
+    }
+
+    var read = false
+    if (token == 254) {
+        val transmit = nativeBufferAt(nativeStackAllocate(514), 514)
+        val receive = nativeBufferAt(nativeStackAllocate(514), 514)
+        sdSpiFill(transmit, 255)
+        if (device.transferWithFlags(transmit, receive, 514, 0)) {
+            var index = 0
+            while (index < 512) {
+                destination.store(index, receive.load(index))
+                index = index + 1
+            }
+            read = true
+        }
+    } else sdSpiFinishSelection(device)
+    device.release()
+    read
+}
+
+trusted fun SdSpiCard.writeBlock(block: int, source: NativeBuffer): bool {
+    if (!this.valid() || block < 0 || source.capacity() < 512) return false
+    val device = this.device()
+    if (!device.acquire()) return false
+    val empty = nativeBufferAt(0, 0)
+    val response = sdSpiCommandSelected(
+        device, 24, this.blockArgument(block), 0, empty, true
+    )
+    var accepted = false
+    if (response == 0) {
+        val transmit = nativeBufferAt(nativeStackAllocate(515), 515)
+        val receive = nativeBufferAt(nativeStackAllocate(515), 515)
+        transmit.store(0, 254)
+        var index = 0
+        while (index < 512) {
+            transmit.store(index + 1, source.load(index))
+            index = index + 1
+        }
+        transmit.store(513, 255)
+        transmit.store(514, 255)
+        if (device.transferWithFlags(
+            transmit, receive, 515, sdSpiKeepChipSelect
+        )) {
+            var responseAttempts = 0
+            while (!accepted && responseAttempts < 8) {
+                val value = sdSpiClockByte(device, true)
+                if (value >= 0 && value != 255) accepted =
+                    sdSpiWriteAccepted(value)
+                responseAttempts = responseAttempts + 1
+            }
+        }
+    }
+
+    var ready = false
+    var attempts = 0
+    while (accepted && !ready && attempts < 250) {
+        ready = sdSpiClockByte(device, true) == 255
+        if (!ready) taskDelay(1)
+        attempts = attempts + 1
+    }
+    sdSpiFinishSelection(device)
+    device.release()
+    accepted && ready
+}

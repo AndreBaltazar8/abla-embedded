@@ -36,7 +36,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Capability | Upstream behavior to cover | Abla status |
 | --- | --- | --- |
 | Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Full canonical ID registry and aliases; Atom Echo typed profile; detection and remaining typed profiles pending |
-| Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Cross-family internal/external I2C registry plus Atom Echo Port A/RGB/power workaround; remaining maps pending |
+| Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Complete upstream registry for all board IDs, including Tab5X aliasing and allocation-free 30-pin M-Bus lookup |
 | GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Self-updating `GpioButton` packs pin, polarity and full state into one scalar; raw `ButtonState` remains reusable; PMIC/expander/touch sources pending |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
 | SPI | Shared bus/device configuration needed by displays and SD | IDF 6 bus/device lifecycle plus blocking full/half-duplex transactions build-verified; queued and variable command/address phases pending |
@@ -50,7 +50,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
 | IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Shared allocation-free packed axes and all five register drivers build-verified, including direct immutable BMI270 configuration upload; persisted calibration pending |
 | IO expander | M5IOE1 and PI4IOE5V6408 direction, pull, I/O, IRQ | Both devices, including M5IOE1 PWM, implemented with checked I2C read-modify-write and build-verified |
-| SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Not implemented |
+| SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Complete board pin registry plus Abla-native SDSPI reset, negotiation, raw 512-byte read/write; SDMMC and filesystems pending |
 | Logging/timer | Serial/display logging and timer callbacks | Direct UART serial only |
 
 `Complete` means the public Abla API exists, every relevant example builds,
