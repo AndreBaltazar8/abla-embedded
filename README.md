@@ -38,6 +38,7 @@ make rtc-rx8130
 make rtc-powerhub
 make io-expander
 make imu
+make power-monitor
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -60,6 +61,9 @@ using an SDSPI protocol implementation written in Abla.
 `imu` probes MPU6886, SH200Q, BMI270, BMM150, and AK8963 devices and exercises
 the shared packed-axis API. These device examples are direct `app_main`
 ESP-IDF firmwares and do not depend on Arduino.
+`power-monitor` probes INA226 and INA3221 monitors and exercises calibrated
+bus-voltage, shunt-voltage, current, and power reads. Both drivers retain their
+configuration in one allocation-free scalar rather than a heap-backed object.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
