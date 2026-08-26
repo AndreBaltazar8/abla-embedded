@@ -50,6 +50,7 @@ make led-powerhub
 make led-paper-mono
 make led-strip-rmt
 make board-detect-c6
+make imu-offsets
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -187,6 +188,13 @@ clients can reserve distinct regions and construct them with `tlsClientAt`.
 The LED constructors follow the same pattern: their convenience form owns one
 static instance, while the `...At` form accepts explicit storage for multiple
 independent controllers.
+
+ESP-IDF NVS namespaces use a scalar `NvsNamespace` handle with exact 32-bit
+vendor ABI declarations. `ImuOffsets` keeps M5Unified-compatible signed Q16
+`ax` through `mz` fields in 36 caller-owned or static bytes and persists them
+only when its module is imported. Saves explicitly call `nvs_commit`; loads
+fail without modifying the live offsets if any field is absent instead of
+silently accepting a partial record.
 
 ## API and portability
 

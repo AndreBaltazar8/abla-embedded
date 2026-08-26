@@ -48,7 +48,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | All distinct upstream classes have allocation-free register drivers and independently buildable examples; PY32 PMIC is only a deprecated alias for M5PM1 |
 | RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
-| IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Shared allocation-free packed axes and all five register drivers build-verified, including direct immutable BMI270 configuration upload; persisted calibration pending |
+| IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Shared allocation-free packed axes and all five register drivers build-verified, including direct immutable BMI270 configuration upload; caller-owned signed Q16 offsets and strict nine-field NVS load/committed save are build-verified; automatic stillness calibration pending |
 | IO expander | M5IOE1 and PI4IOE5V6408 direction, pull, I/O, IRQ | Both devices, including M5IOE1 PWM, implemented with checked I2C read-modify-write and build-verified |
 | SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Complete board pin registry plus Abla-native SDSPI reset, negotiation, raw 512-byte read/write; SDMMC and filesystems pending |
 | Logging/timer | Serial/display logging and timer callbacks | Direct UART serial only |
@@ -95,7 +95,7 @@ Deprecated aliases such as Atom Echo map to their canonical board identity
 
 ## Validation order
 
-1. Finish persisted IMU calibration, safe board detection, remaining static
+1. Finish automatic IMU calibration, safe board detection, remaining static
    board profiles, and PMIC/expander/touch button adapters.
 2. Add raw I2C jobs, queued SPI, SDMMC/filesystems, and board power policy on
    top of the completed blocking bus and PMIC foundations.
