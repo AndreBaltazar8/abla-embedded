@@ -48,6 +48,8 @@ make charger-aw32001
 make led-m5pm1
 make led-powerhub
 make led-paper-mono
+make led-strip-rmt
+make board-detect-c6
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -94,6 +96,11 @@ upstream deprecated alias for this same device, not another implementation.
 RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object. The
 same example initializes its paired BQ27220 fuel gauge and reads signed battery
 current and voltage through an allocation-free driver.
+`board-detect-c6` is the independently buildable opt-in detector for NanoC6
+and StampC6. It reads the package through ESP-IDF's stable eFuse ABI and the
+embedded-flash capacity from the read-only eFuse mirror directly in Abla. It
+does not touch GPIOs, and QFN40 display products remain unknown until a display
+detector identifies them.
 The four LED examples cover ESP-IDF 6 RMT strips, M5PM1 packed RGB output,
 PowerHub's eight RGB channels, and Paper Mono's split PMIC/M5IOE1 RGB path.
 Each backend has the same `setColor`, `setAllColor`, `setBrightness`, and
@@ -112,6 +119,11 @@ integration. Edit the placeholder credentials before flashing `wifi-connect`.
 `atom-echo` demonstrates a statically selected M5Stack board profile with
 built-in button and RGB LED access. See `M5UNIFIED.md` for how these profiles
 relate to M5Unified.
+
+Runtime board detection is never imported by a static board profile. Firmware
+that genuinely needs one image for several boards imports the relevant
+`src/m5stack/detect_*.ab` target module explicitly; importing `m5stack.ab`
+alone retains no probe code or detector state.
 
 Each target first compiles an `.ab` entry to an Xtensa ELF object. The preferred
 ESP32 integration is the ESP-IDF project in `examples/blink`; it links that
