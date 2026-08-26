@@ -47,7 +47,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | One RGB LED value |
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | Not implemented |
-| RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | PCF8563 and RX8130 validated date/time, alarms, timer IRQ, and low-voltage APIs build-verified; PowerHub pending |
+| RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
 | IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Not implemented |
 | IO expander | M5IOE1 and PI4IOE5V6408 direction, pull, I/O, IRQ | Both devices, including M5IOE1 PWM, implemented with checked I2C read-modify-write and build-verified |
 | SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Not implemented |
