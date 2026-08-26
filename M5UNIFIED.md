@@ -37,7 +37,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | --- | --- | --- |
 | Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Full canonical ID registry and aliases; Atom Echo typed profile; detection and remaining typed profiles pending |
 | Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Cross-family internal/external I2C registry plus Atom Echo Port A/RGB/power workaround; remaining maps pending |
-| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Packed pure `ButtonState` covers GPIO behavior; PMIC/expander/touch sources pending |
+| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Self-updating `GpioButton` packs pin, polarity and full state into one scalar; raw `ButtonState` remains reusable; PMIC/expander/touch sources pending |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
 | SPI | Shared bus/device configuration needed by displays and SD | IDF 6 bus/device lifecycle plus blocking full/half-duplex transactions build-verified; queued and variable command/address phases pending |
 | Display | Built-in and external displays, drawing, brightness, rotation | Not implemented; belongs in an Abla display layer informed by M5GFX |
@@ -48,7 +48,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | Not implemented |
 | RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
-| IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Not implemented |
+| IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Shared allocation-free packed axes and all five register drivers build-verified, including direct immutable BMI270 configuration upload; persisted calibration pending |
 | IO expander | M5IOE1 and PI4IOE5V6408 direction, pull, I/O, IRQ | Both devices, including M5IOE1 PWM, implemented with checked I2C read-modify-write and build-verified |
 | SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Not implemented |
 | Logging/timer | Serial/display logging and timer callbacks | Direct UART serial only |
@@ -97,7 +97,7 @@ Deprecated aliases such as Atom Echo map to their canonical board identity
 
 1. Generic SPI, because most remaining display and storage devices depend on it
    (I2C and the GPIO button state machine are complete foundations).
-2. RTC, IMU, PMIC, IO-expander, LED, SD, and power drivers.
+2. Finish persisted IMU calibration, then PMIC, LED, SD, and power drivers.
 3. Speaker/microphone feature parity beyond blocking PCM.
 4. Display/touch foundations and representative M5GFX controller ports.
 5. Static board profiles, detection as an optional module, examples, size and

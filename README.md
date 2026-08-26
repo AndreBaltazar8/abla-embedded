@@ -36,6 +36,7 @@ make rtc-pcf8563
 make rtc-rx8130
 make rtc-powerhub
 make io-expander
+make imu
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -53,7 +54,9 @@ chip-select-preserving command/read transaction against an external SPI flash.
 `rtc-rx8130` reads and validates an external RX8130 RTC over I2C.
 `rtc-powerhub` reads and validates the M5Stack PowerHub RTC protocol.
 `io-expander` probes M5IOE1 and PI4IOE5V6408 devices and configures one input.
-All five are direct `app_main` ESP-IDF firmwares and do not depend on Arduino.
+`imu` probes MPU6886, SH200Q, BMI270, BMM150, and AK8963 devices and exercises
+the shared packed-axis API. These device examples are direct `app_main`
+ESP-IDF firmwares and do not depend on Arduino.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
@@ -84,7 +87,17 @@ led.output()
 led.write(true)
 
 val audio = i2s(0, i2sPins(19, 33, 22, 23), 16000)
+
+var buttonA = pin(39).asButton()
+buttonA.initialize()
+buttonA = buttonA.update()
+if (buttonA.wasPressed()) led.write(true)
 ```
+
+`GpioButton` packs the GPIO pin, active polarity, debounce/click/hold state,
+and transient events into one 64-bit scalar. Its timestamp is modulo 2^22
+milliseconds, so it must be updated at least once per roughly 70 minutes; a
+normal firmware loop updates it many times per second.
 
 Trusted driver code can use `nativeStackAllocate` for short-lived SDK structs
 and native-width loads/stores. LLVM lowers these to stack allocation and direct

@@ -1,7 +1,7 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan spi-jedec rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
 	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-rtc-rx8130 upload-rtc-powerhub upload-io-expander clean
 
@@ -42,6 +42,10 @@ rtc-powerhub:
 io-expander:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example io-expander'
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/io-expander build'
+
+imu:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example imu'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/imu build'
 
 i2s-tone:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2s-tone'
