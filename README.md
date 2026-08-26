@@ -33,6 +33,7 @@ make serial
 make i2c-scan
 make spi-jedec
 make rtc-pcf8563
+make rtc-rx8130
 make io-expander
 make i2s-tone
 make wifi-connect
@@ -48,6 +49,7 @@ ESP-IDF is installed somewhere other than
 `~/.cache/abla-embedded/esp-idf-v6.0.2`. `spi-jedec` demonstrates a single
 chip-select-preserving command/read transaction against an external SPI flash.
 `rtc-pcf8563` reads and validates an external PCF8563 RTC over I2C.
+`rtc-rx8130` reads and validates an external RX8130 RTC over I2C.
 `io-expander` probes M5IOE1 and PI4IOE5V6408 devices and configures one input.
 All three are direct `app_main` ESP-IDF firmwares and do not depend on Arduino.
 The serial, I2S, and Wi-Fi examples

@@ -1,0 +1,134 @@
+import "../esp32/i2c_idf6.ab"
+import "../esp32/sdk/buffer.ab"
+import "./types.ab"
+import "./pcf8563_logic.ab"
+import "./rx8130_logic.ab"
+import "abla/unsafe/memory"
+
+type Rx8130 = int
+
+trusted fun rx8130(bus: I2cBus): Rx8130 =
+    Rx8130(if (bus.valid()) bus.device(50, 400000) & 4294967295 else 0)
+
+fun Rx8130.valid(): bool = this != 0
+fun Rx8130.device(): I2cDevice = I2cDevice(this & 4294967295)
+
+trusted fun Rx8130.begin(): bool = this.valid() &&
+    this.device().updateRegister8(31, 48, 48) &&
+    this.device().writeRegister8(48, 0) &&
+    this.device().writeRegister8(30, 0)
+
+trusted fun Rx8130.close(): bool = this.valid() && this.device().close()
+
+trusted fun Rx8130.lowVoltage(): bool =
+    this.valid() && (this.device().readRegister8(29) & 128) != 0
+
+trusted fun Rx8130.dateTime(): RtcDateTime {
+    if (!this.valid()) return RtcDateTime(0)
+    val bytes = nativeBufferAt(nativeStackAllocate(7), 7)
+    if (!this.device().readRegister(16, bytes, 7)) return RtcDateTime(0)
+    rx8130DecodeDateTime(
+        bytes.load(0), bytes.load(1), bytes.load(2), bytes.load(3),
+        bytes.load(4), bytes.load(5), bytes.load(6)
+    )
+}
+
+trusted fun Rx8130.setDateTime(value: RtcDateTime): bool {
+    if (!this.valid() || !value.valid() || value.year() < 2000 ||
+        value.year() > 2099) return false
+    val bytes = nativeBufferAt(nativeStackAllocate(7), 7)
+    bytes.store(0, bcdEncode(value.second()))
+    bytes.store(1, bcdEncode(value.minute()))
+    bytes.store(2, bcdEncode(value.hour()))
+    bytes.store(3, 1 << value.weekday())
+    bytes.store(4, bcdEncode(value.day()))
+    bytes.store(5, bcdEncode(value.month()))
+    bytes.store(6, bcdEncode(value.year() - 2000))
+    this.device().writeRegister(16, bytes, 7)
+}
+
+trusted fun Rx8130.stopTimer(): bool {
+    var stopped = false
+    var retry = 0
+    while (!stopped && retry < 3) {
+        val extensionStopped = this.device().updateRegister8(28, 16, 0)
+        val controlStopped = this.device().updateRegister8(30, 16, 0)
+        val extension = this.device().readRegister8Checked(28)
+        val control = this.device().readRegister8Checked(30)
+        stopped = extensionStopped && controlStopped && extension.valid() &&
+            control.valid() && (extension.value() & 16) == 0 &&
+            (control.value() & 16) == 0
+        retry = retry + 1
+    }
+    stopped
+}
+
+trusted fun Rx8130.setTimerInterrupt(milliseconds: int): int {
+    if (!this.valid()) return 0
+    if (milliseconds <= 0) {
+        this.stopTimer()
+        this.device().writeRegister8(29, 175)
+        return 0
+    }
+    val plan = rx8130TimerPlan(milliseconds)
+    if (!rx8130TimerEnabled(plan)) return 0
+    val extensionRead = this.device().readRegister8Checked(28)
+    if (!extensionRead.valid()) return 0
+    val extension = (extensionRead.value() & 232) |
+        rx8130TimerSelector(plan)
+    var configured = this.device().writeRegister8(28, extension) &&
+        this.device().writeRegister8(29, 175) &&
+        this.device().updateRegister8(30, 16, 16)
+    val preset = nativeBufferAt(nativeStackAllocate(2), 2)
+    val verify = nativeBufferAt(nativeStackAllocate(2), 2)
+    preset.storeU16(0, rx8130TimerCount(plan))
+    var verified = false
+    var retry = 0
+    while (configured && !verified && retry < 3) {
+        verified = this.device().writeRegister(26, preset, 2) &&
+            this.device().readRegister(26, verify, 2) &&
+            verify.loadU16(0) == preset.loadU16(0)
+        retry = retry + 1
+    }
+    configured = configured && verified &&
+        this.device().writeRegister8(28, extension | 16)
+    if (!configured) {
+        this.stopTimer()
+        return 0
+    }
+    rx8130TimerMilliseconds(plan)
+}
+
+trusted fun Rx8130.setAlarmInterrupt(
+    minute: int = -1,
+    hour: int = -1,
+    day: int = -1,
+    weekday: int = -1
+): bool {
+    if (!this.valid() || minute < -1 || minute > 59 || hour < -1 ||
+        hour > 23 || day < -1 || day > 31 || weekday < -1 || weekday > 6 ||
+        (day >= 0 && weekday >= 0)) return false
+    val enabled = minute >= 0 || hour >= 0 || day >= 0 || weekday >= 0
+    if (day >= 0 && !this.device().updateRegister8(28, 8, 8)) return false
+    if (weekday >= 0 && !this.device().updateRegister8(28, 8, 0)) return false
+    val bytes = nativeBufferAt(nativeStackAllocate(3), 3)
+    bytes.store(0, if (minute < 0) 128 else bcdEncode(minute) & 127)
+    bytes.store(1, if (hour < 0) 128 else bcdEncode(hour) & 63)
+    bytes.store(
+        2,
+        if (day >= 0) bcdEncode(day) & 63 else
+            if (weekday >= 0) 1 << weekday else 128
+    )
+    this.device().writeRegister(23, bytes, 3) &&
+        this.device().updateRegister8(30, 8, if (enabled) 8 else 0)
+}
+
+trusted fun Rx8130.interruptPending(): bool =
+    this.valid() && (this.device().readRegister8(29) & 24) != 0
+
+trusted fun Rx8130.clearInterrupt(): bool =
+    this.valid() && this.device().writeRegister8(29, 167)
+
+trusted fun Rx8130.disableInterrupts(): bool =
+    this.valid() && this.device().updateRegister8(30, 24, 0) &&
+        this.device().writeRegister8(29, 167)

@@ -1,9 +1,9 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan spi-jedec rtc-pcf8563 io-expander i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec rtc-pcf8563 rtc-rx8130 io-expander i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
-	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-io-expander clean
+	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-rtc-rx8130 upload-io-expander clean
 
 setup:
 	./tools/setup
@@ -30,6 +30,10 @@ spi-jedec:
 rtc-pcf8563:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example rtc-pcf8563'
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-pcf8563 build'
+
+rtc-rx8130:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example rtc-rx8130'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-rx8130 build'
 
 io-expander:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example io-expander'
@@ -61,6 +65,9 @@ upload-spi-jedec: spi-jedec
 
 upload-rtc-pcf8563: rtc-pcf8563
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-pcf8563 flash'
+
+upload-rtc-rx8130: rtc-rx8130
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-rx8130 flash'
 
 upload-io-expander: io-expander
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/io-expander flash'
