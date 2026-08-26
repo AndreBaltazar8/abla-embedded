@@ -50,6 +50,7 @@ make led-powerhub
 make led-paper-mono
 make led-strip-rmt
 make board-detect-c6
+make board-detect-s3
 make imu-calibration
 make imu-offsets
 make i2s-tone
@@ -103,6 +104,14 @@ and StampC6. It reads the package through ESP-IDF's stable eFuse ABI and the
 embedded-flash capacity from the read-only eFuse mirror directly in Abla. It
 does not touch GPIOs, and QFN40 display products remain unknown until a display
 detector identifies them.
+`board-detect-s3` is the independently buildable opt-in ESP32-S3 detector. It
+captures and restores every GPIO field it changes, including the output latch,
+and refuses peripheral-controlled outputs. Its allocation-free Abla software
+I2C probe only uses open-drain transitions, checks for strong external pull-ups,
+honors bounded clock stretching, and recovers an interrupted bus without
+allocating ESP-IDF's I2C driver. AtomS3R camera-module distinction still needs
+the target-specific XCLK probe, so a camera variant currently retains the
+shared AtomS3RExt identity.
 The four LED examples cover ESP-IDF 6 RMT strips, M5PM1 packed RGB output,
 PowerHub's eight RGB channels, and Paper Mono's split PMIC/M5IOE1 RGB path.
 Each backend has the same `setColor`, `setAllColor`, `setBrightness`, and

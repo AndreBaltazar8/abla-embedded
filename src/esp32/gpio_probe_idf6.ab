@@ -1,0 +1,184 @@
+import "./gpio_probe_logic.ab"
+import "./sdk/buffer.ab"
+import "abla/unsafe/memory"
+
+trusted noescape extern:"c" fun gpio_get_io_config(
+    pin: i32,
+    configuration: i64*
+): i32
+trusted noescape extern:"c" fun gpio_set_direction(pin: i32, mode: i32): i32
+trusted noescape extern:"c" fun gpio_set_pull_mode(pin: i32, mode: i32): i32
+trusted noescape extern:"c" fun gpio_set_drive_capability(
+    pin: i32,
+    drive: i32
+): i32
+trusted noescape extern:"c" fun gpio_set_level(pin: i32, level: u32): i32
+trusted noescape extern:"c" fun gpio_get_level(pin: i32): i32
+trusted noescape extern:"c" fun esp_rom_delay_us(microseconds: u32): void
+
+type GpioProbePinState = int
+
+// gpio_io_config_t is three 32-bit words followed by eight C bool fields in
+// ESP-IDF 6. The adapter only changes direction, pulls, drive, and output
+// level. A peripheral-controlled output is rejected so its routing can never
+// be disturbed by runtime detection.
+trusted fun gpioProbeCapture(
+    pin: int,
+    outputLevelHigh: bool
+): GpioProbePinState {
+    val address = nativeStackAllocate(20)
+    nativeAddressClear(address, 20)
+    if (gpio_get_io_config(
+            pin, nativePointerFromAddress(address)
+        ) != 0) return GpioProbePinState(0)
+    val outputControlledByPeripheral =
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 16)) != 0
+    if (outputControlledByPeripheral) return GpioProbePinState(0)
+    GpioProbePinState(gpioProbeState(
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 12)) != 0,
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 13)) != 0,
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 14)) != 0,
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 15)) != 0,
+        ablaUnsafeLoadU8(nativeAddressPointer(address, 18)) != 0,
+        nativeAddressLoadU32(address, 8),
+        outputLevelHigh
+    ))
+}
+
+trusted fun GpioProbePinState.restore(pin: int): bool {
+    if (!gpioProbeStateValid(this)) return false
+    var restored = true
+    // Restore the output latch before output enable. This matters even when the
+    // pin was an input: enabling it later must not expose the probe's last bit.
+    if (gpio_set_level(
+            pin, if (gpioProbeStateLevel(this)) 1 else 0
+        ) != 0) restored = false
+    if (gpio_set_pull_mode(pin, gpioProbePullMode(this)) != 0) {
+        restored = false
+    }
+    if (gpio_set_drive_capability(
+            pin, gpioProbeStateDrive(this)
+        ) != 0) restored = false
+    if (gpio_set_direction(pin, gpioProbeDirection(this)) != 0) {
+        restored = false
+    }
+    restored
+}
+
+trusted fun gpioProbeInput(pin: int, pullMode: int): bool =
+    gpio_set_direction(pin, 1) == 0 && gpio_set_pull_mode(pin, pullMode) == 0
+
+trusted fun gpioProbeRead(pin: int): bool = gpio_get_level(pin) != 0
+
+trusted fun gpioProbeDelayMicroseconds(microseconds: int): void {
+    if (microseconds > 0) esp_rom_delay_us(microseconds)
+    return
+}
+
+// Recover an interrupted I2C transaction without ever driving either line
+// high. GPIO_MODE_INPUT_OUTPUT_OD plus level 1 releases the line; level 0
+// pulls it low. The caller owns capture/restore of both pins.
+trusted fun gpioProbeI2cStop(sda: int, scl: int): bool {
+    if (gpio_set_level(sda, 1) != 0 || gpio_set_level(scl, 1) != 0 ||
+        gpio_set_direction(sda, 7) != 0 ||
+        gpio_set_direction(scl, 7) != 0 ||
+        gpio_set_pull_mode(sda, 0) != 0 ||
+        gpio_set_pull_mode(scl, 0) != 0) return false
+    var cycle = 0
+    var valid = true
+    while (cycle < 8) {
+        if (gpio_set_level(scl, 0) != 0) valid = false
+        gpioProbeDelayMicroseconds(5)
+        if (gpio_set_level(sda, 0) != 0) valid = false
+        gpioProbeDelayMicroseconds(5)
+        if (!gpioProbeI2cReleaseClock(scl)) valid = false
+        gpioProbeDelayMicroseconds(5)
+        if (gpio_set_level(sda, 1) != 0) valid = false
+        gpioProbeDelayMicroseconds(5)
+        cycle = cycle + 1
+    }
+    valid && gpioProbeRead(sda) && gpioProbeRead(scl)
+}
+
+trusted fun gpioProbeI2cReleaseClock(scl: int): bool {
+    if (gpio_set_level(scl, 1) != 0) return false
+    var remaining = 1000
+    while (!gpioProbeRead(scl) && remaining > 0) {
+        gpioProbeDelayMicroseconds(1)
+        remaining = remaining - 1
+    }
+    gpioProbeRead(scl)
+}
+
+// A board detector must not mistake two arbitrary GPIOs for an I2C bus. Both
+// lines first have to be drivable low, then a strong external pull-up must win
+// against the internal pull-down. SCL-only recovery is the recognized case in
+// which an interrupted device is still holding SDA low.
+trusted fun gpioProbeI2cBusState(sda: int, scl: int): int {
+    if (gpio_set_level(sda, 0) != 0 || gpio_set_level(scl, 0) != 0 ||
+        gpio_set_direction(sda, 7) != 0 ||
+        gpio_set_direction(scl, 7) != 0 ||
+        gpio_set_pull_mode(sda, 0) != 0 ||
+        gpio_set_pull_mode(scl, 0) != 0) return 0
+    gpioProbeDelayMicroseconds(5)
+    if (gpioProbeRead(sda) || gpioProbeRead(scl)) return 0
+
+    if (gpio_set_direction(sda, 1) != 0 ||
+        gpio_set_direction(scl, 1) != 0 ||
+        gpio_set_pull_mode(sda, 1) != 0 ||
+        gpio_set_pull_mode(scl, 1) != 0) return 0
+    gpioProbeDelayMicroseconds(10)
+    val state = (if (gpioProbeRead(scl)) 1 else 0) |
+        (if (gpioProbeRead(sda)) 2 else 0)
+    gpio_set_pull_mode(sda, 0)
+    gpio_set_pull_mode(scl, 0)
+    state
+}
+
+// Emit one read-only 7-bit address transaction. Both pins are open drain, so
+// this function can only pull a line low or release it. It honors a bounded
+// clock stretch, samples ACK, and emits STOP on every completed transaction.
+trusted fun gpioProbeI2cAddress(sda: int, scl: int, address: int): bool {
+    if (address < 0 || address >= 128) return false
+    val busState = gpioProbeI2cBusState(sda, scl)
+    if (busState != 3 && busState != 1) return false
+    if (!gpioProbeI2cStop(sda, scl)) return false
+    if (busState != 3 && gpioProbeI2cBusState(sda, scl) != 3) {
+        return false
+    }
+    if (gpio_set_level(sda, 1) != 0 || !gpioProbeI2cReleaseClock(scl)) {
+        return false
+    }
+    gpioProbeDelayMicroseconds(5)
+    if (gpio_set_level(sda, 0) != 0) return false
+    gpioProbeDelayMicroseconds(5)
+    if (gpio_set_level(scl, 0) != 0) return false
+
+    val writeAddress = address << 1
+    var mask = 128
+    var valid = true
+    while (valid && mask > 0) {
+        valid = gpio_set_level(
+            sda, if ((writeAddress & mask) != 0) 1 else 0
+        ) == 0
+        gpioProbeDelayMicroseconds(2)
+        if (valid) valid = gpioProbeI2cReleaseClock(scl)
+        gpioProbeDelayMicroseconds(5)
+        if (gpio_set_level(scl, 0) != 0) valid = false
+        mask = mask >>> 1
+    }
+
+    if (gpio_set_level(sda, 1) != 0) valid = false
+    gpioProbeDelayMicroseconds(2)
+    if (valid) valid = gpioProbeI2cReleaseClock(scl)
+    gpioProbeDelayMicroseconds(3)
+    val acknowledged = valid && !gpioProbeRead(sda)
+    gpio_set_level(scl, 0)
+    gpio_set_level(sda, 0)
+    gpioProbeDelayMicroseconds(2)
+    gpioProbeI2cReleaseClock(scl)
+    gpioProbeDelayMicroseconds(2)
+    gpio_set_level(sda, 1)
+    gpioProbeDelayMicroseconds(2)
+    acknowledged
+}

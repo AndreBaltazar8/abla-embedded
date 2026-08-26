@@ -35,7 +35,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 
 | Capability | Upstream behavior to cover | Abla status |
 | --- | --- | --- |
-| Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Full canonical ID registry and aliases; Atom Echo typed profile; host-verified detection decisions for every upstream ESP32 family, kept behind explicit imports; exact read-only eFuse detection for ESP32-C6 is independently build-verified; GPIO/I2C probes and remaining typed profiles pending |
+| Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Full canonical ID registry and aliases; Atom Echo typed profile; host-verified detection decisions for every upstream ESP32 family, kept behind explicit imports; exact ESP32-C6 eFuse detection and allocation-free ESP32-S3 GPIO/I2C detection are independently build-verified; S3 camera-module distinction, other hardware adapters, and remaining typed profiles pending |
 | Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Complete upstream registry for all board IDs, including Tab5X aliasing and allocation-free 30-pin M-Bus lookup |
 | GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Complete upstream board source registry; raw GPIO access stays `Pin`, `GpioButton` packs pin/polarity/full state into one scalar, and checked PI4/PowerHub/M5PM1 adapters never turn I2C failure into an active-low press; touch detail and PMIC event adapters remain |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
@@ -95,8 +95,8 @@ Deprecated aliases such as Atom Echo map to their canonical board identity
 
 ## Validation order
 
-1. Finish safe GPIO/I2C board detection, remaining static board profiles, and
-   PMIC/expander/touch button adapters.
+1. Finish the remaining target-specific board detectors and static profiles,
+   plus PMIC/expander/touch button adapters.
 2. Add raw I2C jobs, queued SPI, SDMMC/filesystems, and board power policy on
    top of the completed blocking bus and PMIC foundations.
 3. Extend speaker/microphone support beyond blocking PCM.
