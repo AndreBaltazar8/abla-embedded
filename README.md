@@ -50,6 +50,7 @@ make led-powerhub
 make led-paper-mono
 make led-strip-rmt
 make board-detect-c6
+make imu-calibration
 make imu-offsets
 make i2s-tone
 make wifi-connect
@@ -195,6 +196,12 @@ vendor ABI declarations. `ImuOffsets` keeps M5Unified-compatible signed Q16
 only when its module is imported. Saves explicitly call `nvs_commit`; loads
 fail without modifying the live offsets if any field is absent instead of
 silently accepting a partial record.
+
+`ImuCalibration` keeps M5Unified's three-sensor previous sample, moving
+average, stillness score, radius, tolerance, noise, and strength state in 120
+caller-owned bytes. Its fixed-point update uses integer square root and direct
+scalar arithmetic, so automatic correction does not require heap objects or a
+floating-point math-library boundary. NVS remains a separate opt-in import.
 
 ## API and portability
 

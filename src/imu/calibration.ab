@@ -1,0 +1,197 @@
+import "./types_logic.ab"
+import "./offsets.ab"
+import "./calibration_logic.ab"
+import "../esp32/sdk/buffer.ab"
+import "abla/unsafe/memory"
+
+type ImuCalibration = int
+
+val imuCalibrationSensorBytes = 40
+val imuCalibrationStorageBytes = 120
+
+trusted fun imuCalibrationAt(address: int): ImuCalibration = ImuCalibration(
+    (address & 4294967295) | (imuCalibrationStorageBytes << 32)
+)
+
+trusted fun imuCalibration(): ImuCalibration =
+    imuCalibrationAt(nativeStaticAllocate(120))
+
+fun ImuCalibration.buffer(): NativeBuffer = NativeBuffer(
+    this & 9223372036854775807
+)
+
+fun ImuCalibration.valid(): bool =
+    this.buffer().capacity() >= imuCalibrationStorageBytes
+
+fun imuCalibrationSensorOffset(sensor: int): int =
+    if (sensor < 0 || sensor > 2) -1 else sensor * imuCalibrationSensorBytes
+
+trusted fun ImuCalibration.clear(): void {
+    if (this.valid()) nativeAddressClear(
+        this.buffer().addressValue(), imuCalibrationStorageBytes
+    )
+    return
+}
+
+trusted fun ImuCalibration.configure(
+    sensor: int,
+    radius: int,
+    tolerance: int,
+    noiseLevel: int,
+    averageShift: int,
+    strength: int
+): bool {
+    val base = imuCalibrationSensorOffset(sensor)
+    if (!this.valid() || base < 0) return false
+    val buffer = this.buffer()
+    buffer.storeU32(base + 24, radius)
+    buffer.storeU32(base + 28, tolerance)
+    buffer.storeU32(base + 32, noiseLevel)
+    buffer.storeU32(
+        base + 36,
+        imuCalibrationMetadata(averageShift, 0, strength)
+    )
+}
+
+trusted fun ImuCalibration.configureM5UnifiedDefaults(
+    accelStrength: int = 0,
+    gyroStrength: int = 0,
+    magneticStrength: int = 0
+): bool = this.configure(0, 4096, 2, 256, 1, accelStrength) &&
+    this.configure(1, 0, 0, 32, 6, gyroStrength) &&
+    this.configure(2, 256, 42, 64, 1, magneticStrength)
+
+trusted fun ImuCalibration.setStrength(sensor: int, strength: int): bool {
+    val base = imuCalibrationSensorOffset(sensor)
+    if (!this.valid() || base < 0) return false
+    val buffer = this.buffer()
+    val metadata = buffer.loadU32(base + 36)
+    buffer.storeU32(
+        base + 36,
+        imuCalibrationMetadata(
+            imuCalibrationAverageShift(metadata),
+            imuCalibrationStillnessValue(metadata),
+            strength
+        )
+    )
+}
+
+trusted fun ImuCalibration.initializeSensor(
+    sensor: int,
+    axes: ImuAxes,
+    offsets: ImuOffsets
+): bool {
+    val base = imuCalibrationSensorOffset(sensor)
+    if (!this.valid() || base < 0 || !axes.valid() || !offsets.valid()) {
+        return false
+    }
+    val buffer = this.buffer()
+    var axis = 0
+    while (axis < 3) {
+        val fixed = axes.axis(axis) << 16
+        buffer.storeU32(base + axis * 4, fixed)
+        buffer.storeU32(base + 12 + axis * 4, fixed)
+        axis = axis + 1
+    }
+    val metadata = buffer.loadU32(base + 36)
+    buffer.storeU32(
+        base + 36,
+        imuCalibrationMetadata(
+            imuCalibrationAverageShift(metadata), 255,
+            imuCalibrationStrength(metadata)
+        )
+    )
+    this.calibrateSensor(sensor, offsets)
+    true
+}
+
+trusted fun ImuCalibration.calibrateSensor(
+    sensor: int,
+    offsets: ImuOffsets
+): bool {
+    val base = imuCalibrationSensorOffset(sensor)
+    if (!this.valid() || base < 0 || !offsets.valid()) return false
+    val buffer = this.buffer()
+    val metadata = buffer.loadU32(base + 36)
+    val stillness = imuCalibrationStillnessValue(metadata)
+    val strength = imuCalibrationStrength(metadata)
+    if (stillness == 0 || strength == 0) return false
+    val dx = imuSigned32(buffer.loadU32(base)) - offsets.sensorAxis(sensor, 0)
+    val dy = imuSigned32(buffer.loadU32(base + 4)) -
+        offsets.sensorAxis(sensor, 1)
+    val dz = imuSigned32(buffer.loadU32(base + 8)) -
+        offsets.sensorAxis(sensor, 2)
+    val distance = imuCalibrationDistance(dx, dy, dz)
+    if (distance < 1) return false
+    val radius = imuSigned32(buffer.loadU32(base + 24))
+    val tolerance = imuSigned32(buffer.loadU32(base + 28))
+    val error = distance - radius
+    val force = imuCalibrationAbsolute(error)
+    if (force <= tolerance) return false
+    val signedForce = if (error < 0) -force else force
+    offsets.setSensorAxis(
+        sensor, 0, offsets.sensorAxis(sensor, 0) +
+            imuCalibrationDelta(
+                dx, signedForce, stillness, strength, distance
+            )
+    )
+    offsets.setSensorAxis(
+        sensor, 1, offsets.sensorAxis(sensor, 1) +
+            imuCalibrationDelta(
+                dy, signedForce, stillness, strength, distance
+            )
+    )
+    offsets.setSensorAxis(
+        sensor, 2, offsets.sensorAxis(sensor, 2) +
+            imuCalibrationDelta(
+                dz, signedForce, stillness, strength, distance
+            )
+    )
+    true
+}
+
+trusted fun ImuCalibration.update(
+    sensor: int,
+    axes: ImuAxes,
+    offsets: ImuOffsets
+): int {
+    val base = imuCalibrationSensorOffset(sensor)
+    if (!this.valid() || base < 0 || !axes.valid() || !offsets.valid()) {
+        return 0
+    }
+    val buffer = this.buffer()
+    val metadata = buffer.loadU32(base + 36)
+    val shift = imuCalibrationAverageShift(metadata)
+    var maximumDifference = 0
+    var axis = 0
+    while (axis < 3) {
+        val fixed = axes.axis(axis) << 16
+        val previous = imuSigned32(buffer.loadU32(base + axis * 4))
+        var difference = imuCalibrationAbsolute(fixed - previous)
+        if (difference > maximumDifference) maximumDifference = difference
+        buffer.storeU32(base + axis * 4, fixed)
+        val average = imuSigned32(
+            buffer.loadU32(base + 12 + axis * 4)
+        )
+        difference = imuCalibrationAbsolute(fixed - average)
+        if (difference > maximumDifference) maximumDifference = difference
+        buffer.storeU32(
+            base + 12 + axis * 4,
+            imuCalibrationAverage(average, fixed, shift)
+        )
+        axis = axis + 1
+    }
+    val stillness = imuCalibrationStillness(
+        imuCalibrationStillnessValue(metadata),
+        imuSigned32(buffer.loadU32(base + 32)),
+        maximumDifference
+    )
+    buffer.storeU32(
+        base + 36,
+        imuCalibrationMetadata(
+            shift, stillness, imuCalibrationStrength(metadata)
+        )
+    )
+    if (stillness > 16) this.calibrateSensor(sensor, offsets)
+    stillness
+}
