@@ -39,7 +39,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Atom Echo internal/external I2C, Port A, RGB, and power workaround |
 | GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Packed pure `ButtonState` covers GPIO behavior; PMIC/expander/touch sources pending |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
-| SPI | Shared bus/device configuration needed by displays and SD | Not implemented |
+| SPI | Shared bus/device configuration needed by displays and SD | IDF 6 bus/device lifecycle plus blocking full/half-duplex transactions build-verified; queued and variable command/address phases pending |
 | Display | Built-in and external displays, drawing, brightness, rotation | Not implemented; belongs in an Abla display layer informed by M5GFX |
 | Touch | Multi-point state, hold, drag/flick, touch-button mapping | Not implemented |
 | Speaker | I2S/DAC/buzzer output, tone, raw PCM/WAV, volume, mixing, board enable callbacks | Blocking raw I2S output; Atom Echo local tone and streamed speech hardware-verified on IDF 6 |
@@ -47,7 +47,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | One RGB LED value |
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | Not implemented |
-| RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | Not implemented |
+| RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | PCF8563 validated date/time, alarms, timer IRQ and low-voltage API build-verified; RX8130 and PowerHub pending |
 | IMU | MPU6886, SH200Q, BMI270, BMM150, AK8963; axes, calibration, NVS offsets | Not implemented |
 | IO expander | M5IOE1 and PI4IOE5V6408 direction, pull, I/O, IRQ | Not implemented |
 | SD/storage | Board SD pin/type mapping and SDMMC/SDSPI operations | Not implemented |

@@ -1,9 +1,9 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec rtc-pcf8563 i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
-	upload-atom-echo clean
+	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 clean
 
 setup:
 	./tools/setup
@@ -22,6 +22,14 @@ serial:
 i2c-scan:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2c-scan'
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/i2c-scan build'
+
+spi-jedec:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example spi-jedec'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/spi-jedec build'
+
+rtc-pcf8563:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example rtc-pcf8563'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-pcf8563 build'
 
 i2s-tone:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2s-tone'
@@ -43,6 +51,12 @@ upload-serial: serial
 
 upload-i2s-tone: i2s-tone
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/i2s-tone -t upload'
+
+upload-spi-jedec: spi-jedec
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/spi-jedec flash'
+
+upload-rtc-pcf8563: rtc-pcf8563
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/rtc-pcf8563 flash'
 
 upload-wifi-connect: wifi-connect
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/wifi-connect -t upload'

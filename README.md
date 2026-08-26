@@ -9,8 +9,9 @@ The ESP32 target emits Xtensa objects directly through LLVM. There is no
 generated C and no handwritten C/C++ shim between an Abla application and the
 linker. Stable hardware operations such as GPIO and UART are implemented with
 volatile MMIO in Abla. Complex vendor services currently call their native ABI:
-the ESP-IDF I2S DMA driver, Wi-Fi initialization/PHY/MAC libraries, TLS, and
-sleep support. Those boundaries are deliberately visible in `src/esp32`.
+the ESP-IDF I2C, SPI and I2S DMA drivers, Wi-Fi initialization/PHY/MAC
+libraries, TLS, and sleep support. Those boundaries are deliberately visible
+in `src/esp32`.
 
 ## Requirements
 
@@ -30,6 +31,8 @@ make setup
 make blink
 make serial
 make i2c-scan
+make spi-jedec
+make rtc-pcf8563
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -41,7 +44,11 @@ equivalent toolchains and set `ABLA_ESP_LLVM_ROOT` and `IDF_PATH`.
 
 `make blink` uses Espressif's official `idf.py` workflow. Set `IDF_PATH` when
 ESP-IDF is installed somewhere other than
-`~/.cache/abla-embedded/esp-idf-v6.0.2`. The serial, I2S, and Wi-Fi examples
+`~/.cache/abla-embedded/esp-idf-v6.0.2`. `spi-jedec` demonstrates a single
+chip-select-preserving command/read transaction against an external SPI flash.
+`rtc-pcf8563` reads and validates an external PCF8563 RTC over I2C.
+Both are direct `app_main` ESP-IDF firmwares and do not depend on Arduino.
+The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
 `atom-echo` demonstrates a statically selected M5Stack board profile with
@@ -60,7 +67,8 @@ make upload-blink
 
 The public handles are nominal scalar values where the hardware identity fits
 in a machine word. For example, `Pin`, `SerialPort`, `RgbLed`, `ButtonState`, `WifiStation`,
-`I2sPins`, `I2sDevice`, `NativeBuffer`, and `TlsClient` keep distinct types
+`I2cBus`, `I2cDevice`, `SpiPins`, `SpiBus`, `SpiDevice`, `I2sPins`,
+`I2sDevice`, `NativeBuffer`, and `TlsClient` keep distinct types
 during checking but lower to ordinary integers. Extension methods use `this`
 directly; there is no wrapper object or `.value` field.
 

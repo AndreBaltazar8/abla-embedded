@@ -1,0 +1,192 @@
+import "abla/unsafe/memory"
+import "./sdk/buffer.ab"
+
+trusted noescape extern:"c" fun spi_bus_initialize(
+    host: i32,
+    config: i64*,
+    dmaChannel: i32
+): i32
+trusted noescape extern:"c" fun spi_bus_free(host: i32): i32
+trusted noescape extern:"c" fun spi_bus_add_device(
+    host: i32,
+    config: i64*,
+    handle: i64*
+): i32
+trusted noescape extern:"c" fun spi_bus_remove_device(handle: i64*): i32
+trusted noescape extern:"c" fun spi_device_transmit(
+    handle: i64*,
+    transaction: i64*
+): i32
+
+// Buses are physical ESP32 controllers and devices are vendor-owned native
+// handles. Both remain one-register nominal scalar values at the public ABI.
+type SpiPins = int
+type SpiBus = int
+type SpiDevice = int
+
+fun spiPins(mosi: int, miso: int, clock: int): SpiPins = SpiPins(
+    (mosi & 255) | ((miso & 255) << 8) | ((clock & 255) << 16)
+)
+
+fun spiPinDecode(value: int): int = if (value < 128) value else value - 256
+
+fun SpiPins.mosiPin(): int = spiPinDecode(this & 255)
+fun SpiPins.misoPin(): int = spiPinDecode((this >>> 8) & 255)
+fun SpiPins.clockPin(): int = spiPinDecode((this >>> 16) & 255)
+
+var idf6SpiBus1Pins = -1
+var idf6SpiBus2Pins = -1
+
+fun storedSpiPins(host: int): int =
+    if (host == 1) idf6SpiBus1Pins else idf6SpiBus2Pins
+
+fun setStoredSpiPins(host: int, pins: int): void {
+    if (host == 1) idf6SpiBus1Pins = pins else idf6SpiBus2Pins = pins
+    return
+}
+
+trusted fun spiMaster(
+    host: int,
+    pins: SpiPins,
+    maximumTransferBytes: int = 4092
+): SpiBus {
+    if (host < 1 || host > 2 || pins.clockPin() < 0 ||
+        maximumTransferBytes < 0) return SpiBus(0)
+
+    val existing = storedSpiPins(host)
+    if (existing != -1) {
+        return if (existing == pins) SpiBus(host + 1) else SpiBus(0)
+    }
+
+    // spi_bus_config_t for the 32-bit ESP-IDF 6 ABI.
+    val config = nativeStackAllocate(56)
+    nativeAddressClear(config, 56)
+    nativeAddressStoreU32(config, 0, pins.mosiPin())
+    nativeAddressStoreU32(config, 4, pins.misoPin())
+    nativeAddressStoreU32(config, 8, pins.clockPin())
+    nativeAddressStoreU32(config, 12, -1)
+    nativeAddressStoreU32(config, 16, -1)
+    nativeAddressStoreU32(config, 20, -1)
+    nativeAddressStoreU32(config, 24, -1)
+    nativeAddressStoreU32(config, 28, -1)
+    nativeAddressStoreU32(config, 32, -1)
+    nativeAddressStoreU32(config, 40, maximumTransferBytes)
+
+    val status = spi_bus_initialize(
+        host, nativePointerFromAddress(config), 3
+    )
+    if (status == 0) setStoredSpiPins(host, pins)
+    SpiBus(if (status == 0) host + 1 else 0)
+}
+
+fun SpiBus.valid(): bool = this >= 2 && this <= 3
+fun SpiBus.hostNumber(): int = this - 1
+
+trusted fun SpiBus.close(): bool {
+    if (!this.valid()) return false
+    val status = spi_bus_free(this.hostNumber())
+    if (status == 0) setStoredSpiPins(this.hostNumber(), -1)
+    status == 0
+}
+
+trusted fun SpiBus.device(
+    chipSelectPin: int,
+    frequency: int,
+    mode: int = 0,
+    halfDuplex: bool = false,
+    queueSize: int = 1
+): SpiDevice {
+    if (!this.valid() || chipSelectPin < -1 || frequency <= 0 ||
+        mode < 0 || mode > 3 || queueSize <= 0) return SpiDevice(0)
+
+    // spi_device_interface_config_t for the 32-bit ESP-IDF 6 ABI.
+    val config = nativeStackAllocate(48)
+    nativeAddressClear(config, 48)
+    nativeAddressStoreU8(config, 3, mode)
+    nativeAddressStoreU32(config, 16, frequency)
+    nativeAddressStoreU32(config, 28, chipSelectPin)
+    nativeAddressStoreU32(config, 32, if (halfDuplex) 16 else 0)
+    nativeAddressStoreU32(config, 36, queueSize)
+
+    val handleCell = nativeStackAllocate(4)
+    nativeAddressStoreU32(handleCell, 0, 0)
+    val status = spi_bus_add_device(
+        this.hostNumber(), nativePointerFromAddress(config),
+        nativePointerFromAddress(handleCell)
+    )
+    SpiDevice(if (status == 0) nativeAddressLoadU32(handleCell, 0) else 0)
+}
+
+fun SpiDevice.valid(): bool = this != 0
+
+trusted fun SpiDevice.close(): bool =
+    this != 0 && spi_bus_remove_device(nativePointerFromAddress(this)) == 0
+
+trusted fun SpiDevice.transfer(
+    transmit: NativeBuffer,
+    receive: NativeBuffer,
+    length: int
+): bool {
+    if (this == 0 || length < 0 || length > transmit.capacity() ||
+        length > receive.capacity()) return false
+
+    // spi_transaction_t for the 32-bit ESP-IDF 6 ABI. size_t is u32.
+    val transaction = nativeStackAllocate(40)
+    nativeAddressClear(transaction, 40)
+    nativeAddressStoreU32(transaction, 16, length * 8)
+    nativeAddressStoreU32(transaction, 20, length * 8)
+    nativeAddressStoreU32(transaction, 32, transmit.addressValue())
+    nativeAddressStoreU32(transaction, 36, receive.addressValue())
+    spi_device_transmit(
+        nativePointerFromAddress(this),
+        nativePointerFromAddress(transaction)
+    ) == 0
+}
+
+trusted fun SpiDevice.write(transmit: NativeBuffer, length: int): bool {
+    if (this == 0 || length < 0 || length > transmit.capacity()) return false
+    val transaction = nativeStackAllocate(40)
+    nativeAddressClear(transaction, 40)
+    nativeAddressStoreU32(transaction, 16, length * 8)
+    nativeAddressStoreU32(transaction, 32, transmit.addressValue())
+    spi_device_transmit(
+        nativePointerFromAddress(this),
+        nativePointerFromAddress(transaction)
+    ) == 0
+}
+
+trusted fun SpiDevice.read(receive: NativeBuffer, length: int): bool {
+    if (this == 0 || length < 0 || length > receive.capacity()) return false
+    val transaction = nativeStackAllocate(40)
+    nativeAddressClear(transaction, 40)
+    nativeAddressStoreU32(transaction, 16, length * 8)
+    nativeAddressStoreU32(transaction, 20, length * 8)
+    nativeAddressStoreU32(transaction, 36, receive.addressValue())
+    spi_device_transmit(
+        nativePointerFromAddress(this),
+        nativePointerFromAddress(transaction)
+    ) == 0
+}
+
+// One half-duplex transaction keeps chip select asserted between the write and
+// read phases, as required by register protocols and JEDEC flash commands.
+trusted fun SpiDevice.writeRead(
+    transmit: NativeBuffer,
+    transmitLength: int,
+    receive: NativeBuffer,
+    receiveLength: int
+): bool {
+    if (this == 0 || transmitLength < 0 || receiveLength < 0 ||
+        transmitLength > transmit.capacity() ||
+        receiveLength > receive.capacity()) return false
+    val transaction = nativeStackAllocate(40)
+    nativeAddressClear(transaction, 40)
+    nativeAddressStoreU32(transaction, 16, transmitLength * 8)
+    nativeAddressStoreU32(transaction, 20, receiveLength * 8)
+    nativeAddressStoreU32(transaction, 32, transmit.addressValue())
+    nativeAddressStoreU32(transaction, 36, receive.addressValue())
+    spi_device_transmit(
+        nativePointerFromAddress(this),
+        nativePointerFromAddress(transaction)
+    ) == 0
+}
