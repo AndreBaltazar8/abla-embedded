@@ -53,9 +53,9 @@ make upload-blink
 
 The public handles are nominal scalar values where the hardware identity fits
 in a machine word. For example, `Pin`, `SerialPort`, `RgbLed`, `WifiStation`,
-`I2sPins`, and `I2sDevice` keep distinct types during checking but lower to
-ordinary integers. Extension methods use `this` directly; there is no wrapper
-object or `.value` field.
+`I2sPins`, `I2sDevice`, `NativeBuffer`, and `TlsClient` keep distinct types
+during checking but lower to ordinary integers. Extension methods use `this`
+directly; there is no wrapper object or `.value` field.
 
 ```abla
 val led = pin(27)
@@ -69,6 +69,12 @@ Trusted driver code can use `nativeStackAllocate` for short-lived SDK structs
 and native-width loads/stores. LLVM lowers these to stack allocation and direct
 memory operations, so a driver does not need a heap-backed buffer merely to
 call a native ABI.
+
+Long-lived firmware storage uses `nativeStaticAllocate`. Each constant-sized
+call site becomes a zero-initialized BSS region, while `nativeBufferAt` wraps
+its address and capacity into one checked scalar. The `tlsClient()` convenience
+constructor similarly owns one static client region; projects needing multiple
+clients can reserve distinct regions and construct them with `tlsClientAt`.
 
 ## API and portability
 

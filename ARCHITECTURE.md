@@ -33,9 +33,15 @@ are packed values; ESP-IDF 6 channel ownership lives with the physical port in
 the backend rather than forcing application code to borrow a heap object.
 
 Transient native records use the trusted `nativeStackAllocate` boundary. It
-lowers to LLVM `alloca`; 8/16/32/64-bit access and memory clearing lower to
-native loads, stores, and `llvm.memset`. Persistent packet and audio storage can
-still use the ownership-checked `NativeByteBuffer` resource.
+lowers directly in the consuming function to LLVM `alloca`; 8/16/32/64-bit
+access and memory clearing lower to native loads, stores, and `llvm.memset`.
+Persistent regions use `nativeStaticAllocate`, which becomes zero-initialized
+BSS rather than a runtime allocation. `NativeBuffer` packs the address and
+capacity into one checked nominal scalar, and `TlsClient` is likewise a scalar
+handle over statically constructed client storage.
+The TLS storage constants match the selected target ABI (`sizeof` 96 for
+Arduino 2 `WiFiClientSecure`, 100 for Arduino 3 `NetworkClientSecure`) and the
+LLVM globals retain stronger-than-required eight-byte alignment.
 
 ## Native boundary
 
