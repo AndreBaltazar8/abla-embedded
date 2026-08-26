@@ -1,0 +1,353 @@
+import "../../register.ab"
+import "../../dma.ab"
+import "./mac_esp32_logic.ab"
+
+// Opt-in classic-ESP32 MAC register access. Merely importing this module has
+// no hardware effect and retains no state. Every mutating operation is trusted:
+// callers must first establish clocks, reset, PHY calibration, DMA ownership,
+// interrupt routing, channel, and regulatory state. This module deliberately
+// does not pretend that those remaining layers are complete.
+type WifiMac = int
+type WifiMacInterruptCause = int
+
+@inline
+fun wifiMac(): WifiMac = WifiMac(esp32WifiMacBase)
+
+@inline
+fun WifiMac.register(offset: int): Register32 = register32(this + offset)
+
+@inline
+trusted fun WifiMac.interruptCause(): WifiMacInterruptCause =
+    WifiMacInterruptCause(
+        this.register(esp32WifiMacInterruptStatusOffset).read()
+    )
+
+fun WifiMacInterruptCause.rawValue(): int = this
+fun WifiMacInterruptCause.receivedFrame(): bool =
+    (this & esp32WifiMacInterruptRxMask) != 0
+fun WifiMacInterruptCause.transmitted(): bool =
+    (this & esp32WifiMacInterruptTxSuccessMask) != 0
+fun WifiMacInterruptCause.collision(): bool =
+    (this & esp32WifiMacInterruptTxCollisionMask) != 0
+fun WifiMacInterruptCause.timeout(): bool =
+    (this & esp32WifiMacInterruptTxTimeoutMask) != 0
+
+@inline
+trusted fun WifiMac.clearInterrupts(cause: WifiMacInterruptCause): void {
+    this.register(esp32WifiMacInterruptClearOffset).write(cause.rawValue())
+    return
+}
+
+@inline
+trusted fun WifiMac.rxEnabled(): bool =
+    (this.register(esp32WifiMacRxControlOffset).read() &
+        esp32WifiMacRxEnableMask) != 0
+
+@inline
+trusted fun WifiMac.setRxEnabled(enabled: bool): void {
+    this.register(esp32WifiMacRxControlOffset).update(
+        esp32WifiMacRxEnableMask,
+        if (enabled) esp32WifiMacRxEnableMask else 0
+    )
+    return
+}
+
+trusted fun WifiMac.reloadRxDescriptors(maxPolls: int): bool {
+    if (maxPolls <= 0) return false
+    val control = this.register(esp32WifiMacRxControlOffset)
+    control.setBits(esp32WifiMacRxReloadMask)
+    var remaining = maxPolls
+    var pending = true
+    while (remaining > 0 && pending) {
+        pending = (control.read() & esp32WifiMacRxReloadMask) != 0
+        remaining = remaining - 1
+    }
+    !pending
+}
+
+@inline
+trusted fun WifiMac.rxDescriptorBase(): DmaDescriptor =
+    dmaDescriptorAt(
+        this.register(esp32WifiMacRxDescriptorBaseOffset).read()
+    )
+
+@inline
+trusted fun WifiMac.rxDescriptorNext(): DmaDescriptor =
+    dmaDescriptorAt(
+        this.register(esp32WifiMacRxDescriptorNextOffset).read()
+    )
+
+@inline
+trusted fun WifiMac.rxDescriptorLast(): DmaDescriptor =
+    dmaDescriptorAt(
+        this.register(esp32WifiMacRxDescriptorLastOffset).read()
+    )
+
+@inline
+trusted fun WifiMac.setRxDescriptorBase(descriptor: DmaDescriptor): void {
+    this.register(esp32WifiMacRxDescriptorBaseOffset).write(
+        descriptor.addressValue()
+    )
+    return
+}
+
+trusted fun WifiMac.startRx(
+    descriptor: DmaDescriptor,
+    maxReloadPolls: int
+): bool {
+    if (descriptor.isNull() || !descriptor.isAligned(4)) return false
+    this.setRxDescriptorBase(descriptor)
+    if (!this.reloadRxDescriptors(maxReloadPolls)) return false
+    this.setRxEnabled(true)
+    true
+}
+
+trusted fun WifiMac.stopRx(maxReloadPolls: int): bool {
+    this.setRxEnabled(false)
+    this.setRxDescriptorBase(dmaDescriptorAt(0))
+    this.reloadRxDescriptors(maxReloadPolls)
+}
+
+@inline
+fun wifiMacFilterAddressRegister(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int,
+    high: bool
+): Register32 = register32(
+    esp32WifiMacFilterAddress(filter, interfaceIndex, if (high) 4 else 0)
+)
+
+@inline
+fun wifiMacFilterMaskRegister(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int,
+    high: bool
+): Register32 = register32(
+    esp32WifiMacFilterAddress(filter, interfaceIndex, if (high) 36 else 32)
+)
+
+trusted fun WifiMac.setFilterAddress(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int,
+    low: int,
+    high: int
+): bool {
+    if (!filter.valid() || interfaceIndex < 0 || interfaceIndex >= 4) return false
+    wifiMacFilterAddressRegister(filter, interfaceIndex, false).write(low)
+    wifiMacFilterAddressRegister(filter, interfaceIndex, true).write(high & 65535)
+    true
+}
+
+trusted fun WifiMac.setFilterMask(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int,
+    low: int,
+    high: int
+): bool {
+    if (!filter.valid() || interfaceIndex < 0 || interfaceIndex >= 4) return false
+    wifiMacFilterMaskRegister(filter, interfaceIndex, false).write(low)
+    wifiMacFilterMaskRegister(filter, interfaceIndex, true).update(
+        65535,
+        high & 65535
+    )
+    true
+}
+
+trusted fun WifiMac.setFilterEnabled(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int,
+    enabled: bool
+): bool {
+    if (!filter.valid() || interfaceIndex < 0 || interfaceIndex >= 4) return false
+    wifiMacFilterMaskRegister(filter, interfaceIndex, true).update(
+        65536,
+        if (enabled) 65536 else 0
+    )
+    true
+}
+
+trusted fun WifiMac.clearFilter(
+    filter: WifiMacRxFilter,
+    interfaceIndex: int
+): bool {
+    if (!filter.valid() || interfaceIndex < 0 || interfaceIndex >= 4) return false
+    wifiMacFilterAddressRegister(filter, interfaceIndex, false).write(0)
+    wifiMacFilterAddressRegister(filter, interfaceIndex, true).write(0)
+    wifiMacFilterMaskRegister(filter, interfaceIndex, false).write(0)
+    wifiMacFilterMaskRegister(filter, interfaceIndex, true).write(0)
+    true
+}
+
+trusted fun WifiMac.setFilterPolicy(
+    interfaceIndex: int,
+    filterUnicast: bool,
+    checkBssid: bool,
+    filterMulticast: bool,
+    receiveBeacons: bool,
+    receiveDataAndManagement: bool
+): bool {
+    val address = esp32WifiMacFilterControlAddress(interfaceIndex)
+    if (address < 0) return false
+    val value = (if (filterUnicast) 1 else 0) |
+        (if (checkBssid) 2 else 0) |
+        (if (filterMulticast) 4 else 0) |
+        (if (receiveBeacons) 16 else 0) |
+        (if (receiveDataAndManagement) 256 else 0)
+    register32(address).update(279, value)
+    true
+}
+
+trusted fun WifiMac.setControlFrameFilter(
+    interfaceIndex: int,
+    allowedFrameMask: int
+): bool {
+    val address = esp32WifiMacControlFrameFilterAddress(interfaceIndex)
+    if (address < 0) return false
+    register32(address).update(
+        4286578688,
+        (allowedFrameMask & 511) << 23
+    )
+    true
+}
+
+@inline
+trusted fun WifiMac.txCompleteStatus(): int =
+    this.register(esp32WifiMacTxCompleteStatusOffset).read() & 31
+
+@inline
+trusted fun WifiMac.txCollisionStatus(): int =
+    this.register(esp32WifiMacTxErrorStatusOffset).read() & 31
+
+@inline
+trusted fun WifiMac.txTimeoutStatus(): int =
+    (this.register(esp32WifiMacTxErrorStatusOffset).read() >>> 16) & 31
+
+trusted fun WifiMac.clearTxComplete(queue: WifiMacTxQueue): bool {
+    val bit = queue.statusBit()
+    if (bit == 0) return false
+    this.register(esp32WifiMacTxCompleteClearOffset).write(bit)
+    true
+}
+
+trusted fun WifiMac.clearTxCollision(queue: WifiMacTxQueue): bool {
+    val bit = queue.statusBit()
+    if (bit == 0) return false
+    this.register(esp32WifiMacTxErrorClearOffset).write(bit)
+    true
+}
+
+trusted fun WifiMac.clearTxTimeout(queue: WifiMacTxQueue): bool {
+    val bit = queue.statusBit()
+    if (bit == 0) return false
+    this.register(esp32WifiMacTxErrorClearOffset).write(bit << 16)
+    true
+}
+
+trusted fun WifiMac.setChannelAccess(
+    queue: WifiMacTxQueue,
+    timeout: int,
+    backoffSlots: int,
+    aifsn: int
+): bool {
+    val address = esp32WifiMacTxConfigAddress(queue)
+    if (address < 0) return false
+    register32(address).write(
+        esp32WifiMacPackChannelAccess(timeout, backoffSlots, aifsn)
+    )
+    true
+}
+
+trusted fun WifiMac.setTxDescriptor(
+    queue: WifiMacTxQueue,
+    descriptor: DmaDescriptor,
+    waitForAck: bool,
+    enableRts: bool
+): bool {
+    val address = esp32WifiMacTxPlcp0Address(queue)
+    if (address < 0 || descriptor.isNull() || !descriptor.isAligned(4)) {
+        return false
+    }
+    register32(address).update(
+        152043519,
+        esp32WifiMacPackPlcp0(
+            descriptor.addressValue(), waitForAck, enableRts
+        )
+    )
+    true
+}
+
+trusted fun WifiMac.setTxQueueStatus(
+    queue: WifiMacTxQueue,
+    valid: bool,
+    enabled: bool
+): bool {
+    val address = esp32WifiMacTxPlcp0Address(queue)
+    if (address < 0) return false
+    register32(address).update(
+        3221225472,
+        (if (valid) 1073741824 else 0) |
+            (if (enabled) 2147483648 else 0)
+    )
+    true
+}
+
+trusted fun WifiMac.setPlcp1(
+    queue: WifiMacTxQueue,
+    frameLength: int,
+    rate: int,
+    keySlot: int,
+    highThroughput: bool,
+    bandwidth40Mhz: bool,
+    interfaceIndex: int
+): bool {
+    val address = esp32WifiMacTxParameterAddress(queue, 0)
+    if (address < 0 || frameLength < 0 || frameLength > 4095 ||
+        rate < 0 || rate > 31 || keySlot < 0 || keySlot > 31 ||
+        interfaceIndex < 0 || interfaceIndex >= 4) return false
+    register32(address).write(esp32WifiMacPackPlcp1(
+        frameLength, rate, keySlot, highThroughput,
+        bandwidth40Mhz, interfaceIndex
+    ))
+    true
+}
+
+trusted fun WifiMac.setPlcp2(queue: WifiMacTxQueue): bool {
+    val address = esp32WifiMacTxParameterAddress(queue, 4)
+    if (address < 0) return false
+    register32(address).write(32)
+    true
+}
+
+trusted fun WifiMac.setDuration(
+    queue: WifiMacTxQueue,
+    duration: int
+): bool {
+    val address = esp32WifiMacTxParameterAddress(queue, 16)
+    if (address < 0 || duration < 0 || duration > 65535) return false
+    register32(address).write(esp32WifiMacPackDuration(duration))
+    true
+}
+
+trusted fun WifiMac.setHighThroughputParameters(
+    queue: WifiMacTxQueue,
+    modulationCoding: int,
+    shortGuardInterval: bool,
+    frameLength: int
+): bool {
+    val signalAddress = esp32WifiMacTxParameterAddress(queue, 8)
+    if (signalAddress < 0 || modulationCoding < 0 ||
+        modulationCoding > 7 || frameLength < 0 || frameLength > 65535) {
+        return false
+    }
+    register32(signalAddress).write(esp32WifiMacPackHtSignal(
+        modulationCoding, shortGuardInterval, frameLength
+    ))
+    register32(signalAddress + 4).write(
+        esp32WifiMacPackHtLength(frameLength)
+    )
+    true
+}
+
+@inline
+trusted fun WifiMac.time(): int =
+    this.register(esp32WifiMacTimeOffset).read()
