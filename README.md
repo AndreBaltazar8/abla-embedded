@@ -40,6 +40,7 @@ make io-expander
 make imu
 make power-monitor
 make pmic-axp192
+make pmic-axp2101
 make i2s-tone
 make wifi-connect
 make atom-echo
@@ -69,6 +70,11 @@ configuration in one allocation-free scalar rather than a heap-backed object.
 system-rail, and temperature telemetry without changing rail configuration.
 The reusable allocation-free driver also exposes DCDC/LDO/GPIO, charging, ADC,
 backup, external-rail, power-key, and shutdown controls.
+`pmic-axp2101` read-only probes the newer PMIC used by CoreS3-class boards and
+samples its battery, VBUS, system, thermistor, die-temperature, charge-state,
+and IRQ registers. Its allocation-free driver also exposes ALDO/BLDO/DLDO,
+charging, ADC, power-key, IRQ, and shutdown controls. IRQ snapshots use the
+same bit positions as IRQ enable masks and require no hidden mutable arrays.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
