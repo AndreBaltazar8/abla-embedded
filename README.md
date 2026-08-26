@@ -109,9 +109,9 @@ captures and restores every GPIO field it changes, including the output latch,
 and refuses peripheral-controlled outputs. Its allocation-free Abla software
 I2C probe only uses open-drain transitions, checks for strong external pull-ups,
 honors bounded clock stretching, and recovers an interrupted bus without
-allocating ESP-IDF's I2C driver. AtomS3R camera-module distinction still needs
-the target-specific XCLK probe, so a camera variant currently retains the
-shared AtomS3RExt identity.
+allocating ESP-IDF's I2C driver. The AtomS3R camera distinction generates XCLK
+and probes the OV3660/GC0308 addresses through direct Abla volatile MMIO, then
+restores every pin it touched.
 The four LED examples cover ESP-IDF 6 RMT strips, M5PM1 packed RGB output,
 PowerHub's eight RGB channels, and Paper Mono's split PMIC/M5IOE1 RGB path.
 Each backend has the same `setColor`, `setAllColor`, `setBrightness`, and
