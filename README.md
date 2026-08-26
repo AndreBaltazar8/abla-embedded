@@ -43,6 +43,7 @@ make power-monitor
 make pmic-axp192
 make pmic-axp2101
 make pmic-ip5306
+make pmic-m5pm1
 make charger-aw32001
 make i2s-tone
 make wifi-connect
@@ -80,7 +81,13 @@ charging, ADC, power-key, IRQ, and shutdown controls. IRQ snapshots use the
 same bit positions as IRQ enable masks and require no hidden mutable arrays.
 `pmic-ip5306` covers the original M5Stack boost/charger PMIC, including its
 coarse battery gauge, charge controls, completed-charge detection, and low-load
-keep-on mode. `charger-aw32001` builds the AW32001 charger used with the
+keep-on mode. `pmic-m5pm1` builds the M5Stack PM1 used by M5StickS3-class
+boards. Its allocation-free driver covers rail control, five GPIOs, two PWM
+channels, wake/IRQ handling, power-key event snapshots, charge enable,
+telemetry, and shutdown. A power-key snapshot retains double-click state in
+the returned scalar rather than in hidden driver state. `PY32PMIC` is only an
+upstream deprecated alias for this same device, not another implementation.
+`charger-aw32001` builds the AW32001 charger used with the
 RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object. The
 same example initializes its paired BQ27220 fuel gauge and reads signed battery
 current and voltage through an allocation-free driver.
