@@ -29,6 +29,7 @@ From this directory:
 make setup
 make blink
 make serial
+make i2c-scan
 make i2s-tone
 make wifi-connect
 make atom-echo

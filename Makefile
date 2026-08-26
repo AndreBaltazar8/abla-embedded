@@ -1,7 +1,7 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
 	upload-atom-echo clean
 
@@ -18,6 +18,10 @@ blink:
 serial:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example serial'
 	nix-shell $(EMBEDDED_SHELL) --run 'pio run -d examples/serial'
+
+i2c-scan:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2c-scan'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/i2c-scan build'
 
 i2s-tone:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example i2s-tone'
