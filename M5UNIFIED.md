@@ -44,7 +44,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | Touch | Multi-point state, hold, drag/flick, touch-button mapping | Not implemented |
 | Speaker | I2S/DAC/buzzer output, tone, raw PCM/WAV, volume, mixing, board enable callbacks | Blocking raw I2S output; Atom Echo local tone and streamed speech hardware-verified on IDF 6 |
 | Microphone | I2S/PDM/ADC capture, mono/stereo conversion, sample-rate conversion | Blocking PDM capture; Atom Echo record-and-echo hardware-verified on IDF 6 |
-| LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | M5PM1 packed RGB, Paper Mono, and PowerHub backends are allocation-free and build-verified with common method names; RMT strip transport pending |
+| LED | RGB strips, PMIC LED, Paper mono LED, PowerHub LED, brightness/buffering | All four backends are allocation-free in Abla-owned state and build-verified with common method names; IDF RMT uses built-in byte/copy encoders without M5Unified's custom allocated callback object |
 | Power | External/USB rails, charge settings/status, battery/VBUS telemetry, vibration, power-off and timed sleep | Deep sleep and one GPIO wake source only |
 | PMIC/fuel gauge | AXP192, AXP2101, IP5306, AW32001, BQ27220, INA226, INA3221, M5PM1, PY32 PMIC | All distinct upstream classes have allocation-free register drivers and independently buildable examples; PY32 PMIC is only a deprecated alias for M5PM1 |
 | RTC | PCF8563, RX8130, PowerHub RTC; date/time, alarms, timer IRQ, low-voltage status | All three date/time and alarm devices ported; PCF8563/RX8130 timers build-verified; PowerHub timer/status remain unavailable upstream and in Abla |
@@ -95,13 +95,14 @@ Deprecated aliases such as Atom Echo map to their canonical board identity
 
 ## Validation order
 
-1. Generic SPI, because most remaining display and storage devices depend on it
-   (I2C and the GPIO button state machine are complete foundations).
-2. Finish persisted IMU calibration, then PMIC, LED, SD, and power drivers.
-3. Speaker/microphone feature parity beyond blocking PCM.
-4. Display/touch foundations and representative M5GFX controller ports.
-5. Static board profiles, detection as an optional module, examples, size and
-   instruction audits.
+1. Finish persisted IMU calibration, safe board detection, remaining static
+   board profiles, and PMIC/expander/touch button adapters.
+2. Add raw I2C jobs, queued SPI, SDMMC/filesystems, and board power policy on
+   top of the completed blocking bus and PMIC foundations.
+3. Extend speaker/microphone support beyond blocking PCM.
+4. Build display/touch foundations and representative M5GFX controller ports.
+5. Complete the profile/examples matrix and repeat whole-firmware size and
+   instruction audits against the C++ reference.
 
 The connected Atom Echo is the reference hardware for the first stage. Its
 profile maps button A to GPIO39, RGB to GPIO27, I2S BCLK/WS/speaker/microphone

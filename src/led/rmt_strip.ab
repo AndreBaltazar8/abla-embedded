@@ -1,0 +1,314 @@
+import "abla/unsafe/memory"
+import "../esp32/gpio.ab"
+import "../esp32/sdk/buffer.ab"
+import "./types.ab"
+import "./rmt_strip_logic.ab"
+
+trusted noescape extern:"c" fun gpio_set_level(pin: i32, level: i32): i32
+trusted noescape extern:"c" fun rmt_new_tx_channel(
+    config: i64*, result: i64*
+): i32
+trusted noescape extern:"c" fun rmt_enable(channel: i64*): i32
+trusted noescape extern:"c" fun rmt_disable(channel: i64*): i32
+trusted noescape extern:"c" fun rmt_del_channel(channel: i64*): i32
+trusted noescape extern:"c" fun rmt_new_bytes_encoder(
+    config: i64*, result: i64*
+): i32
+trusted noescape extern:"c" fun rmt_new_copy_encoder(
+    config: i64*, result: i64*
+): i32
+trusted noescape extern:"c" fun rmt_del_encoder(encoder: i64*): i32
+trusted noescape extern:"c" fun rmt_transmit(
+    channel: i64*,
+    encoder: i64*,
+    payload: i64*,
+    payloadBytes: u32,
+    config: i64*
+): i32
+trusted noescape extern:"c" fun rmt_tx_wait_all_done(
+    channel: i64*, timeoutMilliseconds: i32
+): i32
+
+// State layout (40-byte header): channel, byte encoder, copy encoder, pin,
+// count, color order, brightness, initialized, auto-display, then timing.
+// RGB888 logical colors and a separate transport buffer follow the header.
+val rmtLedStripHeaderSize = 40
+val rmtLedStripDefaultMaximumCount = 64
+val rmtLedStripDefaultStorageSize = 424
+val rmtClockSourceEsp32Apb = 4
+type RmtLedStrip = int
+
+trusted fun rmtLedStripAt(
+    storage: NativeBuffer,
+    pin: int,
+    count: int = 1,
+    colorOrder: int = ledColorOrderGrb,
+    frequency: int = 10000000,
+    t0HighNanoseconds: int = 300,
+    t0LowNanoseconds: int = 900,
+    t1HighNanoseconds: int = 900,
+    t1LowNanoseconds: int = 300,
+    resetMicroseconds: int = 280,
+    clockSource: int = rmtClockSourceEsp32Apb
+): RmtLedStrip {
+    if (pin < 0 || pin > 2147483647 || count < 1 || count > 65535 ||
+        frequency < 1 || frequency > 4294967295 ||
+        t0HighNanoseconds > 65535 || t0LowNanoseconds > 65535 ||
+        t1HighNanoseconds > 65535 || t1LowNanoseconds > 65535 ||
+        resetMicroseconds > 65535 || clockSource < 1 ||
+        clockSource > 2147483647 || !ledColorOrderValid(colorOrder) ||
+        storage.addressValue() == 0 ||
+        storage.capacity() < rmtLedStripHeaderSize + count * 6 ||
+        !rmtLedTimingValid(
+            frequency, t0HighNanoseconds, t0LowNanoseconds,
+            t1HighNanoseconds, t1LowNanoseconds, resetMicroseconds
+        )) return RmtLedStrip(0)
+    nativeAddressClear(storage.addressValue(), storage.capacity())
+    val address = storage.addressValue()
+    nativeAddressStoreU32(address, 12, pin)
+    nativeAddressStoreU16(address, 16, count)
+    nativeAddressStoreU8(address, 18, colorOrder)
+    nativeAddressStoreU8(address, 19, 63)
+    nativeAddressStoreU8(address, 21, 1)
+    nativeAddressStoreU16(address, 22, clockSource)
+    nativeAddressStoreU32(address, 24, frequency)
+    nativeAddressStoreU16(address, 28, t0HighNanoseconds)
+    nativeAddressStoreU16(address, 30, t0LowNanoseconds)
+    nativeAddressStoreU16(address, 32, t1HighNanoseconds)
+    nativeAddressStoreU16(address, 34, t1LowNanoseconds)
+    nativeAddressStoreU16(address, 36, resetMicroseconds)
+    RmtLedStrip(
+        storage.addressValue() | (storage.capacity() << 32)
+    )
+}
+
+trusted fun rmtLedStrip(
+    pin: int,
+    count: int = 1,
+    colorOrder: int = ledColorOrderGrb
+): RmtLedStrip {
+    if (count > rmtLedStripDefaultMaximumCount) return RmtLedStrip(0)
+    rmtLedStripAt(
+        nativeBufferAt(
+            nativeStaticAllocate(424), rmtLedStripDefaultStorageSize
+        ),
+        pin, count, colorOrder
+    )
+}
+
+fun RmtLedStrip.valid(): bool = this != 0
+fun RmtLedStrip.storage(): NativeBuffer = nativeBufferAt(
+    this & 4294967295, (this >>> 32) & 2147483647
+)
+fun RmtLedStrip.addressValue(): int = this & 4294967295
+trusted fun RmtLedStrip.channelAddress(): int =
+    nativeAddressLoadU32(this.addressValue(), 0)
+trusted fun RmtLedStrip.bytesEncoderAddress(): int =
+    nativeAddressLoadU32(this.addressValue(), 4)
+trusted fun RmtLedStrip.copyEncoderAddress(): int =
+    nativeAddressLoadU32(this.addressValue(), 8)
+trusted fun RmtLedStrip.pin(): int =
+    nativeAddressLoadU32(this.addressValue(), 12)
+trusted fun RmtLedStrip.count(): int =
+    nativeAddressLoadU16(this.addressValue(), 16)
+trusted fun RmtLedStrip.colorOrder(): int =
+    ablaUnsafeLoadU8(nativeAddressPointer(this.addressValue(), 18))
+trusted fun RmtLedStrip.brightness(): int =
+    ablaUnsafeLoadU8(nativeAddressPointer(this.addressValue(), 19))
+trusted fun RmtLedStrip.initialized(): bool =
+    this.valid() && ablaUnsafeLoadU8(
+        nativeAddressPointer(this.addressValue(), 20)
+    ) != 0
+trusted fun RmtLedStrip.autoDisplay(): bool =
+    this.valid() && ablaUnsafeLoadU8(
+        nativeAddressPointer(this.addressValue(), 21)
+    ) != 0
+
+trusted fun RmtLedStrip.begin(): bool {
+    if (!this.valid()) return false
+    if (this.initialized()) return true
+    val address = this.addressValue()
+    val pin = this.pin()
+    // Normalize the pad as low push-pull output before RMT takes ownership.
+    if (gpio_set_level(pin, 0) != 0 || gpio_set_direction(pin, 2) != 0) {
+        return false
+    }
+    // rmt_tx_channel_config_t on the 32-bit IDF 6 ABI.
+    val channelConfig = nativeStackAllocate(28)
+    nativeAddressClear(channelConfig, 28)
+    nativeAddressStoreU32(channelConfig, 0, pin)
+    // APB is source 4 on classic ESP32/S2/S3/C2/C3. Other target adapters
+    // pass their IDF clock enum explicitly through rmtLedStripAt.
+    nativeAddressStoreU32(
+        channelConfig, 4, nativeAddressLoadU16(address, 22)
+    )
+    nativeAddressStoreU32(channelConfig, 8, nativeAddressLoadU32(address, 24))
+    nativeAddressStoreU32(channelConfig, 12, 64)
+    nativeAddressStoreU32(channelConfig, 16, 4)
+    val channelCell = nativeStackAllocate(4)
+    nativeAddressStoreU32(channelCell, 0, 0)
+    if (rmt_new_tx_channel(
+        nativePointerFromAddress(channelConfig),
+        nativePointerFromAddress(channelCell)
+    ) != 0) return false
+    val channel = nativeAddressLoadU32(channelCell, 0)
+
+    val frequency = nativeAddressLoadU32(address, 24)
+    val bytesConfig = nativeStackAllocate(12)
+    nativeAddressClear(bytesConfig, 12)
+    nativeAddressStoreU32(bytesConfig, 0, rmtLedSymbol(
+        rmtLedNanosecondsTicks(nativeAddressLoadU16(address, 28), frequency),
+        rmtLedNanosecondsTicks(nativeAddressLoadU16(address, 30), frequency)
+    ))
+    nativeAddressStoreU32(bytesConfig, 4, rmtLedSymbol(
+        rmtLedNanosecondsTicks(nativeAddressLoadU16(address, 32), frequency),
+        rmtLedNanosecondsTicks(nativeAddressLoadU16(address, 34), frequency)
+    ))
+    nativeAddressStoreU32(bytesConfig, 8, 1)
+    val bytesCell = nativeStackAllocate(4)
+    nativeAddressStoreU32(bytesCell, 0, 0)
+    if (rmt_new_bytes_encoder(
+        nativePointerFromAddress(bytesConfig),
+        nativePointerFromAddress(bytesCell)
+    ) != 0) {
+        rmt_del_channel(nativePointerFromAddress(channel))
+        return false
+    }
+    val bytesEncoder = nativeAddressLoadU32(bytesCell, 0)
+
+    val copyConfig = nativeStackAllocate(1)
+    nativeAddressStoreU8(copyConfig, 0, 0)
+    val copyCell = nativeStackAllocate(4)
+    nativeAddressStoreU32(copyCell, 0, 0)
+    if (rmt_new_copy_encoder(
+        nativePointerFromAddress(copyConfig),
+        nativePointerFromAddress(copyCell)
+    ) != 0) {
+        rmt_del_encoder(nativePointerFromAddress(bytesEncoder))
+        rmt_del_channel(nativePointerFromAddress(channel))
+        return false
+    }
+    val copyEncoder = nativeAddressLoadU32(copyCell, 0)
+    if (rmt_enable(nativePointerFromAddress(channel)) != 0) {
+        rmt_del_encoder(nativePointerFromAddress(copyEncoder))
+        rmt_del_encoder(nativePointerFromAddress(bytesEncoder))
+        rmt_del_channel(nativePointerFromAddress(channel))
+        return false
+    }
+    nativeAddressStoreU32(address, 0, channel)
+    nativeAddressStoreU32(address, 4, bytesEncoder)
+    nativeAddressStoreU32(address, 8, copyEncoder)
+    nativeAddressStoreU8(address, 20, 1)
+    true
+}
+
+trusted fun RmtLedStrip.close(): bool {
+    if (!this.initialized()) return false
+    val channel = nativePointerFromAddress(this.channelAddress())
+    val waited = rmt_tx_wait_all_done(channel, -1) == 0
+    val disabled = rmt_disable(channel) == 0
+    val bytesDeleted = rmt_del_encoder(
+        nativePointerFromAddress(this.bytesEncoderAddress())
+    ) == 0
+    val copyDeleted = rmt_del_encoder(
+        nativePointerFromAddress(this.copyEncoderAddress())
+    ) == 0
+    val channelDeleted = rmt_del_channel(channel) == 0
+    nativeAddressStoreU32(this.addressValue(), 0, 0)
+    nativeAddressStoreU32(this.addressValue(), 4, 0)
+    nativeAddressStoreU32(this.addressValue(), 8, 0)
+    nativeAddressStoreU8(this.addressValue(), 20, 0)
+    waited && disabled && bytesDeleted && copyDeleted && channelDeleted
+}
+
+trusted fun RmtLedStrip.setAutoDisplay(enabled: bool): void {
+    if (this.valid()) nativeAddressStoreU8(
+        this.addressValue(), 21, if (enabled) 1 else 0
+    )
+    return
+}
+
+trusted fun RmtLedStrip.setBrightness(brightness: int): bool {
+    if (!this.valid() || brightness < 0 || brightness > 255) return false
+    nativeAddressStoreU8(this.addressValue(), 19, brightness)
+    if (this.autoDisplay()) this.display() else true
+}
+
+trusted fun RmtLedStrip.colorOffset(index: int): int =
+    rmtLedStripHeaderSize + index * 3
+
+trusted fun RmtLedStrip.color(index: int): RgbColor {
+    if (!this.valid() || index < 0 || index >= this.count()) {
+        return rgbColor(0, 0, 0)
+    }
+    val offset = this.colorOffset(index)
+    val storage = this.storage()
+    rgbColor(
+        storage.load(offset), storage.load(offset + 1), storage.load(offset + 2)
+    )
+}
+
+trusted fun RmtLedStrip.storeColor(index: int, color: RgbColor): bool {
+    if (!this.valid() || index < 0 || index >= this.count()) return false
+    val offset = this.colorOffset(index)
+    val storage = this.storage()
+    storage.store(offset, color.red()) &&
+        storage.store(offset + 1, color.green()) &&
+        storage.store(offset + 2, color.blue())
+}
+
+trusted fun RmtLedStrip.setColor(index: int, color: RgbColor): bool =
+    this.storeColor(index, color) &&
+        (if (this.autoDisplay()) this.display() else true)
+
+trusted fun RmtLedStrip.setAllColor(color: RgbColor): bool {
+    if (!this.valid()) return false
+    var index = 0
+    while (index < this.count()) {
+        this.storeColor(index, color)
+        index = index + 1
+    }
+    if (this.autoDisplay()) this.display() else true
+}
+
+trusted fun RmtLedStrip.display(): bool {
+    if (!this.initialized()) return false
+    val channel = nativePointerFromAddress(this.channelAddress())
+    if (rmt_tx_wait_all_done(channel, -1) != 0) return false
+    val storage = this.storage()
+    val count = this.count()
+    val outputOffset = rmtLedStripHeaderSize + count * 3
+    var led = 0
+    while (led < count) {
+        val color = this.color(led).scaled(this.brightness())
+        var channelIndex = 0
+        while (channelIndex < 3) {
+            storage.store(
+                outputOffset + led * 3 + channelIndex,
+                ledOrderedChannel(color, this.colorOrder(), channelIndex)
+            )
+            channelIndex = channelIndex + 1
+        }
+        led = led + 1
+    }
+    val transmitConfig = nativeStackAllocate(8)
+    nativeAddressClear(transmitConfig, 8)
+    val configPointer = nativePointerFromAddress(transmitConfig)
+    if (rmt_transmit(
+        channel, nativePointerFromAddress(this.bytesEncoderAddress()),
+        storage.pointerAt(outputOffset), count * 3, configPointer
+    ) != 0) return false
+    val frequency = nativeAddressLoadU32(this.addressValue(), 24)
+    val resetTicks = rmtLedMicrosecondsTicks(
+        nativeAddressLoadU16(this.addressValue(), 36), frequency
+    )
+    val resetSymbol = nativeStackAllocate(4)
+    nativeAddressStoreU32(resetSymbol, 0, rmtLedResetSymbol(resetTicks))
+    if (rmt_transmit(
+        channel, nativePointerFromAddress(this.copyEncoderAddress()),
+        nativePointerFromAddress(resetSymbol), 4, configPointer
+    ) != 0) return false
+    // Both the state-backed pixel bytes and stack reset symbol stay valid
+    // until the queued transfers have completed.
+    rmt_tx_wait_all_done(channel, -1) == 0
+}

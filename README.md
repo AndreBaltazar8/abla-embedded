@@ -94,12 +94,18 @@ upstream deprecated alias for this same device, not another implementation.
 RISC-V ESP32-C6 Arduino Nesso N1, using an Abla-generated RISC-V object. The
 same example initializes its paired BQ27220 fuel gauge and reads signed battery
 current and voltage through an allocation-free driver.
-The three board-specific LED examples cover M5PM1 packed RGB output,
+The four LED examples cover ESP-IDF 6 RMT strips, M5PM1 packed RGB output,
 PowerHub's eight RGB channels, and Paper Mono's split PMIC/M5IOE1 RGB path.
 Each backend has the same `setColor`, `setAllColor`, `setBrightness`, and
 `display` names. Fixed caller-owned state replaces M5Unified's virtual objects
-and heap-backed color vectors; the examples illuminate briefly and turn off,
-and must only be flashed to the board named by the example.
+and heap-backed color vectors. The RMT backend uses IDF's built-in byte and
+copy encoders directly, so it also avoids M5Unified's allocated custom encoder
+and C callback. `rmtLedStripAt` accepts storage for any checked strip length;
+the convenience constructor owns 424 static bytes for up to 64 LEDs. Its APB
+clock default covers classic ESP32/S2/S3/C2/C3 targets, while adapters for SoCs
+with a different IDF RMT clock enum pass that source explicitly. The examples
+illuminate briefly and turn off, and must only be flashed to the board named by
+the example.
 The serial, I2S, and Wi-Fi examples
 currently also exercise the optional Arduino/PlatformIO compatibility
 integration. Edit the placeholder credentials before flashing `wifi-connect`.
