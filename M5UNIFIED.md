@@ -37,7 +37,7 @@ part of Abla Embedded because this framework has a broader board-neutral role.
 | --- | --- | --- |
 | Board identity | Canonical IDs, explicit selection, optional safe detection, fallback | Full canonical ID registry and aliases; Atom Echo typed profile; detection and remaining typed profiles pending |
 | Pin maps | Internal/external I2C, Ports A-E, SD SPI/SDMMC, RGB, power hold, M-Bus | Complete upstream registry for all board IDs, including Tab5X aliasing and allocation-free 30-pin M-Bus lookup |
-| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Self-updating `GpioButton` packs pin, polarity and full state into one scalar; raw `ButtonState` remains reusable; PMIC/expander/touch sources pending |
+| GPIO/button | Debounce, press/release, hold, click count, power/expander/touch buttons | Complete upstream board source registry; raw GPIO access stays `Pin`, `GpioButton` packs pin/polarity/full state into one scalar, and checked PI4/PowerHub/M5PM1 adapters never turn I2C failure into an active-low press; touch detail and PMIC event adapters remain |
 | I2C | Two buses, probe/scan, start/restart/stop, register and bulk transactions | IDF 6 bus/device, probe, bulk and register transactions build-verified; raw job API pending |
 | SPI | Shared bus/device configuration needed by displays and SD | IDF 6 bus/device lifecycle plus blocking full/half-duplex transactions build-verified; queued and variable command/address phases pending |
 | Display | Built-in and external displays, drawing, brightness, rotation | Not implemented; belongs in an Abla display layer informed by M5GFX |

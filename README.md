@@ -148,6 +148,15 @@ and transient events into one 64-bit scalar. Its timestamp is modulo 2^22
 milliseconds, so it must be updated at least once per roughly 70 minutes; a
 normal firmware loop updates it many times per second.
 
+Every M5Stack board ID exposes `buttonA()`, `buttonB()`, `buttonC()`,
+`buttonExt()`, and `buttonPower()` as raw `Pin` values. A button wired through
+touch, PI4IOE5V6408, PowerHub I2C, M5PM1, or a PMIC key returns `Pin(-1)` rather
+than a fake GPIO; the matching `...Source()` method describes its real source.
+The returned GPIO `Pin` converts explicitly with `.asButton()`. Checked PI4,
+PowerHub, and M5PM1 reads preserve I2C failure separately from the active-low
+level, so a bus error cannot become a false press. The pure source registry
+imports no timing, network, or device service by itself.
+
 Every M5Unified board ID also exposes raw connector topology through `portA()`
 to `portE()`, `sdPins()`, `rgbLedPin()`, `powerHoldPin()`, and `mBusPin(1..30)`.
 These return `Pin` values (with `Pin(-1)` for absent hardware), so higher-level
