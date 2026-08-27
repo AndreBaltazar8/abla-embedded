@@ -73,19 +73,31 @@ The opt-in `src/xtensa/dispatcher_owned.ab` module closes that data dependency
 for a classic dual-core ESP32 build. Compiler lowering emits the initialized
 64-entry interrupt table as interleaved `{handler, argument}` words, with the
 argument initialized to its dispatcher index, plus the 128-entry exception
-table. The same Abla module supplies the exact `xt_ints_on` and `xt_ints_off`
-ABI required by existing Espressif libraries and vector code. Those two names
-are deliberately exported because they are a real compatibility ABI; normal
-Abla callers continue to use typed interrupt masks without an annotation.
+table and classic ESP32's 32-byte read-only interrupt-level table. The Abla
+modules supply `xt_ints_on`, `xt_ints_off`, `xt_unhandled_interrupt`,
+`xt_int_has_handler`, `xt_set_interrupt_handler`, and
+`xt_set_exception_handler`, the exact ABI names required by existing
+Espressif libraries and vector code. Those names are deliberately exported
+because they are a real compatibility ABI; normal Abla callers continue to use
+typed interrupt masks and checked installers without annotations.
+
+The Abla unhandled-interrupt fallback is automatically placed in IRAM with its
+direct call graph. Instead of calling ROM `printf` and returning to a possibly
+still-asserted source, it masks the unexpected CPU interrupt line. The generic
+exception panic handler remains supplied by the platform because it owns the
+complete saved-frame and crash-reporting policy.
 
 `make check-xtensa-dispatcher-ownership` performs a relocatable link against
-the installed classic-ESP32 `libxtensa.a`, forcing references to all four
-symbols. The link map proves `xtensa_intr_asm.S.obj` is excluded while the
-separate C dispatcher consumer is still selected. The tables are exactly
-1,024 bytes in both implementations. Abla's enable/disable leaves are 24/27
-bytes and 9/10 instructions, exactly tying the vendor assembly. This is a
-build-only proof; the owned dispatcher is not linked into or flashed onto the
-Atom Echo firmware yet.
+the installed classic-ESP32 `libxtensa.a` and `libxt_hal.a`, forcing references
+to all nine owned symbols. The link map proves `xtensa_intr_asm.S.obj`,
+`xtensa_intr.c.obj`, and `interrupts--intlevel.o` are all excluded. The two
+dispatcher tables are exactly 1,024 bytes and the level table exactly 32 bytes
+in both implementations. Abla's enable/disable leaves are 24/27 bytes and 9/10
+instructions, exactly tying the vendor assembly. Its management/default unit
+is 222 runtime bytes versus vendor C at 253. The handler query is 38 bytes/12
+instructions versus 43/14; the interrupt setter is 81/28 versus 84/28; and the
+exception setter is 60/21 versus 61/21. This is a build-only proof; the owned
+dispatcher is not linked into or flashed onto the Atom Echo firmware yet.
 
 `src/esp32/radio/rx_esp32.ab` validates a completed RX descriptor before any
 frame is exposed: CPU ownership, successful EOF, 32-byte hardware header,
@@ -139,9 +151,9 @@ licensed source references:
 - [`esp32-open-mac`](https://github.com/esp32-open-mac/esp32-open-mac)
   at commit
   `20ce43d595be914b4d3f553b28352bc07e003fa1` (MIT)
-- [ESP-IDF `xtensa_intr.c`](https://github.com/espressif/esp-idf/blob/master/components/xtensa/xtensa_intr.c)
+- [ESP-IDF 4.4.7 `xtensa_intr.c`](https://github.com/espressif/esp-idf/blob/v4.4.7/components/xtensa/xtensa_intr.c)
   and
-  [`xtensa_intr_asm.S`](https://github.com/espressif/esp-idf/blob/master/components/xtensa/xtensa_intr_asm.S),
+  [`xtensa_intr_asm.S`](https://github.com/espressif/esp-idf/blob/v4.4.7/components/xtensa/xtensa_intr_asm.S),
   used to verify the public two-word dispatcher layout, interrupt-level gate,
   and core-interleaved table indexing
 
@@ -157,16 +169,15 @@ The entry, its literal pool, and its direct Abla call graph reside in
 `.iram1.*`; the build-only Wi-Fi MAC acknowledge handler ties equivalent C++
 at 21 bytes and 8 instructions. Both occupy 29 total code-plus-literal IRAM
 bytes. No export, boxed function value, C trampoline, registration call, or
-unresolved call remains. The optional Abla-owned dispatcher module also closes
-the table and interrupt-mask assembly boundary in a relocatable link. The
-Xtensa vector object, the C dispatcher management/unhandled routines, and
-platform startup still remain external boundaries.
+unresolved call remains. The optional Abla-owned dispatcher modules also close
+the table, interrupt-level data, mask-helper assembly, and C management/default
+boundaries in a relocatable link. The Xtensa vector/context objects, platform
+exception panic path, and startup still remain external boundaries.
 
 The remaining dependency order is:
 
-1. replace the remaining vector assembly and C dispatcher
-   management/unhandled routines, then add interrupt-safe shared-clock
-   ownership;
+1. replace the remaining vector/context assembly and platform exception path,
+   then add interrupt-safe shared-clock ownership;
 2. hardware-validate the implemented bounded RX removal/recycling path and TX
    ownership/outcomes, including the open driver's RX sentinel fallback;
 3. open 802.11 management, authentication, association, and remaining data

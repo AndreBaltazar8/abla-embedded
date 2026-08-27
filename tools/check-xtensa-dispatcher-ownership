@@ -6,6 +6,7 @@ cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
 esp_llvm_root=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
 toolchain_root=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin
 sdk_archive=$project_root/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/lib/libxtensa.a
+hal_archive=$project_root/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/lib/libxt_hal.a
 output_directory=$project_root/build/benchmarks/xtensa-dispatcher
 abla_object=$project_root/build/examples/radio-mac-registers/abla_dispatcher.o
 consumer_object=$output_directory/consumer.o
@@ -13,6 +14,9 @@ linked_object=$output_directory/linked.o
 link_map=$output_directory/linked.map
 vendor_directory=$output_directory/vendor
 vendor_object=$vendor_directory/xtensa_intr_asm.S.obj
+vendor_c_object=$vendor_directory/xtensa_intr.c.obj
+vendor_hal_directory=$output_directory/vendor-hal
+vendor_level_object=$vendor_hal_directory/interrupts--intlevel.o
 runner=()
 
 if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
@@ -30,15 +34,16 @@ for executable in "$clang" "$llvm_size" "$ld" "$nm" "$ar" "$objdump"; do
         exit 1
     fi
 done
-if [[ ! -f $sdk_archive ]]; then
-    printf 'missing classic ESP32 Xtensa archive: %s\n' "$sdk_archive" >&2
+if [[ ! -f $sdk_archive || ! -f $hal_archive ]]; then
+    printf 'missing classic ESP32 Xtensa archive: %s or %s\n' \
+        "$sdk_archive" "$hal_archive" >&2
     exit 1
 fi
 if [[ ! -f $abla_object ]]; then
     "$project_root/tools/build-example" radio-mac-registers
 fi
 
-mkdir -p "$output_directory" "$vendor_directory"
+mkdir -p "$output_directory" "$vendor_directory" "$vendor_hal_directory"
 "${runner[@]}" "$clang" --target=xtensa-esp-elf -mcpu=esp32 -O2 \
     -ffunction-sections -fdata-sections -fno-unwind-tables \
     -fno-asynchronous-unwind-tables -std=c++17 \
@@ -46,16 +51,24 @@ mkdir -p "$output_directory" "$vendor_directory"
     -o "$consumer_object"
 
 "${runner[@]}" "$ld" -r -Map="$link_map" \
-    "$consumer_object" "$abla_object" "$sdk_archive" -o "$linked_object"
+    "$consumer_object" "$abla_object" "$sdk_archive" "$hal_archive" \
+    -o "$linked_object"
 (cd "$vendor_directory" &&
-    "${runner[@]}" "$ar" x "$sdk_archive" xtensa_intr_asm.S.obj)
+    "${runner[@]}" "$ar" x "$sdk_archive" \
+        xtensa_intr_asm.S.obj xtensa_intr.c.obj)
+(cd "$vendor_hal_directory" &&
+    "${runner[@]}" "$ar" x "$hal_archive" interrupts--intlevel.o)
 
 if rg -q 'xtensa_intr_asm\.S\.obj' "$link_map"; then
     echo 'vendor dispatcher assembly was still selected from libxtensa.a' >&2
     exit 1
 fi
-if ! rg -q 'xtensa_intr\.c\.obj' "$link_map"; then
-    echo 'link proof did not select the expected C dispatcher consumer' >&2
+if rg -q 'xtensa_intr\.c\.obj' "$link_map"; then
+    echo 'vendor C dispatcher was still selected from libxtensa.a' >&2
+    exit 1
+fi
+if rg -q 'interrupts--intlevel\.o' "$link_map"; then
+    echo 'vendor interrupt-level table was still selected from libxt_hal.a' >&2
     exit 1
 fi
 
@@ -68,13 +81,20 @@ symbol_size() {
 
 interrupt_bytes=$(symbol_size "$linked_object" _xt_interrupt_table)
 exception_bytes=$(symbol_size "$linked_object" _xt_exception_table)
-if [[ $interrupt_bytes != 512 || $exception_bytes != 512 ]]; then
-    printf 'unexpected table sizes: interrupt=%s exception=%s\n' \
-        "${interrupt_bytes:-missing}" "${exception_bytes:-missing}" >&2
+level_bytes=$(symbol_size "$linked_object" Xthal_intlevel)
+if [[ $interrupt_bytes != 512 || $exception_bytes != 512 ||
+      $level_bytes != 32 ]]; then
+    printf 'unexpected table sizes: interrupt=%s exception=%s level=%s\n' \
+        "${interrupt_bytes:-missing}" "${exception_bytes:-missing}" \
+        "${level_bytes:-missing}" >&2
     exit 1
 fi
 
-for symbol in _xt_interrupt_table _xt_exception_table xt_ints_on xt_ints_off; do
+for symbol in _xt_interrupt_table _xt_exception_table Xthal_intlevel \
+    xt_ints_on xt_ints_off \
+    xt_unhandled_interrupt xt_int_has_handler xt_set_interrupt_handler \
+    xt_set_exception_handler
+do
     if ! "${runner[@]}" "$nm" "$linked_object" |
         awk -v wanted="$symbol" \
             '$NF == wanted && $1 != "U" { found = 1 } END { exit !found }'
@@ -84,6 +104,14 @@ for symbol in _xt_interrupt_table _xt_exception_table xt_ints_on xt_ints_off; do
         exit 1
     fi
 done
+
+unexpected_unresolved=$("${runner[@]}" "$nm" -u "$abla_object" |
+    awk '$NF != "xt_unhandled_exception" { print $NF }')
+if [[ -n $unexpected_unresolved ]]; then
+    printf 'unexpected unresolved Abla dispatcher symbols:\n%s\n' \
+        "$unexpected_unresolved" >&2
+    exit 1
+fi
 
 data_bytes=$("${runner[@]}" "$llvm_size" -A "$abla_object" |
     awk '$1 ~ /^\.data/ { total += $2 } END { print total + 0 }')
@@ -116,11 +144,105 @@ if (( abla_on_bytes > vendor_on_bytes ||
     exit 1
 fi
 
+runtime_sections() {
+    local object=$1
+    shift
+    local joined
+    joined=$(IFS='|'; printf '%s' "$*")
+    "${runner[@]}" "$llvm_size" -A "$object" |
+        awk -v wanted="$joined" \
+            'BEGIN { count = split(wanted, names, "|") }
+             { for (i = 1; i <= count; i += 1) {
+                   if ($1 == names[i]) total += $2
+               }
+             }
+             END { print total + 0 }'
+}
+
+abla_management_bytes=$(runtime_sections "$abla_object" \
+    .iram1.text \
+    .literal.xt_int_has_handler .text.xt_int_has_handler \
+    .literal.xt_set_interrupt_handler .text.xt_set_interrupt_handler \
+    .literal.xt_set_exception_handler .text.xt_set_exception_handler)
+vendor_management_bytes=$(runtime_sections "$vendor_c_object" \
+    .iram1.26.literal .iram1.26 .rodata.str1.1 \
+    .literal.xt_int_has_handler .text.xt_int_has_handler \
+    .literal.xt_set_interrupt_handler .text.xt_set_interrupt_handler \
+    .literal.xt_set_exception_handler .text.xt_set_exception_handler)
+if (( abla_management_bytes > vendor_management_bytes )); then
+    echo 'Abla dispatcher management unit regressed past vendor C' >&2
+    exit 1
+fi
+
+abla_unhandled_bytes=$(runtime_sections "$abla_object" .iram1.text)
+vendor_unhandled_bytes=$(runtime_sections "$vendor_c_object" \
+    .iram1.26.literal .iram1.26 .rodata.str1.1)
+abla_has_bytes=$(runtime_sections "$abla_object" \
+    .literal.xt_int_has_handler .text.xt_int_has_handler)
+vendor_has_bytes=$(runtime_sections "$vendor_c_object" \
+    .literal.xt_int_has_handler .text.xt_int_has_handler)
+abla_set_interrupt_bytes=$(runtime_sections "$abla_object" \
+    .literal.xt_set_interrupt_handler .text.xt_set_interrupt_handler)
+vendor_set_interrupt_bytes=$(runtime_sections "$vendor_c_object" \
+    .literal.xt_set_interrupt_handler .text.xt_set_interrupt_handler)
+abla_set_exception_bytes=$(runtime_sections "$abla_object" \
+    .literal.xt_set_exception_handler .text.xt_set_exception_handler)
+vendor_set_exception_bytes=$(runtime_sections "$vendor_c_object" \
+    .literal.xt_set_exception_handler .text.xt_set_exception_handler)
+if (( abla_unhandled_bytes > vendor_unhandled_bytes ||
+      abla_has_bytes > vendor_has_bytes ||
+      abla_set_interrupt_bytes > vendor_set_interrupt_bytes ||
+      abla_set_exception_bytes > vendor_set_exception_bytes )); then
+    echo 'an Abla dispatcher leaf regressed past vendor C' >&2
+    exit 1
+fi
+
+abla_has_instructions=$(instruction_count "$abla_object" xt_int_has_handler)
+vendor_has_instructions=$(instruction_count \
+    "$vendor_c_object" xt_int_has_handler)
+abla_set_interrupt_instructions=$(instruction_count \
+    "$abla_object" xt_set_interrupt_handler)
+vendor_set_interrupt_instructions=$(instruction_count \
+    "$vendor_c_object" xt_set_interrupt_handler)
+abla_set_exception_instructions=$(instruction_count \
+    "$abla_object" xt_set_exception_handler)
+vendor_set_exception_instructions=$(instruction_count \
+    "$vendor_c_object" xt_set_exception_handler)
+if (( abla_has_instructions > vendor_has_instructions ||
+      abla_set_interrupt_instructions > vendor_set_interrupt_instructions ||
+      abla_set_exception_instructions > vendor_set_exception_instructions )); then
+    echo 'an Abla dispatcher management leaf uses more instructions than C' >&2
+    exit 1
+fi
+
+if ! "${runner[@]}" "$objdump" -t "$abla_object" |
+    awk '$4 == ".iram1.text" && $NF == "xt_unhandled_interrupt" \
+        { found = 1 } END { exit !found }'
+then
+    echo 'Abla unhandled interrupt fallback is not resident in IRAM' >&2
+    exit 1
+fi
+
 printf 'dispatcher tables: Abla %s bytes, vendor ABI 1024 bytes\n' "$data_bytes"
+printf 'interrupt-level table: Abla %s bytes, vendor HAL %s bytes\n' \
+    "$level_bytes" "$(symbol_size "$vendor_level_object" Xthal_intlevel)"
 printf 'xt_ints_on: Abla %s bytes/%s instructions, vendor %s/%s\n' \
     "$abla_on_bytes" "$abla_on_instructions" \
     "$vendor_on_bytes" "$vendor_on_instructions"
 printf 'xt_ints_off: Abla %s bytes/%s instructions, vendor %s/%s\n' \
     "$abla_off_bytes" "$abla_off_instructions" \
     "$vendor_off_bytes" "$vendor_off_instructions"
-echo 'vendor xtensa_intr_asm.S.obj excluded; all four ABI symbols are Abla-owned'
+printf 'dispatcher management runtime: Abla %s bytes, vendor C %s bytes\n' \
+    "$abla_management_bytes" "$vendor_management_bytes"
+printf 'unhandled fallback: Abla %s bytes, vendor C+ROM format %s bytes\n' \
+    "$abla_unhandled_bytes" "$vendor_unhandled_bytes"
+printf 'handler query: Abla %s bytes/%s instructions, vendor C %s/%s\n' \
+    "$abla_has_bytes" "$abla_has_instructions" \
+    "$vendor_has_bytes" "$vendor_has_instructions"
+printf 'interrupt setter: Abla %s bytes/%s instructions, vendor C %s/%s\n' \
+    "$abla_set_interrupt_bytes" "$abla_set_interrupt_instructions" \
+    "$vendor_set_interrupt_bytes" "$vendor_set_interrupt_instructions"
+printf 'exception setter: Abla %s bytes/%s instructions, vendor C %s/%s\n' \
+    "$abla_set_exception_bytes" "$abla_set_exception_instructions" \
+    "$vendor_set_exception_bytes" "$vendor_set_exception_instructions"
+echo 'vendor Xtensa dispatcher assembly, C, and interrupt-level objects excluded; all nine ABI symbols are Abla-owned'
