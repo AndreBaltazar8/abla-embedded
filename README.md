@@ -154,8 +154,11 @@ instructions versus C at 184 bytes and 56 instructions.
 It also emits native hardware AES-CCM and complete conventional-frame
 CCMP-128/CCMP-256 request entries. Their 32-bit request layout avoids a C
 trampoline and keeps the Xtensa boundary stable while the implementation stays
-entirely in Abla. The CCMP replay leaf is 72 bytes and 27 instructions in both
-Abla and equivalent C++ with no unresolved call.
+entirely in Abla. The stateful layer covers the opaque CCMP object's complete
+encap, decap, encrypt, decrypt, ESP-NOW, cipher-metadata, PN, and per-TID replay
+surface with a caller-owned 216-byte state and native Xtensa CAS. Its final
+full-surface KAT passed on an ESP32-PICO-D4. The CCMP replay leaf is 72 bytes
+and 27 instructions in both Abla and equivalent C++ with no unresolved call.
 It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
 Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;

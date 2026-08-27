@@ -5,9 +5,248 @@ import "../esp32/sdk/buffer.ab"
 // one scalar per traffic identifier without a heap-backed key object.
 type WifiCcmpPacketNumber = int
 
+// Compact, allocation-free cipher metadata used by a pure-Abla 802.11
+// dispatcher. Function pointers are unnecessary: the selected cipher's typed
+// packet operations are called directly and LLVM can remove unused ciphers.
+type WifiCipherDescriptor = int
+
+@inline
+fun wifiCipherDescriptor(
+    identifier: int,
+    headerBytes: int,
+    trailerBytes: int,
+    micBytes: int
+): WifiCipherDescriptor = WifiCipherDescriptor(
+    (identifier & 255) | ((headerBytes & 255) << 8) |
+        ((trailerBytes & 255) << 16) | ((micBytes & 255) << 24)
+)
+
+@inline
+fun WifiCipherDescriptor.identifier(): int = this & 255
+
+@inline
+fun WifiCipherDescriptor.headerBytes(): int = (this >>> 8) & 255
+
+@inline
+fun WifiCipherDescriptor.trailerBytes(): int = (this >>> 16) & 255
+
+@inline
+fun WifiCipherDescriptor.micBytes(): int = (this >>> 24) & 255
+
+@inline fun wifiCcmpCipher(): WifiCipherDescriptor =
+    wifiCipherDescriptor(3, 8, 8, 0)
+
 val wifiCcmpMaximumPacketNumber = 281474976710655
 val wifiCcmpHeaderBytes = 8
 val wifiCcmpMicBytes = 8
+val wifiCcmpTrafficIdentifierCount = 17
+val wifiCcmpNonQosTrafficIdentifier = 16
+
+// Caller-owned key state shared by packet encap/decap paths. Keeping the
+// complete key record in a fixed native region makes the same layout usable by
+// a bare-metal driver, an RTOS port, or a host differential test without an
+// allocator or an opaque object. Target packages serialize the lock word with
+// their native atomic primitive.
+type WifiCcmpKeyState = int
+
+val wifiCcmpKeyStateMagic = 1128484176
+val wifiCcmpKeyStateMagicOffset = 0
+val wifiCcmpKeyStateLockOffset = 4
+val wifiCcmpKeyStateKeyIdentifierOffset = 8
+val wifiCcmpKeyStateKeyLengthOffset = 12
+val wifiCcmpKeyStateTagLengthOffset = 16
+val wifiCcmpKeyStateTransmitLowOffset = 20
+val wifiCcmpKeyStateTransmitHighOffset = 24
+val wifiCcmpKeyStateKeyOffset = 28
+val wifiCcmpKeyStateReplayOffset = 64
+val wifiCcmpKeyStatePacketWorkspaceOffset = 200
+val wifiCcmpKeyStateBytes = 216
+
+@inline
+fun wifiCcmpKeyState(storage: NativeBuffer): WifiCcmpKeyState =
+    WifiCcmpKeyState(
+        storage.addressValue() | (storage.capacity() << 32)
+    )
+
+@inline
+fun WifiCcmpKeyState.storage(): NativeBuffer = nativeBufferAt(
+    this & 4294967295, (this >>> 32) & 2147483647
+)
+
+@inline
+fun WifiCcmpKeyState.capacity(): int = this.storage().capacity()
+
+@inline
+fun WifiCcmpKeyState.addressValue(): int = this.storage().addressValue()
+
+@inline
+trusted fun WifiCcmpKeyState.valid(): bool =
+    this.capacity() >= wifiCcmpKeyStateBytes &&
+    this.storage().loadU32(wifiCcmpKeyStateMagicOffset) ==
+        wifiCcmpKeyStateMagic &&
+    (this.keyLength() == 16 || this.keyLength() == 32) &&
+    (this.tagLength() == 8 || this.tagLength() == 16) &&
+    this.keyIdentifier() >= 0 && this.keyIdentifier() <= 3
+
+trusted fun WifiCcmpKeyState.initialize(
+    key: NativeBuffer,
+    keyLength: int,
+    tagLength: int,
+    keyIdentifier: int
+): bool {
+    if (this.capacity() < wifiCcmpKeyStateBytes ||
+        (keyLength != 16 && keyLength != 32) ||
+        (tagLength != 8 && tagLength != 16) ||
+        key.capacity() < keyLength || keyIdentifier < 0 ||
+        keyIdentifier > 3) return false
+    val storage = this.storage()
+    var index = 0
+    while (index < wifiCcmpKeyStateBytes) {
+        storage.store(index, 0)
+        index = index + 1
+    }
+    storage.storeU32(wifiCcmpKeyStateKeyIdentifierOffset, keyIdentifier)
+    storage.storeU32(wifiCcmpKeyStateKeyLengthOffset, keyLength)
+    storage.storeU32(wifiCcmpKeyStateTagLengthOffset, tagLength)
+    index = 0
+    while (index < keyLength) {
+        storage.store(wifiCcmpKeyStateKeyOffset + index, key.load(index))
+        index = index + 1
+    }
+    index = 0
+    while (index < wifiCcmpTrafficIdentifierCount) {
+        val offset = wifiCcmpKeyStateReplayOffset + index * 8
+        storage.storeU32(offset, 4294967295)
+        storage.storeU32(offset + 4, 4294967295)
+        index = index + 1
+    }
+    // Publish validity last so a partly initialized state is never accepted.
+    storage.storeU32(wifiCcmpKeyStateMagicOffset, wifiCcmpKeyStateMagic)
+    true
+}
+
+@inline
+trusted fun WifiCcmpKeyState.keyIdentifier(): int =
+    this.storage().loadU32(wifiCcmpKeyStateKeyIdentifierOffset)
+
+@inline
+trusted fun WifiCcmpKeyState.keyLength(): int =
+    this.storage().loadU32(wifiCcmpKeyStateKeyLengthOffset)
+
+@inline
+trusted fun WifiCcmpKeyState.tagLength(): int =
+    this.storage().loadU32(wifiCcmpKeyStateTagLengthOffset)
+
+@inline
+trusted fun WifiCcmpKeyState.key(): NativeBuffer = nativeBufferAt(
+    this.addressValue() + wifiCcmpKeyStateKeyOffset,
+    if (this.valid()) this.keyLength() else 0
+)
+
+@inline
+trusted fun wifiCcmpPacketNumberFromHalves(
+    low: int,
+    high: int
+): WifiCcmpPacketNumber = if (high == 4294967295 && low == 4294967295)
+    WifiCcmpPacketNumber(-1)
+else if (high < 0 || high > 65535) WifiCcmpPacketNumber(-1)
+else wifiCcmpPacketNumber((low & 4294967295) + high * 4294967296)
+
+@inline
+trusted fun WifiCcmpKeyState.transmitPacketNumber(): WifiCcmpPacketNumber =
+    if (!this.valid()) WifiCcmpPacketNumber(-1) else
+        wifiCcmpPacketNumberFromHalves(
+            this.storage().loadU32(wifiCcmpKeyStateTransmitLowOffset),
+            this.storage().loadU32(wifiCcmpKeyStateTransmitHighOffset)
+        )
+
+// The target-specific caller holds the state's lock. A returned invalid PN
+// means the 48-bit space is exhausted; PN zero is deliberately never emitted.
+trusted fun WifiCcmpKeyState.reserveTransmitPacketNumberUnlocked(
+): WifiCcmpPacketNumber {
+    if (!this.valid()) return WifiCcmpPacketNumber(-1)
+    val next = this.transmitPacketNumber().next()
+    if (!next.valid() || next.rawValue() == 0) {
+        return WifiCcmpPacketNumber(-1)
+    }
+    val value = next.rawValue()
+    this.storage().storeU32(
+        wifiCcmpKeyStateTransmitLowOffset, value & 4294967295
+    )
+    this.storage().storeU32(
+        wifiCcmpKeyStateTransmitHighOffset, value >>> 32
+    )
+    next
+}
+
+@inline
+fun wifiCcmpTrafficIdentifierValid(trafficIdentifier: int): bool =
+    trafficIdentifier >= 0 &&
+    trafficIdentifier < wifiCcmpTrafficIdentifierCount
+
+// Match ieee80211_gettid semantics: QoS data has TID 0..15; management and
+// non-QoS data share the extra replay slot. Control/reserved frames are not
+// CCMP packet candidates.
+trusted fun wifiCcmpTrafficIdentifier(
+    frame: NativeBuffer,
+    frameLength: int
+): int {
+    if (frameLength < 24 || frame.capacity() < frameLength) return -1
+    val control = frame.loadU16(0)
+    if ((control & 3) != 0) return -1
+    val frameType = (control >>> 2) & 3
+    if (frameType == 0) return wifiCcmpNonQosTrafficIdentifier
+    if (frameType != 2) return -1
+    val subtype = (control >>> 4) & 15
+    if ((subtype & 8) == 0) return wifiCcmpNonQosTrafficIdentifier
+    val address4 = (control & 768) == 768
+    val qosOffset = 24 + (if (address4) 6 else 0)
+    if (frameLength < qosOffset + 2) return -1
+    frame.load(qosOffset) & 15
+}
+
+@inline
+trusted fun WifiCcmpKeyState.replayPacketNumber(
+    trafficIdentifier: int
+): WifiCcmpPacketNumber {
+    if (!this.valid() ||
+        !wifiCcmpTrafficIdentifierValid(trafficIdentifier)) {
+        return WifiCcmpPacketNumber(-1)
+    }
+    val offset = wifiCcmpKeyStateReplayOffset + trafficIdentifier * 8
+    wifiCcmpPacketNumberFromHalves(
+        this.storage().loadU32(offset), this.storage().loadU32(offset + 4)
+    )
+}
+
+@inline
+trusted fun WifiCcmpKeyState.packetNumberAcceptedUnlocked(
+    trafficIdentifier: int,
+    packetNumber: WifiCcmpPacketNumber,
+    allowSamePacketNumber: bool = false
+): bool {
+    val previous = this.replayPacketNumber(trafficIdentifier)
+    packetNumber.freshAfter(previous) ||
+        (allowSamePacketNumber && packetNumber.valid() && previous.valid() &&
+            packetNumber.rawValue() == previous.rawValue())
+}
+
+// Commit only after authentication has succeeded while the state lock is
+// still held. This ordering closes the replay race between parallel receivers.
+trusted fun WifiCcmpKeyState.commitReplayPacketNumberUnlocked(
+    trafficIdentifier: int,
+    packetNumber: WifiCcmpPacketNumber,
+    allowSamePacketNumber: bool = false
+): bool {
+    if (!this.packetNumberAcceptedUnlocked(
+        trafficIdentifier, packetNumber, allowSamePacketNumber
+    )) return false
+    val offset = wifiCcmpKeyStateReplayOffset + trafficIdentifier * 8
+    val value = packetNumber.rawValue()
+    this.storage().storeU32(offset, value & 4294967295)
+    this.storage().storeU32(offset + 4, value >>> 32)
+    true
+}
 
 @inline
 fun wifiCcmpPacketNumber(value: int): WifiCcmpPacketNumber =
@@ -58,6 +297,35 @@ trusted fun wifiCcmpWritePacketHeader(
     true
 }
 
+// Insert the binary cipher descriptor's eight-byte header into an existing
+// packet using caller-provided tailroom. Payload movement is backwards so no
+// allocation or temporary packet is needed.
+trusted fun wifiCcmpEncapHeaderInPlace(
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int
+): int {
+    if (frameLength < headerLength || headerLength < 24 ||
+        frame.capacity() < frameLength + wifiCcmpHeaderBytes ||
+        !packetNumber.valid() || keyIdentifier < 0 ||
+        keyIdentifier > 3) return -1
+    var index = frameLength - headerLength
+    while (index > 0) {
+        index = index - 1
+        frame.store(
+            headerLength + wifiCcmpHeaderBytes + index,
+            frame.load(headerLength + index)
+        )
+    }
+    frame.storeU16(0, frame.loadU16(0) | 16384)
+    if (!wifiCcmpWritePacketHeader(
+        frame, headerLength, packetNumber, keyIdentifier
+    )) return -1
+    frameLength + wifiCcmpHeaderBytes
+}
+
 trusted fun wifiCcmpPacketHeaderValid(
     input: NativeBuffer,
     offset: int
@@ -85,6 +353,35 @@ trusted fun wifiCcmpReadPacketNumber(
         (input.load(offset + 6) << 32) |
         (input.load(offset + 7) << 40)
     )
+}
+
+// ESP-NOW's legacy zero-tag compatibility route does not authenticate AAD;
+// only the forced-zero priority, transmitter address, and packet number feed
+// its CTR stream. Building just those bytes avoids the otherwise dead AAD
+// work while preserving the binary route's exact ciphertext semantics.
+trusted fun wifiCcmpWriteEspNowNonce(
+    frame: NativeBuffer,
+    headerLength: int,
+    ccmpOffset: int,
+    nonce: NativeBuffer
+): bool {
+    if (headerLength < 24 || ccmpOffset < headerLength ||
+        ccmpOffset > frame.capacity() - wifiCcmpHeaderBytes ||
+        nonce.capacity() < 13 ||
+        !wifiCcmpPacketHeaderValid(frame, ccmpOffset)) return false
+    nonce.store(0, 0)
+    var index = 0
+    while (index < 6) {
+        nonce.store(1 + index, frame.load(10 + index))
+        index = index + 1
+    }
+    val packetNumber = wifiCcmpReadPacketNumber(frame, ccmpOffset)
+    index = 0
+    while (index < 6) {
+        nonce.store(7 + index, packetNumber.octet(5 - index))
+        index = index + 1
+    }
+    true
 }
 
 // Build the CCM associated data and 13-byte nonce for a conventional 802.11

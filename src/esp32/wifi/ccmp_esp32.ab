@@ -47,18 +47,24 @@ trusted fun esp32WifiCcmpEncrypt(
         payloadLength > 65535 || frame.capacity() < frameLength ||
         output.capacity() < outputLength || !packetNumber.valid() ||
         keyIdentifier < 0 || keyIdentifier > 3 || maximumPolls <= 0 ||
-        maximumPolls > 4294967295 ||
-        frame.addressValue() == output.addressValue()) return -1
+        maximumPolls > 4294967295) return -1
 
+    val inPlace = frame.addressValue() == output.addressValue()
     var index = 0
-    while (index < headerLength) {
-        output.store(index, frame.load(index))
-        index = index + 1
+    if (inPlace) {
+        if (wifiCcmpEncapHeaderInPlace(
+            output, frameLength, headerLength, packetNumber, keyIdentifier
+        ) < 0) return -1
+    } else {
+        while (index < headerLength) {
+            output.store(index, frame.load(index))
+            index = index + 1
+        }
+        output.storeU16(0, output.loadU16(0) | 16384)
+        if (!wifiCcmpWritePacketHeader(
+            output, headerLength, packetNumber, keyIdentifier
+        )) return -1
     }
-    output.storeU16(0, output.loadU16(0) | 16384)
-    if (!wifiCcmpWritePacketHeader(
-        output, headerLength, packetNumber, keyIdentifier
-    )) return -1
     val aad = nativeBufferAt(nativeStackAllocate(30), 30)
     val nonce = nativeBufferAt(nativeStackAllocate(13), 13)
     val aadLength = wifiCcmpWriteAadAndNonceWithOptions(
@@ -66,7 +72,10 @@ trusted fun esp32WifiCcmpEncrypt(
     )
     if (aadLength < 0) return -1
     val plaintext = nativeBufferAt(
-        frame.addressValue() + headerLength, payloadLength
+        (if (inPlace) output.addressValue() + headerLength +
+            wifiCcmpHeaderBytes
+         else frame.addressValue() + headerLength),
+        payloadLength
     )
     val authenticatedCiphertext = nativeBufferAt(
         output.addressValue() + headerLength + wifiCcmpHeaderBytes,
@@ -76,6 +85,51 @@ trusted fun esp32WifiCcmpEncrypt(
         nativeBufferAt(key.addressValue(), keyLength), nonce, plaintext,
         nativeBufferAt(aad.addressValue(), aadLength),
         authenticatedCiphertext, u32(maximumPolls)
+    )) return -1
+    outputLength
+}
+
+// Grow a frame in caller-provided tailroom. This is the allocation-free
+// equivalent of the binary wrapper's allocate-encrypt-copy-free path.
+@inline
+trusted fun esp32WifiCcmpEncryptInPlace(
+    key: NativeBuffer,
+    keyLength: int,
+    tagLength: int,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int {
+    val payloadLength = frameLength - headerLength
+    val outputLength = frameLength + wifiCcmpHeaderBytes + tagLength
+    if ((keyLength != 16 && keyLength != 32) ||
+        (tagLength != 8 && tagLength != 16) || key.capacity() < keyLength ||
+        frameLength < 24 || headerLength < 24 || payloadLength < 0 ||
+        payloadLength > 65535 || frame.capacity() < outputLength ||
+        !packetNumber.valid() || keyIdentifier < 0 || keyIdentifier > 3 ||
+        maximumPolls <= 0 || maximumPolls > 4294967295 ||
+        wifiCcmpEncapHeaderInPlace(
+            frame, frameLength, headerLength, packetNumber, keyIdentifier
+        ) < 0) return -1
+    val aad = nativeBufferAt(nativeStackAllocate(30), 30)
+    val nonce = nativeBufferAt(nativeStackAllocate(13), 13)
+    val aadLength = wifiCcmpWriteAadAndNonceWithOptions(
+        frame, headerLength, headerLength, aad, nonce, sppAmsdu
+    )
+    if (aadLength < 0 || !esp32AesCcmEncryptWithPollLimit(
+        nativeBufferAt(key.addressValue(), keyLength), nonce,
+        nativeBufferAt(
+            frame.addressValue() + headerLength + wifiCcmpHeaderBytes,
+            payloadLength
+        ), nativeBufferAt(aad.addressValue(), aadLength),
+        nativeBufferAt(
+            frame.addressValue() + headerLength + wifiCcmpHeaderBytes,
+            payloadLength + tagLength
+        ), u32(maximumPolls)
     )) return -1
     outputLength
 }
@@ -214,6 +268,57 @@ trusted fun esp32WifiCcmp256Decrypt(
     previousPacketNumber, expectedKeyIdentifier, output, maximumPolls,
     sppAmsdu, allowSamePacketNumber
 )
+
+// ESP-NOW's legacy encrypted receive path uses CCMP's header/AAD construction
+// but deliberately asks CCM for a zero-byte authentication tag, forces the
+// nonce priority byte to zero, and still excludes the normal eight-byte CCMP
+// trailer from plaintext. This matches Espressif's binary-visible length
+// semantics exactly: the retained trailer is ignored rather than verified.
+trusted fun esp32WifiCcmpEspNowDecrypt(
+    key: NativeBuffer,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000
+): int {
+    val payloadLength = encryptedLength - headerLength -
+        wifiCcmpHeaderBytes - wifiCcmpMicBytes
+    val outputLength = headerLength + payloadLength
+    if (key.capacity() < 16 || headerLength < 24 || payloadLength < 0 ||
+        payloadLength > 65535 || encrypted.capacity() < encryptedLength ||
+        output.capacity() < outputLength || maximumPolls <= 0 ||
+        maximumPolls > 4294967295 ||
+        !wifiCcmpPacketHeaderValid(encrypted, headerLength)) return -1
+    val workspaceAddress = nativeStackAllocate(96)
+    val nonce = nativeBufferAt(workspaceAddress + 80, 13)
+    if (!wifiCcmpWriteEspNowNonce(
+        encrypted, headerLength, headerLength, nonce
+    )) return -1
+    var index = 0
+    while (index < headerLength) {
+        output.store(index, encrypted.load(index))
+        index = index + 1
+    }
+    if (!esp32AesCcmDecryptWithoutTagWithPollLimit(
+        nativeBufferAt(key.addressValue(), 16), nonce,
+        nativeBufferAt(
+            encrypted.addressValue() + headerLength + wifiCcmpHeaderBytes,
+            payloadLength
+        ),
+        nativeBufferAt(output.addressValue() + headerLength, payloadLength),
+        u32(maximumPolls)
+    )) {
+        index = 0
+        while (index < outputLength) {
+            output.store(index, 0)
+            index = index + 1
+        }
+        return -1
+    }
+    output.storeU16(0, output.loadU16(0) & ~16384)
+    outputLength
+}
 
 // Stable 32-bit Xtensa request ABI for complete frame transforms. Fields are
 // key address, key bytes, tag bytes, input address, input bytes, header bytes,

@@ -87,16 +87,24 @@ instructions with no unresolved symbols.
 
 AES-128, AES-256, standard CCM ciphertext and tags, direct and full-frame
 decrypt, replay rejection, tampered-MIC rejection, and failure clearing were
-run successfully on the connected ESP32-PICO-D4. The same diagnostic boot then
-associated, obtained DHCP, authenticated to the voice server, requested speech,
-and played the response. The opaque CCMP object remains `partial`, not
-`complete`: packet-buffer/key-slot dispatch, per-peer and per-TID state,
-interrupt-safe hardware ownership, and every original entry point still need
-source, tests, and hardware parity evidence.
-The original object exposes `ccmp_encap`, `ccmp_decap`,
-`ieee80211_ccmp_encrypt`, `ieee80211_ccmp_decrypt`,
-`ieee80211_decrypt_espnow_pkt`, and its cipher descriptor. None is crossed off
-until the Abla packet/key integration reproduces that complete surface.
+run successfully on the connected ESP32-PICO-D4. The complete stateful packet
+surface was then run on the same device: caller-owned key initialization,
+atomic PN reservation, out-of-place encrypt/decrypt, in-place encap/decap,
+per-TID replay commit and rejection, MIC-failure rollback, and both direct and
+stateful ESP-NOW zero-tag decryption all passed.
+
+The `ieee80211_crypto_ccmp.o` row is therefore complete. Its six-symbol surface
+maps to direct Abla operations: `ccmp_encap` to `esp32WifiCcmpEncap`,
+`ccmp_decap` to `esp32WifiCcmpDecap`, `ieee80211_ccmp_encrypt` to
+`esp32WifiCcmpEncryptPacket`, `ieee80211_ccmp_decrypt` to
+`esp32WifiCcmpDecryptPacket`, `ieee80211_decrypt_espnow_pkt` to
+`esp32WifiCcmpDecryptEspNowPacket`, and the `ccmp` descriptor to the scalar
+`wifiCcmpCipher`. A 216-byte caller-owned state holds the key, transmit PN,
+17 replay counters, lock, and packet workspace. The public Xtensa object emits
+stable one-pointer entries for all three stateful routes, an inline `s32c1i`
+CAS, and no unresolved call or vendor crypto/radio declaration. ESP-NOW peer
+lookup remains part of the peer-table object that supplied `get_iav_key` to the
+original CCMP object; it is not silently counted as CCMP functionality.
 
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.

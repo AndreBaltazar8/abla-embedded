@@ -1,0 +1,411 @@
+import "./ccmp_esp32.ab"
+import "../../xtensa/atomic.ab"
+import "abla/unsafe/memory"
+
+// Stateful packet/key integration corresponding to the complete
+// ieee80211_crypto_ccmp object surface. Key and replay state remain portable;
+// this module contributes only classic ESP32 serialization and hardware CCM.
+
+// Keep public metadata statically initialized. These are the scalar fields of
+// wifiCcmpCipher(), not runtime state.
+val esp32WifiCcmpCipherIdentifier = 3
+val esp32WifiCcmpCipherHeaderBytes = 8
+val esp32WifiCcmpCipherTrailerBytes = 8
+val esp32WifiCcmpCipherMicBytes = 0
+
+val esp32WifiCcmpPacketRequestStateAddressOffset = u32(0)
+val esp32WifiCcmpPacketRequestEngineLockAddressOffset = u32(4)
+val esp32WifiCcmpPacketRequestFrameAddressOffset = u32(8)
+val esp32WifiCcmpPacketRequestFrameCapacityOffset = u32(12)
+val esp32WifiCcmpPacketRequestFrameLengthOffset = u32(16)
+val esp32WifiCcmpPacketRequestHeaderLengthOffset = u32(20)
+val esp32WifiCcmpPacketRequestOutputAddressOffset = u32(24)
+val esp32WifiCcmpPacketRequestOutputCapacityOffset = u32(28)
+val esp32WifiCcmpPacketRequestLockAttemptsOffset = u32(32)
+val esp32WifiCcmpPacketRequestMaximumPollsOffset = u32(36)
+val esp32WifiCcmpPacketRequestOptionsOffset = u32(40)
+val esp32WifiCcmpPacketRequestBytes = 44
+
+@inline
+fun esp32WifiCcmpEngineLock(storage: NativeBuffer): XtensaSpinLock =
+    if (storage.capacity() < 4) xtensaSpinLock(u32(0))
+    else xtensaSpinLock(u32(storage.addressValue()))
+
+@inline
+trusted fun esp32WifiCcmpInitializeEngineLock(storage: NativeBuffer): bool {
+    if (storage.capacity() < 4 || (storage.addressValue() & 3) != 0) {
+        return false
+    }
+    ablaUnsafeVolatileStoreU32(storage.addressValue(), u32(0))
+    true
+}
+
+@inline
+trusted fun WifiCcmpKeyState.esp32Lock(): XtensaSpinLock =
+    if (!this.valid()) xtensaSpinLock(u32(0)) else xtensaSpinLock(
+        u32(this.addressValue() + wifiCcmpKeyStateLockOffset)
+    )
+
+// Reserve a fresh 48-bit PN, add the CCMP header, encrypt, and append the MIC.
+// Exact input/output aliasing selects the allocation-free in-place encap path.
+trusted fun esp32WifiCcmpEncryptPacket(
+    state: WifiCcmpKeyState,
+    engineLock: XtensaSpinLock,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    output: NativeBuffer,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int {
+    if (!state.valid() || !engineLock.valid()) return -1
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    val packetNumber = state.reserveTransmitPacketNumberUnlocked()
+    var result = -1
+    if (packetNumber.valid() && engineLock.acquire(maximumLockAttempts)) {
+        result = esp32WifiCcmpEncrypt(
+            state.key(), state.keyLength(), state.tagLength(), frame,
+            frameLength, headerLength, packetNumber, state.keyIdentifier(),
+            output, maximumPolls, sppAmsdu
+        )
+        engineLock.release()
+    }
+    stateLock.release()
+    result
+}
+
+@inline
+trusted fun esp32WifiCcmpEncap(
+    state: WifiCcmpKeyState,
+    engineLock: XtensaSpinLock,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int {
+    if (!state.valid() || !engineLock.valid()) return -1
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    val packetNumber = state.reserveTransmitPacketNumberUnlocked()
+    var result = -1
+    if (packetNumber.valid() && engineLock.acquire(maximumLockAttempts)) {
+        result = esp32WifiCcmpEncryptInPlace(
+            state.key(), state.keyLength(), state.tagLength(), frame,
+            frameLength, headerLength, packetNumber, state.keyIdentifier(),
+            maximumPolls, sppAmsdu
+        )
+        engineLock.release()
+    }
+    stateLock.release()
+    result
+}
+
+// Authenticate before committing the per-TID replay counter. Holding the key
+// lock across both operations prevents two cores from accepting the same PN.
+trusted fun esp32WifiCcmpDecryptPacket(
+    state: WifiCcmpKeyState,
+    engineLock: XtensaSpinLock,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    output: NativeBuffer,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false,
+    allowSamePacketNumber: bool = false
+): int {
+    if (!state.valid() || !engineLock.valid()) return -1
+    val trafficIdentifier = wifiCcmpTrafficIdentifier(
+        encrypted, encryptedLength
+    )
+    if (!wifiCcmpTrafficIdentifierValid(trafficIdentifier) ||
+        !wifiCcmpPacketHeaderValid(encrypted, headerLength)) return -1
+    val packetNumber = wifiCcmpReadPacketNumber(encrypted, headerLength)
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    var result = -1
+    val previous = state.replayPacketNumber(trafficIdentifier)
+    if (state.packetNumberAcceptedUnlocked(
+        trafficIdentifier, packetNumber, allowSamePacketNumber
+    ) && engineLock.acquire(maximumLockAttempts)) {
+        result = esp32WifiCcmpDecrypt(
+            state.key(), state.keyLength(), state.tagLength(), encrypted,
+            encryptedLength, headerLength, previous, state.keyIdentifier(),
+            output, maximumPolls, sppAmsdu, allowSamePacketNumber
+        )
+        engineLock.release()
+        if (result >= 0 && !state.commitReplayPacketNumberUnlocked(
+            trafficIdentifier, packetNumber, allowSamePacketNumber
+        )) result = -1
+    }
+    stateLock.release()
+    result
+}
+
+@inline
+trusted fun esp32WifiCcmpDecap(
+    state: WifiCcmpKeyState,
+    engineLock: XtensaSpinLock,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false,
+    allowSamePacketNumber: bool = false
+): int {
+    if (!state.valid() || !engineLock.valid()) return -1
+    val trafficIdentifier = wifiCcmpTrafficIdentifier(frame, frameLength)
+    if (!wifiCcmpTrafficIdentifierValid(trafficIdentifier) ||
+        !wifiCcmpPacketHeaderValid(frame, headerLength)) return -1
+    val packetNumber = wifiCcmpReadPacketNumber(frame, headerLength)
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    var result = -1
+    val previous = state.replayPacketNumber(trafficIdentifier)
+    if (state.packetNumberAcceptedUnlocked(
+        trafficIdentifier, packetNumber, allowSamePacketNumber
+    ) && engineLock.acquire(maximumLockAttempts)) {
+        result = esp32WifiCcmpDecrypt(
+            state.key(), state.keyLength(), state.tagLength(), frame,
+            frameLength, headerLength, previous, state.keyIdentifier(), frame,
+            maximumPolls, sppAmsdu, allowSamePacketNumber
+        )
+        engineLock.release()
+        if (result >= 0 && !state.commitReplayPacketNumberUnlocked(
+            trafficIdentifier, packetNumber, allowSamePacketNumber
+        )) result = -1
+    }
+    stateLock.release()
+    result
+}
+
+// The IAV/peer-key lookup belongs to the ESP-NOW peer table, not to CCMP.
+// Once that lookup has selected a key state, this owns the binary object's
+// complete decrypt-copy-free route, including its intentional tag-length zero.
+trusted fun esp32WifiCcmpDecryptEspNowPacket(
+    state: WifiCcmpKeyState,
+    engineLock: XtensaSpinLock,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    output: NativeBuffer,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000
+): int {
+    if (!state.valid() || state.keyLength() != 16 ||
+        !engineLock.valid()) return -1
+    val payloadLength = encryptedLength - headerLength -
+        wifiCcmpHeaderBytes - wifiCcmpMicBytes
+    val outputLength = headerLength + payloadLength
+    if (headerLength < 24 || payloadLength < 0 || payloadLength > 65535 ||
+        encrypted.capacity() < encryptedLength ||
+        output.capacity() < outputLength ||
+        !wifiCcmpPacketHeaderValid(encrypted, headerLength)) return -1
+    var result = -1
+    if (engineLock.acquire(maximumLockAttempts)) {
+        // This fixed caller-owned workspace remains stable across the nested
+        // CCM call and is safe because the global engine lock is held.
+        val packetWorkspace = state.addressValue() +
+            wifiCcmpKeyStatePacketWorkspaceOffset
+        val nonce = nativeBufferAt(packetWorkspace, 13)
+        val nonceValid = wifiCcmpWriteEspNowNonce(
+            encrypted, headerLength, headerLength, nonce
+        )
+        var index = 0
+        while (index < headerLength) {
+            output.store(index, encrypted.load(index))
+            index = index + 1
+        }
+        if (nonceValid && esp32AesCcmDecryptWithoutTagWithPollLimit(
+            state.key(), nonce,
+            nativeBufferAt(
+                encrypted.addressValue() + headerLength +
+                    wifiCcmpHeaderBytes,
+                payloadLength
+            ),
+            nativeBufferAt(
+                output.addressValue() + headerLength, payloadLength
+            ), u32(maximumPolls)
+        )) {
+            output.storeU16(0, output.loadU16(0) & ~16384)
+            result = outputLength
+        } else {
+            index = 0
+            while (index < outputLength) {
+                output.store(index, 0)
+                index = index + 1
+            }
+        }
+        engineLock.release()
+    }
+    result
+}
+
+// One-pointer native ABI used by a scheduler, interrupt handoff, or hardware
+// KAT without widening size_t or constructing a language-level function value.
+// The eleven fields are state address, engine-lock address, frame address and
+// capacity, frame bytes, header bytes, output address and capacity, bounded
+// lock attempts, AES polls, and the existing SPP/same-PN option mask.
+trusted fun esp32WifiCcmpEncryptPacketRequest32(requestAddress: u32): int {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967252) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val stateAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestStateAddressOffset
+    ))
+    val engineAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestEngineLockAddressOffset
+    ))
+    val frameAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameAddressOffset
+    ))
+    val frameCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameCapacityOffset
+    )))
+    val frameLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameLengthOffset
+    )))
+    val headerLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestHeaderLengthOffset
+    )))
+    val outputAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputAddressOffset
+    ))
+    val outputCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputCapacityOffset
+    )))
+    val lockAttempts = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestLockAttemptsOffset
+    )))
+    val maximumPolls = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestMaximumPollsOffset
+    )))
+    val options = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOptionsOffset
+    )))
+    if (stateAddress == u32(0) || engineAddress == u32(0) ||
+        frameAddress == u32(0) || outputAddress == u32(0) ||
+        (int(stateAddress) & 3) != 0 ||
+        (int(engineAddress) & 3) != 0 ||
+        (options & ~esp32WifiCcmpRequestSppAmsdu) != 0) return -1
+    esp32WifiCcmpEncryptPacket(
+        wifiCcmpKeyState(nativeBufferAt(
+            int(stateAddress), wifiCcmpKeyStateBytes
+        )), xtensaSpinLock(engineAddress),
+        nativeBufferAt(int(frameAddress), frameCapacity), frameLength,
+        headerLength, nativeBufferAt(int(outputAddress), outputCapacity),
+        lockAttempts, maximumPolls,
+        (options & esp32WifiCcmpRequestSppAmsdu) != 0
+    )
+}
+
+trusted fun esp32WifiCcmpDecryptPacketRequest32(requestAddress: u32): int {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967252) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val stateAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestStateAddressOffset
+    ))
+    val engineAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestEngineLockAddressOffset
+    ))
+    val frameAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameAddressOffset
+    ))
+    val frameCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameCapacityOffset
+    )))
+    val frameLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameLengthOffset
+    )))
+    val headerLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestHeaderLengthOffset
+    )))
+    val outputAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputAddressOffset
+    ))
+    val outputCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputCapacityOffset
+    )))
+    val lockAttempts = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestLockAttemptsOffset
+    )))
+    val maximumPolls = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestMaximumPollsOffset
+    )))
+    val options = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOptionsOffset
+    )))
+    if (stateAddress == u32(0) || engineAddress == u32(0) ||
+        frameAddress == u32(0) || outputAddress == u32(0) ||
+        (int(stateAddress) & 3) != 0 ||
+        (int(engineAddress) & 3) != 0 ||
+        (options & ~(esp32WifiCcmpRequestSppAmsdu |
+            esp32WifiCcmpRequestAllowSamePacketNumber)) != 0) return -1
+    esp32WifiCcmpDecryptPacket(
+        wifiCcmpKeyState(nativeBufferAt(
+            int(stateAddress), wifiCcmpKeyStateBytes
+        )), xtensaSpinLock(engineAddress),
+        nativeBufferAt(int(frameAddress), frameCapacity), frameLength,
+        headerLength, nativeBufferAt(int(outputAddress), outputCapacity),
+        lockAttempts, maximumPolls,
+        (options & esp32WifiCcmpRequestSppAmsdu) != 0,
+        (options & esp32WifiCcmpRequestAllowSamePacketNumber) != 0
+    )
+}
+
+trusted fun esp32WifiCcmpEspNowPacketRequest32(requestAddress: u32): int {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967252) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val stateAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestStateAddressOffset
+    ))
+    val engineAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestEngineLockAddressOffset
+    ))
+    val frameAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameAddressOffset
+    ))
+    val frameCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameCapacityOffset
+    )))
+    val frameLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestFrameLengthOffset
+    )))
+    val headerLength = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestHeaderLengthOffset
+    )))
+    val outputAddress = ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputAddressOffset
+    ))
+    val outputCapacity = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOutputCapacityOffset
+    )))
+    val lockAttempts = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestLockAttemptsOffset
+    )))
+    val maximumPolls = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestMaximumPollsOffset
+    )))
+    val options = int(ablaUnsafeVolatileLoadU32(int(
+        requestAddress + esp32WifiCcmpPacketRequestOptionsOffset
+    )))
+    if (stateAddress == u32(0) || engineAddress == u32(0) ||
+        frameAddress == u32(0) || outputAddress == u32(0) || options != 0 ||
+        (int(stateAddress) & 3) != 0 ||
+        (int(engineAddress) & 3) != 0) return -1
+    esp32WifiCcmpDecryptEspNowPacket(
+        wifiCcmpKeyState(nativeBufferAt(
+            int(stateAddress), wifiCcmpKeyStateBytes
+        )), xtensaSpinLock(engineAddress),
+        nativeBufferAt(int(frameAddress), frameCapacity), frameLength,
+        headerLength, nativeBufferAt(int(outputAddress), outputCapacity),
+        lockAttempts, maximumPolls
+    )
+}

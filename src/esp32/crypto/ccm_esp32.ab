@@ -192,31 +192,90 @@ trusted fun esp32CcmTransform(
     length: int,
     counter: NativeBuffer,
     stream: NativeBuffer,
+    overlapBlock: NativeBuffer,
     maximumPolls: u32
 ): bool {
     var offset = 0
     var counterValue = 1
     var valid = true
+    val inputStart = input.addressValue()
+    val outputStart = output.addressValue()
+    val overlaps = outputStart < inputStart + length &&
+        inputStart < outputStart + length
     while (valid && offset < length) {
+        var count = length - offset
+        if (count > 16) count = 16
+        var source = input
+        var sourceOffset = offset
+        if (overlaps) {
+            var copied = 0
+            while (copied < count) {
+                overlapBlock.store(copied, input.load(offset + copied))
+                copied = copied + 1
+            }
+            source = overlapBlock
+            sourceOffset = 0
+        }
         counter.store(14, (counterValue >>> 8) & 255)
         counter.store(15, counterValue & 255)
         valid = esp32AesEncryptCurrent32(
             u32(counter.addressValue()), u32(stream.addressValue()),
             maximumPolls
         )
-        var count = length - offset
-        if (count > 16) count = 16
         var index = 0
         while (valid && index < count) {
             output.store(
                 offset + index,
-                input.load(offset + index) ^ stream.load(index)
+                source.load(sourceOffset + index) ^ stream.load(index)
             )
             index = index + 1
         }
         offset = offset + count
         counterValue = counterValue + 1
     }
+    valid
+}
+
+// ESP-NOW in Espressif's CCMP compatibility path deliberately requests a
+// zero-byte CCM tag. With no tag to verify, CCM decryption is exactly the CTR
+// transform and the CBC-MAC/AAD pass cannot affect the plaintext. Keep this
+// explicit so callers cannot accidentally mistake the operation for
+// authenticated decryption, and avoid doing the unused authentication work.
+trusted fun esp32AesCcmDecryptWithoutTagWithPollLimit(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    ciphertext: NativeBuffer,
+    plaintext: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val keyLength = key.capacity()
+    val messageLength = plaintext.capacity()
+    val inputStart = ciphertext.addressValue()
+    val outputStart = plaintext.addressValue()
+    if ((keyLength != 16 && keyLength != 24 && keyLength != 32) ||
+        nonce.capacity() < 13 || messageLength < 0 ||
+        messageLength > 65535 || ciphertext.capacity() < messageLength ||
+        maximumPolls == u32(0) ||
+        (outputStart < inputStart + messageLength &&
+            inputStart < outputStart + messageLength)) return false
+    // Keep the live transform blocks in the same high-offset slots as the
+    // authenticated CCM paths. This also leaves the Xtensa outgoing-call area
+    // below them until nativeStackAllocate's target lowering can reserve that
+    // area itself.
+    val workspaceAddress = nativeStackAllocate(96)
+    val overlapBlock = nativeBufferAt(workspaceAddress + 48, 16)
+    val counter = nativeBufferAt(workspaceAddress + 64, 16)
+    val stream = nativeBufferAt(workspaceAddress + 80, 16)
+    if (!esp32AesBegin32(u32(key.addressValue()), keyLength)) {
+        esp32CcmClearData(plaintext, messageLength)
+        return false
+    }
+    esp32CcmPrepareCounter(counter, nonce)
+    val valid = esp32CcmTransform(
+        ciphertext, plaintext, messageLength, counter, stream, overlapBlock,
+        maximumPolls
+    )
+    if (!valid) esp32CcmClearData(plaintext, messageLength)
     valid
 }
 
@@ -270,7 +329,8 @@ trusted fun esp32AesCcmEncryptWithPollLimit(
     }
     esp32CcmPrepareCounter(counter, nonce)
     if (!esp32CcmTransform(
-        plaintext, ciphertext, plaintextLength, counter, stream, maximumPolls
+        plaintext, ciphertext, plaintextLength, counter, stream, block,
+        maximumPolls
     )) {
         esp32CcmClearData(
             authenticatedCiphertext, authenticatedCiphertext.capacity()
@@ -371,7 +431,8 @@ trusted fun esp32AesCcmDecryptWithPollLimit(
     }
     esp32CcmPrepareCounter(counter, nonce)
     if (!esp32CcmTransform(
-        ciphertext, plaintext, ciphertextLength, counter, stream, maximumPolls
+        ciphertext, plaintext, ciphertextLength, counter, stream, block,
+        maximumPolls
     ) || !esp32CcmStartAuthentication(
         nonce, aad, aadLength, ciphertextLength, tagLength,
         state, block, maximumPolls
