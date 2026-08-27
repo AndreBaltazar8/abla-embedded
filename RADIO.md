@@ -116,6 +116,15 @@ M5Echo link map; the replacement added only 16 bytes to the application image
 and the device again completed WPA2, server authentication, speech, and
 playback. This boundary retains no opaque algorithm of its own.
 
+`src/esp32/wifi/legacy_crypto_esp32.ab` supplies the exact `wep`, `wep_encap`,
+`wep_decap`, `tkip`, `tkip_encap`, and `tkip_decap` symbols. It preserves the
+vendor key/mbuf offsets, 24-byte cipher descriptors, WEP and TKIP IV byte
+ordering, global software-crypto gate, 48-bit PN progression, per-TID replay
+state, and header/trailer pointer adjustment. Both original archive members
+are absent from the M5Echo link map, and the combined image passed the full
+WPA2 voice smoke path. These replacements currently cost 368 bytes over the
+preceding image and therefore still need instruction-level size work.
+
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
 management-frame integrity portion of `ieee80211_crypto.o`. The portable layer

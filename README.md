@@ -171,6 +171,13 @@ gate, callback register/reset/unregister operations, and guarded receive
 dispatch remove `ieee80211_rfid.o`. That lowers the same live-tested M5Echo
 inventory again, from 60 to 59 retained opaque objects, at a net image cost of
 16 bytes.
+The cipher table's legacy WEP and TKIP descriptor/header objects are now exact
+Abla ABIs as well. Their IV construction, PN progression, TKIP per-TID replay
+checks, and mbuf encap/decap bookkeeping remove both opaque objects and lower
+the retained inventory from 59 to 57. The current straightforward replacement
+adds 368 application bytes versus the preceding image, so it is retained for
+source ownership and correctness but remains an explicit size-optimization
+target.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
