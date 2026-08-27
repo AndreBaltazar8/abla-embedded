@@ -391,8 +391,21 @@ row or changes replacement status. `tools/check-esp32-opaque-radio-parity`
 validates the fixed full inventory and can additionally reject an unknown
 opaque member in a supplied `ESP32_LINK_MAP`. A row reaches `complete` only
 with source, tests, and hardware evidence for its entire surface. The
-six-symbol `ieee80211_crypto_ccmp.o` and full `ieee80211_crypto.o` rows
-currently meet that bar.
+six-symbol `ieee80211_crypto_ccmp.o`, full `ieee80211_crypto.o`, and full
+`ieee80211.o` rows currently meet that bar. The last of those is now
+`src/esp32/wifi/ieee80211_core_esp32.ab`: it owns `g_ic`, interface lifecycle,
+mode transitions, PMF/SA Query, information-element parsing, transmit metadata,
+and attach/detach orchestration. The original 3,836-byte archive member is not
+included in the M5Echo link, and the replacement was physically verified
+through WPA2 association, server authentication, speech transfer, and audio
+playback on 2026-08-28.
+
+The core calls crypto, protocol, vendor-action, RFID reset, random-MAC, NAN,
+and lifecycle helpers as ordinary Abla functions. Those helpers have no export
+annotation. Exact linker names remain only where another still-opaque archive
+member enters the Abla implementation; they are migration ABI boundaries, not
+public package APIs. Replacing each caller cluster removes the corresponding
+boundary and lets LLVM prune the entire unused path.
 
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
