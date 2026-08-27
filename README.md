@@ -58,6 +58,7 @@ make board-detect-s3
 make radio-mac-registers
 make compare-radio-power-size
 make compare-rx-chain-size
+make compare-wifi-fcs-size
 make imu-calibration
 make imu-offsets
 make i2s-tone
@@ -145,6 +146,9 @@ targets check that sequence and the null-terminated RX descriptor-chain
 initializer against equivalent C under the same toolchain and flags. The RX
 leaf retains all alignment, count, and 32-bit range checks and is three bytes
 smaller than the C reference (114 versus 117 bytes of text plus literals).
+The same example emits a board-independent IEEE 802.11 FCS leaf and checks it
+against equivalent volatile-memory C: Abla is 180 bytes and 54 Xtensa
+instructions versus C at 184 bytes and 56 instructions.
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

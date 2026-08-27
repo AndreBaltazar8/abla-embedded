@@ -22,6 +22,15 @@ Abla versus 117 bytes for C, with no unresolved calls. When an Espressif GCC
 same gate also disassembles just those symbols; the current result is 42 Abla
 instructions versus 43 C instructions.
 
+The board-independent `src/wifi/ieee80211_logic.ab` module defines zero-storage
+`u16` frame-control and sequence-control fields with typed accessors. The
+reusable `src/checksum/crc32.ab` module implements reflected CRC-32/ISO-HDLC;
+`src/wifi/ieee80211.ab` exposes it as the allocation-free 802.11 frame check
+sequence over an existing DMA range. `make compare-wifi-fcs-size` checks the
+same volatile-byte algorithm under identical Xtensa flags. The current leaf is
+180 bytes and 54 instructions for Abla versus 184 bytes and 56 instructions
+for C, with no unresolved calls.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
@@ -68,7 +77,8 @@ The remaining dependency order is:
 1. interrupt-safe shared-clock ownership and interrupt routing;
 2. bounded RX consumption/recycling and TX ownership on top of the implemented
    null-terminated descriptor chains;
-3. open 802.11 management, authentication, association, and data framing;
+3. open 802.11 management, authentication, association, and remaining data
+   framing on top of the implemented common header fields and FCS;
 4. hardware crypto plus WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
 6. a native network interface and IP stack boundary.
