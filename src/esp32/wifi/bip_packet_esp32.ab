@@ -1,0 +1,241 @@
+import "../../wifi/bip_logic.ab"
+import "../crypto/cmac_gmac_esp32.ab"
+import "../../xtensa/atomic.ab"
+import "abla/unsafe/memory"
+
+// Stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256 over the
+// classic ESP32 AES engine. Key and replay state are caller-owned.
+
+val esp32WifiBipRequestBytes = 28
+
+@inline
+trusted fun esp32WifiBipCmac(
+    key: NativeBuffer,
+    aad: NativeBuffer,
+    body: NativeBuffer,
+    mic: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val request = nativeStackAllocate(esp32CmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, u32(key.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 4, u32(key.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 8, u32(aad.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 12, u32(aad.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 16, u32(body.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 20, u32(body.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 24, u32(mic.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 28, maximumPolls)
+    esp32AesCmacTwoBuffersRequest32(u32(request))
+}
+
+@inline
+trusted fun esp32WifiBipGmac(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    aad: NativeBuffer,
+    body: NativeBuffer,
+    mic: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val request = nativeStackAllocate(esp32GmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, u32(key.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 4, u32(key.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 8, u32(nonce.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 12, u32(nonce.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 16, u32(aad.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 20, u32(aad.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 24, u32(body.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 28, u32(body.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 32, u32(mic.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 36, maximumPolls)
+    esp32AesGmacTwoBuffersRequest32(u32(request))
+}
+
+@inline
+trusted fun WifiBipKeyState.esp32Lock(): XtensaSpinLock =
+    if (!this.valid()) xtensaSpinLock(u32(0)) else xtensaSpinLock(
+        u32(this.storage().addressValue() + wifiBipKeyStateLockOffset)
+    )
+
+trusted fun esp32WifiBipClearMmie(
+    frame: NativeBuffer,
+    offset: int,
+    length: int
+): void {
+    var index = 0
+    while (index < length) {
+        frame.store(offset + index, 0)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32WifiBipProtect(
+    state: WifiBipKeyState,
+    engineLock: XtensaSpinLock,
+    frame: NativeBuffer,
+    frameLength: int,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000
+): int {
+    if (!state.valid() || !engineLock.valid() || frameLength < 24 ||
+        frame.capacity() < frameLength || maximumPolls <= 0) return -1
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    val packetNumber = state.reserveTransmitPacketNumberUnlocked()
+    val cipher = state.cipher()
+    val protectedLength = if (!packetNumber.valid()) -1 else
+        wifiBipAppendMmie(
+            frame, frameLength, cipher, state.keyIdentifier(), packetNumber
+        )
+    var result = -1
+    if (protectedLength > 0 && engineLock.acquire(maximumLockAttempts)) {
+        val workspaceAddress = nativeStackAllocate(112)
+        val aad = nativeBufferAt(workspaceAddress + 48, 20)
+        val nonce = nativeBufferAt(workspaceAddress + 68, 12)
+        val computedMic = nativeBufferAt(workspaceAddress + 80, 16)
+        val mmieOffset = protectedLength - cipher.mmieBytes()
+        val mic = nativeBufferAt(
+            frame.addressValue() + mmieOffset + 10, cipher.micLength()
+        )
+        val body = nativeBufferAt(
+            frame.addressValue() + 24, protectedLength - 24
+        )
+        var valid = wifiBipWriteAad(frame, protectedLength, aad)
+        if (valid && cipher == wifiBipCmac128) {
+            valid = esp32WifiBipCmac(
+                state.key(), aad, body, computedMic, u32(maximumPolls)
+            )
+            var index = 0
+            while (valid && index < 8) {
+                mic.store(index, computedMic.load(index))
+                index = index + 1
+            }
+        } else if (valid && (cipher == wifiBipGmac128 ||
+            cipher == wifiBipGmac256)) {
+            valid = wifiBipWriteGmacNonce(
+                frame, protectedLength, packetNumber, nonce
+            ) && esp32WifiBipGmac(
+                state.key(), nonce, aad, body, mic, u32(maximumPolls)
+            )
+        } else {
+            valid = false
+        }
+        if (valid) result = protectedLength
+        else esp32WifiBipClearMmie(frame, mmieOffset, cipher.mmieBytes())
+        engineLock.release()
+    }
+    stateLock.release()
+    result
+}
+
+trusted fun esp32WifiBipVerify(
+    state: WifiBipKeyState,
+    engineLock: XtensaSpinLock,
+    frame: NativeBuffer,
+    frameLength: int,
+    maximumLockAttempts: int = 100000,
+    maximumPolls: int = 100000
+): int {
+    if (!state.valid() || !engineLock.valid() || maximumPolls <= 0) return -1
+    val cipher = state.cipher()
+    val mmieOffset = wifiBipMmieOffset(frame, frameLength, cipher)
+    if (mmieOffset < 0 || frame.loadU16(mmieOffset + 2) !=
+        state.keyIdentifier()) return -1
+    val packetNumber = wifiBipReadPacketNumber(frame, mmieOffset + 4)
+    val stateLock = state.esp32Lock()
+    if (!stateLock.acquire(maximumLockAttempts)) return -1
+    var result = -1
+    if (state.packetNumberAcceptedUnlocked(packetNumber) &&
+        engineLock.acquire(maximumLockAttempts)) {
+        val workspaceAddress = nativeStackAllocate(128)
+        val aad = nativeBufferAt(workspaceAddress + 48, 20)
+        val nonce = nativeBufferAt(workspaceAddress + 68, 12)
+        val computedMic = nativeBufferAt(workspaceAddress + 80, 16)
+        val receivedMic = nativeBufferAt(workspaceAddress + 96, 16)
+        val micLength = cipher.micLength()
+        val micOffset = mmieOffset + 10
+        var index = 0
+        while (index < micLength) {
+            receivedMic.store(index, frame.load(micOffset + index))
+            frame.store(micOffset + index, 0)
+            index = index + 1
+        }
+        val body = nativeBufferAt(frame.addressValue() + 24, frameLength - 24)
+        var valid = wifiBipWriteAad(frame, frameLength, aad)
+        if (valid && cipher == wifiBipCmac128) {
+            valid = esp32WifiBipCmac(
+                state.key(), aad, body, computedMic, u32(maximumPolls)
+            )
+        } else if (valid && (cipher == wifiBipGmac128 ||
+            cipher == wifiBipGmac256)) {
+            valid = wifiBipWriteGmacNonce(
+                frame, frameLength, packetNumber, nonce
+            ) && esp32WifiBipGmac(
+                state.key(), nonce, aad, body, computedMic, u32(maximumPolls)
+            )
+        } else {
+            valid = false
+        }
+        index = 0
+        while (index < micLength) {
+            frame.store(micOffset + index, receivedMic.load(index))
+            index = index + 1
+        }
+        valid = valid && cryptoConstantTimeEqual(
+            receivedMic, computedMic, micLength
+        ) && state.commitReplayPacketNumberUnlocked(packetNumber)
+        if (valid) result = mmieOffset
+        engineLock.release()
+    }
+    stateLock.release()
+    result
+}
+
+trusted fun esp32WifiBipProtectRequest32(requestAddress: u32): int =
+    esp32WifiBipRequest32(requestAddress, true)
+
+trusted fun esp32WifiBipVerifyRequest32(requestAddress: u32): int =
+    esp32WifiBipRequest32(requestAddress, false)
+
+// state address, engine-lock address, frame address/capacity, frame bytes,
+// bounded lock attempts, and bounded AES polls.
+trusted fun esp32WifiBipRequest32(
+    requestAddress: u32,
+    protect: bool
+): int {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967268) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val stateAddress = ablaUnsafeVolatileLoadU32(int(requestAddress))
+    val engineAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(4))
+    )
+    val frameAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(8))
+    )
+    val frameCapacity = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(12))
+    ))
+    val frameLength = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(16))
+    ))
+    val lockAttempts = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(20))
+    ))
+    val maximumPolls = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(24))
+    ))
+    if (stateAddress == u32(0) || engineAddress == u32(0) ||
+        frameAddress == u32(0) || (int(stateAddress) & 3) != 0 ||
+        (int(engineAddress) & 3) != 0) return -1
+    val state = wifiBipKeyState(nativeBufferAt(
+        int(stateAddress), wifiBipKeyStateBytes
+    ))
+    val engineLock = xtensaSpinLock(engineAddress)
+    val frame = nativeBufferAt(int(frameAddress), frameCapacity)
+    if (protect) esp32WifiBipProtect(
+        state, engineLock, frame, frameLength, lockAttempts, maximumPolls
+    ) else esp32WifiBipVerify(
+        state, engineLock, frame, frameLength, lockAttempts, maximumPolls
+    )
+}

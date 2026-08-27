@@ -1,0 +1,399 @@
+import "./aes_esp32.ab"
+import "../../crypto/block_modes.ab"
+
+// Allocation-free AES-CMAC and AES-GMAC over the classic ESP32 hardware AES
+// block engine. The caller serializes the complete operation with every other
+// user of the shared engine.
+
+val esp32CmacRequestBytes = 24
+val esp32GmacRequestBytes = 32
+val esp32CmacTwoBufferRequestBytes = 32
+val esp32GmacTwoBufferRequestBytes = 40
+
+trusted fun esp32CryptoCopyKey(
+    destination: NativeBuffer,
+    key: NativeBuffer,
+    keyLength: int
+): bool {
+    if (destination.capacity() < keyLength || key.capacity() < keyLength) {
+        return false
+    }
+    var index = 0
+    while (index < keyLength) {
+        destination.store(index, key.load(index))
+        index = index + 1
+    }
+    true
+}
+
+@inline
+trusted fun esp32CryptoFillConcatenatedBlock(
+    block: NativeBuffer,
+    first: NativeBuffer,
+    second: NativeBuffer,
+    offset: int,
+    count: int
+): bool {
+    val totalLength = first.capacity() + second.capacity()
+    if (block.capacity() < 16 || offset < 0 || count < 0 || count > 16 ||
+        totalLength < first.capacity() || offset > totalLength - count) {
+        return false
+    }
+    var index = 0
+    while (index < 16) {
+        var value = 0
+        if (index < count) {
+            val sourceIndex = offset + index
+            value = if (sourceIndex < first.capacity())
+                first.load(sourceIndex)
+            else second.load(sourceIndex - first.capacity())
+        }
+        block.store(index, value)
+        index = index + 1
+    }
+    true
+}
+
+trusted fun esp32AesCmacTwoBuffersRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967264) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val key = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(4))))
+    )
+    val first = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(8)))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(12))))
+    )
+    val second = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(16)))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(20))))
+    )
+    val mac = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(24)))), 16
+    )
+    val maximumPolls = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(28))
+    )
+    val keyLength = key.capacity()
+    val totalLength = first.capacity() + second.capacity()
+    if ((keyLength != 16 && keyLength != 24 && keyLength != 32) ||
+        totalLength < first.capacity() || mac.capacity() < 16 ||
+        maximumPolls == u32(0)) return false
+    // The first 48 bytes are reserved for the Xtensa outgoing-call area.
+    val workspaceAddress = nativeStackAllocate(128)
+    val keyCopy = nativeBufferAt(workspaceAddress + 48, 32)
+    val state = nativeBufferAt(workspaceAddress + 80, 16)
+    val block = nativeBufferAt(workspaceAddress + 96, 16)
+    val subkey = nativeBufferAt(workspaceAddress + 112, 16)
+    if (!esp32CryptoCopyKey(keyCopy, key, keyLength) ||
+        !cryptoBlockClear(state) || !cryptoBlockClear(block) ||
+        !esp32AesBegin32(u32(keyCopy.addressValue()), keyLength) ||
+        !esp32AesEncryptCurrent32(
+            u32(block.addressValue()), u32(subkey.addressValue()), maximumPolls
+        ) || !cryptoCmacDoubleBlock(subkey)) return false
+
+    val completeLastBlock = totalLength > 0 && (totalLength & 15) == 0
+    var bytesBeforeLast = (totalLength / 16) * 16
+    if (completeLastBlock) bytesBeforeLast = bytesBeforeLast - 16
+    var offset = 0
+    var valid = true
+    while (valid && offset < bytesBeforeLast) {
+        valid = esp32CryptoFillConcatenatedBlock(
+            block, first, second, offset, 16
+        ) && cryptoBlockXor(block, state) &&
+            esp32AesEncryptCurrent32(
+                u32(block.addressValue()), u32(state.addressValue()),
+                maximumPolls
+            )
+        offset = offset + 16
+    }
+    var lastBytes = totalLength - bytesBeforeLast
+    if (lastBytes > 16) lastBytes = 16
+    valid = valid && esp32CryptoFillConcatenatedBlock(
+        block, first, second, bytesBeforeLast, lastBytes
+    )
+    if (!completeLastBlock) {
+        block.store(lastBytes, 128)
+        valid = valid && cryptoCmacDoubleBlock(subkey)
+    }
+    valid = valid && cryptoBlockXor(block, subkey) &&
+        cryptoBlockXor(block, state) && esp32AesEncryptCurrent32(
+            u32(block.addressValue()), u32(mac.addressValue()), maximumPolls
+        )
+    if (!valid) cryptoBlockClear(mac)
+    valid
+}
+
+@inline
+trusted fun esp32AesCmacWithPollLimit(
+    key: NativeBuffer,
+    data: NativeBuffer,
+    mac: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val request = nativeStackAllocate(esp32CmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, u32(key.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 4, u32(key.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 8, u32(data.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 12, u32(data.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 16, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 20, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 24, u32(mac.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 28, maximumPolls)
+    esp32AesCmacTwoBuffersRequest32(u32(request))
+}
+
+@inline
+trusted fun esp32AesCmac(
+    key: NativeBuffer,
+    data: NativeBuffer,
+    mac: NativeBuffer
+): bool = esp32AesCmacWithPollLimit(
+    key, data, mac, u32(100000)
+)
+
+@inline
+trusted fun esp32GhashData(
+    state: NativeBuffer,
+    hashSubkey: NativeBuffer,
+    data: NativeBuffer,
+    block: NativeBuffer,
+    temporaryProduct: NativeBuffer,
+    temporaryV: NativeBuffer
+): bool = esp32GhashTwoBuffers(
+    state, hashSubkey, data, nativeBufferAt(0, 0), block,
+    temporaryProduct, temporaryV
+)
+
+@inline
+trusted fun esp32GhashTwoBuffers(
+    state: NativeBuffer,
+    hashSubkey: NativeBuffer,
+    first: NativeBuffer,
+    second: NativeBuffer,
+    block: NativeBuffer,
+    temporaryProduct: NativeBuffer,
+    temporaryV: NativeBuffer
+): bool {
+    val totalLength = first.capacity() + second.capacity()
+    if (totalLength < first.capacity()) return false
+    var offset = 0
+    var valid = true
+    while (valid && offset < totalLength) {
+        var count = totalLength - offset
+        if (count > 16) count = 16
+        valid = esp32CryptoFillConcatenatedBlock(
+            block, first, second, offset, count
+        )
+        valid = valid && cryptoGhashUpdateBlock(
+            state, hashSubkey, block, temporaryProduct, temporaryV
+        )
+        offset = offset + count
+    }
+    valid
+}
+
+trusted fun esp32GhashStoreBitLength(
+    block: NativeBuffer,
+    offset: int,
+    byteLength: int
+): bool {
+    if (block.capacity() < offset + 8 || offset < 0 || byteLength < 0 ||
+        byteLength > 1152921504606846975) return false
+    val bits = byteLength * 8
+    var index = 0
+    while (index < 8) {
+        block.store(offset + index, (bits >>> ((7 - index) * 8)) & 255)
+        index = index + 1
+    }
+    true
+}
+
+@inline
+trusted fun esp32AesGmacWithPollLimit(
+    key: NativeBuffer,
+    iv: NativeBuffer,
+    aad: NativeBuffer,
+    tag: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val request = nativeStackAllocate(esp32GmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, u32(key.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 4, u32(key.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 8, u32(iv.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 12, u32(iv.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 16, u32(aad.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 20, u32(aad.capacity()))
+    ablaUnsafeVolatileStoreU32(request + 24, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 28, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 32, u32(tag.addressValue()))
+    ablaUnsafeVolatileStoreU32(request + 36, maximumPolls)
+    esp32AesGmacTwoBuffersRequest32(u32(request))
+}
+
+trusted fun esp32AesGmacTwoBuffersRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967256) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val key = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(4))))
+    )
+    val iv = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(8)))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(12))))
+    )
+    val aadFirst = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(16)))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(20))))
+    )
+    val aadSecond = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(24)))),
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(28))))
+    )
+    val tag = nativeBufferAt(
+        int(ablaUnsafeVolatileLoadU32(int(requestAddress + u32(32)))), 16
+    )
+    val maximumPolls = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(36))
+    )
+    val keyLength = key.capacity()
+    val aadLength = aadFirst.capacity() + aadSecond.capacity()
+    if ((keyLength != 16 && keyLength != 24 && keyLength != 32) ||
+        aadLength < aadFirst.capacity() || tag.capacity() < 16 ||
+        maximumPolls == u32(0)) return false
+    val workspaceAddress = nativeStackAllocate(192)
+    val keyCopy = nativeBufferAt(workspaceAddress + 48, 32)
+    val hashSubkey = nativeBufferAt(workspaceAddress + 80, 16)
+    val initialCounter = nativeBufferAt(workspaceAddress + 96, 16)
+    val state = nativeBufferAt(workspaceAddress + 112, 16)
+    val block = nativeBufferAt(workspaceAddress + 128, 16)
+    val product = nativeBufferAt(workspaceAddress + 144, 16)
+    val temporaryV = nativeBufferAt(workspaceAddress + 160, 16)
+    val stream = nativeBufferAt(workspaceAddress + 176, 16)
+    if (!esp32CryptoCopyKey(keyCopy, key, keyLength) ||
+        !cryptoBlockClear(block) ||
+        !esp32AesBegin32(u32(keyCopy.addressValue()), keyLength) ||
+        !esp32AesEncryptCurrent32(
+            u32(block.addressValue()), u32(hashSubkey.addressValue()),
+            maximumPolls
+        )) return false
+
+    var valid = cryptoBlockClear(initialCounter)
+    if (iv.capacity() == 12) {
+        var index = 0
+        while (index < 12) {
+            initialCounter.store(index, iv.load(index))
+            index = index + 1
+        }
+        initialCounter.store(15, 1)
+    } else {
+        valid = valid && esp32GhashData(
+            initialCounter, hashSubkey, iv, block, product, temporaryV
+        ) && cryptoBlockClear(block) &&
+            esp32GhashStoreBitLength(block, 8, iv.capacity()) &&
+            cryptoGhashUpdateBlock(
+                initialCounter, hashSubkey, block, product, temporaryV
+            )
+    }
+    valid = valid && cryptoBlockClear(state) && esp32GhashTwoBuffers(
+        state, hashSubkey, aadFirst, aadSecond, block, product, temporaryV
+    ) && cryptoBlockClear(block) &&
+        esp32GhashStoreBitLength(block, 0, aadLength) &&
+        cryptoGhashUpdateBlock(
+            state, hashSubkey, block, product, temporaryV
+        ) && esp32AesEncryptCurrent32(
+            u32(initialCounter.addressValue()), u32(stream.addressValue()),
+            maximumPolls
+        ) && cryptoBlockXor(stream, state) && cryptoBlockCopy(tag, stream)
+    if (!valid) cryptoBlockClear(tag)
+    valid
+}
+
+@inline
+trusted fun esp32AesGmac(
+    key: NativeBuffer,
+    iv: NativeBuffer,
+    aad: NativeBuffer,
+    tag: NativeBuffer
+): bool = esp32AesGmacWithPollLimit(
+    key, iv, aad, tag, u32(100000)
+)
+
+// Native one-pointer boundaries: CMAC uses key address/bytes, data
+// address/bytes, output address, and poll limit. GMAC inserts IV address/bytes
+// and AAD address/bytes before its tag address and poll limit.
+trusted fun esp32AesCmacRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967272) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val keyAddress = ablaUnsafeVolatileLoadU32(int(requestAddress))
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(4))
+    ))
+    val dataAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(8))
+    )
+    val dataBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(12))
+    ))
+    val outputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(16))
+    )
+    val maximumPolls = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(20))
+    )
+    if (keyAddress == u32(0) || outputAddress == u32(0) ||
+        (dataBytes > 0 && dataAddress == u32(0))) return false
+    val request = nativeStackAllocate(esp32CmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, keyAddress)
+    ablaUnsafeVolatileStoreU32(request + 4, u32(keyBytes))
+    ablaUnsafeVolatileStoreU32(request + 8, dataAddress)
+    ablaUnsafeVolatileStoreU32(request + 12, u32(dataBytes))
+    ablaUnsafeVolatileStoreU32(request + 16, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 20, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 24, outputAddress)
+    ablaUnsafeVolatileStoreU32(request + 28, maximumPolls)
+    esp32AesCmacTwoBuffersRequest32(u32(request))
+}
+
+trusted fun esp32AesGmacRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967264) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val keyAddress = ablaUnsafeVolatileLoadU32(int(requestAddress))
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(4))
+    ))
+    val ivAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(8))
+    )
+    val ivBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(12))
+    ))
+    val aadAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(16))
+    )
+    val aadBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(20))
+    ))
+    val tagAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(24))
+    )
+    val maximumPolls = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(28))
+    )
+    if (keyAddress == u32(0) || tagAddress == u32(0) ||
+        (ivBytes > 0 && ivAddress == u32(0)) ||
+        (aadBytes > 0 && aadAddress == u32(0))) return false
+    val request = nativeStackAllocate(esp32GmacTwoBufferRequestBytes)
+    ablaUnsafeVolatileStoreU32(request, keyAddress)
+    ablaUnsafeVolatileStoreU32(request + 4, u32(keyBytes))
+    ablaUnsafeVolatileStoreU32(request + 8, ivAddress)
+    ablaUnsafeVolatileStoreU32(request + 12, u32(ivBytes))
+    ablaUnsafeVolatileStoreU32(request + 16, aadAddress)
+    ablaUnsafeVolatileStoreU32(request + 20, u32(aadBytes))
+    ablaUnsafeVolatileStoreU32(request + 24, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 28, u32(0))
+    ablaUnsafeVolatileStoreU32(request + 32, tagAddress)
+    ablaUnsafeVolatileStoreU32(request + 36, maximumPolls)
+    esp32AesGmacTwoBuffersRequest32(u32(request))
+}

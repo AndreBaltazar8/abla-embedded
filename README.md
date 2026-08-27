@@ -159,6 +159,14 @@ encap, decap, encrypt, decrypt, ESP-NOW, cipher-metadata, PN, and per-TID replay
 surface with a caller-owned 216-byte state and native Xtensa CAS. Its final
 full-surface KAT passed on an ESP32-PICO-D4. The CCMP replay leaf is 72 bytes
 and 27 instructions in both Abla and equivalent C++ with no unresolved call.
+The same object now emits allocation-free AES-CMAC and AES-GMAC request
+entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
+protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
+register argument window. Standard tags, replay rejection, tamper rejection,
+state rollback, and retry all passed on the connected ESP32-PICO-D4. This is a
+verified partial replacement of `ieee80211_crypto.o`, not a completeness claim:
+its generic cipher dispatcher and complete 11-entry WPA crypto-provider surface
+remain open in the parity ledger.
 It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
 Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;

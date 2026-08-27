@@ -1,0 +1,323 @@
+import "../esp32/sdk/buffer.ab"
+
+// IEEE 802.11w Broadcast/Multicast Integrity Protocol wire and key-state
+// primitives. These are independent of a crypto engine and use caller-owned
+// storage throughout.
+
+type WifiBipCipher = int
+type WifiBipPacketNumber = int
+type WifiBipKeyState = int
+
+// Espressif's internal management-cipher identifiers, recovered from all
+// branches of ieee80211_crypto.o and its station/SoftAP callers.
+val wifiBipCmac128 = WifiBipCipher(9)
+val wifiBipGmac128 = WifiBipCipher(13)
+val wifiBipGmac256 = WifiBipCipher(14)
+
+val wifiBipMaximumPacketNumber = 281474976710655
+val wifiBipMmieElementIdentifier = 76
+val wifiBipHeaderBytes = 24
+val wifiBipKeyStateMagic = 1112100944
+val wifiBipKeyStateMagicOffset = 0
+val wifiBipKeyStateLockOffset = 4
+val wifiBipKeyStateKeyIdentifierOffset = 8
+val wifiBipKeyStateCipherOffset = 12
+val wifiBipKeyStateKeyLengthOffset = 16
+val wifiBipKeyStateTransmitLowOffset = 20
+val wifiBipKeyStateTransmitHighOffset = 24
+val wifiBipKeyStateReplayLowOffset = 28
+val wifiBipKeyStateReplayHighOffset = 32
+val wifiBipKeyStateKeyOffset = 36
+val wifiBipKeyStateBytes = 68
+
+@inline
+fun WifiBipCipher.rawValue(): int = this
+
+@inline
+fun WifiBipCipher.micLength(): int =
+    if (this == wifiBipCmac128) 8
+    else if (this == wifiBipGmac128 || this == wifiBipGmac256) 16
+    else 0
+
+@inline
+fun WifiBipCipher.keyLength(): int =
+    if (this == wifiBipCmac128 || this == wifiBipGmac128) 16
+    else if (this == wifiBipGmac256) 32
+    else 0
+
+@inline
+fun WifiBipCipher.valid(): bool =
+    this.micLength() > 0 && this.keyLength() > 0
+
+// Exact seven-byte switch table in ieee80211_get_cipher_mic_len.
+@inline
+fun wifiCipherMicLength(identifier: int): int =
+    if (identifier == 3 || identifier == 4) 8
+    else if (identifier >= 7 && identifier <= 9) 16
+    else 0
+
+@inline
+fun wifiBipPacketNumber(value: int): WifiBipPacketNumber =
+    WifiBipPacketNumber(
+        if (value < 0 || value > wifiBipMaximumPacketNumber) -1 else value
+    )
+
+@inline
+fun WifiBipPacketNumber.rawValue(): int = this
+
+@inline
+fun WifiBipPacketNumber.valid(): bool =
+    this >= 0 && this <= wifiBipMaximumPacketNumber
+
+@inline
+fun WifiBipPacketNumber.next(): WifiBipPacketNumber =
+    if (!this.valid() || this == wifiBipMaximumPacketNumber)
+        WifiBipPacketNumber(-1)
+    else WifiBipPacketNumber(this + 1)
+
+@inline
+fun WifiBipPacketNumber.freshAfter(
+    previous: WifiBipPacketNumber
+): bool = this.valid() && (!previous.valid() || this > previous)
+
+@inline
+fun wifiBipKeyState(storage: NativeBuffer): WifiBipKeyState =
+    WifiBipKeyState(storage.addressValue() | (storage.capacity() << 32))
+
+@inline
+fun WifiBipKeyState.storage(): NativeBuffer = nativeBufferAt(
+    this & 4294967295, (this >>> 32) & 2147483647
+)
+
+@inline
+trusted fun WifiBipKeyState.valid(): bool =
+    this.storage().capacity() >= wifiBipKeyStateBytes &&
+    this.storage().loadU32(wifiBipKeyStateMagicOffset) ==
+        wifiBipKeyStateMagic && this.cipher().valid() &&
+    this.keyLength() == this.cipher().keyLength() &&
+    (this.keyIdentifier() == 4 || this.keyIdentifier() == 5)
+
+@inline
+trusted fun WifiBipKeyState.keyIdentifier(): int =
+    this.storage().loadU32(wifiBipKeyStateKeyIdentifierOffset)
+
+@inline
+trusted fun WifiBipKeyState.cipher(): WifiBipCipher = WifiBipCipher(
+    this.storage().loadU32(wifiBipKeyStateCipherOffset)
+)
+
+@inline
+trusted fun WifiBipKeyState.keyLength(): int =
+    this.storage().loadU32(wifiBipKeyStateKeyLengthOffset)
+
+@inline
+trusted fun WifiBipKeyState.key(): NativeBuffer = nativeBufferAt(
+    this.storage().addressValue() + wifiBipKeyStateKeyOffset,
+    if (this.valid()) this.keyLength() else 0
+)
+
+@inline
+fun wifiBipPacketNumberFromHalves(
+    low: int,
+    high: int
+): WifiBipPacketNumber =
+    if (low == 4294967295 && high == 4294967295)
+        WifiBipPacketNumber(-1)
+    else if (high < 0 || high > 65535) WifiBipPacketNumber(-1)
+    else wifiBipPacketNumber((low & 4294967295) + high * 4294967296)
+
+trusted fun WifiBipKeyState.initialize(
+    key: NativeBuffer,
+    cipher: WifiBipCipher,
+    keyIdentifier: int,
+    transmitPacketNumber: WifiBipPacketNumber = wifiBipPacketNumber(0)
+): bool {
+    val storage = this.storage()
+    val keyLength = cipher.keyLength()
+    if (storage.capacity() < wifiBipKeyStateBytes || !cipher.valid() ||
+        (keyIdentifier != 4 && keyIdentifier != 5) ||
+        key.capacity() < keyLength || !transmitPacketNumber.valid()) {
+        return false
+    }
+    var index = 0
+    while (index < wifiBipKeyStateBytes) {
+        storage.store(index, 0)
+        index = index + 1
+    }
+    storage.storeU32(wifiBipKeyStateKeyIdentifierOffset, keyIdentifier)
+    storage.storeU32(wifiBipKeyStateCipherOffset, cipher.rawValue())
+    storage.storeU32(wifiBipKeyStateKeyLengthOffset, keyLength)
+    val packetNumber = transmitPacketNumber.rawValue()
+    storage.storeU32(wifiBipKeyStateTransmitLowOffset, packetNumber)
+    storage.storeU32(wifiBipKeyStateTransmitHighOffset, packetNumber >>> 32)
+    storage.storeU32(wifiBipKeyStateReplayLowOffset, 4294967295)
+    storage.storeU32(wifiBipKeyStateReplayHighOffset, 4294967295)
+    index = 0
+    while (index < keyLength) {
+        storage.store(wifiBipKeyStateKeyOffset + index, key.load(index))
+        index = index + 1
+    }
+    storage.storeU32(wifiBipKeyStateMagicOffset, wifiBipKeyStateMagic)
+    true
+}
+
+@inline
+trusted fun WifiBipKeyState.transmitPacketNumber(): WifiBipPacketNumber =
+    if (!this.valid()) WifiBipPacketNumber(-1)
+    else wifiBipPacketNumberFromHalves(
+        this.storage().loadU32(wifiBipKeyStateTransmitLowOffset),
+        this.storage().loadU32(wifiBipKeyStateTransmitHighOffset)
+    )
+
+trusted fun WifiBipKeyState.reserveTransmitPacketNumberUnlocked(
+): WifiBipPacketNumber {
+    val next = this.transmitPacketNumber().next()
+    if (!next.valid()) return WifiBipPacketNumber(-1)
+    this.storage().storeU32(
+        wifiBipKeyStateTransmitLowOffset, next.rawValue()
+    )
+    this.storage().storeU32(
+        wifiBipKeyStateTransmitHighOffset, next.rawValue() >>> 32
+    )
+    next
+}
+
+@inline
+trusted fun WifiBipKeyState.replayPacketNumber(): WifiBipPacketNumber =
+    if (!this.valid()) WifiBipPacketNumber(-1)
+    else wifiBipPacketNumberFromHalves(
+        this.storage().loadU32(wifiBipKeyStateReplayLowOffset),
+        this.storage().loadU32(wifiBipKeyStateReplayHighOffset)
+    )
+
+@inline
+trusted fun WifiBipKeyState.packetNumberAcceptedUnlocked(
+    packetNumber: WifiBipPacketNumber
+): bool = packetNumber.freshAfter(this.replayPacketNumber())
+
+trusted fun WifiBipKeyState.commitReplayPacketNumberUnlocked(
+    packetNumber: WifiBipPacketNumber
+): bool {
+    if (!this.packetNumberAcceptedUnlocked(packetNumber)) return false
+    this.storage().storeU32(
+        wifiBipKeyStateReplayLowOffset, packetNumber.rawValue()
+    )
+    this.storage().storeU32(
+        wifiBipKeyStateReplayHighOffset, packetNumber.rawValue() >>> 32
+    )
+    true
+}
+
+trusted fun wifiBipWritePacketNumber(
+    output: NativeBuffer,
+    offset: int,
+    packetNumber: WifiBipPacketNumber
+): bool {
+    if (!packetNumber.valid() || offset < 0 ||
+        output.capacity() < offset + 6) return false
+    var index = 0
+    while (index < 6) {
+        output.store(
+            offset + index, (packetNumber.rawValue() >>> (index * 8)) & 255
+        )
+        index = index + 1
+    }
+    true
+}
+
+trusted fun wifiBipReadPacketNumber(
+    input: NativeBuffer,
+    offset: int
+): WifiBipPacketNumber {
+    if (offset < 0 || input.capacity() < offset + 6) {
+        return WifiBipPacketNumber(-1)
+    }
+    var value = 0
+    var index = 0
+    while (index < 6) {
+        value = value | (input.load(offset + index) << (index * 8))
+        index = index + 1
+    }
+    wifiBipPacketNumber(value)
+}
+
+// FC(masked) || A1 || A2 || A3. Retry, power-management, and More Data are
+// mutable and therefore cleared exactly as required by BIP.
+trusted fun wifiBipWriteAad(
+    frame: NativeBuffer,
+    frameLength: int,
+    aad: NativeBuffer
+): bool {
+    if (frameLength < wifiBipHeaderBytes || frame.capacity() < frameLength ||
+        aad.capacity() < 20 || (frame.loadU16(0) & 12) != 0) return false
+    aad.storeU16(0, frame.loadU16(0) & ~14336)
+    var index = 0
+    while (index < 18) {
+        aad.store(2 + index, frame.load(4 + index))
+        index = index + 1
+    }
+    true
+}
+
+@inline
+fun WifiBipCipher.mmieBytes(): int = 10 + this.micLength()
+
+trusted fun wifiBipAppendMmie(
+    frame: NativeBuffer,
+    frameLength: int,
+    cipher: WifiBipCipher,
+    keyIdentifier: int,
+    packetNumber: WifiBipPacketNumber
+): int {
+    val micLength = cipher.micLength()
+    val mmieBytes = cipher.mmieBytes()
+    if (frameLength < wifiBipHeaderBytes || frame.capacity() < frameLength ||
+        frame.capacity() - frameLength < mmieBytes || micLength == 0 ||
+        (keyIdentifier != 4 && keyIdentifier != 5)) return -1
+    frame.store(frameLength, wifiBipMmieElementIdentifier)
+    frame.store(frameLength + 1, mmieBytes - 2)
+    frame.storeU16(frameLength + 2, keyIdentifier)
+    if (!wifiBipWritePacketNumber(frame, frameLength + 4, packetNumber)) {
+        return -1
+    }
+    var index = 0
+    while (index < micLength) {
+        frame.store(frameLength + 10 + index, 0)
+        index = index + 1
+    }
+    frameLength + mmieBytes
+}
+
+trusted fun wifiBipMmieOffset(
+    frame: NativeBuffer,
+    frameLength: int,
+    cipher: WifiBipCipher
+): int {
+    val mmieBytes = cipher.mmieBytes()
+    val offset = frameLength - mmieBytes
+    if (!cipher.valid() || frameLength < wifiBipHeaderBytes + mmieBytes ||
+        frame.capacity() < frameLength || offset < wifiBipHeaderBytes ||
+        frame.load(offset) != wifiBipMmieElementIdentifier ||
+        frame.load(offset + 1) != mmieBytes - 2) return -1
+    offset
+}
+
+trusted fun wifiBipWriteGmacNonce(
+    frame: NativeBuffer,
+    frameLength: int,
+    packetNumber: WifiBipPacketNumber,
+    nonce: NativeBuffer
+): bool {
+    if (frameLength < wifiBipHeaderBytes || frame.capacity() < frameLength ||
+        nonce.capacity() < 12 || !packetNumber.valid()) return false
+    var index = 0
+    while (index < 6) {
+        nonce.store(index, frame.load(10 + index))
+        nonce.store(
+            6 + index,
+            (packetNumber.rawValue() >>> ((5 - index) * 8)) & 255
+        )
+        index = index + 1
+    }
+    true
+}

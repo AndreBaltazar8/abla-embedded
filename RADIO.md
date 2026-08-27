@@ -106,6 +106,26 @@ CAS, and no unresolved call or vendor crypto/radio declaration. ESP-NOW peer
 lookup remains part of the peer-table object that supplied `get_iav_key` to the
 original CCMP object; it is not silently counted as CCMP functionality.
 
+`src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
+`src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
+management-frame integrity portion of `ieee80211_crypto.o`. The portable layer
+owns CMAC doubling, GHASH, constant-time comparison, management AAD, MMIE,
+48-bit packet numbers, and replay state. The classic-ESP32 layer uses the
+hardware AES engine for AES-CMAC and AES-GMAC with 128-, 192-, or 256-bit keys
+and supports split AAD without allocation. Its one-pointer request records are
+also used internally: packed buffer arguments otherwise exceed the six-word
+Xtensa register window and make later stack arguments unstable.
+
+Standard BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256 tags passed on the
+connected ESP32-PICO-D4. The same full packet KAT passed first verification,
+replay rejection, tamper rejection without committing replay state, and a
+successful retry after restoring the frame. This advances
+`ieee80211_crypto.o` only to `partial`. The generic encap/decap cipher
+dispatcher and the complete WPA crypto-provider table—HMAC-SHA256-vector,
+PBKDF2-SHA1, AES-CBC encrypt/decrypt, OMAC1, CCMP encrypt/decrypt, AES-GMAC,
+and SHA256-vector—must all be present and tested before that row can become
+`complete`.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
@@ -294,8 +314,9 @@ The remaining dependency order is:
    ownership/outcomes, including the open driver's RX sentinel fallback;
 3. open 802.11 management, authentication, association, and remaining data
    framing on top of the implemented common header fields and FCS;
-4. finish packet/key integration around the implemented hardware AES and
-   CCMP-128/256, then add WPA2 key management;
+4. finish the generic cipher dispatcher and the remaining WPA crypto-provider
+   primitives around the implemented AES, CCMP-128/256, CMAC, GMAC, and BIP,
+   then add WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
 6. a native network interface and IP stack boundary.
 
@@ -308,8 +329,8 @@ may prove whole-program elimination for one application, but never removes its
 row or changes replacement status. `tools/check-esp32-opaque-radio-parity`
 validates the fixed full inventory and can additionally reject an unknown
 opaque member in a supplied `ESP32_LINK_MAP`. A row reaches `complete` only
-with source, tests, and hardware evidence for its entire surface; the current
-ledger deliberately reports zero complete objects.
+with source, tests, and hardware evidence for its entire surface; only the
+six-symbol `ieee80211_crypto_ccmp.o` row currently meets that bar.
 
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
