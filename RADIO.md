@@ -58,6 +58,20 @@ and 34 Xtensa instructions versus equivalent C++ at 109 bytes and 40
 instructions, with no unresolved calls. Peer storage, cryptographic exchange,
 roaming policy, and frame scheduling remain explicit higher-layer work.
 
+`src/esp32/crypto/aes_esp32.ab` owns the classic ESP32 hardware AES-128 block
+operation in Abla: DPORT clock/reset sequencing, key and text register access,
+bounded completion polling, and aligned native-width input validation. The
+primitive deliberately requires caller serialization because the engine is
+shared by Wi-Fi, TLS, SHA, secure boot, and both cores. It has no ESP-IDF,
+mbedTLS, C, or C++ call. `make compare-esp32-aes-size` checks the complete
+operation against semantically equivalent optimized C++; both currently emit
+361 bytes and 118 Xtensa instructions with no unresolved symbols. The NIST
+AES-128 ECB known-answer vector was also run successfully on the connected
+ESP32-PICO-D4 before Wi-Fi initialization, after which the same boot associated
+normally. CCMP formatting, authentication, replay state, and concurrency
+ownership remain to be implemented, so both crypto parity ledger entries are
+correctly partial rather than complete.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,

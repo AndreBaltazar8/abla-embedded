@@ -59,6 +59,7 @@ make radio-mac-registers
 make compare-radio-power-size
 make compare-rx-chain-size
 make compare-wifi-fcs-size
+make compare-esp32-aes-size
 make imu-calibration
 make imu-offsets
 make i2s-tone
