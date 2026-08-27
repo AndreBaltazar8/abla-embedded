@@ -10,7 +10,8 @@ generated C and no handwritten C/C++ shim between an Abla application and the
 linker. The shared `Register8`, `Register16`, `Register32`, and `Register64`
 types are zero-storage views over volatile MMIO. Classic ESP32 GPIO direction,
 levels, pulls, open-drain mode, and drive strength are implemented entirely in
-Abla on top of those views; UART also uses direct volatile MMIO. Complex vendor
+Abla on top of those views; UART also uses direct volatile MMIO. Xtensa cycle
+reads and bounded delays lower directly to CCOUNT instructions. Complex vendor
 services currently call their native ABI:
 the ESP-IDF I2C, SPI and I2S DMA drivers, Wi-Fi initialization/PHY/MAC
 libraries, TLS, and sleep support. Those boundaries are deliberately visible
@@ -55,6 +56,7 @@ make led-strip-rmt
 make board-detect-c6
 make board-detect-s3
 make radio-mac-registers
+make compare-radio-power-size
 make imu-calibration
 make imu-offsets
 make i2s-tone
@@ -135,8 +137,11 @@ integration. Edit the placeholder credentials before flashing `wifi-connect`.
 interrupt, RX DMA/filter, TX queue/PLCP, and MAC-time operations lower directly
 to volatile MMIO with no vendor radio ABI. It also emits a separate native ESP
 DMA descriptor object so ownership publication can be inspected independently.
-The build also emits classic ESP32 radio power/clock/reset leaves; none of the
-three objects performs initialization merely by being linked.
+The build also emits classic ESP32 radio power/clock/reset leaves, including a
+complete 10-microsecond CCOUNT-timed power-on sequence; none of the three
+objects performs initialization merely by being linked. The size comparison
+target checks that sequence against equivalent C under the same toolchain and
+flags.
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

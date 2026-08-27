@@ -10,10 +10,18 @@ It is reusable by radio, I2S, SPI, camera, and other DMA-backed drivers.
 
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
-Power-on is split around the documented 10-microsecond delay because Abla does
-not yet expose a target-native CPU cycle counter. Shared-clock ownership must
-also be serialized by the caller; the framework does not silently add global
-state or pretend that PHY initialization is complete.
+`src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
+so `powerOn(cpuFrequencyMegahertz)` performs the documented 10-microsecond
+power-up interval without an ESP-IDF, ROM, C, or C++ call. The split operations
+remain available for a scheduler-owned timer. Shared-clock ownership must also
+be serialized by the caller; the framework does not silently add global state
+or pretend that PHY initialization is complete.
+
+`make compare-radio-power-size` compiles an equivalent C leaf with the same
+Espressif LLVM target, CPU, optimization, section, frame-pointer, and unwind
+settings. It compares only each function's `.text` and `.literal` sections and
+fails if Abla grows beyond C. The first checked result is 169 bytes for each;
+the emitted 141-byte bodies and 28-byte literal sections are byte-identical.
 
 The first MAC slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
 the classic ESP32 MAC register operations for interrupt causes, RX DMA list
@@ -43,8 +51,7 @@ measured on owned hardware.
 
 The remaining dependency order is:
 
-1. native cycle delay, interrupt-safe shared-clock ownership, and interrupt
-   routing;
+1. interrupt-safe shared-clock ownership and interrupt routing;
 2. bounded RX/TX ring ownership on top of the implemented descriptors;
 3. open 802.11 management, authentication, association, and data framing;
 4. hardware crypto plus WPA2 key management;
