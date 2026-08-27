@@ -108,6 +108,14 @@ request ABIs remain available to non-vendor users. ESP-NOW peer lookup remains
 part of the peer-table object that supplies `get_iav_key`; it is not silently
 counted as CCMP implementation work.
 
+`src/esp32/wifi/rfid_esp32.ab` owns the complete six-function
+`ieee80211_rfid.o` ABI. It reproduces the NVS mode gate and the callback slot
+at `g_ic + 452`, including null rejection, reset/unregister, and the guarded
+three-argument receive dispatch. The opaque archive member is absent from the
+M5Echo link map; the replacement added only 16 bytes to the application image
+and the device again completed WPA2, server authentication, speech, and
+playback. This boundary retains no opaque algorithm of its own.
+
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
 management-frame integrity portion of `ieee80211_crypto.o`. The portable layer

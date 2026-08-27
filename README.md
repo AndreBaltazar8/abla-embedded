@@ -166,6 +166,11 @@ the original allocate-copy-free provider route. A real M5Echo link removed the
 opaque archive member, reducing the retained inventory from 61 to 60 objects,
 and the resulting image passed WPA2 association, DHCP, authenticated server
 connection, speech request, and playback on the connected device.
+The adjacent RFID location callback boundary is also fully Abla: its mode
+gate, callback register/reset/unregister operations, and guarded receive
+dispatch remove `ieee80211_rfid.o`. That lowers the same live-tested M5Echo
+inventory again, from 60 to 59 retained opaque objects, at a net image cost of
+16 bytes.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
