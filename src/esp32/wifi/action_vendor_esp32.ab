@@ -1,0 +1,691 @@
+import "../../runtime/freestanding_memory.ab"
+import "../../xtensa/assembly.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Classic ESP32 vendor-action state. These are ordinary module-private Abla
+// scalars, not public ABI data. LLVM can remove each slot with the paths that
+// use it once the remaining foreign Wi-Fi callers have been replaced.
+var esp32VendorActionGetKeyCallback: u32 = u32(0)
+var esp32VendorActionCallback: u32 = u32(0)
+var esp32VendorActionTransmitContent: u32 = u32(0)
+var esp32VendorActionReceiveContent: u32 = u32(0)
+var esp32VendorActionSequence: u32 = u32(0)
+
+@inline
+trusted fun esp32VendorActionLoadU8(address: u32): int =
+    ablaUnsafeVolatileLoadU8(int(address)) & 255
+
+@inline
+trusted fun esp32VendorActionLoadU32(address: u32): u32 =
+    ablaUnsafeVolatileLoadU32(int(address))
+
+@inline
+trusted fun esp32VendorActionLoadU16(address: u32): int =
+    ablaUnsafeVolatileLoadU16(int(address)) & 65535
+
+@inline
+trusted fun esp32VendorActionStoreU8(
+    address: u32,
+    value: int
+): void {
+    ablaUnsafeVolatileStoreU8(int(address), value & 255)
+    return
+}
+
+@inline
+trusted fun esp32VendorActionStoreU32(
+    address: u32,
+    value: u32
+): void {
+    ablaUnsafeVolatileStoreU32(int(address), value)
+    return
+}
+
+@inline
+trusted fun esp32VendorActionStoreU16(
+    address: u32,
+    value: int
+): void {
+    ablaUnsafeVolatileStoreU16(int(address), value & 65535)
+    return
+}
+
+@inline
+trusted fun esp32VendorActionEspOuiAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, .Labla_action_vendor_esp_oui", "=a")
+
+@inline
+trusted fun esp32VendorActionUserOuiAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, g_espnow_user_oui", "=a")
+
+@inline
+trusted fun esp32VendorActionGlobalInterfaceAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, g_ic", "=a")
+
+@inline
+trusted fun esp32VendorActionOsiTableAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, g_osi_funcs_p", "=a")
+
+@inline
+trusted fun esp32VendorActionReceiveCallbackAddress(): u32 =
+    xtensaAssemblyReadU32(
+        "movi $0, ieee80211_recv_action_vendor_spec", "=a"
+    )
+
+// CCMP, station, and SoftAP code still enter through this exact name. The
+// callback itself and its storage are otherwise entirely internal Abla code.
+@export("get_iav_key")
+trusted fun esp32VendorActionGetKey(address: u32): u32 {
+    xtensaAssemblyVoid(
+        ".pushsection .rodata.abla_action_vendor,\"a\",@progbits\n.balign 4\n.Labla_action_vendor_esp_oui:\n.byte 0x18, 0xfe, 0x34, 0\n.popsection",
+        "~{memory}"
+    )
+    if (address == u32(0) ||
+        esp32VendorActionGetKeyCallback == u32(0)) return u32(0)
+    u32(callNativeI32Pointer(
+        int(esp32VendorActionGetKeyCallback),
+        nativePointerFromAddress(int(address))
+    ))
+}
+
+trusted fun esp32VendorActionRegisterGetKeyCallback(
+    callback: u32
+): i32 {
+    if (callback == u32(0)) return i32(-1)
+    esp32VendorActionGetKeyCallback = callback
+    i32(0)
+}
+
+trusted fun esp32VendorActionUnregisterGetKeyCallback(): void {
+    esp32VendorActionGetKeyCallback = u32(0)
+    return
+}
+
+// Append the Espressif OUI and a fresh non-repeating random word. The first
+// byte is the remaining vendor-action capacity used by the original member.
+trusted fun esp32VendorActionAddEspHeader(
+    destination: u32,
+    usedBytes: u32
+): u32 {
+    val oui = esp32VendorActionEspOuiAddress()
+    esp32VendorActionStoreU8(destination, 127 - int(usedBytes))
+    esp32VendorActionStoreU8(
+        destination + u32(1), esp32VendorActionLoadU8(oui)
+    )
+    esp32VendorActionStoreU8(
+        destination + u32(2), esp32VendorActionLoadU8(oui + u32(1))
+    )
+    esp32VendorActionStoreU8(
+        destination + u32(3), esp32VendorActionLoadU8(oui + u32(2))
+    )
+    var random = xtensaAssemblyReadU32(
+        "movi a8, ic_get_random\ncallx8 a8\nmov.n $0, a10",
+        "=a,~{a8},~{a10},~{memory}"
+    )
+    while (random == esp32VendorActionTransmitContent) {
+        random = xtensaAssemblyReadU32(
+            "movi a8, ic_get_random\ncallx8 a8\nmov.n $0, a10",
+            "=a,~{a8},~{a10},~{memory}"
+        )
+    }
+    esp32VendorActionStoreU8(destination + u32(4), int(random))
+    esp32VendorActionStoreU8(destination + u32(5), int(random >>> u32(8)))
+    esp32VendorActionStoreU8(destination + u32(6), int(random >>> u32(16)))
+    esp32VendorActionStoreU8(destination + u32(7), int(random >>> u32(24)))
+    esp32VendorActionTransmitContent = random
+    destination + u32(8)
+}
+
+trusted fun esp32VendorActionRegisterCallback(callback: u32): i32 {
+    if (callback == u32(0)) return i32(-1)
+    esp32VendorActionCallback = callback
+    i32(0)
+}
+
+trusted fun esp32VendorActionUnregisterCallback(): void {
+    esp32VendorActionCallback = u32(0)
+    return
+}
+
+@inline
+trusted fun esp32VendorActionAllocatePayload(size: int): u32 {
+    val table = esp32VendorActionLoadU32(
+        esp32VendorActionOsiTableAddress()
+    )
+    if (table == u32(0)) return u32(0)
+    val allocate = esp32VendorActionLoadU32(table + u32(364))
+    if (allocate == u32(0)) return u32(0)
+    u32(callNativeI32Pointer(
+        int(allocate), nativePointerFromAddress(size)
+    ))
+}
+
+@inline
+trusted fun esp32VendorActionFreePayload(payload: u32): void {
+    val table = esp32VendorActionLoadU32(
+        esp32VendorActionOsiTableAddress()
+    )
+    if (table != u32(0)) {
+        val release = esp32VendorActionLoadU32(table + u32(176))
+        if (release != u32(0)) callNativeVoidPointer(
+            int(release), nativePointerFromAddress(int(payload))
+        )
+    }
+    return
+}
+
+@inline
+trusted fun esp32VendorActionTxAllocateAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, ieee80211_alloc_tx_buf", "=a")
+
+@inline
+trusted fun esp32VendorActionMacAddressFunction(): u32 =
+    xtensaAssemblyReadU32("movi $0, wifi_get_macaddr", "=a")
+
+@inline
+trusted fun esp32VendorActionConnectionSearchAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, cnx_node_search", "=a")
+
+@inline
+trusted fun esp32VendorActionPostTransmitAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, ieee80211_post_hmac_tx", "=a")
+
+@inline
+trusted fun esp32VendorActionCurrentBand(): u32 = xtensaAssemblyReadU32(
+    "call8 chm_get_current_band\nmov.n $0, a10",
+    "=a,~{a8},~{a9},~{a10},~{a11},~{a12},~{a13},~{a14},~{a15},~{memory}"
+)
+
+@inline
+trusted fun esp32VendorActionNow(): u32 = xtensaAssemblyReadU32(
+    "call8 hal_now\nmov.n $0, a10",
+    "=a,~{a8},~{a9},~{a10},~{a11},~{a12},~{a13},~{a14},~{a15},~{memory}"
+)
+
+@inline
+trusted fun esp32VendorActionDefaultSchedule(): u32 =
+    xtensaAssemblyReadU32(
+        "call8 ic_get_default_sched\nmov.n $0, a10",
+        "=a,~{a8},~{a9},~{a10},~{a11},~{a12},~{a13},~{a14},~{a15},~{memory}"
+    )
+
+@inline
+trusted fun esp32VendorActionEspNowRate(interfaceIndex: u32): u32 =
+    xtensaAssemblyReadU32WithU32(
+        "mov.n a10, $1\ncall8 ic_get_espnow_rate\nmov.n $0, a10",
+        "=&a,a,~{a8},~{a9},~{a10},~{a11},~{a12},~{a13},~{a14},~{a15},~{memory}",
+        interfaceIndex
+    )
+
+// The Wi-Fi archive serializes frame construction through these two OSI
+// callbacks. Keeping the lock plumbing here preserves that behavior while the
+// OSI table itself is still supplied by the remaining radio implementation.
+trusted fun esp32VendorActionGlobalLock(acquire: bool): void {
+    val table = esp32VendorActionLoadU32(
+        esp32VendorActionOsiTableAddress()
+    )
+    if (table == u32(0)) return
+    val operation = esp32VendorActionLoadU32(
+        table + (if (acquire) u32(84) else u32(88))
+    )
+    if (operation == u32(0)) return
+    val lockAddress = xtensaAssemblyReadU32(
+        "movi $0, g_wifi_global_lock", "=a"
+    )
+    val lock = esp32VendorActionLoadU32(lockAddress)
+    val ignored = callNativeI32Pointer(
+        int(operation), nativePointerFromAddress(int(lock))
+    )
+    return
+}
+
+// Allocate the management buffer, emit the vendor action and ESP-NOW element
+// headers, and install a CCMP packet number when a peer key is available.
+// This covers the complete behavior of ieee80211_alloc_action_vendor_spec;
+// it remains an internal Abla operation because no live foreign caller needs
+// that symbol in the Atom Echo image.
+trusted fun esp32VendorActionAllocate(
+    interfaceAddress: u32,
+    destination: u32,
+    payload: u32,
+    payloadLength: int,
+    key: u32
+): u32 {
+    val fragmentCount = if (payloadLength <= 250) 1
+        else (payloadLength + 249) / 250
+    var actionHeaderBytes = 8
+    if (key != u32(0)) {
+        val keyData = esp32VendorActionLoadU32(key + u32(160))
+        if (keyData != u32(0)) {
+            actionHeaderBytes =
+                int(esp32VendorActionLoadU32(keyData + u32(4))) + 8
+        }
+    }
+    val frameBytes = fragmentCount * 7 + payloadLength + actionHeaderBytes
+    val allocationBytes = (frameBytes + 27) & -4
+    val buffer = u32(callNativeI32PointerPointer(
+        int(esp32VendorActionTxAllocateAddress()),
+        nativePointerFromAddress(0),
+        nativePointerFromAddress(allocationBytes)
+    ))
+    if (buffer == u32(0)) return u32(0)
+
+    val storage = esp32VendorActionLoadU32(buffer + u32(4))
+    val frameBase = esp32VendorActionLoadU32(storage + u32(4))
+    var body = frameBase + u32(24)
+    if (key != u32(0)) {
+        val keyData = esp32VendorActionLoadU32(key + u32(160))
+        if (keyData != u32(0)) {
+            val packetLow = esp32VendorActionLoadU32(key + u32(152))
+            val nextLow = packetLow + u32(1)
+            var packetHigh = esp32VendorActionLoadU32(key + u32(156))
+            if (nextLow < packetLow) packetHigh = packetHigh + u32(1)
+            esp32VendorActionStoreU32(key + u32(152), nextLow)
+            esp32VendorActionStoreU32(key + u32(156), packetHigh)
+            esp32VendorActionStoreU8(frameBase + u32(24), int(nextLow))
+            esp32VendorActionStoreU8(
+                frameBase + u32(25), int(nextLow >>> u32(8))
+            )
+            esp32VendorActionStoreU8(frameBase + u32(26), 0)
+            esp32VendorActionStoreU8(
+                frameBase + u32(27),
+                ((esp32VendorActionLoadU8(key + u32(185)) << 6) | 32)
+            )
+            esp32VendorActionStoreU8(
+                frameBase + u32(28), int(nextLow >>> u32(16))
+            )
+            esp32VendorActionStoreU8(
+                frameBase + u32(29), int(nextLow >>> u32(24))
+            )
+            esp32VendorActionStoreU8(
+                frameBase + u32(30), int(packetHigh)
+            )
+            esp32VendorActionStoreU8(
+                frameBase + u32(31), int(packetHigh >>> u32(8))
+            )
+            body = body + esp32VendorActionLoadU32(keyData + u32(4))
+        }
+    }
+    body = esp32VendorActionAddEspHeader(body, u32(0))
+    body = esp32AddVendorEspNowElement(body, payload, payloadLength)
+    esp32VendorActionStoreU16(buffer + u32(20), 24)
+    esp32VendorActionStoreU16(
+        buffer + u32(22), int(body - (frameBase + u32(24)))
+    )
+    buffer
+}
+
+@inline
+trusted fun esp32VendorActionSelectInterface(
+    interfaceIndex: u32
+): u32 {
+    val interfaces = esp32VendorActionGlobalInterfaceAddress()
+    if (interfaceIndex == u32(0)) {
+        return esp32VendorActionLoadU32(interfaces + u32(16))
+    }
+    if (interfaceIndex == u32(1)) {
+        return esp32VendorActionLoadU32(interfaces + u32(20))
+    }
+    u32(0)
+}
+
+trusted fun esp32VendorActionSelectNode(
+    interfaceIndex: u32,
+    interfaceAddress: u32,
+    destination: u32
+): u32 {
+    if (interfaceIndex == u32(0)) {
+        val primary = esp32VendorActionLoadU32(
+            interfaceAddress + u32(228)
+        )
+        if (primary != u32(0) && freestandingCompare(
+            primary + u32(4), destination, u32(6)
+        ) == i32(0)) return primary
+        return esp32VendorActionLoadU32(interfaceAddress + u32(232))
+    }
+    if (interfaceIndex == u32(1)) {
+        val found = u32(callNativeI32Pointer(
+            int(esp32VendorActionConnectionSearchAddress()),
+            nativePointerFromAddress(int(destination))
+        ))
+        if (found != u32(0)) return found
+        return esp32VendorActionLoadU32(interfaceAddress + u32(236))
+    }
+    u32(0)
+}
+
+@inline
+trusted fun esp32VendorActionHtEnabled(
+    interfaceIndex: u32,
+    band: u32
+): bool {
+    val base = esp32VendorActionGlobalInterfaceAddress() + u32(512)
+    val interfaceOffset = if (interfaceIndex == u32(1)) 166 else 170
+    val bandOffset = if (band == u32(1)) 0 else 1
+    esp32VendorActionLoadU8(base + u32(interfaceOffset + bandOffset)) == 2
+}
+
+// Construct the complete action frame and transmit descriptor. The output
+// slot receives the allocated management buffer on success. Return values
+// retain the archive ABI: 0 success, 0x101 allocation failure, and 0x3004 for
+// an unavailable interface/node.
+trusted fun esp32VendorActionConstruct(
+    interfaceIndex: u32,
+    destination: u32,
+    payload: u32,
+    payloadLength: int,
+    immediate: bool,
+    rateConfiguration: u32,
+    outputAddress: u32
+): u32 {
+    val band = esp32VendorActionCurrentBand()
+    val sourceMac = nativeStackAllocate(6)
+    val ignoredMac = callNativeI32PointerPointer(
+        int(esp32VendorActionMacAddressFunction()),
+        nativePointerFromAddress(int(interfaceIndex)),
+        nativePointerFromAddress(sourceMac)
+    )
+    val key = esp32VendorActionGetKey(destination)
+
+    esp32VendorActionGlobalLock(true)
+    val interfaceAddress = esp32VendorActionSelectInterface(interfaceIndex)
+    val node = if (interfaceAddress == u32(0)) u32(0)
+        else esp32VendorActionSelectNode(
+            interfaceIndex, interfaceAddress, destination
+        )
+    if (interfaceAddress == u32(0)) {
+        esp32VendorActionGlobalLock(false)
+        return u32(12292)
+    }
+
+    val buffer = esp32VendorActionAllocate(
+        interfaceAddress, destination, payload, payloadLength, key
+    )
+    if (buffer == u32(0)) {
+        esp32VendorActionGlobalLock(false)
+        return u32(257)
+    }
+
+    val storage = esp32VendorActionLoadU32(buffer + u32(4))
+    val transmit = esp32VendorActionLoadU32(storage + u32(4))
+    val descriptor = esp32VendorActionLoadU32(buffer + u32(44))
+    val totalBytes = (
+        esp32VendorActionLoadU16(buffer + u32(20)) +
+        esp32VendorActionLoadU16(buffer + u32(22))
+    ) & 4095
+    var transmitFlags = esp32VendorActionLoadU32(transmit)
+    transmitFlags = transmitFlags | u32(2147483648)
+    transmitFlags = transmitFlags | u32(1073741824)
+    transmitFlags = transmitFlags & u32(3758096383)
+    transmitFlags = (transmitFlags & u32(4278194175)) |
+        (u32(totalBytes) << u32(12))
+    esp32VendorActionStoreU32(transmit, transmitFlags)
+
+    var descriptorFlags = esp32VendorActionLoadU32(descriptor)
+    descriptorFlags = descriptorFlags & u32(4294959103)
+    esp32VendorActionStoreU32(descriptor, descriptorFlags)
+    var frame = esp32VendorActionLoadU32(transmit + u32(4))
+    if ((descriptorFlags & u32(262144)) != u32(0)) frame = frame + u32(4)
+    esp32VendorActionStoreU16(frame, 208)
+    esp32VendorActionStoreU16(frame + u32(2), 0)
+    val ignoredDestination = freestandingCopy(
+        frame + u32(4), destination, u32(6)
+    )
+    val ignoredSource = freestandingCopy(
+        frame + u32(10), u32(sourceMac), u32(6)
+    )
+    val broadcast = xtensaAssemblyReadU32(
+        "movi $0, ieee80211_ethbroadcast", "=a"
+    )
+    val ignoredBroadcast = freestandingCopy(
+        frame + u32(16), broadcast, u32(6)
+    )
+
+    if (key != u32(0)) {
+        esp32VendorActionStoreU8(frame + u32(1), 64)
+        descriptorFlags = esp32VendorActionLoadU32(descriptor) | u32(1)
+        esp32VendorActionStoreU32(descriptor, descriptorFlags)
+        var cipher = esp32VendorActionLoadU8(key)
+        val apInterface = esp32VendorActionLoadU32(
+            esp32VendorActionGlobalInterfaceAddress() + u32(20)
+        )
+        if (apInterface == interfaceAddress) cipher = cipher | 64
+        esp32VendorActionStoreU8(transmit + u32(16), cipher)
+        val keyData = esp32VendorActionLoadU32(key + u32(160))
+        val keyIndex = esp32VendorActionLoadU32(keyData) & u32(15)
+        val control = (esp32VendorActionLoadU32(transmit + u32(16)) &
+            u32(4294963455)) | (keyIndex << u32(8))
+        esp32VendorActionStoreU32(transmit + u32(16), control)
+    }
+
+    if ((esp32VendorActionLoadU8(destination) & 1) != 0) {
+        descriptorFlags = esp32VendorActionLoadU32(descriptor) | u32(1026)
+        esp32VendorActionStoreU32(descriptor, descriptorFlags)
+    }
+    descriptorFlags = esp32VendorActionLoadU32(descriptor) | u32(16400)
+    esp32VendorActionStoreU32(descriptor, descriptorFlags)
+    esp32VendorActionStoreU8(descriptor + u32(4), 7)
+    esp32VendorActionStoreU32(
+        descriptor + u32(24), esp32VendorActionNow()
+    )
+    val interfaceControl = (
+        esp32VendorActionLoadU32(transmit + u32(16)) & u32(4294180863)
+    ) | ((interfaceIndex & u32(3)) << u32(18))
+    esp32VendorActionStoreU32(transmit + u32(16), interfaceControl)
+    if (immediate) esp32VendorActionStoreU32(descriptor + u32(20), u32(128))
+    esp32VendorActionStoreU32(
+        descriptor + u32(28), esp32VendorActionDefaultSchedule()
+    )
+    esp32VendorActionStoreU8(
+        descriptor + u32(12), int(esp32VendorActionEspNowRate(interfaceIndex))
+    )
+
+    var htEnabled = esp32VendorActionHtEnabled(interfaceIndex, band)
+    var rateFlags = esp32VendorActionLoadU32(descriptor + u32(8))
+    if (htEnabled) rateFlags = rateFlags | u32(32768)
+    else rateFlags = rateFlags & u32(4294934527)
+    if (interfaceIndex == u32(0)) {
+        val peerMode = esp32VendorActionLoadU8(node + u32(360))
+        var mode = esp32VendorActionLoadU32(descriptor + u32(16))
+        if (peerMode == 4) mode = mode | u32(65536)
+        else mode = mode & u32(4294901759)
+        esp32VendorActionStoreU32(descriptor + u32(16), mode)
+    }
+    if (rateConfiguration != u32(0)) {
+        esp32VendorActionStoreU8(
+            descriptor + u32(12),
+            int(esp32VendorActionLoadU32(rateConfiguration + u32(4)))
+        )
+        if (htEnabled) {
+            htEnabled = esp32VendorActionLoadU32(rateConfiguration) == u32(5)
+            if (htEnabled) rateFlags = rateFlags | u32(32768)
+            else rateFlags = rateFlags & u32(4294934527)
+        }
+    }
+    esp32VendorActionStoreU32(descriptor + u32(8), rateFlags)
+
+    var sequence = 0
+    if (node != u32(0)) {
+        sequence = esp32VendorActionLoadU16(node + u32(206))
+        esp32VendorActionStoreU16(node + u32(206), sequence + 1)
+    } else {
+        sequence = int(esp32VendorActionSequence & u32(65535))
+        esp32VendorActionSequence = u32((sequence + 1) & 65535)
+    }
+    esp32VendorActionStoreU16(frame + u32(22), sequence << 4)
+    esp32VendorActionStoreU32(outputAddress, buffer)
+    esp32VendorActionGlobalLock(false)
+    u32(0)
+}
+
+trusted fun esp32VendorActionSend(
+    interfaceIndex: u32,
+    destination: u32,
+    payload: u32,
+    payloadLength: int,
+    immediate: bool,
+    rateConfiguration: u32
+): u32 {
+    val output = nativeStackAllocate(4)
+    esp32VendorActionStoreU32(u32(output), u32(0))
+    val status = esp32VendorActionConstruct(
+        interfaceIndex,
+        destination,
+        payload,
+        payloadLength,
+        immediate,
+        rateConfiguration,
+        u32(output)
+    )
+    if (status != u32(0)) return status
+    u32(callNativeI32Pointer(
+        int(esp32VendorActionPostTransmitAddress()),
+        nativePointerFromAddress(int(esp32VendorActionLoadU32(u32(output))))
+    ))
+}
+
+// Reassembles ESP-NOW vendor elements exactly as the archive member does:
+// each element must use the configured OUI and type 4, and its payload starts
+// after the seven-byte vendor header.
+trusted fun esp32VendorActionReceiveEspNow(
+    interfaceAddress: u32,
+    peerAddress: u32,
+    contentBegin: u32,
+    contentEnd: u32
+): u32 {
+    if (contentEnd <= contentBegin + u32(14) ||
+        freestandingCompare(
+            contentBegin + u32(1),
+            esp32VendorActionEspOuiAddress(),
+            u32(3)
+        ) != i32(0)) return u32(0)
+
+    val contentIdentity = contentBegin + u32(4)
+    val contentValue = u32(esp32VendorActionLoadU8(contentIdentity)) |
+        (u32(esp32VendorActionLoadU8(contentIdentity + u32(1))) << u32(8)) |
+        (u32(esp32VendorActionLoadU8(contentIdentity + u32(2))) << u32(16)) |
+        (u32(esp32VendorActionLoadU8(contentIdentity + u32(3))) << u32(24))
+    if ((esp32VendorActionLoadU8(peerAddress + u32(1)) & 8) != 0 &&
+        esp32VendorActionReceiveContent == contentValue) return u32(0)
+    esp32VendorActionReceiveContent = contentValue
+
+    val userOui = esp32VendorActionUserOuiAddress()
+    var cursor = contentBegin + u32(8)
+    var payloadBytes = 0
+    var fragments = 0
+    while (cursor < contentEnd) {
+        if (esp32VendorActionLoadU8(cursor) != 221) return u32(0)
+        val elementBytes = esp32VendorActionLoadU8(cursor + u32(1))
+        if (elementBytes < 5 ||
+            cursor + u32(elementBytes + 2) > contentEnd ||
+            freestandingCompare(
+                cursor + u32(2), userOui, u32(3)
+            ) != i32(0) ||
+            esp32VendorActionLoadU8(cursor + u32(5)) != 4) {
+            return u32(0)
+        }
+        payloadBytes = payloadBytes + elementBytes - 5
+        fragments = fragments + 1
+        cursor = cursor + u32(elementBytes + 2)
+    }
+    if (payloadBytes == 0 || fragments == 0) return u32(0)
+
+    val payload = esp32VendorActionAllocatePayload(payloadBytes)
+    if (payload == u32(0)) return u32(0)
+    cursor = contentBegin + u32(8)
+    var output = payload
+    var remaining = fragments
+    while (remaining > 0) {
+        val elementBytes = esp32VendorActionLoadU8(cursor + u32(1))
+        val fragmentBytes = elementBytes - 5
+        val ignored = freestandingCopy(
+            output, cursor + u32(7), u32(fragmentBytes)
+        )
+        output = output + u32(fragmentBytes)
+        cursor = cursor + u32(elementBytes + 2)
+        remaining = remaining - 1
+    }
+
+    val descriptor = nativeStackAllocate(12)
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(descriptor), peerAddress + u32(10)
+    )
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(descriptor + 4), peerAddress + u32(4)
+    )
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(descriptor + 8), peerAddress - u32(28)
+    )
+    if (esp32VendorActionCallback != u32(0)) {
+        callNativeVoidPointer3(
+            int(esp32VendorActionCallback),
+            nativePointerFromAddress(descriptor),
+            nativePointerFromAddress(int(payload)),
+            nativePointerFromAddress(payloadBytes)
+        )
+    }
+    esp32VendorActionFreePayload(payload)
+    u32(0)
+}
+
+// The callback address is consumed by the still-opaque management dispatcher,
+// so this is a temporary ABI shim. The ESP-NOW worker it calls is internal.
+@export("ieee80211_recv_action_vendor_spec")
+trusted fun esp32VendorActionReceive(
+    interfaceAddress: u32,
+    peerAddress: u32,
+    frameAddress: u32,
+    frameEndAddress: u32
+): u32 {
+    if (esp32VendorActionCallback == u32(0)) return u32(0)
+
+    val peerMac = nativeStackAllocate(6)
+    val ignored = freestandingCopy(
+        u32(peerMac), peerAddress + u32(10), u32(6)
+    )
+    if ((esp32VendorActionLoadU8(peerAddress + u32(1)) & 64) != 0) {
+        val key = esp32VendorActionGetKey(u32(peerMac))
+        if (key != u32(0) &&
+            esp32VendorActionLoadU32(key + u32(160)) != u32(0) &&
+            (esp32VendorActionLoadU8(peerAddress + u32(27)) & 32) != 0) {
+            val low = u32(esp32VendorActionLoadU8(
+                peerAddress + u32(24)
+            )) | (u32(esp32VendorActionLoadU8(
+                peerAddress + u32(25)
+            )) << u32(8)) | (u32(esp32VendorActionLoadU8(
+                peerAddress + u32(28)
+            )) << u32(16)) | (u32(esp32VendorActionLoadU8(
+                peerAddress + u32(29)
+            )) << u32(24))
+            val high = u32(esp32VendorActionLoadU8(
+                peerAddress + u32(30)
+            )) | (u32(esp32VendorActionLoadU8(
+                peerAddress + u32(31)
+            )) << u32(8))
+            esp32VendorActionStoreU32(key + u32(8), low)
+            esp32VendorActionStoreU32(key + u32(12), high)
+        }
+    }
+    if (esp32VendorActionLoadU8(frameAddress + u32(13)) != 4) {
+        return u32(0)
+    }
+    esp32VendorActionReceiveEspNow(
+        interfaceAddress, peerAddress, frameAddress, frameEndAddress
+    )
+}
+
+// ieee80211.o still calls this exact setup name. Everything it installs is an
+// Abla function or private scalar; only the entry itself crosses the archive
+// boundary during the migration.
+@export("ieee80211_action_vendor_spec_attach")
+trusted fun esp32VendorActionAttach(): u32 {
+    val result = esp32Ieee80211ReceiveActionRegisterAbi(
+        u32(127), u32(0), esp32VendorActionReceiveCallbackAddress()
+    )
+    val interfaceAddress = esp32VendorActionGlobalInterfaceAddress()
+    esp32VendorActionStoreU32(interfaceAddress + u32(456), u32(0))
+    esp32VendorActionStoreU32(interfaceAddress + u32(460), u32(0))
+    esp32VendorActionStoreU8(interfaceAddress + u32(468), 0)
+    result
+}
