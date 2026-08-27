@@ -154,6 +154,9 @@ Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;
 each is one byte smaller than the equivalent C++ leaf (24 versus 25 bytes and
 27 versus 28 bytes).
+The RX descriptor/header validator checks ownership, EOF, capacity, address,
+and both hardware signal lengths before exposing a frame; its checked leaf is
+142 bytes versus 160 bytes for equivalent C++ and has no unresolved calls.
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

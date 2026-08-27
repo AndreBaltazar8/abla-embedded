@@ -59,6 +59,15 @@ versus 25 C++ bytes and disable is 27 versus 28, with equal 9/10 instruction
 counts. Core ID is 11 bytes and four instructions in both languages. The Abla
 object has no unresolved calls.
 
+`src/esp32/radio/rx_esp32.ab` validates a completed RX descriptor before any
+frame is exposed: CPU ownership, successful EOF, 32-byte hardware header,
+length within capacity, bounded 32-bit buffer address, and both legacy/HT
+signal-length fields at header offset `0x18`. It samples descriptor flags once
+and reads the signal word only after the bounds checks. The reusable logic is
+separate for host tests. `make compare-radio-rx-size` compares the same
+volatile descriptor/header algorithm against C++; the current leaf is 142
+bytes versus 160, with no unresolved Abla calls.
+
 The first MAC slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
 the classic ESP32 MAC register operations for interrupt causes, RX DMA list
 control, four-interface BSSID/receiver filtering, five TX queues, PLCP
@@ -89,8 +98,8 @@ The remaining dependency order is:
 
 1. bind typed Abla interrupt handlers into the linker-owned Xtensa vector table
    without a C trampoline, then add interrupt-safe shared-clock ownership;
-2. bounded RX consumption/recycling and TX ownership on top of the implemented
-   null-terminated descriptor chains;
+2. bounded RX list removal/recycling and TX ownership on top of the implemented
+   null-terminated descriptor chains and RX frame validator;
 3. open 802.11 management, authentication, association, and remaining data
    framing on top of the implemented common header fields and FCS;
 4. hardware crypto plus WPA2 key management;
