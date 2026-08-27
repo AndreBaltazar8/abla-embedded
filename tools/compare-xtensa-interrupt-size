@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+esp_llvm_root=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
+output_directory=$project_root/build/benchmarks/xtensa-interrupt
+abla_object=$project_root/build/examples/radio-mac-registers/abla_interrupt.o
+cxx_object=$output_directory/reference.o
+runner=()
+
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+
+if [[ ! -x $esp_llvm_root/bin/clang || ! -x $esp_llvm_root/bin/llvm-size ]]; then
+    printf 'missing Espressif LLVM under %s; run make setup\n' \
+        "$esp_llvm_root" >&2
+    exit 1
+fi
+
+if [[ ! -f $abla_object ]]; then
+    "$project_root/tools/build-example" radio-mac-registers
+fi
+
+mkdir -p "$output_directory"
+"${runner[@]}" "$esp_llvm_root/bin/clang" \
+    --target=xtensa-esp-elf -mcpu=esp32 -O2 -fomit-frame-pointer \
+    -ffunction-sections -fdata-sections -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -std=c++17 \
+    -c "$project_root/benchmarks/xtensa-interrupt-reference.cpp" \
+    -o "$cxx_object"
+
+section_bytes() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$esp_llvm_root/bin/llvm-size" -A "$object" |
+        awk -v text=".text.$symbol" -v literal=".literal.$symbol" \
+            '$1 == text || $1 == literal { total += $2 } END { print total + 0 }'
+}
+
+compare_leaf() {
+    local operation=$1
+    local abla_symbol=$2
+    local cxx_symbol=$3
+    local abla_bytes
+    local cxx_bytes
+    abla_bytes=$(section_bytes "$abla_object" "$abla_symbol")
+    cxx_bytes=$(section_bytes "$cxx_object" "$cxx_symbol")
+    printf '%s leaf (.text + .literal): Abla %s bytes, C++ %s bytes\n' \
+        "$operation" "$abla_bytes" "$cxx_bytes"
+    if (( abla_bytes > cxx_bytes )); then
+        printf 'Abla %s leaf regressed past equivalent C++\n' \
+            "$operation" >&2
+        exit 1
+    fi
+}
+
+compare_leaf core-id abla_esp32_core_id cxx_esp32_core_id
+compare_leaf enable abla_xtensa_interrupts_enable cxx_xtensa_interrupts_enable
+compare_leaf disable abla_xtensa_interrupts_disable cxx_xtensa_interrupts_disable
+
+toolchain_root=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin
+objdump=$toolchain_root/xtensa-esp32-elf-objdump
+nm=$toolchain_root/xtensa-esp32-elf-nm
+if [[ -x $objdump && -x $nm ]]; then
+    instruction_count() {
+        local object=$1
+        local symbol=$2
+        "${runner[@]}" "$objdump" -d --disassemble="$symbol" "$object" |
+            awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
+    }
+    operations=(core-id enable disable)
+    abla_symbols=(abla_esp32_core_id abla_xtensa_interrupts_enable \
+        abla_xtensa_interrupts_disable)
+    cxx_symbols=(cxx_esp32_core_id cxx_xtensa_interrupts_enable \
+        cxx_xtensa_interrupts_disable)
+    for index in "${!operations[@]}"; do
+        operation=${operations[$index]}
+        abla_instructions=$(instruction_count \
+            "$abla_object" "${abla_symbols[$index]}")
+        cxx_instructions=$(instruction_count \
+            "$cxx_object" "${cxx_symbols[$index]}")
+        printf '%s leaf instructions: Abla %s, C++ %s\n' \
+            "$operation" "$abla_instructions" "$cxx_instructions"
+        if (( abla_instructions > cxx_instructions )); then
+            printf 'Abla %s leaf uses more instructions than C++\n' \
+                "$operation" >&2
+            exit 1
+        fi
+    done
+    if "${runner[@]}" "$nm" -u "$abla_object" | grep -q .; then
+        echo 'Abla Xtensa interrupt object has unresolved calls' >&2
+        exit 1
+    fi
+    echo 'Xtensa interrupt leaves contain no unresolved calls'
+fi

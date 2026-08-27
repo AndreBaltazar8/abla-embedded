@@ -149,6 +149,11 @@ smaller than the C reference (114 versus 117 bytes of text plus literals).
 The same example emits a board-independent IEEE 802.11 FCS leaf and checks it
 against equivalent volatile-memory C: Abla is 180 bytes and 54 Xtensa
 instructions versus C at 184 bytes and 56 instructions.
+It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
+Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
+enable/disable operations use 9/10 instructions with no call or allocation;
+each is one byte smaller than the equivalent C++ leaf (24 versus 25 bytes and
+27 versus 28 bytes).
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

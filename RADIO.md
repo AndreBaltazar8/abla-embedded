@@ -46,6 +46,19 @@ settings. It compares only each function's `.text` and `.literal` sections and
 fails if Abla grows beyond C. The first checked result is 169 bytes for each;
 the emitted 141-byte bodies and 28-byte literal sections are byte-identical.
 
+`src/xtensa/cpu.ab` also exposes nominal, single-register CPU interrupt numbers
+and `u32` masks, the current core ID, and race-safe enable/disable operations.
+The compiler lowers those operations directly to `rsr.prid`, `xsr.intenable`,
+`wsr.intenable`, and `rsync`; there is no `xt_ints_on`, `xt_ints_off`, RTOS, or
+C ABI dependency. `src/esp32/interrupt_matrix_esp32.ab` independently maps any
+of the classic ESP32's 69 peripheral sources to either CPU through DPORT MMIO,
+including the Wi-Fi MAC source and its conventional CPU interrupt line. It has
+no import-time hardware side effect. `make compare-xtensa-interrupt-size`
+checks equivalent C++ leaves under identical flags: enable is 24 Abla bytes
+versus 25 C++ bytes and disable is 27 versus 28, with equal 9/10 instruction
+counts. Core ID is 11 bytes and four instructions in both languages. The Abla
+object has no unresolved calls.
+
 The first MAC slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
 the classic ESP32 MAC register operations for interrupt causes, RX DMA list
 control, four-interface BSSID/receiver filtering, five TX queues, PLCP
@@ -74,7 +87,8 @@ measured on owned hardware.
 
 The remaining dependency order is:
 
-1. interrupt-safe shared-clock ownership and interrupt routing;
+1. bind typed Abla interrupt handlers into the linker-owned Xtensa vector table
+   without a C trampoline, then add interrupt-safe shared-clock ownership;
 2. bounded RX consumption/recycling and TX ownership on top of the implemented
    null-terminated descriptor chains;
 3. open 802.11 management, authentication, association, and remaining data
