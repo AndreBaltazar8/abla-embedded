@@ -153,7 +153,14 @@ It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
 Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;
 each is one byte smaller than the equivalent C++ leaf (24 versus 25 bytes and
-27 versus 28 bytes).
+27 versus 28 bytes). A named top-level Abla function can now become a native
+IRAM interrupt entry without an export, C trampoline, boxed `Fn`, or manual
+section annotation. The build-only example acknowledges the Wi-Fi MAC
+interrupt through direct MMIO; its entry is 21 bytes/8 instructions, exactly
+matching equivalent C++, with the same 29 total code-plus-literal IRAM bytes;
+its 12-byte/3-instruction address leaf also ties.
+Closures and aliases are rejected, and direct Abla helpers are placed in IRAM
+automatically.
 The RX descriptor/header validator checks ownership, EOF, capacity, address,
 and both hardware signal lengths before exposing a frame; its checked leaf is
 103 bytes/35 instructions versus 108 bytes/37 instructions for equivalent C++

@@ -118,10 +118,18 @@ differential tests. Source implementation comes from public register facts,
 permissively licensed open drivers, protocol specifications, and behavior
 measured on owned hardware.
 
+The compiler and framework now produce a typed, native no-argument Xtensa
+handler entry from a named top-level Abla function. The entry, its literal
+pool, and its direct Abla call graph reside in `.iram1.*`; the build-only Wi-Fi
+MAC acknowledge handler ties equivalent C++ at 21 bytes and 8 instructions.
+Both occupy 29 total code-plus-literal IRAM bytes. No export, boxed function
+value, C trampoline, or unresolved call remains.
+
 The remaining dependency order is:
 
-1. bind typed Abla interrupt handlers into the linker-owned Xtensa vector table
-   without a C trampoline, then add interrupt-safe shared-clock ownership;
+1. install the typed entry into the linker-owned Xtensa dispatcher table from
+   Abla, then replace the remaining vector/table assembly and add
+   interrupt-safe shared-clock ownership;
 2. hardware-validate the implemented bounded RX removal/recycling path and TX
    ownership/outcomes, including the open driver's RX sentinel fallback;
 3. open 802.11 management, authentication, association, and remaining data

@@ -24,6 +24,14 @@ Every function and datum is emitted into its own ELF section. ESP-IDF and
 PlatformIO link with section garbage collection, so importing a module does not
 retain unused drivers or dynamic Abla compatibility wrappers.
 
+Named top-level Xtensa interrupt functions use a compiler-generated native
+entry instead of the boxed function dispatcher. The entry and every direct
+Abla callee are assigned to `.iram1.*` automatically; closure and alias inputs
+are compile errors. This is code generation rather than a hidden SDK service:
+the resulting object contains the handler implementation and literal pool, and
+the framework separately documents which vector/table implementation installs
+the address.
+
 ## Value and allocation model
 
 Board identities and immutable configurations use nominal scalar types. They

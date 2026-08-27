@@ -44,3 +44,13 @@ cxx_xtensa_interrupts_disable(std::uint32_t mask) {
     );
     return previous;
 }
+extern "C" __attribute__((section(".iram1.text"), noinline, used))
+void cxx_xtensa_interrupt_handler() {
+    auto status = *reinterpret_cast<volatile std::uint32_t *>(0x3ff730c0);
+    *reinterpret_cast<volatile std::uint32_t *>(0x3ff730c4) = status;
+}
+
+extern "C" __attribute__((noinline)) std::uint32_t
+cxx_xtensa_interrupt_handler_address() {
+    return reinterpret_cast<std::uintptr_t>(&cxx_xtensa_interrupt_handler);
+}
