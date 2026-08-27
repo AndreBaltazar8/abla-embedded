@@ -146,6 +146,20 @@ map, and live WPA2 plus the voice path passed. Warning-only alignment and
 allocation messages remain part of the pending `wifi_log` replacement, so the
 ledger conservatively keeps diagnostic parity partial.
 
+`src/wifi/ieee80211_protocol_logic.ab` and
+`src/esp32/wifi/ieee80211_protocol_esp32.ab` replace all seven functions and
+the one-byte public setting from `libnet80211.a:ieee80211_proto.o`. The Abla
+implementation preserves callback registration, TID extraction, short-slot
+updates, all seven ERP-rate searches, four WME access categories and the
+optional contention override, station/BSSID state, the original diagnostic,
+and the state transition. Generic typed Xtensa call signatures make the
+remaining radio callbacks direct LLVM calls without platform-named compiler
+annotations or `extern:"c"` declarations. The member is absent from the
+M5Echo map. Its five live functions use 115 instructions versus 101 in the
+member; 10 of the 14-instruction delta are identical export-initialization
+guards, isolating a general compiler optimization rather than hiding it in the
+platform layer.
+
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
 management-frame integrity portion of `ieee80211_crypto.o`. The portable layer

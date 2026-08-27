@@ -193,6 +193,18 @@ M5Echo inventory falls from 56 to 55 opaque radio objects and WPA2, server
 authentication, speech, and playback passed with the replacement active. Its
 three diagnostic warnings remain grouped with the pending logger replacement;
 the operational ABI is complete, while diagnostic parity stays explicit.
+`src/wifi/ieee80211_protocol_logic.ab` and
+`src/esp32/wifi/ieee80211_protocol_esp32.ab` replace the complete
+`ieee80211_proto.o` member: protocol attachment, traffic identifiers, short
+slots, the full ERP basic-rate search, WME initialization and updates, BSS
+connection state, its diagnostic log, and the public contention-control byte.
+The M5Echo link inventory falls from 55 to 54 opaque radio objects without an
+`extern:"c"` declaration; typed generic Xtensa call assembly reaches the
+remaining callbacks directly. The replacement adds 96 image bytes. Across the
+five routines retained by this firmware it is 115 instructions versus 101;
+10 of the 14 extra instructions are the compiler's common two-instruction
+export-initialization guard, leaving four in the operational bodies for a
+future safe automatic guard-elision round.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
