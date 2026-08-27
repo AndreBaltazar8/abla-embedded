@@ -50,6 +50,14 @@ reasons now make those paths construct real frames without allocation. Queue
 duration, sequence allocation, action bodies, and security state remain owned
 by their respective higher layers rather than hidden in the wire writer.
 
+`src/wifi/connection_logic.ab` supplies shared STA and SoftAP transitions for
+candidate selection, open/shared/FT/SAE/FILS authentication, association, key
+authorization, retry exhaustion, disassociation/deauthentication, channel
+iteration, and wrap-safe deadlines. Its native authentication leaf is 94 bytes
+and 34 Xtensa instructions versus equivalent C++ at 109 bytes and 40
+instructions, with no unresolved calls. Peer storage, cryptographic exchange,
+roaming policy, and frame scheduling remain explicit higher-layer work.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
