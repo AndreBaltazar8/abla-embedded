@@ -161,6 +161,11 @@ and has no unresolved calls. The same build emits a caller-owned, 8-byte RX
 queue with bounded two-phase descriptor reloads: a timeout keeps explicit
 pending state and cannot hand hardware-owned memory to the application. Its
 native-width take leaf is 220 bytes/78 instructions versus C++ at 223/79.
+The TX slice validates PLCP0's 20-bit descriptor window, publishes the buffer
+and null link before DMA ownership, accounts for the hardware-generated FCS,
+and reports typed complete/timeout/collision/conflict outcomes per queue. Its
+descriptor-preparation leaf matches optimized C++ at 97 bytes and 31
+instructions, with no initialization guard or unresolved call.
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

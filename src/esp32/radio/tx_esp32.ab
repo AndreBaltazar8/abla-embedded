@@ -1,0 +1,84 @@
+import "../../dma.ab"
+import "../dma_descriptor.ab"
+import "./mac_esp32.ab"
+import "./tx_esp32_logic.ab"
+import "abla/unsafe/mmio"
+
+// Prepare one caller-owned classic-ESP32 TX descriptor. The MAC generates the
+// four-byte FCS, but its DMA length includes those four bytes. Buffer range
+// validation therefore covers the caller's MPDU bytes while descriptor size
+// and length contain MPDU + FCS. Ownership is published by the final store.
+@inline
+trusted fun esp32WifiPrepareTxDescriptorNative(
+    descriptorAddress: u32,
+    bufferAddress: u32,
+    mpduLength: u32
+): bool {
+    val zero = u32(0)
+    if (descriptorAddress < u32(1072693252) ||
+        descriptorAddress > u32(1073741812) ||
+        (descriptorAddress & u32(3)) != zero || bufferAddress == zero ||
+        mpduLength > u32(4091) ||
+        (mpduLength != zero &&
+            bufferAddress > u32(4294967295) - mpduLength + u32(1))) {
+        return false
+    }
+    val frameLength = mpduLength + u32(4)
+    mmioStoreU32(
+        i64(descriptorAddress + u32(4)), i64(bufferAddress)
+    )
+    mmioStoreU32(i64(descriptorAddress + u32(8)), i64(zero))
+    mmioStoreU32(
+        i64(descriptorAddress),
+        i64(u32(3221225472) | frameLength | (frameLength << u32(12)))
+    )
+    true
+}
+
+trusted fun DmaDescriptor.initializeWifiTx(
+    bufferAddress: int,
+    mpduLength: int
+): bool {
+    val descriptorAddress = this.addressValue()
+    if (!esp32WifiDmaDescriptorAddressValid(descriptorAddress) ||
+        bufferAddress <= 0 || bufferAddress > 4294967295 ||
+        mpduLength < 0 || mpduLength > 4091) return false
+    esp32WifiPrepareTxDescriptorNative(
+        u32(descriptorAddress), u32(bufferAddress), u32(mpduLength)
+    )
+}
+
+// Sample both status registers once. A conflicting outcome is explicit rather
+// than silently choosing one event when hardware reports multiple terminal
+// bits for the same queue.
+trusted fun WifiMac.txOutcome(queue: WifiMacTxQueue): WifiTxOutcome {
+    if (!queue.valid()) return wifiTxInvalid()
+    val complete = this.register(
+        esp32WifiMacTxCompleteStatusOffset
+    ).read()
+    val errors = this.register(esp32WifiMacTxErrorStatusOffset).read()
+    esp32WifiTxOutcome(complete, errors, queue)
+}
+
+trusted fun WifiMac.startTx(queue: WifiMacTxQueue): bool {
+    val address = esp32WifiMacTxPlcp0Address(queue)
+    if (address < 0 || (register32(address).read() & 1048575) == 0) {
+        return false
+    }
+    this.setTxQueueStatus(queue, true, true)
+}
+
+// Clear every terminal bit for this queue, then disable and reset its slot.
+// Callers retain descriptor storage until a terminal outcome has been sampled.
+trusted fun WifiMac.finishTx(
+    queue: WifiMacTxQueue,
+    outcome: WifiTxOutcome
+): bool {
+    val bit = queue.statusBit()
+    val address = esp32WifiMacTxPlcp0Address(queue)
+    if (bit == 0 || address < 0 || !outcome.terminal()) return false
+    this.register(esp32WifiMacTxCompleteClearOffset).write(bit)
+    this.register(esp32WifiMacTxErrorClearOffset).write(bit | (bit << 16))
+    register32(address).write(0)
+    true
+}
