@@ -184,6 +184,15 @@ decap bookkeeping. This removes `ieee80211_crypto_sms4.o` and lowers the live
 link inventory from 57 to 56 objects for 64 additional application bytes. Its
 old-PN warning still belongs to the separately tracked debug/logger boundary,
 so SMS4 diagnostic parity remains partial rather than being overstated.
+`src/esp32/radio/crypto_table_esp32.ab` now replaces `libpp`'s
+`hal_crypto.o`: initialization, per-interface enable/disable, management-frame
+state, the 25-slot validity bitmap, key clearing, active-slot reporting, and
+the complete 9-byte descriptor/key pack and unpack ABI are Abla MMIO. Direct
+byte packing also removes the original aligned temporary allocation. The live
+M5Echo inventory falls from 56 to 55 opaque radio objects and WPA2, server
+authentication, speech, and playback passed with the replacement active. Its
+three diagnostic warnings remain grouped with the pending logger replacement;
+the operational ABI is complete, while diagnostic parity stays explicit.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa

@@ -134,6 +134,18 @@ warning was routed through the separately opaque `wifi_log` boundary; until
 that logger is replaced and the warning is restored, the SMS4 row remains
 partial even though its archive member is no longer linked.
 
+`src/esp32/radio/crypto_table_logic.ab` and
+`src/esp32/radio/crypto_table_esp32.ab` replace the nine-symbol
+`libpp.a:hal_crypto.o` boundary. The portable part round-trips interface,
+cipher, key ID, algorithm selection, and peer-address fields. The ESP32 part
+owns the exact `0x3ff73800` control block and 25 40-byte key slots at
+`0x3ff74400`, including init, enable/disable, validity, active-key reporting,
+clear, set, and get. Unaligned keys are packed directly, removing the original
+allocate-zero-copy-free workaround. The object is absent from the M5Echo link
+map, and live WPA2 plus the voice path passed. Warning-only alignment and
+allocation messages remain part of the pending `wifi_log` replacement, so the
+ledger conservatively keeps diagnostic parity partial.
+
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
 management-frame integrity portion of `ieee80211_crypto.o`. The portable layer
