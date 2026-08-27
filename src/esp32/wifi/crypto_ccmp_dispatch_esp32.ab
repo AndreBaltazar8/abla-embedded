@@ -1,0 +1,324 @@
+import "./ccmp_esp32.ab"
+import "../../xtensa/assembly.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Exact classic-ESP32 ieee80211_crypto_ccmp.o ABI. The vendor MAC continues
+// to own its key and mbuf records; packet-number handling and AES-CCM execute
+// directly from Abla/LLVM without the allocating wpa_crypto_funcs callbacks.
+
+val esp32VendorCcmpReplayOffset = 8
+val esp32VendorCcmpTransmitLowOffset = 152
+val esp32VendorCcmpTransmitHighOffset = 156
+val esp32VendorCcmpDescriptorOffset = 160
+val esp32VendorCcmpKeyOffset = 168
+
+@inline
+trusted fun esp32VendorCcmpLoadU8(address: int): int =
+    ablaUnsafeVolatileLoadU8(address)
+
+@inline
+trusted fun esp32VendorCcmpLoadU16(address: int): int =
+    ablaUnsafeVolatileLoadU16(address)
+
+@inline
+trusted fun esp32VendorCcmpLoadU32(address: int): int =
+    ablaUnsafeVolatileLoadU32(address)
+
+@inline
+trusted fun esp32VendorCcmpStoreU8(address: int, value: int): void =
+    ablaUnsafeVolatileStoreU8(address, value & 255)
+
+@inline
+trusted fun esp32VendorCcmpStoreU16(address: int, value: int): void =
+    ablaUnsafeVolatileStoreU16(address, u16(value))
+
+@inline
+trusted fun esp32VendorCcmpStoreU32(address: int, value: int): void =
+    ablaUnsafeVolatileStoreU32(address, u32(value))
+
+@inline
+trusted fun esp32VendorCcmpMbufStorage(mbuf: u32): u32 =
+    if (mbuf == u32(0)) u32(0)
+    else u32(esp32VendorCcmpLoadU32(int(mbuf) + 4))
+
+@inline
+trusted fun esp32VendorCcmpMbufFrame(mbuf: u32): u32 {
+    val storage = esp32VendorCcmpMbufStorage(mbuf)
+    if (storage == u32(0)) u32(0)
+    else u32(esp32VendorCcmpLoadU32(int(storage) + 4))
+}
+
+@inline
+trusted fun esp32VendorCcmpHeadLength(mbuf: u32): int =
+    esp32VendorCcmpLoadU16(int(mbuf) + 20)
+
+@inline
+trusted fun esp32VendorCcmpBodyLength(mbuf: u32): int =
+    esp32VendorCcmpLoadU16(int(mbuf) + 22)
+
+@inline
+trusted fun esp32VendorCcmpTotalLength(mbuf: u32): int =
+    esp32VendorCcmpHeadLength(mbuf) + esp32VendorCcmpBodyLength(mbuf)
+
+@inline
+trusted fun esp32VendorCcmpSetFrame(mbuf: u32, frame: u32): void {
+    val storage = esp32VendorCcmpMbufStorage(mbuf)
+    if (storage != u32(0)) {
+        esp32VendorCcmpStoreU32(int(storage) + 4, int(frame))
+    }
+    return
+}
+
+@inline
+trusted fun esp32VendorCcmpNextTransmitPacketNumber(
+    key: u32
+): WifiCcmpPacketNumber {
+    val lowAddress = int(key) + esp32VendorCcmpTransmitLowOffset
+    val highAddress = int(key) + esp32VendorCcmpTransmitHighOffset
+    val previousLow = esp32VendorCcmpLoadU32(lowAddress)
+    val low = (previousLow + 1) & 4294967295
+    var high = esp32VendorCcmpLoadU32(highAddress)
+    if (low == 0) high = (high + 1) & 4294967295
+    esp32VendorCcmpStoreU32(lowAddress, low)
+    esp32VendorCcmpStoreU32(highAddress, high)
+    wifiCcmpPacketNumberFromHalves(low, high & 65535)
+}
+
+@inline
+trusted fun esp32VendorCcmpReceivedPacketNumber(
+    frame: u32,
+    headerLength: int
+): WifiCcmpPacketNumber {
+    val address = int(frame) + headerLength
+    val low = esp32VendorCcmpLoadU8(address) |
+        (esp32VendorCcmpLoadU8(address + 1) << 8) |
+        (esp32VendorCcmpLoadU8(address + 4) << 16) |
+        (esp32VendorCcmpLoadU8(address + 5) << 24)
+    val high = esp32VendorCcmpLoadU8(address + 6) |
+        (esp32VendorCcmpLoadU8(address + 7) << 8)
+    wifiCcmpPacketNumberFromHalves(low & 4294967295, high)
+}
+
+@inline
+trusted fun esp32VendorCcmpTrafficIdentifier(
+    frame: u32,
+    frameLength: int
+): int = wifiCcmpTrafficIdentifier(
+    nativeBufferAt(int(frame), frameLength), frameLength
+)
+
+@inline
+trusted fun esp32VendorCcmpReplayPacketNumber(
+    key: u32,
+    trafficIdentifier: int
+): WifiCcmpPacketNumber {
+    val address = int(key) + esp32VendorCcmpReplayOffset +
+        trafficIdentifier * 8
+    wifiCcmpPacketNumberFromHalves(
+        esp32VendorCcmpLoadU32(address),
+        esp32VendorCcmpLoadU32(address + 4)
+    )
+}
+
+@inline
+trusted fun esp32VendorCcmpCommitReplay(
+    key: u32,
+    trafficIdentifier: int,
+    packetNumber: WifiCcmpPacketNumber
+): void {
+    val address = int(key) + esp32VendorCcmpReplayOffset +
+        trafficIdentifier * 8
+    val value = packetNumber.rawValue()
+    esp32VendorCcmpStoreU32(address, value & 4294967295)
+    esp32VendorCcmpStoreU32(address + 4, value >>> 32)
+    return
+}
+
+@inline
+trusted fun esp32VendorCcmpGetIavKeyAddress(): u32 =
+    xtensaAssemblyReadU32(
+        "l32r $0, .Labla_get_iav_key_address",
+        "=a"
+    )
+
+@inline
+trusted fun esp32VendorCcmpGetIavKey(address: u32): u32 = u32(
+    callNativeI32Pointer(
+        int(esp32VendorCcmpGetIavKeyAddress()),
+        nativePointerFromAddress(int(address))
+    )
+)
+
+// Add the wire header and reserve a fresh PN. The emitted descriptor has the
+// exact six-word layout consumed through g_ic's cipher table.
+@export("ccmp_encap")
+trusted fun esp32VendorCcmpEncap(
+    key: u32,
+    mbuf: u32,
+    keyIdentifier: u32
+): i32 {
+    xtensaAssemblyVoid(
+        ".literal .Labla_get_iav_key_address, get_iav_key\n.pushsection .data.ccmp,\"aw\",@progbits\n.global ccmp\n.type ccmp,@object\n.balign 4\nccmp:\n.long 3\n.long 8\n.long 8\n.long 0\n.long ccmp_encap\n.long ccmp_decap\n.size ccmp,24\n.popsection",
+        "~{memory}"
+    )
+    if (key == u32(0) || mbuf == u32(0)) return i32(0)
+    val frame = esp32VendorCcmpMbufFrame(mbuf)
+    if (frame == u32(0) || frame < u32(8)) return i32(0)
+    val shifted = frame - u32(8)
+    esp32VendorCcmpSetFrame(mbuf, shifted)
+    esp32VendorCcmpStoreU16(
+        int(mbuf) + 22, esp32VendorCcmpBodyLength(mbuf) + 8
+    )
+    val packetNumber = esp32VendorCcmpNextTransmitPacketNumber(key)
+    if (!packetNumber.valid()) return i32(0)
+    val value = packetNumber.rawValue()
+    val address = int(shifted)
+    esp32VendorCcmpStoreU8(address, value)
+    esp32VendorCcmpStoreU8(address + 1, value >>> 8)
+    esp32VendorCcmpStoreU8(address + 2, 0)
+    esp32VendorCcmpStoreU8(
+        address + 3, (int(keyIdentifier) & 255) | 32
+    )
+    esp32VendorCcmpStoreU8(address + 4, value >>> 16)
+    esp32VendorCcmpStoreU8(address + 5, value >>> 24)
+    esp32VendorCcmpStoreU8(address + 6, value >>> 32)
+    esp32VendorCcmpStoreU8(address + 7, value >>> 40)
+    i32(1)
+}
+
+// Replay-check and strip the caller-specified 802.11 header plus CCMP header
+// from the mbuf data pointer. Authentication happens in the paired decrypt
+// routine before this path is used by the MAC.
+@export("ccmp_decap")
+trusted fun esp32VendorCcmpDecap(
+    key: u32,
+    mbuf: u32,
+    headerLength: i32
+): i32 {
+    if (key == u32(0) || mbuf == u32(0) || headerLength < 0) return i32(0)
+    val frame = esp32VendorCcmpMbufFrame(mbuf)
+    val frameLength = esp32VendorCcmpTotalLength(mbuf)
+    if (frame == u32(0) || frameLength < int(headerLength) + 8) {
+        return i32(0)
+    }
+    val ccmpHeader = int(frame) + int(headerLength)
+    if ((esp32VendorCcmpLoadU8(ccmpHeader + 3) & 32) == 0) return i32(0)
+    val trafficIdentifier = esp32VendorCcmpTrafficIdentifier(
+        frame, frameLength
+    )
+    if (!wifiCcmpTrafficIdentifierValid(trafficIdentifier)) return i32(0)
+    val packetNumber = esp32VendorCcmpReceivedPacketNumber(
+        frame, int(headerLength)
+    )
+    val previous = esp32VendorCcmpReplayPacketNumber(
+        key, trafficIdentifier
+    )
+    if (!packetNumber.freshAfter(previous)) return i32(0)
+    esp32VendorCcmpCommitReplay(key, trafficIdentifier, packetNumber)
+    esp32VendorCcmpSetFrame(
+        mbuf, frame + u32(int(headerLength) + wifiCcmpHeaderBytes)
+    )
+    esp32VendorCcmpStoreU16(
+        int(mbuf) + 22,
+        esp32VendorCcmpBodyLength(mbuf) -
+            wifiCcmpHeaderBytes - wifiCcmpMicBytes
+    )
+    i32(1)
+}
+
+// Full software-path encryption used when the MAC has not already inserted a
+// CCMP header. Tailroom belongs to the vendor mbuf, so no allocation is needed.
+@export("ieee80211_ccmp_encrypt")
+trusted fun esp32VendorCcmpEncrypt(mbuf: u32, key: u32): i32 {
+    if (mbuf == u32(0) || key == u32(0)) return i32(0)
+    val frame = esp32VendorCcmpMbufFrame(mbuf)
+    val frameLength = esp32VendorCcmpTotalLength(mbuf)
+    if (frame == u32(0) || frameLength < 24) return i32(0)
+    val packetNumber = esp32VendorCcmpNextTransmitPacketNumber(key)
+    if (!packetNumber.valid()) return i32(0)
+    val result = esp32WifiCcmpEncryptInPlace(
+        nativeBufferAt(int(key) + esp32VendorCcmpKeyOffset, 16),
+        16, 8, nativeBufferAt(int(frame), frameLength + 16), frameLength,
+        24, packetNumber, 0
+    )
+    if (result < 0) return i32(0)
+    esp32VendorCcmpStoreU16(
+        int(mbuf) + 22, esp32VendorCcmpBodyLength(mbuf) + 16
+    )
+    val metadata = esp32VendorCcmpLoadU32(int(mbuf) + 44)
+    if (metadata != 0) {
+        esp32VendorCcmpStoreU32(
+            metadata, esp32VendorCcmpLoadU32(metadata) & 4294967294
+        )
+        esp32VendorCcmpStoreU16(
+            metadata + 16,
+            (esp32VendorCcmpLoadU16(metadata + 16) & 61440) | 192
+        )
+    }
+    i32(0)
+}
+
+// Authenticate in place, then expose the plaintext body and only then commit
+// replay state. Return values match the retained binary's public contract.
+@export("ieee80211_ccmp_decrypt")
+trusted fun esp32VendorCcmpDecrypt(mbuf: u32, key: u32): i32 {
+    if (mbuf == u32(0) || key == u32(0)) return i32(-1)
+    val frame = esp32VendorCcmpMbufFrame(mbuf)
+    val frameLength = esp32VendorCcmpTotalLength(mbuf)
+    if (frame == u32(0)) return i32(-1)
+    if (frameLength < 32) return i32(260)
+    val ccmpControl = esp32VendorCcmpLoadU8(int(frame) + 27)
+    if ((ccmpControl & 32) == 0 ||
+        esp32VendorCcmpLoadU8(int(frame) + 26) != 0 ||
+        (ccmpControl & 31) != 0) return i32(-1)
+    val trafficIdentifier = esp32VendorCcmpTrafficIdentifier(
+        frame, frameLength
+    )
+    if (!wifiCcmpTrafficIdentifierValid(trafficIdentifier)) return i32(-1)
+    val packetNumber = esp32VendorCcmpReceivedPacketNumber(frame, 24)
+    val previous = esp32VendorCcmpReplayPacketNumber(
+        key, trafficIdentifier
+    )
+    if (!packetNumber.freshAfter(previous)) return i32(-1)
+    val result = esp32WifiCcmpDecrypt(
+        nativeBufferAt(int(key) + esp32VendorCcmpKeyOffset, 16),
+        16, 8, nativeBufferAt(int(frame), frameLength), frameLength, 24,
+        previous, 0, nativeBufferAt(int(frame), frameLength)
+    )
+    if (result < 0) return i32(-1)
+    esp32VendorCcmpSetFrame(mbuf, frame + u32(24))
+    esp32VendorCcmpStoreU16(
+        int(mbuf) + 22,
+        esp32VendorCcmpBodyLength(mbuf) -
+            wifiCcmpHeaderBytes - wifiCcmpMicBytes
+    )
+    esp32VendorCcmpCommitReplay(key, trafficIdentifier, packetNumber)
+    i32(0)
+}
+
+// ESP-NOW uses the peer/IAV key selected from address two and the legacy
+// zero-tag CCM path. The peer-table lookup is retained until that table's
+// owning object is replaced; the cryptographic body itself is pure Abla.
+@export("ieee80211_decrypt_espnow_pkt")
+trusted fun esp32VendorCcmpDecryptEspNow(mbuf: u32): i32 {
+    if (mbuf == u32(0)) return i32(-1)
+    val frame = esp32VendorCcmpMbufFrame(mbuf)
+    val frameLength = esp32VendorCcmpTotalLength(mbuf)
+    if (frame == u32(0) || frameLength < 32) return i32(-1)
+    val key = esp32VendorCcmpGetIavKey(frame + u32(10))
+    if (key == u32(0)) return i32(-1)
+    val result = esp32WifiCcmpEspNowDecrypt(
+        nativeBufferAt(int(key) + esp32VendorCcmpKeyOffset, 16),
+        nativeBufferAt(int(frame), frameLength), frameLength, 24,
+        nativeBufferAt(int(frame), frameLength)
+    )
+    if (result < 0) return i32(-1)
+    esp32VendorCcmpSetFrame(mbuf, frame + u32(24))
+    esp32VendorCcmpStoreU16(
+        int(mbuf) + 22,
+        esp32VendorCcmpBodyLength(mbuf) -
+            wifiCcmpHeaderBytes - wifiCcmpMicBytes
+    )
+    i32(0)
+}

@@ -159,6 +159,13 @@ encap, decap, encrypt, decrypt, ESP-NOW, cipher-metadata, PN, and per-TID replay
 surface with a caller-owned 216-byte state and native Xtensa CAS. Its final
 full-surface KAT passed on an ESP32-PICO-D4. The CCMP replay leaf is 72 bytes
 and 27 instructions in both Abla and equivalent C++ with no unresolved call.
+The exact classic-ESP32 `ieee80211_crypto_ccmp.o` ABI now uses those same
+primitives directly: all five callable symbols and the 24-byte `ccmp`
+descriptor resolve to the Abla application object, while encrypt/decrypt avoid
+the original allocate-copy-free provider route. A real M5Echo link removed the
+opaque archive member, reducing the retained inventory from 61 to 60 objects,
+and the resulting image passed WPA2 association, DHCP, authenticated server
+connection, speech request, and playback on the connected device.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa

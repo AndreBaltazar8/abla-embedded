@@ -93,18 +93,20 @@ atomic PN reservation, out-of-place encrypt/decrypt, in-place encap/decap,
 per-TID replay commit and rejection, MIC-failure rollback, and both direct and
 stateful ESP-NOW zero-tag decryption all passed.
 
-The `ieee80211_crypto_ccmp.o` row is therefore complete. Its six-symbol surface
-maps to direct Abla operations: `ccmp_encap` to `esp32WifiCcmpEncap`,
-`ccmp_decap` to `esp32WifiCcmpDecap`, `ieee80211_ccmp_encrypt` to
-`esp32WifiCcmpEncryptPacket`, `ieee80211_ccmp_decrypt` to
-`esp32WifiCcmpDecryptPacket`, `ieee80211_decrypt_espnow_pkt` to
-`esp32WifiCcmpDecryptEspNowPacket`, and the `ccmp` descriptor to the scalar
-`wifiCcmpCipher`. A 216-byte caller-owned state holds the key, transmit PN,
-17 replay counters, lock, and packet workspace. The public Xtensa object emits
-stable one-pointer entries for all three stateful routes, an inline `s32c1i`
-CAS, and no unresolved call or vendor crypto/radio declaration. ESP-NOW peer
-lookup remains part of the peer-table object that supplied `get_iav_key` to the
-original CCMP object; it is not silently counted as CCMP functionality.
+The `ieee80211_crypto_ccmp.o` row is complete at both the reusable and exact
+vendor boundaries. `src/esp32/wifi/crypto_ccmp_dispatch_esp32.ab` exports
+`ccmp_encap`, `ccmp_decap`, `ieee80211_ccmp_encrypt`,
+`ieee80211_ccmp_decrypt`, `ieee80211_decrypt_espnow_pkt`, and the exact
+24-byte `ccmp` descriptor. It reads the vendor-owned key/mbuf layout directly,
+uses the allocation-free Abla CCM engine instead of the original
+allocate-copy-free provider callbacks, and commits replay state only after
+authentication. The M5Echo link map assigns all six symbols to `abla_app.o`
+and does not retain `ieee80211_crypto_ccmp.o`; the image then completed WPA2
+association, DHCP, server authentication, speech request, and playback on the
+connected ESP32-PICO-D4. The reusable 216-byte caller-owned state and stable
+request ABIs remain available to non-vendor users. ESP-NOW peer lookup remains
+part of the peer-table object that supplies `get_iav_key`; it is not silently
+counted as CCMP implementation work.
 
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
