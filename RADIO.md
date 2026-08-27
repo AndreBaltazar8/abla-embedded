@@ -81,6 +81,16 @@ Espressif libraries and vector code. Those names are deliberately exported
 because they are a real compatibility ABI; normal Abla callers continue to use
 typed interrupt masks and checked installers without annotations.
 
+The same ownership module supplies the complete low-level Xtensa interrupt
+register ABI: `xthal_get_intenable`, `xthal_set_intenable`, both public names
+for reading `INTERRUPT`, `xthal_set_intset`, and `xthal_set_intclear`. Normal
+Abla code uses `xtensaEnabledInterrupts`, `xtensaPendingInterrupts`, and the
+typed `XtensaInterruptMask` operations instead. Each compiler intrinsic is one
+direct `rsr` or `wsr` instruction, without a foreign call, box, allocation, or
+runtime helper. The two non-windowed context leaves save and restore the
+classic ESP32's 48-byte extra register state as compiler-owned naked functions;
+that ABI detail is automatic and is not a source-language annotation.
+
 The Abla unhandled-interrupt fallback is automatically placed in IRAM with its
 direct call graph. Instead of calling ROM `printf` and returning to a possibly
 still-asserted source, it masks the unexpected CPU interrupt line. The generic
@@ -89,15 +99,20 @@ complete saved-frame and crash-reporting policy.
 
 `make check-xtensa-dispatcher-ownership` performs a relocatable link against
 the installed classic-ESP32 `libxtensa.a` and `libxt_hal.a`, forcing references
-to all nine owned symbols. The link map proves `xtensa_intr_asm.S.obj`,
-`xtensa_intr.c.obj`, and `interrupts--intlevel.o` are all excluded. The two
+to all 17 owned ABI names. The link map proves `xtensa_intr_asm.S.obj`,
+`xtensa_intr.c.obj`, `interrupts--intlevel.o`, and all five relevant
+`int_asm--*.o` register-access members are excluded, along with
+`state_asm--save_extra_nw.o` and `state_asm--restore_extra_nw.o`. The two
 dispatcher tables are exactly 1,024 bytes and the level table exactly 32 bytes
 in both implementations. Abla's enable/disable leaves are 24/27 bytes and 9/10
-instructions, exactly tying the vendor assembly. Its management/default unit
-is 222 runtime bytes versus vendor C at 253. The handler query is 38 bytes/12
-instructions versus 43/14; the interrupt setter is 81/28 versus 84/28; and the
-exception setter is 60/21 versus 61/21. This is a build-only proof; the owned
-dispatcher is not linked into or flashed onto the Atom Echo firmware yet.
+instructions, exactly tying the vendor assembly. All six exported register
+access names are byte-identical at 8 bytes and 3 instructions apiece. The save
+and restore leaves are likewise byte-identical at 62 bytes and 25 instructions
+each. Its management/default unit is 222 runtime bytes versus vendor C at 253.
+The handler query is 38 bytes/12 instructions versus 43/14; the interrupt
+setter is 81/28 versus 84/28; and the exception setter is 60/21 versus 61/21.
+This is a build-only proof; the owned dispatcher is not linked into or flashed
+onto the Atom Echo firmware yet.
 
 `src/esp32/radio/rx_esp32.ab` validates a completed RX descriptor before any
 frame is exposed: CPU ownership, successful EOF, 32-byte hardware header,
@@ -156,6 +171,8 @@ licensed source references:
   [`xtensa_intr_asm.S`](https://github.com/espressif/esp-idf/blob/v4.4.7/components/xtensa/xtensa_intr_asm.S),
   used to verify the public two-word dispatcher layout, interrupt-level gate,
   and core-interleaved table indexing
+- [ESP-IDF Xtensa HAL declarations](https://github.com/espressif/esp-idf/blob/master/components/xtensa/include/xtensa/hal.h),
+  used to verify the public interrupt-register compatibility ABI
 
 No vendor archive code or disassembly is copied into the project. Archive
 symbols, relocations, and instructions are evidence for dependency mapping and
@@ -170,9 +187,10 @@ The entry, its literal pool, and its direct Abla call graph reside in
 at 21 bytes and 8 instructions. Both occupy 29 total code-plus-literal IRAM
 bytes. No export, boxed function value, C trampoline, registration call, or
 unresolved call remains. The optional Abla-owned dispatcher modules also close
-the table, interrupt-level data, mask-helper assembly, and C management/default
-boundaries in a relocatable link. The Xtensa vector/context objects, platform
-exception panic path, and startup still remain external boundaries.
+the table, interrupt-level data, mask-helper assembly, interrupt-register HAL,
+extra-state save/restore, and C management/default boundaries in a relocatable
+link. The Xtensa register-window spill and FreeRTOS vector/context objects,
+platform exception panic path, and startup still remain external boundaries.
 
 The remaining dependency order is:
 
