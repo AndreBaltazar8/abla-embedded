@@ -1,8 +1,15 @@
 import "abla/unsafe/memory"
 import "./sdk/buffer.ab"
-import "../arduino/time.ab"
+import "./clock.ab"
+import "./task.ab"
+import "./netif_idf6.ab"
+import "./nvs_idf6.ab"
+import "../xtensa/assembly.ab"
 
-trusted noescape extern:"c" fun _Z16wifiLowLevelInitb(persistent: bool): bool
+trusted noescape extern:"c" fun esp_event_loop_create_default(): i32
+trusted noescape extern:"c" fun esp_netif_create_default_wifi_sta(): i64*
+trusted noescape extern:"c" fun esp_wifi_init(config: i64*): i32
+trusted noescape extern:"c" fun esp_wifi_set_storage(storage: i32): i32
 trusted noescape extern:"c" fun esp_wifi_set_mode(mode: i32): i32
 trusted noescape extern:"c" fun esp_wifi_start(): i32
 trusted noescape extern:"c" fun esp_wifi_stop(): i32
@@ -15,16 +22,88 @@ trusted noescape extern:"c" fun esp_netif_get_ip_info(netif: i64*, info: i64*): 
 
 type WifiStation = int
 
+// ESP-IDF 6 wifi_config_t is the 180-byte wifi_sta_config_t on ESP32.
+// Keep the entire SDK-owned value initialized: fields after the password include
+// SAE/PMF policy, and leaving them outside the cleared region makes the driver
+// interpret neighboring stack data as configuration.
+val esp32WifiStationConfigBytes = 180
+val esp32WifiInitializationConfigBytes = 152
+var esp32WifiInitialized = false
+
+// ESP-IDF exposes these two tables as data symbols rather than functions.
+// Materialize their relocatable addresses as ordinary inline expressions so
+// the compiler preserves the surrounding windowed ABI. The following Abla
+// initializer copies the SDK ABI data into its own wifi_init_config_t. These
+// references disappear when the SDK radio boundary is replaced.
+@inline
+trusted fun esp32WifiOsiFunctionsAddress(): u32 =
+    xtensaAssemblyReadU32("movi $0, g_wifi_osi_funcs", "=a")
+
+@inline
+trusted fun esp32WifiCryptoFunctionsAddress(): u32 =
+    xtensaAssemblyReadU32(
+        "movi $0, g_wifi_default_wpa_crypto_funcs",
+        "=a"
+    )
+
+trusted fun esp32InitializeIdfWifi(): bool {
+    if (esp32WifiInitialized) return true
+    if (!nvsInitialize() || esp_netif_init() != 0 ||
+        esp_event_loop_create_default() != 0) return false
+    val station = esp_netif_create_default_wifi_sta()
+    if (pointerIsNull(station)) return false
+
+    val config = nativeStackAllocate(152)
+    nativeAddressClear(config, esp32WifiInitializationConfigBytes)
+    nativeAddressStoreU32(config, 0, int(esp32WifiOsiFunctionsAddress()))
+    ablaUnsafeCopyMemory(
+        config + 4, int(esp32WifiCryptoFunctionsAddress()), 44
+    )
+
+    // ESP-IDF 6.0 wifi_init_config_t layout, with the same dynamic-buffer
+    // policy previously selected by Arduino's wifiLowLevelInit(false).
+    nativeAddressStoreU32(config, 48, 4)
+    nativeAddressStoreU32(config, 52, 32)
+    nativeAddressStoreU32(config, 56, 1)
+    nativeAddressStoreU32(config, 60, 0)
+    nativeAddressStoreU32(config, 64, 32)
+    nativeAddressStoreU32(config, 68, 0)
+    nativeAddressStoreU32(config, 72, 5)
+    nativeAddressStoreU32(config, 76, 4)
+    nativeAddressStoreU32(config, 80, 0)
+    nativeAddressStoreU32(config, 84, 1)
+    nativeAddressStoreU32(config, 88, 1)
+    nativeAddressStoreU32(config, 92, 0)
+    nativeAddressStoreU32(config, 96, 0)
+    nativeAddressStoreU32(config, 100, 0)
+    nativeAddressStoreU32(config, 104, 6)
+    nativeAddressStoreU32(config, 108, 0)
+    nativeAddressStoreU32(config, 112, 752)
+    nativeAddressStoreU32(config, 116, 32)
+    nativeAddressStoreU32(config, 120, 0)
+    nativeAddressStoreU32(config, 124, 0)
+    nativeAddressStoreU8(config, 128, 1)
+    nativeAddressStoreU32(config, 132, 7)
+    nativeAddressStoreU32(config, 136, 1)
+    nativeAddressStoreU8(config, 140, 0)
+    nativeAddressStoreU32(config, 144, 523190095)
+
+    if (esp_wifi_init(nativePointerFromAddress(config)) != 0 ||
+        esp_wifi_set_storage(1) != 0) return false
+    esp32WifiInitialized = true
+    true
+}
+
 fun wifiStation(): WifiStation = WifiStation(0)
 
 trusted fun WifiStation.initialize(): bool {
-    if (!_Z16wifiLowLevelInitb(false)) false
+    if (!esp32InitializeIdfWifi()) false
     else esp_wifi_set_mode(1) == 0 && esp_wifi_start() == 0
 }
 
 trusted fun WifiStation.connect(ssid: string, password: string): bool {
-    val config = nativeStackAllocate(128)
-    nativeAddressClear(config, 128)
+    val config = nativeStackAllocate(esp32WifiStationConfigBytes)
+    nativeAddressClear(config, esp32WifiStationConfigBytes)
     nativeAddressCopyText(config, 0, 32, ssid)
     nativeAddressCopyText(config, 32, 64, password)
     val configured = esp_wifi_set_config(
@@ -48,11 +127,11 @@ trusted fun WifiStation.hasAddress(): bool {
     }
 }
 
-fun WifiStation.waitForAddress(timeoutMilliseconds: int): bool {
+trusted fun WifiStation.waitForAddress(timeoutMilliseconds: int): bool {
     val started = esp_timer_get_time() / 1000
     while (!this.hasAddress() &&
         esp_timer_get_time() / 1000 - started < timeoutMilliseconds) {
-        delay(25)
+        vTaskDelay(u32(25))
     }
     this.hasAddress()
 }

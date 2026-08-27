@@ -1,0 +1,170 @@
+import "abla/unsafe/memory"
+import "../src/esp32/sdk/buffer.ab"
+import "../src/wifi/ieee80211_management_logic.ab"
+
+trusted noescape extern:"c" fun mmap(
+    requested: i64*,
+    length: int,
+    protection: i32,
+    flags: i32,
+    descriptor: i32,
+    offset: int
+): i64*
+trusted noescape extern:"c" fun munmap(address: i64*, length: int): i32
+
+trusted fun main(): int {
+    val capabilities = wifiCapabilities(
+        true, false, true, true, true, true, true, true, true, true,
+        true, true
+    )
+    if (capabilities.rawValue() != u16(65329) ||
+        !capabilities.infrastructure() || capabilities.independent() ||
+        !capabilities.privacy() || !capabilities.shortPreamble() ||
+        !capabilities.spectrumManagement() || !capabilities.qos() ||
+        !capabilities.shortSlotTime() ||
+        !capabilities.automaticPowerSaveDelivery() ||
+        !capabilities.radioMeasurement() || !capabilities.dsssOfdm() ||
+        !capabilities.delayedBlockAcknowledgement() ||
+        !capabilities.immediateBlockAcknowledgement()) return 1
+    if (wifiAssociationId(1) != u16(49153) ||
+        wifiAssociationIdValue(wifiAssociationId(2007)) != 2007 ||
+        wifiAssociationId(0) != u16(0) || wifiAssociationId(2008) != u16(0)) {
+        return 2
+    }
+
+    // NativeBuffer deliberately carries a classic-ESP32 32-bit address. Keep
+    // this x86-64 fixture in MAP_32BIT so the host test exercises that exact
+    // scalar representation instead of changing the firmware ABI for tests.
+    val allocation = mmap(nativeNullPointer(), 4096, i32(3), i32(98), i32(-1), 0)
+    val allocationAddress = nativePointerAddress(allocation)
+    if (allocationAddress <= 0 || allocationAddress > 4294967295) return 14
+    val storage = nativeBufferAt(allocationAddress, 256)
+    nativeAddressClear(storage.addressValue(), storage.capacity())
+    var next = wifiAppendInformationElementText(
+        storage, 0, wifiElementSsid, "abla-ap"
+    )
+    if (next != 9) return 3
+    next = wifiAppendSupportedRates(
+        storage, next,
+        2 | (4 << 8) | (11 << 16) | (22 << 24) | (12 << 32) |
+            (18 << 40) | (24 << 48) | (36 << 56),
+        48 | (72 << 8), 10, 15
+    )
+    if (next != 23) return 4
+    next = wifiAppendDsParameterSet(storage, next, 9)
+    if (next != 26) return 5
+    next = wifiAppendRsnElement(
+        storage, next, wifiCipherCcmp128,
+        wifiCipherCcmp128 | (wifiCipherGcmp128 << 8), 2,
+        wifiAuthenticationPsk | (wifiAuthenticationSae << 8), 2,
+        wifiRsnCapabilityManagementFrameProtectionRequired |
+            wifiRsnCapabilityManagementFrameProtectionCapable
+    )
+    if (next != 56) return 6
+    storage.store(next, wifiElementExtension)
+    storage.store(next + 1, 3)
+    storage.store(next + 2, 35)
+    storage.store(next + 3, 7)
+    storage.store(next + 4, 9)
+    next = next + 5
+    if (!wifiInformationElementsValid(storage, 0, next)) return 7
+
+    val ssid = wifiFindInformationElement(storage, 0, next, wifiElementSsid)
+    val rates = wifiFindInformationElement(
+        storage, 0, next, wifiElementSupportedRates
+    )
+    val extendedRates = wifiFindInformationElement(
+        storage, 0, next, wifiElementExtendedSupportedRates
+    )
+    val channel = wifiFindInformationElement(
+        storage, 0, next, wifiElementDsParameterSet
+    )
+    val rsn = wifiFindInformationElement(storage, 0, next, wifiElementRsn)
+    val extension = wifiFindExtendedInformationElement(storage, 0, next, 35)
+    if (!ssid.equalsText(storage, "abla-ap") || rates.length() != 8 ||
+        extendedRates.length() != 2 || storage.load(channel.dataOffset()) != 9 ||
+        extension.length() != 3 || !wifiRsnElementValid(storage, rsn)) return 8
+    if (wifiRsnGroupCipher(storage, rsn) != wifiCipherCcmp128 ||
+        wifiRsnPairwiseCipherCount(storage, rsn) != 2 ||
+        wifiRsnPairwiseCipher(storage, rsn, 0) != wifiCipherCcmp128 ||
+        wifiRsnPairwiseCipher(storage, rsn, 1) != wifiCipherGcmp128 ||
+        wifiRsnAuthenticationSuiteCount(storage, rsn) != 2 ||
+        wifiRsnAuthenticationSuite(storage, rsn, 0) !=
+            wifiAuthenticationPsk ||
+        wifiRsnAuthenticationSuite(storage, rsn, 1) !=
+            wifiAuthenticationSae ||
+        !wifiRsnSupportsPersonal(storage, rsn) ||
+        wifiRsnSupportsEnterprise(storage, rsn) ||
+        !wifiRsnManagementFrameProtectionCapable(storage, rsn) ||
+        !wifiRsnManagementFrameProtectionRequired(storage, rsn)) return 9
+
+    val enterpriseStorage = nativeBufferAt(allocationAddress + 512, 64)
+    val enterpriseEnd = wifiAppendRsnElement(
+        enterpriseStorage, 0, wifiCipherCcmp128, wifiCipherCcmp128, 1,
+        wifiAuthentication8021x, 1, 0
+    )
+    val enterprise = wifiFindInformationElement(
+        enterpriseStorage, 0, enterpriseEnd, wifiElementRsn
+    )
+    if (!wifiRsnElementValid(enterpriseStorage, enterprise) ||
+        wifiRsnSupportsPersonal(enterpriseStorage, enterprise) ||
+        !wifiRsnSupportsEnterprise(enterpriseStorage, enterprise)) return 10
+
+    val selectors = nativeBufferAt(allocationAddress + 2048, 16)
+    selectors.storeU32(0, wifiRsnSuiteSelector(wifiCipherCcmp128))
+    selectors.storeU32(4, wifiAuthenticationDppSelector)
+    val dppStorage = nativeBufferAt(allocationAddress + 2304, 64)
+    val dppEnd = wifiAppendRsnElementSelectors(
+        dppStorage, 0, wifiRsnSuiteSelector(wifiCipherCcmp128),
+        selectors, 0, 1, selectors, 4, 1,
+        wifiRsnCapabilityManagementFrameProtectionCapable
+    )
+    val dpp = wifiFindInformationElement(
+        dppStorage, 0, dppEnd, wifiElementRsn
+    )
+    if (!wifiRsnElementValid(dppStorage, dpp) ||
+        !wifiRsnSupportsDpp(dppStorage, dpp) ||
+        wifiRsnAuthenticationSuite(dppStorage, dpp, 0) != -1 ||
+        wifiRsnAuthenticationSuiteSelector(dppStorage, dpp, 0) !=
+            wifiAuthenticationDppSelector ||
+        wifiSuiteSelectorOrganization(wifiAuthenticationDppSelector) !=
+            10121040 ||
+        wifiSuiteSelectorType(wifiAuthenticationDppSelector) != 2) return 16
+
+    val malformed = nativeBufferAt(allocationAddress + 1024, 4)
+    malformed.store(0, wifiElementSsid)
+    malformed.store(1, 3)
+    malformed.store(2, 65)
+    malformed.store(3, 66)
+    if (wifiInformationElementsValid(malformed, 0, 4) ||
+        wifiFindInformationElement(malformed, 0, 4, wifiElementSsid).valid()) {
+        return 11
+    }
+
+    val beacon = nativeBufferAt(allocationAddress + 1536, 64)
+    nativeAddressClear(beacon.addressValue(), beacon.capacity())
+    beacon.storeU16(
+        0, int(wifiManagementFrameControl(
+            wifiManagementSubtypeBeacon
+        ).rawValue())
+    )
+    beacon.storeU16(32, 100)
+    beacon.storeU16(34, int(capabilities.rawValue()))
+    val beaconEnd = wifiAppendInformationElementText(
+        beacon, wifiManagementInformationElementsOffset(
+            wifiManagementSubtypeBeacon
+        ), wifiElementSsid, "abla-ap"
+    )
+    if (beaconEnd != 45 || !wifiManagementFrameValid(beacon, beaconEnd) ||
+        !wifiManagementFrameValid32(u32(beacon.addressValue()), u32(beaconEnd)) ||
+        wifiManagementFixedBodyBytes(wifiManagementSubtypeAssociationRequest) != 4 ||
+        wifiManagementFixedBodyBytes(wifiManagementSubtypeAuthentication) != 6 ||
+        wifiManagementFixedBodyBytes(wifiManagementSubtypeAction) != -1) return 12
+    beacon.store(37, 40)
+    if (wifiManagementFrameValid(beacon, beaconEnd) ||
+        wifiManagementFrameValid32(u32(beacon.addressValue()), u32(beaconEnd))) {
+        return 13
+    }
+    if (munmap(allocation, 4096) != i32(0)) return 15
+    77
+}

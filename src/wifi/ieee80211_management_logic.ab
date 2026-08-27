@@ -1,0 +1,807 @@
+import "../esp32/sdk/buffer.ab"
+import "./ieee80211_logic.ab"
+import "abla/unsafe/mmio"
+
+// Allocation-free IEEE 802.11 management-frame and information-element
+// primitives. The packed scalar handles carry offsets and lengths only; the
+// caller continues to own packet storage, which keeps RX, scan, STA, and AP
+// paths on the same direct ABI.
+
+val wifiManagementSubtypeAssociationRequest = u8(0)
+val wifiManagementSubtypeAssociationResponse = u8(1)
+val wifiManagementSubtypeReassociationRequest = u8(2)
+val wifiManagementSubtypeReassociationResponse = u8(3)
+val wifiManagementSubtypeProbeRequest = u8(4)
+val wifiManagementSubtypeProbeResponse = u8(5)
+val wifiManagementSubtypeTimingAdvertisement = u8(6)
+val wifiManagementSubtypeBeacon = u8(8)
+val wifiManagementSubtypeAtim = u8(9)
+val wifiManagementSubtypeDisassociation = u8(10)
+val wifiManagementSubtypeAuthentication = u8(11)
+val wifiManagementSubtypeDeauthentication = u8(12)
+val wifiManagementSubtypeAction = u8(13)
+val wifiManagementSubtypeActionNoAcknowledgement = u8(14)
+
+val wifiManagementHeaderBytes = 24
+
+@inline
+fun wifiManagementFrameControl(
+    subtype: u8,
+    retry: bool = false,
+    powerManagement: bool = false,
+    moreData: bool = false,
+    protectedFrame: bool = false
+): WifiFrameControl = wifiFrameControl(
+    wifiFrameTypeManagement, subtype, false, false, false, retry,
+    powerManagement, moreData, protectedFrame, false
+)
+
+type WifiCapabilities = u16
+
+@inline
+fun wifiCapabilities(
+    infrastructure: bool,
+    independent: bool,
+    privacy: bool,
+    shortPreamble: bool,
+    spectrumManagement: bool,
+    qos: bool,
+    shortSlotTime: bool,
+    automaticPowerSaveDelivery: bool,
+    radioMeasurement: bool,
+    dsssOfdm: bool,
+    delayedBlockAcknowledgement: bool,
+    immediateBlockAcknowledgement: bool
+): WifiCapabilities = WifiCapabilities(
+    (if (infrastructure) u16(1) else u16(0)) |
+    (if (independent) u16(2) else u16(0)) |
+    (if (privacy) u16(16) else u16(0)) |
+    (if (shortPreamble) u16(32) else u16(0)) |
+    (if (spectrumManagement) u16(256) else u16(0)) |
+    (if (qos) u16(512) else u16(0)) |
+    (if (shortSlotTime) u16(1024) else u16(0)) |
+    (if (automaticPowerSaveDelivery) u16(2048) else u16(0)) |
+    (if (radioMeasurement) u16(4096) else u16(0)) |
+    (if (dsssOfdm) u16(8192) else u16(0)) |
+    (if (delayedBlockAcknowledgement) u16(16384) else u16(0)) |
+    (if (immediateBlockAcknowledgement) u16(32768) else u16(0))
+)
+
+@inline
+fun WifiCapabilities.rawValue(): u16 = this
+@inline
+fun WifiCapabilities.infrastructure(): bool = (this & u16(1)) != u16(0)
+@inline
+fun WifiCapabilities.independent(): bool = (this & u16(2)) != u16(0)
+@inline
+fun WifiCapabilities.privacy(): bool = (this & u16(16)) != u16(0)
+@inline
+fun WifiCapabilities.shortPreamble(): bool = (this & u16(32)) != u16(0)
+@inline
+fun WifiCapabilities.spectrumManagement(): bool =
+    (this & u16(256)) != u16(0)
+@inline
+fun WifiCapabilities.qos(): bool = (this & u16(512)) != u16(0)
+@inline
+fun WifiCapabilities.shortSlotTime(): bool = (this & u16(1024)) != u16(0)
+@inline
+fun WifiCapabilities.automaticPowerSaveDelivery(): bool =
+    (this & u16(2048)) != u16(0)
+@inline
+fun WifiCapabilities.radioMeasurement(): bool =
+    (this & u16(4096)) != u16(0)
+@inline
+fun WifiCapabilities.dsssOfdm(): bool = (this & u16(8192)) != u16(0)
+@inline
+fun WifiCapabilities.delayedBlockAcknowledgement(): bool =
+    (this & u16(16384)) != u16(0)
+@inline
+fun WifiCapabilities.immediateBlockAcknowledgement(): bool =
+    (this & u16(32768)) != u16(0)
+
+// Association IDs occupy 14 bits on the wire; response frames set the two
+// most-significant bits. Values 1 through 2007 are assignable to stations.
+@inline
+fun wifiAssociationId(value: int): u16 =
+    if (value < 1 || value > 2007) u16(0)
+    else u16(value | 49152)
+
+@inline
+fun wifiAssociationIdValue(value: u16): int = int(value & u16(16383))
+
+val wifiElementSsid = 0
+val wifiElementSupportedRates = 1
+val wifiElementDsParameterSet = 3
+val wifiElementTrafficIndicationMap = 5
+val wifiElementCountry = 7
+val wifiElementBssLoad = 11
+val wifiElementChallengeText = 16
+val wifiElementPowerConstraint = 32
+val wifiElementTpcReport = 35
+val wifiElementSupportedChannels = 36
+val wifiElementChannelSwitchAnnouncement = 37
+val wifiElementQuiet = 40
+val wifiElementErp = 42
+val wifiElementHtCapabilities = 45
+val wifiElementRsn = 48
+val wifiElementExtendedSupportedRates = 50
+val wifiElementMobilityDomain = 54
+val wifiElementFastBssTransition = 55
+val wifiElementTimeoutInterval = 56
+val wifiElementSupportedOperatingClasses = 59
+val wifiElementHtOperation = 61
+val wifiElementExtendedCapabilities = 127
+val wifiElementVhtCapabilities = 191
+val wifiElementVhtOperation = 192
+val wifiElementVendorSpecific = 221
+val wifiElementExtension = 255
+
+// Zero means invalid/not found. Otherwise the low 32 bits contain offset + 1,
+// followed by the one-byte payload length and one-byte element identifier.
+type WifiInformationElement = int
+
+@inline
+fun wifiInformationElement(offset: int, identifier: int, length: int): WifiInformationElement =
+    if (offset < 0 || identifier < 0 || identifier > 255 ||
+        length < 0 || length > 255) WifiInformationElement(0)
+    else WifiInformationElement(
+        ((offset + 1) & 4294967295) | (length << 32) | (identifier << 40)
+    )
+
+@inline
+fun WifiInformationElement.valid(): bool = this != 0
+@inline
+fun WifiInformationElement.offset(): int =
+    if (!this.valid()) -1 else (this & 4294967295) - 1
+@inline
+fun WifiInformationElement.dataOffset(): int = this.offset() + 2
+@inline
+fun WifiInformationElement.length(): int = (this >>> 32) & 255
+@inline
+fun WifiInformationElement.identifier(): int = (this >>> 40) & 255
+@inline
+fun WifiInformationElement.endOffset(): int =
+    if (!this.valid()) -1 else this.dataOffset() + this.length()
+
+trusted fun wifiInformationElementAt(
+    buffer: NativeBuffer,
+    offset: int,
+    endOffset: int
+): WifiInformationElement {
+    if (offset < 0 || endOffset < offset || endOffset > buffer.capacity() ||
+        offset > endOffset - 2) return WifiInformationElement(0)
+    val length = buffer.load(offset + 1)
+    if (length > endOffset - offset - 2) return WifiInformationElement(0)
+    wifiInformationElement(offset, buffer.load(offset), length)
+}
+
+trusted fun wifiInformationElementsValid(
+    buffer: NativeBuffer,
+    offset: int,
+    length: int
+): bool {
+    if (offset < 0 || length < 0 || offset > buffer.capacity() - length) {
+        return false
+    }
+    val endOffset = offset + length
+    var current = offset
+    while (current < endOffset) {
+        val element = wifiInformationElementAt(buffer, current, endOffset)
+        if (!element.valid()) return false
+        current = element.endOffset()
+    }
+    current == endOffset
+}
+
+trusted fun wifiFindInformationElement(
+    buffer: NativeBuffer,
+    offset: int,
+    length: int,
+    identifier: int,
+    occurrence: int = 0
+): WifiInformationElement {
+    if (identifier < 0 || identifier > 255 || occurrence < 0 ||
+        offset < 0 || length < 0 || offset > buffer.capacity() - length) {
+        return WifiInformationElement(0)
+    }
+    val endOffset = offset + length
+    var current = offset
+    var remainingOccurrence = occurrence
+    while (current < endOffset) {
+        val element = wifiInformationElementAt(buffer, current, endOffset)
+        if (!element.valid()) return WifiInformationElement(0)
+        if (element.identifier() == identifier) {
+            if (remainingOccurrence == 0) return element
+            remainingOccurrence = remainingOccurrence - 1
+        }
+        current = element.endOffset()
+    }
+    WifiInformationElement(0)
+}
+
+trusted fun wifiFindExtendedInformationElement(
+    buffer: NativeBuffer,
+    offset: int,
+    length: int,
+    extensionIdentifier: int,
+    occurrence: int = 0
+): WifiInformationElement {
+    if (extensionIdentifier < 0 || extensionIdentifier > 255 ||
+        occurrence < 0) return WifiInformationElement(0)
+    var elementOccurrence = 0
+    var remainingOccurrence = occurrence
+    while (true) {
+        val element = wifiFindInformationElement(
+            buffer, offset, length, wifiElementExtension, elementOccurrence
+        )
+        if (!element.valid()) return element
+        if (element.length() > 0 &&
+            buffer.load(element.dataOffset()) == extensionIdentifier) {
+            if (remainingOccurrence == 0) return element
+            remainingOccurrence = remainingOccurrence - 1
+        }
+        elementOccurrence = elementOccurrence + 1
+    }
+    WifiInformationElement(0)
+}
+
+trusted fun WifiInformationElement.equalsText(
+    buffer: NativeBuffer,
+    text: string
+): bool {
+    if (!this.valid() || this.length() != text.size ||
+        this.endOffset() > buffer.capacity()) return false
+    var index = 0
+    while (index < text.size) {
+        if (buffer.load(this.dataOffset() + index) != text[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+trusted fun wifiAppendInformationElementBytes(
+    output: NativeBuffer,
+    offset: int,
+    identifier: int,
+    source: NativeBuffer,
+    sourceOffset: int,
+    length: int
+): int {
+    if (offset < 0 || identifier < 0 || identifier > 255 || length < 0 ||
+        length > 255 || sourceOffset < 0 ||
+        sourceOffset > source.capacity() - length ||
+        offset > output.capacity() - length - 2) return -1
+    output.store(offset, identifier)
+    output.store(offset + 1, length)
+    var index = 0
+    while (index < length) {
+        output.store(offset + 2 + index, source.load(sourceOffset + index))
+        index = index + 1
+    }
+    offset + length + 2
+}
+
+trusted fun wifiAppendInformationElementText(
+    output: NativeBuffer,
+    offset: int,
+    identifier: int,
+    text: string
+): int {
+    if (offset < 0 || identifier < 0 || identifier > 255 || text.size > 255 ||
+        offset > output.capacity() - text.size - 2) return -1
+    output.store(offset, identifier)
+    output.store(offset + 1, text.size)
+    var index = 0
+    while (index < text.size) {
+        output.store(offset + 2 + index, text[index])
+        index = index + 1
+    }
+    offset + text.size + 2
+}
+
+trusted fun wifiAppendDsParameterSet(
+    output: NativeBuffer,
+    offset: int,
+    channel: int
+): int {
+    if (channel < 1 || channel > 196 || offset < 0 ||
+        offset > output.capacity() - 3) return -1
+    output.store(offset, wifiElementDsParameterSet)
+    output.store(offset + 1, 1)
+    output.store(offset + 2, channel)
+    offset + 3
+}
+
+// Each packed rate byte is expressed in 500 kbit/s units. basicRateMask marks
+// which entries have the on-wire basic-rate bit. The first eight rates use the
+// Supported Rates element and the remainder use Extended Supported Rates.
+trusted fun wifiAppendSupportedRates(
+    output: NativeBuffer,
+    offset: int,
+    packedRatesLow: int,
+    packedRatesHigh: int,
+    count: int,
+    basicRateMask: int
+): int {
+    if (count < 1 || count > 16 || offset < 0 ||
+        offset > output.capacity() - count - (if (count > 8) 4 else 2)) {
+        return -1
+    }
+    val firstCount = if (count > 8) 8 else count
+    output.store(offset, wifiElementSupportedRates)
+    output.store(offset + 1, firstCount)
+    var index = 0
+    while (index < firstCount) {
+        val rate = (packedRatesLow >>> (index * 8)) & 127
+        output.store(
+            offset + 2 + index,
+            rate | (if ((basicRateMask & (1 << index)) != 0) 128 else 0)
+        )
+        index = index + 1
+    }
+    var next = offset + firstCount + 2
+    if (count > 8) {
+        val extendedCount = count - 8
+        output.store(next, wifiElementExtendedSupportedRates)
+        output.store(next + 1, extendedCount)
+        index = 0
+        while (index < extendedCount) {
+            val rate = (packedRatesHigh >>> (index * 8)) & 127
+            output.store(
+                next + 2 + index,
+                rate | (if ((basicRateMask & (1 << (index + 8))) != 0)
+                    128 else 0)
+            )
+            index = index + 1
+        }
+        next = next + extendedCount + 2
+    }
+    next
+}
+
+type WifiCipherSuite = int
+type WifiAuthenticationSuite = int
+
+val wifiCipherUseGroup = WifiCipherSuite(0)
+val wifiCipherWep40 = WifiCipherSuite(1)
+val wifiCipherTkip = WifiCipherSuite(2)
+val wifiCipherCcmp128 = WifiCipherSuite(4)
+val wifiCipherWep104 = WifiCipherSuite(5)
+val wifiCipherBipCmac128 = WifiCipherSuite(6)
+val wifiCipherNoGroupAddressed = WifiCipherSuite(7)
+val wifiCipherGcmp128 = WifiCipherSuite(8)
+val wifiCipherGcmp256 = WifiCipherSuite(9)
+val wifiCipherCcmp256 = WifiCipherSuite(10)
+val wifiCipherBipGmac128 = WifiCipherSuite(11)
+val wifiCipherBipGmac256 = WifiCipherSuite(12)
+val wifiCipherBipCmac256 = WifiCipherSuite(13)
+
+val wifiAuthentication8021x = WifiAuthenticationSuite(1)
+val wifiAuthenticationPsk = WifiAuthenticationSuite(2)
+val wifiAuthenticationFt8021x = WifiAuthenticationSuite(3)
+val wifiAuthenticationFtPsk = WifiAuthenticationSuite(4)
+val wifiAuthentication8021xSha256 = WifiAuthenticationSuite(5)
+val wifiAuthenticationPskSha256 = WifiAuthenticationSuite(6)
+val wifiAuthenticationTdls = WifiAuthenticationSuite(7)
+val wifiAuthenticationSae = WifiAuthenticationSuite(8)
+val wifiAuthenticationFtSae = WifiAuthenticationSuite(9)
+val wifiAuthenticationApPeerKey = WifiAuthenticationSuite(10)
+val wifiAuthentication8021xSuiteB = WifiAuthenticationSuite(11)
+val wifiAuthentication8021xSuiteB192 = WifiAuthenticationSuite(12)
+val wifiAuthenticationFt8021xSha384 = WifiAuthenticationSuite(13)
+val wifiAuthenticationFilsSha256 = WifiAuthenticationSuite(14)
+val wifiAuthenticationFilsSha384 = WifiAuthenticationSuite(15)
+val wifiAuthenticationFtFilsSha256 = WifiAuthenticationSuite(16)
+val wifiAuthenticationFtFilsSha384 = WifiAuthenticationSuite(17)
+val wifiAuthenticationOwe = WifiAuthenticationSuite(18)
+val wifiAuthenticationSaeExtendedKey = WifiAuthenticationSuite(24)
+
+// DPP uses the Wi-Fi Alliance 50:6f:9a OUI rather than the IEEE RSN OUI.
+val wifiAuthenticationDppSelector = 43675472
+
+val wifiRsnCapabilityManagementFrameProtectionRequired = 64
+val wifiRsnCapabilityManagementFrameProtectionCapable = 128
+
+@inline
+fun wifiRsnSuiteSelector(suiteType: int): int =
+    (15 << 8) | (172 << 16) | ((suiteType & 255) << 24)
+
+@inline
+fun wifiRsnSuiteType(selector: int): int =
+    if ((selector & 16777215) != 11276032) -1
+    else (selector >>> 24) & 255
+
+@inline
+fun wifiSuiteSelectorOrganization(selector: int): int =
+    selector & 16777215
+
+@inline
+fun wifiSuiteSelectorType(selector: int): int = (selector >>> 24) & 255
+
+trusted fun wifiRsnElementValid(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool {
+    if (!element.valid() || element.identifier() != wifiElementRsn ||
+        element.length() < 18 || element.endOffset() > buffer.capacity()) {
+        return false
+    }
+    val start = element.dataOffset()
+    val end = element.endOffset()
+    if (buffer.loadU16(start) != 1) return false
+    val pairwiseCount = buffer.loadU16(start + 6)
+    if (pairwiseCount < 1 || pairwiseCount > 63) return false
+    val authenticationCountOffset = start + 8 + pairwiseCount * 4
+    if (authenticationCountOffset > end - 2) return false
+    val authenticationCount = buffer.loadU16(authenticationCountOffset)
+    if (authenticationCount < 1 || authenticationCount > 63) return false
+    var next = authenticationCountOffset + 2 + authenticationCount * 4
+    if (next > end) return false
+    if (next == end) return true
+    if (next > end - 2) return false
+    next = next + 2
+    if (next == end) return true
+    if (next > end - 2) return false
+    val pmkidCount = buffer.loadU16(next)
+    next = next + 2
+    if (pmkidCount > 63 || pmkidCount > (end - next) / 16) return false
+    next = next + pmkidCount * 16
+    next == end || next + 4 == end
+}
+
+trusted fun wifiRsnGroupCipher(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): int = if (!wifiRsnElementValid(buffer, element)) -1
+    else wifiRsnSuiteType(buffer.loadU32(element.dataOffset() + 2))
+
+trusted fun wifiRsnGroupCipherSelector(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): int = if (!wifiRsnElementValid(buffer, element)) -1
+    else buffer.loadU32(element.dataOffset() + 2)
+
+trusted fun wifiRsnPairwiseCipherCount(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): int = if (!wifiRsnElementValid(buffer, element)) 0
+    else buffer.loadU16(element.dataOffset() + 6)
+
+trusted fun wifiRsnPairwiseCipher(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    index: int
+): int {
+    val count = wifiRsnPairwiseCipherCount(buffer, element)
+    if (index < 0 || index >= count) return -1
+    wifiRsnSuiteType(buffer.loadU32(element.dataOffset() + 8 + index * 4))
+}
+
+trusted fun wifiRsnPairwiseCipherSelector(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    index: int
+): int {
+    val count = wifiRsnPairwiseCipherCount(buffer, element)
+    if (index < 0 || index >= count) return -1
+    buffer.loadU32(element.dataOffset() + 8 + index * 4)
+}
+
+trusted fun wifiRsnAuthenticationSuiteCount(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): int {
+    val pairwiseCount = wifiRsnPairwiseCipherCount(buffer, element)
+    if (pairwiseCount == 0) return 0
+    buffer.loadU16(element.dataOffset() + 8 + pairwiseCount * 4)
+}
+
+trusted fun wifiRsnAuthenticationSuite(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    index: int
+): int {
+    val pairwiseCount = wifiRsnPairwiseCipherCount(buffer, element)
+    val count = wifiRsnAuthenticationSuiteCount(buffer, element)
+    if (index < 0 || index >= count) return -1
+    val offset = element.dataOffset() + 10 + pairwiseCount * 4 + index * 4
+    wifiRsnSuiteType(buffer.loadU32(offset))
+}
+
+trusted fun wifiRsnAuthenticationSuiteSelector(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    index: int
+): int {
+    val pairwiseCount = wifiRsnPairwiseCipherCount(buffer, element)
+    val count = wifiRsnAuthenticationSuiteCount(buffer, element)
+    if (index < 0 || index >= count) return -1
+    buffer.loadU32(
+        element.dataOffset() + 10 + pairwiseCount * 4 + index * 4
+    )
+}
+
+trusted fun wifiRsnCapabilities(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): int {
+    val pairwiseCount = wifiRsnPairwiseCipherCount(buffer, element)
+    val authenticationCount = wifiRsnAuthenticationSuiteCount(buffer, element)
+    if (pairwiseCount == 0 || authenticationCount == 0) return 0
+    val offset = element.dataOffset() + 10 +
+        pairwiseCount * 4 + authenticationCount * 4
+    if (offset > element.endOffset() - 2) 0 else buffer.loadU16(offset)
+}
+
+trusted fun wifiRsnHasAuthenticationSuite(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    suite: WifiAuthenticationSuite
+): bool {
+    val count = wifiRsnAuthenticationSuiteCount(buffer, element)
+    var index = 0
+    while (index < count) {
+        if (wifiRsnAuthenticationSuite(buffer, element, index) == suite) {
+            return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+trusted fun wifiRsnHasAuthenticationSelector(
+    buffer: NativeBuffer,
+    element: WifiInformationElement,
+    selector: int
+): bool {
+    val count = wifiRsnAuthenticationSuiteCount(buffer, element)
+    var index = 0
+    while (index < count) {
+        if (wifiRsnAuthenticationSuiteSelector(buffer, element, index) ==
+            selector) return true
+        index = index + 1
+    }
+    false
+}
+
+trusted fun wifiRsnSupportsPersonal(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool = wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationPsk
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFtPsk
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationPskSha256
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationSae
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFtSae
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationSaeExtendedKey
+)
+
+trusted fun wifiRsnSupportsEnterprise(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool = wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthentication8021x
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthentication8021xSha256
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFt8021x
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthentication8021xSuiteB
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthentication8021xSuiteB192
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFt8021xSha384
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFilsSha256
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFilsSha384
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFtFilsSha256
+) || wifiRsnHasAuthenticationSuite(
+    buffer, element, wifiAuthenticationFtFilsSha384
+)
+
+trusted fun wifiRsnSupportsDpp(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool = wifiRsnHasAuthenticationSelector(
+    buffer, element, wifiAuthenticationDppSelector
+)
+
+trusted fun wifiRsnManagementFrameProtectionCapable(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool = (wifiRsnCapabilities(buffer, element) &
+    wifiRsnCapabilityManagementFrameProtectionCapable) != 0
+
+trusted fun wifiRsnManagementFrameProtectionRequired(
+    buffer: NativeBuffer,
+    element: WifiInformationElement
+): bool = (wifiRsnCapabilities(buffer, element) &
+    wifiRsnCapabilityManagementFrameProtectionRequired) != 0
+
+trusted fun wifiAppendRsnElement(
+    output: NativeBuffer,
+    offset: int,
+    groupCipher: WifiCipherSuite,
+    packedPairwiseCiphers: int,
+    pairwiseCount: int,
+    packedAuthenticationSuites: int,
+    authenticationCount: int,
+    capabilities: int
+): int {
+    if (pairwiseCount < 1 || pairwiseCount > 4 ||
+        authenticationCount < 1 || authenticationCount > 4) return -1
+    val length = 12 + pairwiseCount * 4 + authenticationCount * 4
+    if (offset < 0 || offset > output.capacity() - length - 2) return -1
+    output.store(offset, wifiElementRsn)
+    output.store(offset + 1, length)
+    output.storeU16(offset + 2, 1)
+    output.storeU32(offset + 4, wifiRsnSuiteSelector(groupCipher))
+    output.storeU16(offset + 8, pairwiseCount)
+    var index = 0
+    var next = offset + 10
+    while (index < pairwiseCount) {
+        output.storeU32(
+            next, wifiRsnSuiteSelector(packedPairwiseCiphers >>> (index * 8))
+        )
+        next = next + 4
+        index = index + 1
+    }
+    output.storeU16(next, authenticationCount)
+    next = next + 2
+    index = 0
+    while (index < authenticationCount) {
+        output.storeU32(
+            next,
+            wifiRsnSuiteSelector(packedAuthenticationSuites >>> (index * 8))
+        )
+        next = next + 4
+        index = index + 1
+    }
+    output.storeU16(next, capabilities)
+    next + 2
+}
+
+// General selector form for suites outside the IEEE 00:0f:ac namespace (for
+// example DPP) and advertisements containing more than four choices.
+trusted fun wifiAppendRsnElementSelectors(
+    output: NativeBuffer,
+    offset: int,
+    groupCipherSelector: int,
+    pairwiseSelectors: NativeBuffer,
+    pairwiseOffset: int,
+    pairwiseCount: int,
+    authenticationSelectors: NativeBuffer,
+    authenticationOffset: int,
+    authenticationCount: int,
+    capabilities: int
+): int {
+    if (pairwiseCount < 1 || authenticationCount < 1 ||
+        pairwiseCount + authenticationCount > 60 || pairwiseOffset < 0 ||
+        authenticationOffset < 0 ||
+        pairwiseOffset > pairwiseSelectors.capacity() - pairwiseCount * 4 ||
+        authenticationOffset > authenticationSelectors.capacity() -
+            authenticationCount * 4) return -1
+    val length = 12 + pairwiseCount * 4 + authenticationCount * 4
+    if (offset < 0 || offset > output.capacity() - length - 2) return -1
+    output.store(offset, wifiElementRsn)
+    output.store(offset + 1, length)
+    output.storeU16(offset + 2, 1)
+    output.storeU32(offset + 4, groupCipherSelector)
+    output.storeU16(offset + 8, pairwiseCount)
+    var next = offset + 10
+    var index = 0
+    while (index < pairwiseCount) {
+        output.storeU32(
+            next, pairwiseSelectors.loadU32(pairwiseOffset + index * 4)
+        )
+        next = next + 4
+        index = index + 1
+    }
+    output.storeU16(next, authenticationCount)
+    next = next + 2
+    index = 0
+    while (index < authenticationCount) {
+        output.storeU32(
+            next,
+            authenticationSelectors.loadU32(authenticationOffset + index * 4)
+        )
+        next = next + 4
+        index = index + 1
+    }
+    output.storeU16(next, capabilities)
+    next + 2
+}
+
+fun wifiManagementFixedBodyBytes(subtype: u8): int {
+    if (subtype == wifiManagementSubtypeAssociationRequest) return 4
+    if (subtype == wifiManagementSubtypeAssociationResponse ||
+        subtype == wifiManagementSubtypeReassociationResponse) return 6
+    if (subtype == wifiManagementSubtypeReassociationRequest) return 10
+    if (subtype == wifiManagementSubtypeProbeRequest ||
+        subtype == wifiManagementSubtypeAtim) return 0
+    if (subtype == wifiManagementSubtypeProbeResponse ||
+        subtype == wifiManagementSubtypeBeacon) return 12
+    if (subtype == wifiManagementSubtypeAuthentication) return 6
+    if (subtype == wifiManagementSubtypeDisassociation ||
+        subtype == wifiManagementSubtypeDeauthentication) return 2
+    -1
+}
+
+fun wifiManagementInformationElementsOffset(subtype: u8): int {
+    val fixedBytes = wifiManagementFixedBodyBytes(subtype)
+    if (fixedBytes < 0) -1 else wifiManagementHeaderBytes + fixedBytes
+}
+
+trusted fun wifiManagementFrameValid(
+    frame: NativeBuffer,
+    frameLength: int
+): bool {
+    if (frameLength < wifiManagementHeaderBytes ||
+        frameLength > frame.capacity()) return false
+    val control = WifiFrameControl(u16(frame.loadU16(0)))
+    if (control.protocolVersion() != u8(0) ||
+        control.frameType() != wifiFrameTypeManagement) return false
+    val informationElementsOffset = wifiManagementInformationElementsOffset(
+        control.subtype()
+    )
+    if (informationElementsOffset < 0 || informationElementsOffset > frameLength) {
+        return control.subtype() == wifiManagementSubtypeAction ||
+            control.subtype() == wifiManagementSubtypeActionNoAcknowledgement ||
+            control.subtype() == wifiManagementSubtypeTimingAdvertisement
+    }
+    wifiInformationElementsValid(
+        frame, informationElementsOffset, frameLength - informationElementsOffset
+    )
+}
+
+// Native ESP packet leaf. Keeping the address and length in u32 avoids the
+// widening, packed-capacity extraction, and generic buffer calls that are
+// useful to higher layers but redundant after the RX descriptor was checked.
+@inline
+trusted fun wifiManagementFrameValid32(
+    address: u32,
+    length: u32
+): bool {
+    val zero = u32(0)
+    if (address == zero || length < u32(24) ||
+        address > u32(4294967295) - length) return false
+    val control = u16(ablaUnsafeVolatileLoadU8(i64(address))) |
+        (u16(ablaUnsafeVolatileLoadU8(i64(address + u32(1)))) << u16(8))
+    if ((control & u16(3)) != u16(0) ||
+        ((control >> u16(2)) & u16(3)) != u16(0)) return false
+    val subtype = u8((control >> u16(4)) & u16(15))
+    var fixed = u32(0)
+    if (subtype == wifiManagementSubtypeAssociationRequest) fixed = u32(4)
+    else if (subtype == wifiManagementSubtypeAssociationResponse ||
+        subtype == wifiManagementSubtypeReassociationResponse) fixed = u32(6)
+    else if (subtype == wifiManagementSubtypeReassociationRequest) fixed = u32(10)
+    else if (subtype == wifiManagementSubtypeProbeRequest ||
+        subtype == wifiManagementSubtypeAtim) fixed = zero
+    else if (subtype == wifiManagementSubtypeProbeResponse ||
+        subtype == wifiManagementSubtypeBeacon) fixed = u32(12)
+    else if (subtype == wifiManagementSubtypeAuthentication) fixed = u32(6)
+    else if (subtype == wifiManagementSubtypeDisassociation ||
+        subtype == wifiManagementSubtypeDeauthentication) fixed = u32(2)
+    else if (subtype == wifiManagementSubtypeAction ||
+        subtype == wifiManagementSubtypeActionNoAcknowledgement ||
+        subtype == wifiManagementSubtypeTimingAdvertisement) return true
+    else return false
+    var current = u32(24) + fixed
+    if (current > length) return false
+    while (current < length) {
+        if (current > length - u32(2)) return false
+        val elementLength = u32(ablaUnsafeVolatileLoadU8(
+            i64(address + current + u32(1))
+        ))
+        if (elementLength > length - current - u32(2)) return false
+        current = current + elementLength + u32(2)
+    }
+    current == length
+}

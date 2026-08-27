@@ -1,0 +1,182 @@
+import "abla/unsafe/memory"
+import "./sdk/buffer.ab"
+
+trusted noescape extern:"c" fun esp_tls_init(): i64*
+trusted noescape extern:"c" fun esp_tls_conn_new_sync(
+    host: cstring,
+    hostLength: i32,
+    port: i32,
+    config: i64*,
+    tls: i64*
+): i32
+trusted noescape extern:"c" fun esp_tls_conn_write(
+    tls: i64*, data: i64*, length: u32
+): i32
+trusted noescape extern:"c" fun esp_tls_conn_read(
+    tls: i64*, data: i64*, length: u32
+): i32
+trusted noescape extern:"c" fun esp_tls_get_bytes_avail(tls: i64*): i32
+trusted noescape extern:"c" fun esp_tls_get_conn_sockfd(
+    tls: i64*, descriptor: i64*
+): i32
+trusted noescape extern:"c" fun esp_tls_conn_destroy(tls: i64*): i32
+trusted noescape extern:"c" fun lwip_setsockopt(
+    descriptor: i32,
+    level: i32,
+    option: i32,
+    value: i64*,
+    length: u32
+): i32
+trusted noescape extern:"c" fun lwip_poll(
+    descriptors: i64*, count: u32, timeoutMilliseconds: i32
+): i32
+
+// This is application-owned state, not an ESP-TLS or C++ object:
+//   0  esp_tls_t pointer
+//   4  retained CA certificate pointer
+//   8  retained CA certificate byte count
+//  12  connected flag
+//  16  socket descriptor
+type TlsClient = int
+val tlsClientStorageBytes = 20
+val espTlsClientConfigBytes = 96
+
+trusted fun tlsClientAt(address: int): TlsClient {
+    nativeAddressClear(address, tlsClientStorageBytes)
+    nativeAddressStoreU32(address, 16, -1)
+    TlsClient(address)
+}
+
+trusted fun tlsClient(): TlsClient =
+    tlsClientAt(nativeStaticAllocate(20))
+
+trusted fun TlsClient.pointer(): i64* =
+    nativePointerFromAddress(nativeAddressLoadU32(this, 0))
+
+trusted fun TlsClient.setCertificate(certificate: string): void {
+    if (this != 0) {
+        nativeAddressStoreU32(this, 4, nativeCStringAddress(certificate))
+        nativeAddressStoreU32(this, 8, certificate.size + 1)
+    }
+    return
+}
+
+trusted fun TlsClient.connected(): bool =
+    this != 0 && nativeAddressLoadU32(this, 12) != 0
+
+trusted fun TlsClient.markDisconnected(): void {
+    if (this != 0) nativeAddressStoreU32(this, 12, 0)
+    return
+}
+
+trusted fun TlsClient.connect(host: string, port: int): bool {
+    if (this == 0) return false
+    this.stop()
+    val tls = esp_tls_init()
+    if (pointerIsNull(tls)) return false
+
+    nativeAddressStoreU32(this, 0, nativePointerAddress(tls))
+    val config = nativeStackAllocate(espTlsClientConfigBytes)
+    nativeAddressClear(config, espTlsClientConfigBytes)
+    nativeAddressStoreU32(config, 4, nativeAddressLoadU32(this, 4))
+    nativeAddressStoreU32(config, 8, nativeAddressLoadU32(this, 8))
+
+    if (esp_tls_conn_new_sync(
+        host, host.size, port, nativePointerFromAddress(config), tls
+    ) != 1) {
+        esp_tls_conn_destroy(tls)
+        nativeAddressStoreU32(this, 0, 0)
+        return false
+    }
+
+    val descriptor = nativeStackAllocate(4)
+    nativeAddressStoreU32(descriptor, 0, -1)
+    if (esp_tls_get_conn_sockfd(
+        tls, nativePointerFromAddress(descriptor)
+    ) != 0) {
+        esp_tls_conn_destroy(tls)
+        nativeAddressStoreU32(this, 0, 0)
+        return false
+    }
+    nativeAddressStoreU32(this, 16, nativeAddressLoadU32(descriptor, 0))
+    nativeAddressStoreU32(this, 12, 1)
+    true
+}
+
+trusted fun TlsClient.available(): int {
+    if (!this.connected()) return 0
+    val decrypted = esp_tls_get_bytes_avail(this.pointer())
+    if (decrypted > 0) return decrypted
+
+    // pollfd is { int fd; short events; short revents }. A readable TLS
+    // record is reported as at least one protocol header so callers enter
+    // esp_tls_conn_read(), which performs decryption and reports closure.
+    val descriptor = nativeStackAllocate(8)
+    nativeAddressClear(descriptor, 8)
+    nativeAddressStoreU32(descriptor, 0, nativeAddressLoadU32(this, 16))
+    nativeAddressStoreU16(descriptor, 4, 1)
+    if (lwip_poll(nativePointerFromAddress(descriptor), u32(1), 0) <= 0) return 0
+    val events = nativeAddressLoadU16(descriptor, 6)
+    if ((events & 56) != 0) {
+        this.markDisconnected()
+        return 0
+    }
+    if ((events & 1) != 0) 9 else 0
+}
+
+trusted fun TlsClient.noDelay(enabled: bool): bool {
+    if (!this.connected()) return false
+    val value = nativeStackAllocate(4)
+    nativeAddressStoreU32(value, 0, if (enabled) 1 else 0)
+    lwip_setsockopt(
+        nativeAddressLoadU32(this, 16), 6, 1,
+        nativePointerFromAddress(value), u32(4)
+    ) == 0
+}
+
+trusted fun TlsClient.write(buffer: NativeBuffer, length: int): int =
+    this.writeSlice(buffer, 0, length)
+
+trusted fun TlsClient.writeSlice(
+    buffer: NativeBuffer,
+    offset: int,
+    length: int
+): int {
+    if (!this.connected() || offset < 0 || length < 0 ||
+        offset > buffer.capacity() - length) return 0
+    val result = esp_tls_conn_write(
+        this.pointer(), buffer.pointerAt(offset), length
+    )
+    if (result < 0) this.markDisconnected()
+    result
+}
+
+trusted fun TlsClient.read(buffer: NativeBuffer, length: int): int =
+    this.readSlice(buffer, 0, length)
+
+trusted fun TlsClient.readSlice(
+    buffer: NativeBuffer,
+    offset: int,
+    length: int
+): int {
+    if (!this.connected() || offset < 0 || length < 0 ||
+        offset > buffer.capacity() - length) return 0
+    val result = esp_tls_conn_read(
+        this.pointer(), buffer.pointerAt(offset), length
+    )
+    if (result <= 0) this.markDisconnected()
+    result
+}
+
+trusted fun TlsClient.stop(): void {
+    if (this != 0) {
+        val tls = this.pointer()
+        this.markDisconnected()
+        nativeAddressStoreU32(this, 16, -1)
+        nativeAddressStoreU32(this, 0, 0)
+        if (!pointerIsNull(tls)) esp_tls_conn_destroy(tls)
+    }
+    return
+}
+
+trusted fun TlsClient.destroy(): void = this.stop()

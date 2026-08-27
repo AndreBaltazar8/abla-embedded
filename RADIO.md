@@ -31,6 +31,19 @@ same volatile-byte algorithm under identical Xtensa flags. The current leaf is
 180 bytes and 54 instructions for Abla versus 184 bytes and 56 instructions
 for C, with no unresolved calls.
 
+`src/wifi/ieee80211_management_logic.ab` adds allocation-free management
+subtypes and capability fields, bounded information-element iteration and
+construction, supported-rate and channel elements, and RSN suite parsing and
+construction. Its RSN surface represents the complete standard cipher and key
+management selectors needed by WEP/TKIP compatibility, WPA2 personal and
+enterprise, SAE/WPA3, OWE, FILS, Suite B, and protected management frames;
+this is protocol representation and validation, not a claim that their crypto
+or state machines are already complete. The same primitives serve scan/STA
+and beacon/probe/association/SoftAP paths. A native-width structural validator
+keeps a validated ESP packet address and length in `u32`; it is 156 bytes
+versus equivalent C++ at 158, with both at 59 Xtensa instructions and no
+unresolved calls. `make compare-wifi-management-size` enforces both gates.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
@@ -217,6 +230,18 @@ The remaining dependency order is:
 4. hardware crypto plus WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
 6. a native network interface and IP stack boundary.
+
+`esp32-opaque-radio-parity.tsv` is the non-prunable compatibility ledger. It
+records all 62 members observed across the unpruned opaque ESP32 radio
+archives, including two linked members with zero attributed image bytes, and
+the 277,357 bytes attributed to the other members in the baseline firmware.
+Disabling SoftAP, WPA3, enterprise, NAN, mesh, coexistence, or another feature
+may prove whole-program elimination for one application, but never removes its
+row or changes replacement status. `tools/check-esp32-opaque-radio-parity`
+validates the fixed full inventory and can additionally reject an unknown
+opaque member in a supplied `ESP32_LINK_MAP`. A row reaches `complete` only
+with source, tests, and hardware evidence for its entire surface; the current
+ledger deliberately reports zero complete objects.
 
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
