@@ -43,6 +43,12 @@ and beacon/probe/association/SoftAP paths. A native-width structural validator
 keeps a validated ESP packet address and length in `u32`; it is 156 bytes
 versus equivalent C++ at 158, with both at 59 Xtensa instructions and no
 unresolved calls. `make compare-wifi-management-size` enforces both gates.
+Packed 48-bit MAC addresses and writers for the common three-address header,
+open/shared/FT/SAE/FILS authentication body, association and reassociation
+requests/responses, beacon/probe fixed fields, and disassociation/deauthentication
+reasons now make those paths construct real frames without allocation. Queue
+duration, sequence allocation, action bodies, and security state remain owned
+by their respective higher layers rather than hidden in the wire writer.
 
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
