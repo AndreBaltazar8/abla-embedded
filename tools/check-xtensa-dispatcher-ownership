@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+esp_llvm_root=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
+toolchain_root=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin
+sdk_archive=$project_root/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/lib/libxtensa.a
+output_directory=$project_root/build/benchmarks/xtensa-dispatcher
+abla_object=$project_root/build/examples/radio-mac-registers/abla_dispatcher.o
+consumer_object=$output_directory/consumer.o
+linked_object=$output_directory/linked.o
+link_map=$output_directory/linked.map
+vendor_directory=$output_directory/vendor
+vendor_object=$vendor_directory/xtensa_intr_asm.S.obj
+runner=()
+
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+
+clang=$esp_llvm_root/bin/clang
+llvm_size=$esp_llvm_root/bin/llvm-size
+ld=$toolchain_root/xtensa-esp32-elf-ld
+nm=$toolchain_root/xtensa-esp32-elf-nm
+ar=$toolchain_root/xtensa-esp32-elf-ar
+objdump=$toolchain_root/xtensa-esp32-elf-objdump
+
+for executable in "$clang" "$llvm_size" "$ld" "$nm" "$ar" "$objdump"; do
+    if [[ ! -x $executable ]]; then
+        printf 'missing required Xtensa tool: %s\n' "$executable" >&2
+        exit 1
+    fi
+done
+if [[ ! -f $sdk_archive ]]; then
+    printf 'missing classic ESP32 Xtensa archive: %s\n' "$sdk_archive" >&2
+    exit 1
+fi
+if [[ ! -f $abla_object ]]; then
+    "$project_root/tools/build-example" radio-mac-registers
+fi
+
+mkdir -p "$output_directory" "$vendor_directory"
+"${runner[@]}" "$clang" --target=xtensa-esp-elf -mcpu=esp32 -O2 \
+    -ffunction-sections -fdata-sections -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -std=c++17 \
+    -c "$project_root/benchmarks/xtensa-dispatcher-consumer.cpp" \
+    -o "$consumer_object"
+
+"${runner[@]}" "$ld" -r -Map="$link_map" \
+    "$consumer_object" "$abla_object" "$sdk_archive" -o "$linked_object"
+(cd "$vendor_directory" &&
+    "${runner[@]}" "$ar" x "$sdk_archive" xtensa_intr_asm.S.obj)
+
+if rg -q 'xtensa_intr_asm\.S\.obj' "$link_map"; then
+    echo 'vendor dispatcher assembly was still selected from libxtensa.a' >&2
+    exit 1
+fi
+if ! rg -q 'xtensa_intr\.c\.obj' "$link_map"; then
+    echo 'link proof did not select the expected C dispatcher consumer' >&2
+    exit 1
+fi
+
+symbol_size() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$nm" -S --radix=d "$object" |
+        awk -v wanted="$symbol" '$4 == wanted { print $2 + 0 }'
+}
+
+interrupt_bytes=$(symbol_size "$linked_object" _xt_interrupt_table)
+exception_bytes=$(symbol_size "$linked_object" _xt_exception_table)
+if [[ $interrupt_bytes != 512 || $exception_bytes != 512 ]]; then
+    printf 'unexpected table sizes: interrupt=%s exception=%s\n' \
+        "${interrupt_bytes:-missing}" "${exception_bytes:-missing}" >&2
+    exit 1
+fi
+
+for symbol in _xt_interrupt_table _xt_exception_table xt_ints_on xt_ints_off; do
+    if ! "${runner[@]}" "$nm" "$linked_object" |
+        awk -v wanted="$symbol" \
+            '$NF == wanted && $1 != "U" { found = 1 } END { exit !found }'
+    then
+        printf 'Abla-owned symbol is not defined after linking: %s\n' \
+            "$symbol" >&2
+        exit 1
+    fi
+done
+
+data_bytes=$("${runner[@]}" "$llvm_size" -A "$abla_object" |
+    awk '$1 ~ /^\.data/ { total += $2 } END { print total + 0 }')
+if [[ $data_bytes != 1024 ]]; then
+    printf 'Abla dispatcher data is %s bytes; vendor ABI requires 1024\n' \
+        "$data_bytes" >&2
+    exit 1
+fi
+
+instruction_count() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$objdump" -d --disassemble="$symbol" "$object" |
+        awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
+}
+
+abla_on_bytes=$(symbol_size "$abla_object" xt_ints_on)
+abla_off_bytes=$(symbol_size "$abla_object" xt_ints_off)
+vendor_on_bytes=$(symbol_size "$vendor_object" xt_ints_on)
+vendor_off_bytes=$(symbol_size "$vendor_object" xt_ints_off)
+abla_on_instructions=$(instruction_count "$abla_object" xt_ints_on)
+abla_off_instructions=$(instruction_count "$abla_object" xt_ints_off)
+vendor_on_instructions=$(instruction_count "$vendor_object" xt_ints_on)
+vendor_off_instructions=$(instruction_count "$vendor_object" xt_ints_off)
+if (( abla_on_bytes > vendor_on_bytes ||
+      abla_off_bytes > vendor_off_bytes ||
+      abla_on_instructions > vendor_on_instructions ||
+      abla_off_instructions > vendor_off_instructions )); then
+    echo 'Abla interrupt helper regressed past the vendor assembly' >&2
+    exit 1
+fi
+
+printf 'dispatcher tables: Abla %s bytes, vendor ABI 1024 bytes\n' "$data_bytes"
+printf 'xt_ints_on: Abla %s bytes/%s instructions, vendor %s/%s\n' \
+    "$abla_on_bytes" "$abla_on_instructions" \
+    "$vendor_on_bytes" "$vendor_on_instructions"
+printf 'xt_ints_off: Abla %s bytes/%s instructions, vendor %s/%s\n' \
+    "$abla_off_bytes" "$abla_off_instructions" \
+    "$vendor_off_bytes" "$vendor_off_instructions"
+echo 'vendor xtensa_intr_asm.S.obj excluded; all four ABI symbols are Abla-owned'
