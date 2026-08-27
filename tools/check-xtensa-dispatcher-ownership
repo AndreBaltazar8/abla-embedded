@@ -164,6 +164,15 @@ instruction_count() {
         awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
 }
 
+section_prefix_instruction_count() {
+    local object=$1
+    local section=$2
+    local bytes=$3
+    "${runner[@]}" "$objdump" -d -j "$section" \
+        --start-address=0 --stop-address="$bytes" "$object" |
+        awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
+}
+
 machine_code() {
     local object=$1
     local symbol=$2
@@ -198,8 +207,9 @@ symbol_hex() {
 
 normalized_window_wrapper_hex() {
     local object=$1
+    local section=${2:-.text}
     local bytes
-    bytes=$(symbol_hex "$object" xthal_window_spill)
+    bytes=$(symbol_hex "$object" xthal_window_spill "$section")
     # The L32R literal and CALL0 targets carry the same relocations, but LLVM's
     # direct emitter and the archived assembler encode different placeholders.
     printf '%s000000%s000000%s\n' \
@@ -207,31 +217,42 @@ normalized_window_wrapper_hex() {
 }
 
 compare_window_spill() {
-    local abla_primary vendor_primary abla_wrapper vendor_wrapper
-    abla_primary=$(symbol_hex "$abla_object" xthal_window_spill_nw)
-    vendor_primary=$(symbol_hex \
+    local abla_wrapper vendor_wrapper
+    local abla_bytes vendor_bytes abla_instructions vendor_instructions
+    abla_bytes=$(symbol_size "$abla_object" xthal_window_spill_nw)
+    vendor_bytes=$(symbol_size \
         "$vendor_window_spill_object" xthal_window_spill_nw)
-    abla_wrapper=$(normalized_window_wrapper_hex "$abla_object")
+    abla_instructions=$(section_prefix_instruction_count \
+        "$abla_object" .text.xthal_window_spill_nw "$abla_bytes")
+    vendor_instructions=$(section_prefix_instruction_count \
+        "$vendor_window_spill_object" .text "$vendor_bytes")
+    abla_wrapper=$(normalized_window_wrapper_hex \
+        "$abla_object" .text.xthal_window_spill)
     vendor_wrapper=$(normalized_window_wrapper_hex \
         "$vendor_window_spill_object")
-    if [[ $abla_primary != "$vendor_primary" ||
-          $abla_wrapper != "$vendor_wrapper" ]]; then
-        echo 'Abla window-spill instruction bytes differ from vendor HAL' >&2
+    if (( abla_bytes > vendor_bytes ||
+          abla_instructions > vendor_instructions )); then
+        echo 'Abla window-spill routine regressed past vendor HAL' >&2
         exit 1
     fi
-    for object in "$abla_object" "$vendor_window_spill_object"; do
-        if ! "${runner[@]}" "$objdump" -r -j .text "$object" |
-            awk '$1 == "00000117" && $2 == "R_XTENSA_SLOT0_OP" &&
-                     $3 == ".literal" { literal = 1 }
-                 $1 == "0000012a" && $2 == "R_XTENSA_SLOT0_OP" &&
-                     $3 == "xthal_window_spill_nw" { call = 1 }
-                 END { exit !(literal && call) }'
-        then
-            printf 'window-spill relocation contract differs: %s\n' \
-                "$object" >&2
-            exit 1
-        fi
-    done
+    if [[ $abla_wrapper != "$vendor_wrapper" ]]; then
+        echo 'Abla window-spill wrapper differs from vendor HAL' >&2
+        exit 1
+    fi
+    if ! "${runner[@]}" "$objdump" -r \
+        -j .text.xthal_window_spill "$abla_object" |
+        awk '$1 == "00000003" && $2 == "R_XTENSA_SLOT0_OP" &&
+                 $3 == ".literal.xthal_window_spill" { literal = 1 }
+             $1 == "00000016" && $2 == "R_XTENSA_SLOT0_OP" &&
+                 $3 == "xthal_window_spill_nw" { call = 1 }
+             END { exit !(literal && call) }'
+    then
+        echo 'Abla window-spill relocation contract differs' >&2
+        exit 1
+    fi
+    printf 'xthal_window_spill_nw: Abla %s bytes/%s instructions, vendor %s/%s\n' \
+        "$abla_bytes" "$abla_instructions" \
+        "$vendor_bytes" "$vendor_instructions"
 }
 
 abla_on_bytes=$(symbol_size "$abla_object" xt_ints_on)
@@ -264,7 +285,7 @@ compare_hal_leaf() {
         printf 'Abla %s regressed past vendor HAL\n' "$symbol" >&2
         exit 1
     fi
-    if ! cmp -s \
+    if [[ ${4:-compatible} == exact ]] && ! cmp -s \
         <(machine_code "$abla_object" "$symbol") \
         <(machine_code "$vendor_object" "$vendor_symbol")
     then
@@ -372,8 +393,10 @@ compare_hal_leaf xthal_get_interrupt "$vendor_get_pending_object" \
     xthal_get_intread
 compare_hal_leaf xthal_set_intset "$vendor_set_pending_object"
 compare_hal_leaf xthal_set_intclear "$vendor_clear_pending_object"
-compare_hal_leaf xthal_save_extra_nw "$vendor_save_extra_object"
-compare_hal_leaf xthal_restore_extra_nw "$vendor_restore_extra_object"
+compare_hal_leaf xthal_save_extra_nw "$vendor_save_extra_object" \
+    xthal_save_extra_nw exact
+compare_hal_leaf xthal_restore_extra_nw "$vendor_restore_extra_object" \
+    xthal_restore_extra_nw exact
 compare_window_spill
 abla_window_address=$(symbol_address \
     "$abla_object" xthal_window_spill_nw)
@@ -388,11 +411,13 @@ if [[ $abla_window_address != "$abla_window_alias_address" ||
     echo 'window-spill compatibility alias does not share the primary entry' >&2
     exit 1
 fi
-abla_window_runtime=$(runtime_sections "$abla_object" .literal .text)
+abla_window_runtime=$(runtime_sections "$abla_object" \
+    .text.xthal_window_spill_nw .text.xthal_window_spill \
+    .literal.xthal_window_spill)
 vendor_window_runtime=$(runtime_sections \
     "$vendor_window_spill_object" .literal .text)
-if [[ $abla_window_runtime != "$vendor_window_runtime" ]]; then
-    printf 'window-spill runtime differs: Abla=%s vendor=%s\n' \
+if (( abla_window_runtime > vendor_window_runtime )); then
+    printf 'window-spill runtime regressed: Abla=%s vendor=%s\n' \
         "$abla_window_runtime" "$vendor_window_runtime" >&2
     exit 1
 fi

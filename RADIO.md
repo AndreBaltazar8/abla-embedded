@@ -85,17 +85,19 @@ The same ownership module supplies the complete low-level Xtensa interrupt
 register ABI: `xthal_get_intenable`, `xthal_set_intenable`, both public names
 for reading `INTERRUPT`, `xthal_set_intset`, and `xthal_set_intclear`. Normal
 Abla code uses `xtensaEnabledInterrupts`, `xtensaPendingInterrupts`, and the
-typed `XtensaInterruptMask` operations instead. Each compiler intrinsic is one
+typed `XtensaInterruptMask` operations instead. Each typed wrapper is one
 direct `rsr` or `wsr` instruction, without a foreign call, box, allocation, or
-runtime helper. The two non-windowed context leaves save and restore the
-classic ESP32's 48-byte extra register state as compiler-owned naked functions;
-that ABI detail is automatic and is not a source-language annotation.
-The compiler also emits the classic ESP32 register-window spill implementation
-as module assembly, automatically and only when the ownership module is
-imported. Its three compatibility symbols follow Tensilica's permissively
+runtime helper. These operations are ordinary Abla wrappers over generic typed
+inline assembly declared by `src/xtensa/assembly.ab`; that module also owns and
+registers the `$xtensa` subparser. Adding an instruction or register does not
+change `ablac`. The two non-windowed context leaves save and restore the
+classic ESP32's 48-byte extra register state as source-owned naked Abla
+functions. The same package defines the classic ESP32 register-window spill
+implementation as a naked `$xtensa` leaf, selected only when the ownership
+module is imported. Its three compatibility symbols follow Tensilica's permissively
 licensed [window-spill source](https://chromium.googlesource.com/chromiumos/third_party/sound-open-firmware/+/refs/heads/stabilize-13099.101.B%5E/src/arch/xtensa/smp/hal/windowspill_asm.S),
-specialized to the ESP32's 64 physical registers; applications declare no
-foreign ABI or source annotation.
+specialized to the ESP32's 64 physical registers. LLVM still sees ordinary
+function-local assembly and can eliminate unused paths.
 
 The Abla unhandled-interrupt fallback is automatically placed in IRAM with its
 direct call graph. Instead of calling ROM `printf` and returning to a possibly
@@ -113,13 +115,14 @@ to all 20 owned ABI names. The link map proves `xtensa_intr_asm.S.obj`,
 dispatcher tables are exactly 1,024 bytes and the level table exactly 32 bytes
 in both implementations. Abla's enable/disable leaves are 24/27 bytes and 9/10
 instructions, exactly tying the vendor assembly. All six exported register
-access names are byte-identical at 8 bytes and 3 instructions apiece. The save
-and restore leaves are likewise byte-identical at 62 bytes and 25 instructions
-each. The 273-byte primary window-spill entry is raw-byte-identical, while the
+access names tie at 8 bytes and 3 instructions apiece. The save and restore
+leaves are byte-identical at 62 bytes and 25 instructions each. The primary
+window-spill entry is 269 bytes/102 decoded instructions versus the HAL's
+273/106, while the
 35-byte wrapper matches after normalizing its identical literal/call relocation
 slots. Its compatibility alias has the exact primary address, and the full unit
-occupies 315 runtime bytes including the literal. The management/default unit
-is 222 runtime bytes versus vendor C at 253.
+occupies 308 runtime bytes including the literal versus the HAL's 315. The
+management/default unit is 222 runtime bytes versus vendor C at 253.
 The handler query is 38 bytes/12 instructions versus 43/14; the interrupt
 setter is 81/28 versus 84/28; and the exception setter is 60/21 versus 61/21.
 This is a build-only proof; the owned dispatcher is not linked into or flashed

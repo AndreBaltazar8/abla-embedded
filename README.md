@@ -177,13 +177,16 @@ five register-access plus two extra-state and window-spill objects are not
 selected. The two
 dispatcher tables occupy the exact required 1,024 bytes and the level table the
 exact 32 bytes.
-Abla's mask helpers tie the vendor assembly. Its 8-byte/3-instruction register
-access and 62-byte/25-instruction extra-state leaves are byte-identical to the
-HAL. The 273-byte window-spill entry is raw-byte-identical; the 35-byte wrapper
-matches after normalizing its identical literal/call relocation slots. The
-compatibility alias shares the primary address and the complete unit remains
-315 runtime bytes including its literal. The management/default unit is 222
-bytes versus vendor C at 253. The
+The target package defines generic typed and naked assembly signatures and
+registers its own `$xtensa` subparser; the compiler contains no Xtensa opcode,
+register, or `_nw` naming table. Abla's mask helpers tie the vendor assembly.
+Its register-access leaves tie the HAL at 8 bytes/3 instructions, and the
+62-byte/25-instruction extra-state leaves are byte-identical. The source-owned
+window-spill entry is 269 bytes/102 decoded instructions versus the HAL's
+273/106. Its 35-byte wrapper matches after normalizing identical literal/call
+relocation slots. The compatibility alias shares the primary address, making
+the complete unit 308 runtime bytes versus 315 for the HAL. The
+management/default unit is 222 bytes versus vendor C at 253. The
 handler query is 5 bytes/2 instructions smaller, the interrupt setter 3 bytes
 smaller at the same 28 instructions, and the exception setter one byte smaller
 at the same 21 instructions.
