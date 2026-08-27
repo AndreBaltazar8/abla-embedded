@@ -156,7 +156,11 @@ each is one byte smaller than the equivalent C++ leaf (24 versus 25 bytes and
 27 versus 28 bytes).
 The RX descriptor/header validator checks ownership, EOF, capacity, address,
 and both hardware signal lengths before exposing a frame; its checked leaf is
-142 bytes versus 160 bytes for equivalent C++ and has no unresolved calls.
+103 bytes/35 instructions versus 108 bytes/37 instructions for equivalent C++
+and has no unresolved calls. The same build emits a caller-owned, 8-byte RX
+queue with bounded two-phase descriptor reloads: a timeout keeps explicit
+pending state and cannot hand hardware-owned memory to the application. Its
+native-width take leaf is 220 bytes/78 instructions versus C++ at 223/79.
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

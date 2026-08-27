@@ -65,16 +65,29 @@ length within capacity, bounded 32-bit buffer address, and both legacy/HT
 signal-length fields at header offset `0x18`. It samples descriptor flags once
 and reads the signal word only after the bounds checks. The reusable logic is
 separate for host tests. `make compare-radio-rx-size` compares the same
-volatile descriptor/header algorithm against C++; the current leaf is 142
-bytes versus 160, with no unresolved Abla calls.
+volatile descriptor/header algorithm against C++; after keeping addresses in
+the ESP's native `u32` width, the current leaf is 103 bytes and 35 instructions
+versus C++ at 108 bytes and 37 instructions, with no unresolved Abla calls.
+
+`src/esp32/radio/rx_queue_esp32.ab` adds a zero-allocation view over 8 bytes of
+caller-owned internal RAM. Removal and recycling are explicit two-phase
+transactions around `RX_DESCR_RELOAD`: bounded polling can time out without
+losing the old first descriptor or appending a buffer twice, and a detached
+descriptor's stale link is cleared before DMA ownership is republished. Two
+alignment bits in the last pointer encode the transaction kind. The caller
+must serialize this trusted state against the Wi-Fi interrupt. The
+native-width take leaf is 220 bytes/78 instructions versus equivalent C++ at
+223/79, with no unresolved calls. The public open driver contains an unusual
+`RX_DESCR_NEXT == 0x3ff00000` recycling fallback; that behavior remains a
+hardware-validation item instead of being presented as verified here.
 
 The first MAC slice is `src/esp32/radio/mac_esp32.ab`. It directly implements
 the classic ESP32 MAC register operations for interrupt causes, RX DMA list
 control, four-interface BSSID/receiver filtering, five TX queues, PLCP
-parameters, and the MAC timer. Importing it has no hardware side effect, and it
-is intentionally absent from the default package entry until native delay,
-shared-clock ownership, PHY/calibration, interrupt routing, and bounded DMA
-ring ownership are implemented.
+parameters, and the MAC timer. Importing it has no hardware side effect, and
+whole-program DCE removes it when the default package consumer does not use
+native radio operations. It remains opt-in at runtime until shared-clock
+ownership, PHY/calibration, and a complete interrupt-driven DMA path exist.
 
 The register topology was independently expressed from these permissively
 licensed source references:
@@ -98,8 +111,8 @@ The remaining dependency order is:
 
 1. bind typed Abla interrupt handlers into the linker-owned Xtensa vector table
    without a C trampoline, then add interrupt-safe shared-clock ownership;
-2. bounded RX list removal/recycling and TX ownership on top of the implemented
-   null-terminated descriptor chains and RX frame validator;
+2. hardware-validate the implemented bounded RX removal/recycling path,
+   including the open driver's sentinel fallback, then complete TX ownership;
 3. open 802.11 management, authentication, association, and remaining data
    framing on top of the implemented common header fields and FCS;
 4. hardware crypto plus WPA2 key management;

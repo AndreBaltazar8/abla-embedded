@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+esp_llvm_root=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
+output_directory=$project_root/build/benchmarks/radio-rx-queue
+abla_object=$project_root/build/examples/radio-mac-registers/abla_queue.o
+cxx_object=$output_directory/reference.o
+runner=()
+
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+if [[ ! -x $esp_llvm_root/bin/clang || ! -x $esp_llvm_root/bin/llvm-size ]]; then
+    printf 'missing Espressif LLVM under %s; run make setup\n' \
+        "$esp_llvm_root" >&2
+    exit 1
+fi
+if [[ ! -f $abla_object ]]; then
+    "$project_root/tools/build-example" radio-mac-registers
+fi
+
+mkdir -p "$output_directory"
+"${runner[@]}" "$esp_llvm_root/bin/clang" \
+    --target=xtensa-esp-elf -mcpu=esp32 -O2 -fomit-frame-pointer \
+    -ffunction-sections -fdata-sections -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -std=c++17 \
+    -c "$project_root/benchmarks/radio-rx-queue-reference.cpp" \
+    -o "$cxx_object"
+
+section_bytes() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$esp_llvm_root/bin/llvm-size" -A "$object" |
+        awk -v text=".text.$symbol" -v literal=".literal.$symbol" \
+            '$1 == text || $1 == literal { total += $2 } END { print total + 0 }'
+}
+
+abla_bytes=$(section_bytes "$abla_object" abla_wifi_rx_take_first)
+cxx_bytes=$(section_bytes "$cxx_object" cxx_wifi_rx_take_first)
+printf 'Wi-Fi RX queue take leaf (.text + .literal): Abla %s bytes, C++ %s bytes\n' \
+    "$abla_bytes" "$cxx_bytes"
+if (( abla_bytes > cxx_bytes )); then
+    echo 'Abla Wi-Fi RX queue take leaf regressed past C++' >&2
+    exit 1
+fi
+
+toolchain_root=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin
+nm=$toolchain_root/xtensa-esp32-elf-nm
+objdump=$toolchain_root/xtensa-esp32-elf-objdump
+if [[ -x $nm && -x $objdump ]]; then
+    instruction_count() {
+        local object=$1
+        local symbol=$2
+        "${runner[@]}" "$objdump" -d --disassemble="$symbol" "$object" |
+            awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
+    }
+    abla_instructions=$(instruction_count \
+        "$abla_object" abla_wifi_rx_take_first)
+    cxx_instructions=$(instruction_count \
+        "$cxx_object" cxx_wifi_rx_take_first)
+    printf 'Wi-Fi RX queue take instructions: Abla %s, C++ %s\n' \
+        "$abla_instructions" "$cxx_instructions"
+    if (( abla_instructions > cxx_instructions )); then
+        echo 'Abla Wi-Fi RX queue take uses more instructions than C++' >&2
+        exit 1
+    fi
+    if "${runner[@]}" "$nm" -u "$abla_object" | grep -q .; then
+        echo 'Abla Wi-Fi RX queue object has unresolved calls' >&2
+        exit 1
+    fi
+fi
+echo 'Wi-Fi RX queue take leaf has no unresolved calls'

@@ -1,8 +1,8 @@
 #include <cstdint>
 
 extern "C" __attribute__((noinline)) bool
-cxx_wifi_rx_frame_valid(std::uint64_t descriptor_address) {
-    if (descriptor_address == 0 || descriptor_address > 0xfffffffcu ||
+cxx_wifi_rx_frame_valid(std::uint32_t descriptor_address) {
+    if (descriptor_address == 0 || descriptor_address > 0xfffffff4u ||
         (descriptor_address & 3u) != 0) {
         return false;
     }

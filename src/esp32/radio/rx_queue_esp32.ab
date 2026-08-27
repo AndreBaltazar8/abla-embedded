@@ -1,0 +1,232 @@
+import "../../register.ab"
+import "../../dma.ab"
+import "../dma_descriptor.ab"
+import "../dma_descriptor_logic.ab"
+import "./mac_esp32.ab"
+import "./rx_esp32_logic.ab"
+import "./rx_queue_esp32_logic.ab"
+import "abla/unsafe/mmio"
+
+// A zero-allocation view over two caller-owned u32 words: first descriptor and
+// last descriptor. Its two alignment bits encode the pending reload kind.
+// Keeping this state in caller storage avoids a framework global and permits
+// one queue per MAC.
+// Mutation is trusted because the caller must provide internal RAM, serialize
+// access against the Wi-Fi interrupt, and keep descriptors alive and detached
+// while a bounded reload transaction is pending.
+type WifiRxQueue = int
+
+// Native-width hot path after a queue address has been validated once. This
+// deliberately avoids widening every descriptor, loop counter, and MMIO
+// address through Abla's general-purpose `int` ABI on a 32-bit ESP target.
+@inline
+trusted fun esp32WifiRxQueueTakeFirstNative(
+    queueAddress: u32,
+    maxPolls: i32
+): u32 {
+    val zero = u32(0)
+    val one = u32(1)
+    if (queueAddress == zero || queueAddress > u32(4294967288) ||
+        (queueAddress & u32(3)) != zero || maxPolls <= i32(0)) return zero
+    val first = u32(mmioLoadU32(i64(queueAddress)))
+    val state = u32(mmioLoadU32(i64(queueAddress + u32(4))))
+    if ((state & u32(3)) != zero) return zero
+    val last = state & u32(4294967292)
+    if (first == zero || last == zero || first > u32(4294967284) ||
+        last > u32(4294967284) || ((first | last) & u32(3)) != zero) {
+        return zero
+    }
+    val flags = u32(mmioLoadU32(i64(first)))
+    val length = (flags >> u32(12)) & u32(4095)
+    val capacity = flags & u32(4095)
+    if ((flags & u32(2147483648)) != zero ||
+        (flags & u32(1073741824)) == zero || length < u32(32) ||
+        length > capacity) return zero
+    val next = u32(mmioLoadU32(i64(first + u32(8))))
+    if ((next & u32(3)) != zero ||
+        ((first == last) != (next == zero))) return zero
+    mmioStoreU32(i64(queueAddress + u32(4)), i64(last | one))
+    mmioStoreU32(i64(u32(1073164424)), i64(next))
+    val rxControl = u32(1073164420)
+    val control = u32(mmioLoadU32(i64(rxControl)))
+    mmioStoreU32(i64(rxControl), i64(control | one))
+    var remaining = maxPolls
+    var reload = u32(mmioLoadU32(i64(rxControl))) & one
+    while (reload != zero && remaining > i32(1)) {
+        remaining = remaining - i32(1)
+        reload = u32(mmioLoadU32(i64(rxControl))) & one
+    }
+    if (reload != zero) return zero
+    // The initial flags sample already proved CPU ownership. The reload
+    // acknowledgement proves the detached descriptor is no longer reachable
+    // by hardware, so another flags read-modify-write would be redundant.
+    mmioStoreU32(i64(queueAddress), i64(next))
+    mmioStoreU32(
+        i64(queueAddress + u32(4)),
+        i64(if (next == zero) zero else last)
+    )
+    first
+}
+
+@inline
+fun wifiRxQueueAt(address: int): WifiRxQueue = WifiRxQueue(address)
+
+@inline
+fun WifiRxQueue.addressValue(): int = this
+
+@inline
+fun WifiRxQueue.valid(): bool =
+    esp32WifiRxQueueStorageAddressValid(this.addressValue())
+
+@inline
+fun WifiRxQueue.word(offset: int): Register32 =
+    register32(this.addressValue() + offset)
+
+@inline
+trusted fun WifiRxQueue.first(): DmaDescriptor =
+    if (!this.valid()) dmaDescriptorAt(0)
+    else dmaDescriptorAt(this.word(esp32WifiRxQueueFirstOffset).read())
+
+@inline
+trusted fun WifiRxQueue.last(): DmaDescriptor =
+    if (!this.valid()) dmaDescriptorAt(0)
+    else dmaDescriptorAt(esp32WifiRxQueueStateLast(
+        this.word(esp32WifiRxQueueStateOffset).read()
+    ))
+
+@inline
+trusted fun WifiRxQueue.pendingKind(): int =
+    if (!this.valid()) -1
+    else esp32WifiRxQueueStatePendingKind(
+        this.word(esp32WifiRxQueueStateOffset).read()
+    )
+
+@inline
+trusted fun WifiRxQueue.reloadPending(): bool =
+    this.pendingKind() != esp32WifiRxQueueIdle
+
+trusted fun WifiRxQueue.initialize(
+    first: DmaDescriptor,
+    last: DmaDescriptor
+): bool {
+    if (!this.valid() || !esp32WifiRxQueueEndpointsValid(
+        first.addressValue(), last.addressValue()
+    )) return false
+    this.word(esp32WifiRxQueueStateOffset).write(last.addressValue())
+    this.word(esp32WifiRxQueueFirstOffset).write(first.addressValue())
+    true
+}
+
+// Start removing one completed descriptor. The old first pointer is retained
+// until RX_DESCR_RELOAD clears, so a timeout remains retryable and never hands
+// a descriptor to application code while hardware may still own it.
+@inline
+trusted fun WifiRxQueue.beginTakeFirst(): bool {
+    if (!this.valid() || this.reloadPending()) return false
+    val first = this.first()
+    val last = this.last()
+    if (first.isNull() || last.isNull()) return false
+    val flags = first.flags()
+    if (espDmaDescriptorOwnedByDma(flags) ||
+        !espDmaDescriptorSuccessfulEof(flags) ||
+        espDmaDescriptorLength(flags) < esp32WifiRxControlHeaderBytes ||
+        espDmaDescriptorLength(flags) > espDmaDescriptorCapacity(flags)) {
+        return false
+    }
+    val next = first.nextDescriptor()
+    if (!esp32WifiRxQueueDescriptorAddressValid(next.addressValue()) ||
+        (first.addressValue() == last.addressValue()) != next.isNull()) {
+        return false
+    }
+    this.word(esp32WifiRxQueueStateOffset).write(
+        last.addressValue() | esp32WifiRxQueueTaking
+    )
+    wifiMac().setRxDescriptorBase(next)
+    wifiMac().requestRxDescriptorReload()
+    true
+}
+
+@inline
+trusted fun WifiRxQueue.finishTakeFirst(
+    maxPolls: int
+): DmaDescriptor {
+    if (!this.valid() ||
+        this.pendingKind() != esp32WifiRxQueueTaking ||
+        !wifiMac().waitRxDescriptorReload(maxPolls)) return dmaDescriptorAt(0)
+    val first = this.first()
+    val next = first.nextDescriptor()
+    if (!first.claimForCpu()) return dmaDescriptorAt(0)
+    this.word(esp32WifiRxQueueFirstOffset).write(next.addressValue())
+    this.word(esp32WifiRxQueueStateOffset).write(
+        if (next.isNull()) 0 else this.last().addressValue()
+    )
+    first
+}
+
+@inline
+trusted fun WifiRxQueue.takeFirst(
+    maxPolls: int
+): DmaDescriptor {
+    // Keep the explicit begin/finish operations available for schedulers. The
+    // common bounded operation uses the 32-bit leaf on classic ESP32.
+    if (!this.valid() || maxPolls <= 0) return dmaDescriptorAt(0)
+    val boundedPolls = if (maxPolls > 2147483647) 2147483647 else maxPolls
+    dmaDescriptorAt(int(esp32WifiRxQueueTakeFirstNative(
+        u32(this.addressValue()), i32(boundedPolls)
+    )))
+}
+
+// Recycle only a detached CPU-owned descriptor. Its stale link is cleared
+// before DMA ownership is published, then the descriptor is appended. A
+// timed-out reload leaves the queue in an explicit pending state which callers
+// finish with finishRecycle; no descriptor is appended twice.
+trusted fun WifiRxQueue.beginRecycle(
+    descriptor: DmaDescriptor
+): bool {
+    if (!this.valid() || this.reloadPending() || descriptor.isNull() ||
+        !descriptor.isAligned(4)) return false
+    val flags = descriptor.flags()
+    val capacity = espDmaDescriptorCapacity(flags)
+    val buffer = descriptor.bufferAddress()
+    if (espDmaDescriptorOwnedByDma(flags) ||
+        capacity < esp32WifiRxControlHeaderBytes || buffer <= 0 ||
+        buffer > 4294967295 - capacity + 1) return false
+    val first = this.first()
+    val last = this.last()
+    if (!esp32WifiRxQueueEndpointsValid(
+        first.addressValue(), last.addressValue()
+    ) || descriptor.addressValue() == first.addressValue() ||
+        descriptor.addressValue() == last.addressValue() ||
+        !descriptor.setNext(dmaDescriptorAt(0)) ||
+        !descriptor.recycleRx()) return false
+    if (first.isNull()) {
+        this.word(esp32WifiRxQueueFirstOffset).write(
+            descriptor.addressValue()
+        )
+        wifiMac().setRxDescriptorBase(descriptor)
+    } else {
+        if (!last.setNext(descriptor)) return false
+    }
+    this.word(esp32WifiRxQueueStateOffset).write(
+        descriptor.addressValue() | esp32WifiRxQueueRecycling
+    )
+    wifiMac().requestRxDescriptorReload()
+    true
+}
+
+trusted fun WifiRxQueue.finishRecycle(
+    maxPolls: int
+): bool {
+    if (!this.valid() ||
+        this.pendingKind() != esp32WifiRxQueueRecycling ||
+        !wifiMac().waitRxDescriptorReload(maxPolls)) return false
+    this.word(esp32WifiRxQueueStateOffset).write(
+        this.last().addressValue()
+    )
+    true
+}
+
+trusted fun WifiRxQueue.recycle(
+    descriptor: DmaDescriptor,
+    maxPolls: int
+): bool = this.beginRecycle(descriptor) && this.finishRecycle(maxPolls)
