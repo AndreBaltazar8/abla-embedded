@@ -125,6 +125,15 @@ are absent from the M5Echo link map, and the combined image passed the full
 WPA2 voice smoke path. These replacements currently cost 368 bytes over the
 preceding image and therefore still need instruction-level size work.
 
+The same legacy module emits the exact 24-byte `sms4` descriptor and direct
+Abla callbacks for its 18-byte WAPI header, alternating PN step, fixed
+`36 5c` suffix, per-TID replay commit, and 16-byte trailer decap. The original
+`ieee80211_crypto_sms4.o` is absent from the M5Echo link map and the
+replacement costs 64 bytes over the preceding image. The original stale-PN
+warning was routed through the separately opaque `wifi_log` boundary; until
+that logger is replaced and the warning is restored, the SMS4 row remains
+partial even though its archive member is no longer linked.
+
 `src/crypto/block_modes.ab`, `src/esp32/crypto/cmac_gmac_esp32.ab`,
 `src/wifi/bip_logic.ab`, and `src/esp32/wifi/bip_packet_esp32.ab` implement the
 management-frame integrity portion of `ieee80211_crypto.o`. The portable layer

@@ -178,6 +178,12 @@ the retained inventory from 59 to 57. The current straightforward replacement
 adds 368 application bytes versus the preceding image, so it is retained for
 source ownership and correctness but remains an explicit size-optimization
 target.
+The same module also owns the WAPI/SMS4 descriptor and both private callbacks,
+including its 18-byte header, fixed suffix, 64-bit PN step, replay commit, and
+decap bookkeeping. This removes `ieee80211_crypto_sms4.o` and lowers the live
+link inventory from 57 to 56 objects for 64 additional application bytes. Its
+old-PN warning still belongs to the separately tracked debug/logger boundary,
+so SMS4 diagnostic parity remains partial rather than being overstated.
 The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
