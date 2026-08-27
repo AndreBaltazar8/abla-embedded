@@ -1,0 +1,172 @@
+import "../esp32/sdk/buffer.ab"
+
+// Allocation-free IEEE 802.11 CCMP wire and replay primitives. Packet numbers
+// are kept in their natural low-PN0 48-bit scalar order. A caller can retain
+// one scalar per traffic identifier without a heap-backed key object.
+type WifiCcmpPacketNumber = int
+
+val wifiCcmpMaximumPacketNumber = 281474976710655
+val wifiCcmpHeaderBytes = 8
+val wifiCcmpMicBytes = 8
+
+@inline
+fun wifiCcmpPacketNumber(value: int): WifiCcmpPacketNumber =
+    WifiCcmpPacketNumber(
+        if (value < 0 || value > wifiCcmpMaximumPacketNumber) -1 else value
+    )
+
+@inline
+fun WifiCcmpPacketNumber.rawValue(): int = this
+
+@inline
+fun WifiCcmpPacketNumber.valid(): bool =
+    this >= 0 && this <= wifiCcmpMaximumPacketNumber
+
+@inline
+fun WifiCcmpPacketNumber.octet(index: int): int =
+    if (!this.valid() || index < 0 || index >= 6) 0
+    else (this >>> (index * 8)) & 255
+
+@inline
+fun WifiCcmpPacketNumber.freshAfter(previous: WifiCcmpPacketNumber): bool =
+    this.valid() && (!previous.valid() || this > previous)
+
+@inline
+fun WifiCcmpPacketNumber.next(): WifiCcmpPacketNumber =
+    if (!this.valid()) WifiCcmpPacketNumber(0)
+    else if (this == wifiCcmpMaximumPacketNumber) WifiCcmpPacketNumber(-1)
+    else WifiCcmpPacketNumber(this + 1)
+
+trusted fun wifiCcmpWritePacketHeader(
+    output: NativeBuffer,
+    offset: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int
+): bool {
+    if (!packetNumber.valid() || keyIdentifier < 0 || keyIdentifier > 3 ||
+        offset < 0 || offset > output.capacity() - wifiCcmpHeaderBytes) {
+        return false
+    }
+    output.store(offset, packetNumber.octet(0))
+    output.store(offset + 1, packetNumber.octet(1))
+    output.store(offset + 2, 0)
+    output.store(offset + 3, 32 | (keyIdentifier << 6))
+    output.store(offset + 4, packetNumber.octet(2))
+    output.store(offset + 5, packetNumber.octet(3))
+    output.store(offset + 6, packetNumber.octet(4))
+    output.store(offset + 7, packetNumber.octet(5))
+    true
+}
+
+trusted fun wifiCcmpPacketHeaderValid(
+    input: NativeBuffer,
+    offset: int
+): bool = offset >= 0 && offset <= input.capacity() - wifiCcmpHeaderBytes &&
+    input.load(offset + 2) == 0 && (input.load(offset + 3) & 32) != 0 &&
+    (input.load(offset + 3) & 31) == 0
+
+trusted fun wifiCcmpPacketHeaderKeyIdentifier(
+    input: NativeBuffer,
+    offset: int
+): int = if (!wifiCcmpPacketHeaderValid(input, offset)) -1
+    else (input.load(offset + 3) >>> 6) & 3
+
+trusted fun wifiCcmpReadPacketNumber(
+    input: NativeBuffer,
+    offset: int
+): WifiCcmpPacketNumber {
+    if (!wifiCcmpPacketHeaderValid(input, offset)) {
+        return WifiCcmpPacketNumber(-1)
+    }
+    wifiCcmpPacketNumber(
+        input.load(offset) | (input.load(offset + 1) << 8) |
+        (input.load(offset + 4) << 16) |
+        (input.load(offset + 5) << 24) |
+        (input.load(offset + 6) << 32) |
+        (input.load(offset + 7) << 40)
+    )
+}
+
+// Build the CCM associated data and 13-byte nonce for a conventional 802.11
+// protocol-version-zero frame. Returns the AAD byte count (22, 24, 28, or 30)
+// or -1 for an invalid header. The CCMP header begins at ccmpOffset.
+@inline
+trusted fun wifiCcmpWriteAadAndNonceWithOptions(
+    frame: NativeBuffer,
+    headerLength: int,
+    ccmpOffset: int,
+    aad: NativeBuffer,
+    nonce: NativeBuffer,
+    sppAmsdu: bool
+): int {
+    if (headerLength < 24 || ccmpOffset < headerLength ||
+        ccmpOffset > frame.capacity() - wifiCcmpHeaderBytes ||
+        aad.capacity() < 30 || nonce.capacity() < 13 ||
+        !wifiCcmpPacketHeaderValid(frame, ccmpOffset)) return -1
+    val originalControl = frame.loadU16(0)
+    val frameType = (originalControl >>> 2) & 3
+    val subtype = (originalControl >>> 4) & 15
+    if ((originalControl & 3) != 0 ||
+        (frameType != 0 && frameType != 2)) return -1
+    val address4 = (originalControl & 768) == 768
+    val qos = frameType == 2 && (subtype & 8) != 0
+    val baseHeaderLength = 24 + (if (address4) 6 else 0) +
+        (if (qos) 2 else 0)
+    if (headerLength < baseHeaderLength) return -1
+
+    var control = originalControl & ~14336
+    if (frameType == 2) {
+        control = control & ~112
+        if (qos) control = control & ~32768
+    }
+    control = (control & ~14336) | 16384
+    aad.storeU16(0, control)
+    var index = 0
+    while (index < 18) {
+        aad.store(2 + index, frame.load(4 + index))
+        index = index + 1
+    }
+    aad.storeU16(20, frame.loadU16(22) & 15)
+    var aadLength = 22
+    if (address4) {
+        index = 0
+        while (index < 6) {
+            aad.store(aadLength + index, frame.load(24 + index))
+            index = index + 1
+        }
+        aadLength = aadLength + 6
+    }
+
+    var priority = 0
+    if (qos) {
+        val qosOffset = 24 + (if (address4) 6 else 0)
+        priority = frame.load(qosOffset) & (if (sppAmsdu) 143 else 15)
+        aad.store(aadLength, priority)
+        aad.store(aadLength + 1, 0)
+        aadLength = aadLength + 2
+    } else if (frameType == 0) priority = 16
+    nonce.store(0, priority)
+    index = 0
+    while (index < 6) {
+        nonce.store(1 + index, frame.load(10 + index))
+        index = index + 1
+    }
+    val packetNumber = wifiCcmpReadPacketNumber(frame, ccmpOffset)
+    index = 0
+    while (index < 6) {
+        nonce.store(7 + index, packetNumber.octet(5 - index))
+        index = index + 1
+    }
+    aadLength
+}
+
+@inline
+trusted fun wifiCcmpWriteAadAndNonce(
+    frame: NativeBuffer,
+    headerLength: int,
+    ccmpOffset: int,
+    aad: NativeBuffer,
+    nonce: NativeBuffer
+): int = wifiCcmpWriteAadAndNonceWithOptions(
+    frame, headerLength, ccmpOffset, aad, nonce, false
+)

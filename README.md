@@ -60,6 +60,7 @@ make compare-radio-power-size
 make compare-rx-chain-size
 make compare-wifi-fcs-size
 make compare-esp32-aes-size
+make compare-wifi-ccmp-size
 make imu-calibration
 make imu-offsets
 make i2s-tone
@@ -150,6 +151,11 @@ smaller than the C reference (114 versus 117 bytes of text plus literals).
 The same example emits a board-independent IEEE 802.11 FCS leaf and checks it
 against equivalent volatile-memory C: Abla is 180 bytes and 54 Xtensa
 instructions versus C at 184 bytes and 56 instructions.
+It also emits native hardware AES-CCM and complete conventional-frame
+CCMP-128/CCMP-256 request entries. Their 32-bit request layout avoids a C
+trampoline and keeps the Xtensa boundary stable while the implementation stays
+entirely in Abla. The CCMP replay leaf is 72 bytes and 27 instructions in both
+Abla and equivalent C++ with no unresolved call.
 It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
 Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;

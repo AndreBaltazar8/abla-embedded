@@ -1,0 +1,340 @@
+import "../crypto/ccm_esp32.ab"
+import "../../wifi/ccmp_logic.ab"
+import "abla/unsafe/memory"
+
+// Complete allocation-free CCMP-128/CCMP-256 frame transforms for conventional
+// protocol-version-zero 802.11 frames. The caller owns packet-number storage,
+// one replay scalar per traffic identifier, and serialization of the shared
+// AES engine. A receive PN is committed only after this decrypt call succeeds.
+
+val esp32WifiCcmpRequestKeyAddressOffset = u32(0)
+val esp32WifiCcmpRequestKeyBytesOffset = u32(4)
+val esp32WifiCcmpRequestTagBytesOffset = u32(8)
+val esp32WifiCcmpRequestInputAddressOffset = u32(12)
+val esp32WifiCcmpRequestInputBytesOffset = u32(16)
+val esp32WifiCcmpRequestHeaderBytesOffset = u32(20)
+val esp32WifiCcmpRequestPacketLowOffset = u32(24)
+val esp32WifiCcmpRequestPacketHighOffset = u32(28)
+val esp32WifiCcmpRequestKeyIdentifierOffset = u32(32)
+val esp32WifiCcmpRequestOutputAddressOffset = u32(36)
+val esp32WifiCcmpRequestOutputCapacityOffset = u32(40)
+val esp32WifiCcmpRequestPreviousLowOffset = u32(44)
+val esp32WifiCcmpRequestPreviousHighOffset = u32(48)
+val esp32WifiCcmpRequestOptionsOffset = u32(52)
+val esp32WifiCcmpRequestSppAmsdu = 1
+val esp32WifiCcmpRequestAllowSamePacketNumber = 2
+val esp32WifiCcmpRequestBytes = 56
+
+@inline
+trusted fun esp32WifiCcmpEncrypt(
+    key: NativeBuffer,
+    keyLength: int,
+    tagLength: int,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int {
+    val payloadLength = frameLength - headerLength
+    val outputLength = frameLength + wifiCcmpHeaderBytes + tagLength
+    if ((keyLength != 16 && keyLength != 32) ||
+        (tagLength != 8 && tagLength != 16) || key.capacity() < keyLength ||
+        frameLength < 24 || headerLength < 24 || payloadLength < 0 ||
+        payloadLength > 65535 || frame.capacity() < frameLength ||
+        output.capacity() < outputLength || !packetNumber.valid() ||
+        keyIdentifier < 0 || keyIdentifier > 3 || maximumPolls <= 0 ||
+        maximumPolls > 4294967295 ||
+        frame.addressValue() == output.addressValue()) return -1
+
+    var index = 0
+    while (index < headerLength) {
+        output.store(index, frame.load(index))
+        index = index + 1
+    }
+    output.storeU16(0, output.loadU16(0) | 16384)
+    if (!wifiCcmpWritePacketHeader(
+        output, headerLength, packetNumber, keyIdentifier
+    )) return -1
+    val aad = nativeBufferAt(nativeStackAllocate(30), 30)
+    val nonce = nativeBufferAt(nativeStackAllocate(13), 13)
+    val aadLength = wifiCcmpWriteAadAndNonceWithOptions(
+        output, headerLength, headerLength, aad, nonce, sppAmsdu
+    )
+    if (aadLength < 0) return -1
+    val plaintext = nativeBufferAt(
+        frame.addressValue() + headerLength, payloadLength
+    )
+    val authenticatedCiphertext = nativeBufferAt(
+        output.addressValue() + headerLength + wifiCcmpHeaderBytes,
+        payloadLength + tagLength
+    )
+    if (!esp32AesCcmEncryptWithPollLimit(
+        nativeBufferAt(key.addressValue(), keyLength), nonce, plaintext,
+        nativeBufferAt(aad.addressValue(), aadLength),
+        authenticatedCiphertext, u32(maximumPolls)
+    )) return -1
+    outputLength
+}
+
+@inline
+trusted fun esp32WifiCcmpDecrypt(
+    key: NativeBuffer,
+    keyLength: int,
+    tagLength: int,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    previousPacketNumber: WifiCcmpPacketNumber,
+    expectedKeyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false,
+    allowSamePacketNumber: bool = false
+): int {
+    val payloadLength = encryptedLength - headerLength -
+        wifiCcmpHeaderBytes - tagLength
+    val outputLength = headerLength + payloadLength
+    if ((keyLength != 16 && keyLength != 32) ||
+        (tagLength != 8 && tagLength != 16) || key.capacity() < keyLength ||
+        encryptedLength < headerLength + wifiCcmpHeaderBytes + tagLength ||
+        headerLength < 24 || payloadLength < 0 || payloadLength > 65535 ||
+        encrypted.capacity() < encryptedLength ||
+        output.capacity() < outputLength || expectedKeyIdentifier < 0 ||
+        expectedKeyIdentifier > 3 || maximumPolls <= 0 ||
+        maximumPolls > 4294967295 ||
+        !wifiCcmpPacketHeaderValid(encrypted, headerLength) ||
+        wifiCcmpPacketHeaderKeyIdentifier(encrypted, headerLength) !=
+            expectedKeyIdentifier) return -1
+    val packetNumber = wifiCcmpReadPacketNumber(encrypted, headerLength)
+    val samePacketNumber = allowSamePacketNumber && packetNumber.valid() &&
+        previousPacketNumber.valid() &&
+        packetNumber.rawValue() == previousPacketNumber.rawValue()
+    if (!packetNumber.freshAfter(previousPacketNumber) &&
+        !samePacketNumber) return -1
+
+    val aad = nativeBufferAt(nativeStackAllocate(30), 30)
+    val nonce = nativeBufferAt(nativeStackAllocate(13), 13)
+    val aadLength = wifiCcmpWriteAadAndNonceWithOptions(
+        encrypted, headerLength, headerLength, aad, nonce, sppAmsdu
+    )
+    if (aadLength < 0) return -1
+    var index = 0
+    while (index < headerLength) {
+        output.store(index, encrypted.load(index))
+        index = index + 1
+    }
+    val authenticatedCiphertext = nativeBufferAt(
+        encrypted.addressValue() + headerLength + wifiCcmpHeaderBytes,
+        payloadLength + tagLength
+    )
+    val plaintext = nativeBufferAt(
+        output.addressValue() + headerLength, payloadLength
+    )
+    if (!esp32AesCcmDecryptWithPollLimit(
+        nativeBufferAt(key.addressValue(), keyLength), nonce,
+        authenticatedCiphertext,
+        nativeBufferAt(aad.addressValue(), aadLength), plaintext,
+        u32(maximumPolls)
+    )) {
+        index = 0
+        while (index < outputLength) {
+            output.store(index, 0)
+            index = index + 1
+        }
+        return -1
+    }
+    output.storeU16(0, output.loadU16(0) & ~16384)
+    outputLength
+}
+
+trusted fun esp32WifiCcmp128Encrypt(
+    key: NativeBuffer,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int = esp32WifiCcmpEncrypt(
+    key, 16, 8, frame, frameLength, headerLength,
+    packetNumber, keyIdentifier, output, maximumPolls, sppAmsdu
+)
+
+trusted fun esp32WifiCcmp128Decrypt(
+    key: NativeBuffer,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    previousPacketNumber: WifiCcmpPacketNumber,
+    expectedKeyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false,
+    allowSamePacketNumber: bool = false
+): int = esp32WifiCcmpDecrypt(
+    key, 16, 8, encrypted, encryptedLength, headerLength,
+    previousPacketNumber, expectedKeyIdentifier, output, maximumPolls,
+    sppAmsdu, allowSamePacketNumber
+)
+
+trusted fun esp32WifiCcmp256Encrypt(
+    key: NativeBuffer,
+    frame: NativeBuffer,
+    frameLength: int,
+    headerLength: int,
+    packetNumber: WifiCcmpPacketNumber,
+    keyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false
+): int = esp32WifiCcmpEncrypt(
+    key, 32, 16, frame, frameLength, headerLength,
+    packetNumber, keyIdentifier, output, maximumPolls, sppAmsdu
+)
+
+trusted fun esp32WifiCcmp256Decrypt(
+    key: NativeBuffer,
+    encrypted: NativeBuffer,
+    encryptedLength: int,
+    headerLength: int,
+    previousPacketNumber: WifiCcmpPacketNumber,
+    expectedKeyIdentifier: int,
+    output: NativeBuffer,
+    maximumPolls: int = 100000,
+    sppAmsdu: bool = false,
+    allowSamePacketNumber: bool = false
+): int = esp32WifiCcmpDecrypt(
+    key, 32, 16, encrypted, encryptedLength, headerLength,
+    previousPacketNumber, expectedKeyIdentifier, output, maximumPolls,
+    sppAmsdu, allowSamePacketNumber
+)
+
+// Stable 32-bit Xtensa request ABI for complete frame transforms. Fields are
+// key address, key bytes, tag bytes, input address, input bytes, header bytes,
+// PN low 32, PN high 16, key id, output address, output capacity, previous PN
+// low 32, previous PN high 16, and option bits. Option bit zero preserves the
+// SPP A-MSDU-present QoS bit in AAD and nonce. Decrypt also accepts option bit
+// one to permit the same PN when a validated reassembly path requires it.
+// Encrypt ignores the previous-PN fields and same-PN option; decrypt reads the
+// PN from the CCMP header and uses the previous fields for replay rejection.
+trusted fun esp32WifiCcmpEncryptRequest32(requestAddress: u32): int {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967240) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val keyAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyAddressOffset)
+    )
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyBytesOffset)
+    ))
+    val tagBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestTagBytesOffset)
+    ))
+    val inputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestInputAddressOffset)
+    )
+    val inputBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestInputBytesOffset)
+    ))
+    val headerBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestHeaderBytesOffset)
+    ))
+    val packetLow = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestPacketLowOffset)
+    )
+    val packetHigh = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestPacketHighOffset)
+    )
+    val keyIdentifier = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyIdentifierOffset)
+    ))
+    val outputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOutputAddressOffset)
+    )
+    val outputCapacity = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOutputCapacityOffset)
+    ))
+    val options = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOptionsOffset)
+    ))
+    if (keyAddress == u32(0) || inputAddress == u32(0) ||
+        outputAddress == u32(0) || packetHigh > u32(65535) ||
+        (options & ~esp32WifiCcmpRequestSppAmsdu) != 0) return -1
+    val packetNumber = wifiCcmpPacketNumber(
+        int(packetLow) + int(packetHigh) * 4294967296
+    )
+    esp32WifiCcmpEncrypt(
+        nativeBufferAt(int(keyAddress), keyBytes), keyBytes, tagBytes,
+        nativeBufferAt(int(inputAddress), inputBytes), inputBytes,
+        headerBytes, packetNumber, keyIdentifier,
+        nativeBufferAt(int(outputAddress), outputCapacity), 100000,
+        (options & esp32WifiCcmpRequestSppAmsdu) != 0
+    )
+}
+
+trusted fun esp32WifiCcmpDecryptRequest32(requestAddress: u32): int {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967240) ||
+        (requestAddress & u32(3)) != u32(0)) return -1
+    val keyAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyAddressOffset)
+    )
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyBytesOffset)
+    ))
+    val tagBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestTagBytesOffset)
+    ))
+    val inputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestInputAddressOffset)
+    )
+    val inputBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestInputBytesOffset)
+    ))
+    val headerBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestHeaderBytesOffset)
+    ))
+    val keyIdentifier = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestKeyIdentifierOffset)
+    ))
+    val outputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOutputAddressOffset)
+    )
+    val outputCapacity = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOutputCapacityOffset)
+    ))
+    val previousLow = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestPreviousLowOffset)
+    )
+    val previousHigh = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestPreviousHighOffset)
+    )
+    val options = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32WifiCcmpRequestOptionsOffset)
+    ))
+    if (keyAddress == u32(0) || inputAddress == u32(0) ||
+        outputAddress == u32(0) ||
+        (options & ~(esp32WifiCcmpRequestSppAmsdu |
+            esp32WifiCcmpRequestAllowSamePacketNumber)) != 0 ||
+        (previousHigh > u32(65535) &&
+            !(previousHigh == u32(4294967295) &&
+                previousLow == u32(4294967295)))) return -1
+    val previousPacketNumber = wifiCcmpPacketNumber(
+        if (previousHigh == u32(4294967295)) -1
+        else int(previousLow) + int(previousHigh) * 4294967296
+    )
+    esp32WifiCcmpDecrypt(
+        nativeBufferAt(int(keyAddress), keyBytes), keyBytes, tagBytes,
+        nativeBufferAt(int(inputAddress), inputBytes), inputBytes,
+        headerBytes, previousPacketNumber, keyIdentifier,
+        nativeBufferAt(int(outputAddress), outputCapacity), 100000,
+        (options & esp32WifiCcmpRequestSppAmsdu) != 0,
+        (options & esp32WifiCcmpRequestAllowSamePacketNumber) != 0
+    )
+}

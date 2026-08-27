@@ -58,19 +58,45 @@ and 34 Xtensa instructions versus equivalent C++ at 109 bytes and 40
 instructions, with no unresolved calls. Peer storage, cryptographic exchange,
 roaming policy, and frame scheduling remain explicit higher-layer work.
 
-`src/esp32/crypto/aes_esp32.ab` owns the classic ESP32 hardware AES-128 block
-operation in Abla: DPORT clock/reset sequencing, key and text register access,
-bounded completion polling, and aligned native-width input validation. The
-primitive deliberately requires caller serialization because the engine is
-shared by Wi-Fi, TLS, SHA, secure boot, and both cores. It has no ESP-IDF,
-mbedTLS, C, or C++ call. `make compare-esp32-aes-size` checks the complete
-operation against semantically equivalent optimized C++; both currently emit
-361 bytes and 118 Xtensa instructions with no unresolved symbols. The NIST
-AES-128 ECB known-answer vector was also run successfully on the connected
-ESP32-PICO-D4 before Wi-Fi initialization, after which the same boot associated
-normally. CCMP formatting, authentication, replay state, and concurrency
-ownership remain to be implemented, so both crypto parity ledger entries are
-correctly partial rather than complete.
+`src/esp32/crypto/aes_esp32.ab` owns classic ESP32 hardware AES-128, AES-192,
+and AES-256 block encryption in Abla: DPORT clock/reset sequencing, key and
+text register access, bounded completion polling, and aligned native-width
+input validation. The primitive deliberately requires caller serialization
+because the engine is shared by Wi-Fi, TLS, SHA, secure boot, and both cores.
+It has no ESP-IDF, mbedTLS, C, or C++ call. `make compare-esp32-aes-size`
+checks the complete AES-128 operation against semantically equivalent optimized
+C++; both currently emit 361 bytes and 118 Xtensa instructions with no
+unresolved symbols.
+
+`src/esp32/crypto/ccm_esp32.ab` builds allocation-free AES-CCM over that engine
+for the 13-byte nonce and two-byte message length used by CCMP. It supports the
+standard CCM associated-data encodings applicable to ESP32-addressable buffers,
+AES-128/192/256 keys, even tags
+from 4 through 16 bytes (plus CCM*'s zero-tag transform), caller-selected
+bounded polling, constant-time tag comparison, and plaintext clearing after an
+authentication failure. `src/wifi/ccmp_logic.ab` and
+`src/esp32/wifi/ccmp_esp32.ab` add 48-bit packet numbers, header validation,
+three- and four-address AAD, management/data/QoS nonces, CCMP-128/CCMP-256
+frame transforms, mutable-header masking, SPP A-MSDU authentication, key
+identifiers, strict or explicitly same-PN replay handling, and protected-bit
+handling. Stable one-pointer 32-bit request entries are the hardware boundary;
+they require no C trampoline and avoid passing several packed 64-bit buffer
+views through the Xtensa ABI. `make compare-wifi-ccmp-size` keeps the replay
+leaf at or below equivalent C++; both currently emit 72 bytes and 27
+instructions with no unresolved symbols.
+
+AES-128, AES-256, standard CCM ciphertext and tags, direct and full-frame
+decrypt, replay rejection, tampered-MIC rejection, and failure clearing were
+run successfully on the connected ESP32-PICO-D4. The same diagnostic boot then
+associated, obtained DHCP, authenticated to the voice server, requested speech,
+and played the response. The opaque CCMP object remains `partial`, not
+`complete`: packet-buffer/key-slot dispatch, per-peer and per-TID state,
+interrupt-safe hardware ownership, and every original entry point still need
+source, tests, and hardware parity evidence.
+The original object exposes `ccmp_encap`, `ccmp_decap`,
+`ieee80211_ccmp_encrypt`, `ieee80211_ccmp_decrypt`,
+`ieee80211_decrypt_espnow_pkt`, and its cipher descriptor. None is crossed off
+until the Abla packet/key integration reproduces that complete surface.
 
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
@@ -229,6 +255,11 @@ licensed source references:
 - [ESP-IDF Xtensa HAL declarations](https://github.com/espressif/esp-idf/blob/master/components/xtensa/include/xtensa/hal.h),
   used to verify the public interrupt-register compatibility ABI
 
+CCMP mutable-header masking, QoS/SPP A-MSDU nonce construction, and replay
+edge behavior were independently cross-checked against
+[Linux mac80211 `wpa.c`](https://github.com/torvalds/linux/blob/master/net/mac80211/wpa.c).
+That protocol reference is not copied into this project.
+
 No vendor archive code or disassembly is copied into the project. Archive
 symbols, relocations, and instructions are evidence for dependency mapping and
 differential tests. Source implementation comes from public register facts,
@@ -255,7 +286,8 @@ The remaining dependency order is:
    ownership/outcomes, including the open driver's RX sentinel fallback;
 3. open 802.11 management, authentication, association, and remaining data
    framing on top of the implemented common header fields and FCS;
-4. hardware crypto plus WPA2 key management;
+4. finish packet/key integration around the implemented hardware AES and
+   CCMP-128/256, then add WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
 6. a native network interface and IP stack boundary.
 

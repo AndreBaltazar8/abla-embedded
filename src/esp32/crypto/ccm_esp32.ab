@@ -1,0 +1,529 @@
+import "./aes_esp32.ab"
+import "../sdk/buffer.ab"
+import "abla/unsafe/memory"
+
+// AES-CCM with the 13-byte nonce and two-byte message length used by CCMP.
+// The entire call is one hardware-key session. Callers must serialize it with
+// every other user of the classic ESP32 crypto peripheral.
+
+val esp32CcmDefaultMaximumPolls = u32(100000)
+val esp32CcmRequestKeyAddressOffset = u32(0)
+val esp32CcmRequestKeyBytesOffset = u32(4)
+val esp32CcmRequestNonceAddressOffset = u32(8)
+val esp32CcmRequestInputAddressOffset = u32(12)
+val esp32CcmRequestMessageBytesOffset = u32(16)
+val esp32CcmRequestAadAddressOffset = u32(20)
+val esp32CcmRequestAadBytesOffset = u32(24)
+val esp32CcmRequestOutputAddressOffset = u32(28)
+val esp32CcmRequestTagBytesOffset = u32(32)
+val esp32CcmRequestBytes = 36
+
+@inline
+fun esp32CcmTagLengthValid(length: int): bool =
+    length == 0 || (length >= 4 && length <= 16 && (length & 1) == 0)
+
+@inline
+trusted fun esp32CcmClearBlock(block: NativeBuffer): void {
+    var index = 0
+    while (index < 16) {
+        block.store(index, 0)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32CcmClearData(data: NativeBuffer, length: int): void {
+    var index = 0
+    while (index < length) {
+        data.store(index, 0)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32CcmCopyBlock(
+    destination: NativeBuffer,
+    source: NativeBuffer,
+    sourceOffset: int,
+    count: int
+): void {
+    var index = 0
+    while (index < 16) {
+        destination.store(
+            index,
+            if (index < count) source.load(sourceOffset + index) else 0
+        )
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32CcmAuthenticateBlock(
+    state: NativeBuffer,
+    source: NativeBuffer,
+    sourceOffset: int,
+    count: int,
+    block: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    esp32CcmCopyBlock(block, source, sourceOffset, count)
+    var index = 0
+    while (index < 16) {
+        block.store(index, block.load(index) ^ state.load(index))
+        index = index + 1
+    }
+    esp32AesEncryptCurrent32(
+        u32(block.addressValue()), u32(state.addressValue()), maximumPolls
+    )
+}
+
+trusted fun esp32CcmAuthenticateData(
+    state: NativeBuffer,
+    data: NativeBuffer,
+    length: int,
+    block: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    var offset = 0
+    var valid = true
+    while (valid && offset < length) {
+        var count = length - offset
+        if (count > 16) count = 16
+        valid = esp32CcmAuthenticateBlock(
+            state, data, offset, count, block, maximumPolls
+        )
+        offset = offset + count
+    }
+    valid
+}
+
+trusted fun esp32CcmStartAuthentication(
+    nonce: NativeBuffer,
+    aad: NativeBuffer,
+    aadLength: int,
+    messageLength: int,
+    tagLength: int,
+    state: NativeBuffer,
+    block: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    esp32CcmClearBlock(block)
+    var flags = if (aadLength > 0) 64 else 0
+    if (tagLength > 0) flags = flags | (((tagLength - 2) / 2) << 3)
+    block.store(0, flags | 1)
+    var index = 0
+    while (index < 13) {
+        block.store(1 + index, nonce.load(index))
+        index = index + 1
+    }
+    block.store(14, (messageLength >>> 8) & 255)
+    block.store(15, messageLength & 255)
+    if (!esp32AesEncryptCurrent32(
+        u32(block.addressValue()), u32(state.addressValue()), maximumPolls
+    )) return false
+    if (aadLength == 0) return true
+
+    esp32CcmClearBlock(block)
+    var prefixBytes = 2
+    if (aadLength < 65280) {
+        block.store(0, (aadLength >>> 8) & 255)
+        block.store(1, aadLength & 255)
+    } else if (aadLength <= 4294967295) {
+        prefixBytes = 6
+        block.store(0, 255)
+        block.store(1, 254)
+        block.store(2, (aadLength >>> 24) & 255)
+        block.store(3, (aadLength >>> 16) & 255)
+        block.store(4, (aadLength >>> 8) & 255)
+        block.store(5, aadLength & 255)
+    } else {
+        prefixBytes = 10
+        block.store(0, 255)
+        block.store(1, 255)
+        index = 0
+        while (index < 8) {
+            block.store(2 + index, (aadLength >>> ((7 - index) * 8)) & 255)
+            index = index + 1
+        }
+    }
+    var consumed = 0
+    while (consumed < aadLength && prefixBytes + consumed < 16) {
+        block.store(prefixBytes + consumed, aad.load(consumed))
+        consumed = consumed + 1
+    }
+    index = 0
+    while (index < 16) {
+        block.store(index, block.load(index) ^ state.load(index))
+        index = index + 1
+    }
+    if (!esp32AesEncryptCurrent32(
+        u32(block.addressValue()), u32(state.addressValue()), maximumPolls
+    )) return false
+    var offset = consumed
+    var valid = true
+    while (valid && offset < aadLength) {
+        var count = aadLength - offset
+        if (count > 16) count = 16
+        valid = esp32CcmAuthenticateBlock(
+            state, aad, offset, count, block, maximumPolls
+        )
+        offset = offset + count
+    }
+    valid
+}
+
+trusted fun esp32CcmPrepareCounter(
+    counter: NativeBuffer,
+    nonce: NativeBuffer
+): void {
+    esp32CcmClearBlock(counter)
+    counter.store(0, 1)
+    var index = 0
+    while (index < 13) {
+        counter.store(1 + index, nonce.load(index))
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32CcmTransform(
+    input: NativeBuffer,
+    output: NativeBuffer,
+    length: int,
+    counter: NativeBuffer,
+    stream: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    var offset = 0
+    var counterValue = 1
+    var valid = true
+    while (valid && offset < length) {
+        counter.store(14, (counterValue >>> 8) & 255)
+        counter.store(15, counterValue & 255)
+        valid = esp32AesEncryptCurrent32(
+            u32(counter.addressValue()), u32(stream.addressValue()),
+            maximumPolls
+        )
+        var count = length - offset
+        if (count > 16) count = 16
+        var index = 0
+        while (valid && index < count) {
+            output.store(
+                offset + index,
+                input.load(offset + index) ^ stream.load(index)
+            )
+            index = index + 1
+        }
+        offset = offset + count
+        counterValue = counterValue + 1
+    }
+    valid
+}
+
+@inline
+trusted fun esp32AesCcmEncryptWithPollLimit(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    plaintext: NativeBuffer,
+    aad: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val keyLength = key.capacity()
+    val plaintextLength = plaintext.capacity()
+    val aadLength = aad.capacity()
+    val tagLength = authenticatedCiphertext.capacity() - plaintextLength
+    if ((keyLength != 16 && keyLength != 24 && keyLength != 32) ||
+        nonce.capacity() < 13 ||
+        plaintextLength < 0 || plaintextLength > 65535 ||
+        aadLength < 0 || maximumPolls == u32(0) ||
+        authenticatedCiphertext.capacity() < plaintextLength ||
+        !esp32CcmTagLengthValid(tagLength)) return false
+    val ciphertext = nativeBufferAt(
+        authenticatedCiphertext.addressValue(), plaintextLength
+    )
+    val tag = nativeBufferAt(
+        authenticatedCiphertext.addressValue() + plaintextLength, tagLength
+    )
+    val workspaceAddress = nativeStackAllocate(96)
+    val keyCopy = nativeBufferAt(workspaceAddress, 32)
+    val state = nativeBufferAt(workspaceAddress + 32, 16)
+    val block = nativeBufferAt(workspaceAddress + 48, 16)
+    val counter = nativeBufferAt(workspaceAddress + 64, 16)
+    val stream = nativeBufferAt(workspaceAddress + 80, 16)
+    var index = 0
+    while (index < keyLength) {
+        keyCopy.store(index, key.load(index))
+        index = index + 1
+    }
+    if (!esp32AesBegin32(u32(keyCopy.addressValue()), keyLength) ||
+        !esp32CcmStartAuthentication(
+            nonce, aad, aadLength, plaintextLength, tagLength,
+            state, block, maximumPolls
+        ) || !esp32CcmAuthenticateData(
+            state, plaintext, plaintextLength, block, maximumPolls
+    )) {
+        esp32CcmClearData(
+            authenticatedCiphertext, authenticatedCiphertext.capacity()
+        )
+        return false
+    }
+    esp32CcmPrepareCounter(counter, nonce)
+    if (!esp32CcmTransform(
+        plaintext, ciphertext, plaintextLength, counter, stream, maximumPolls
+    )) {
+        esp32CcmClearData(
+            authenticatedCiphertext, authenticatedCiphertext.capacity()
+        )
+        return false
+    }
+    counter.store(14, 0)
+    counter.store(15, 0)
+    if (!esp32AesEncryptCurrent32(
+        u32(counter.addressValue()), u32(stream.addressValue()), maximumPolls
+    )) {
+        esp32CcmClearData(
+            authenticatedCiphertext, authenticatedCiphertext.capacity()
+        )
+        return false
+    }
+    index = 0
+    while (index < tagLength) {
+        tag.store(index, state.load(index) ^ stream.load(index))
+        index = index + 1
+    }
+    true
+}
+
+@inline
+trusted fun esp32AesCcmEncrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    plaintext: NativeBuffer,
+    aad: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer
+): bool = esp32AesCcmEncryptWithPollLimit(
+    key, nonce, plaintext, aad, authenticatedCiphertext,
+    esp32CcmDefaultMaximumPolls
+)
+
+trusted fun esp32AesCcm128Encrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    plaintext: NativeBuffer,
+    aad: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer
+): bool = if (key.capacity() < 16) false else esp32AesCcmEncrypt(
+    nativeBufferAt(key.addressValue(), 16), nonce, plaintext, aad,
+    authenticatedCiphertext
+)
+
+trusted fun esp32AesCcm256Encrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    plaintext: NativeBuffer,
+    aad: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer
+): bool = if (key.capacity() < 32) false else esp32AesCcmEncrypt(
+    nativeBufferAt(key.addressValue(), 32), nonce, plaintext, aad,
+    authenticatedCiphertext
+)
+
+@inline
+trusted fun esp32AesCcmDecryptWithPollLimit(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer,
+    aad: NativeBuffer,
+    plaintext: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val keyLength = key.capacity()
+    val ciphertextLength = plaintext.capacity()
+    val aadLength = aad.capacity()
+    val tagLength = authenticatedCiphertext.capacity() - ciphertextLength
+    if ((keyLength != 16 && keyLength != 24 && keyLength != 32) ||
+        nonce.capacity() < 13 ||
+        ciphertextLength < 0 || ciphertextLength > 65535 ||
+        aadLength < 0 || maximumPolls == u32(0) ||
+        authenticatedCiphertext.capacity() < ciphertextLength ||
+        !esp32CcmTagLengthValid(tagLength)) return false
+    val ciphertext = nativeBufferAt(
+        authenticatedCiphertext.addressValue(), ciphertextLength
+    )
+    val tag = nativeBufferAt(
+        authenticatedCiphertext.addressValue() + ciphertextLength, tagLength
+    )
+    val workspaceAddress = nativeStackAllocate(96)
+    val keyCopy = nativeBufferAt(workspaceAddress, 32)
+    val state = nativeBufferAt(workspaceAddress + 32, 16)
+    val block = nativeBufferAt(workspaceAddress + 48, 16)
+    val counter = nativeBufferAt(workspaceAddress + 64, 16)
+    val stream = nativeBufferAt(workspaceAddress + 80, 16)
+    var index = 0
+    while (index < keyLength) {
+        keyCopy.store(index, key.load(index))
+        index = index + 1
+    }
+    if (!esp32AesBegin32(u32(keyCopy.addressValue()), keyLength)) {
+        esp32CcmClearData(plaintext, ciphertextLength)
+        return false
+    }
+    esp32CcmPrepareCounter(counter, nonce)
+    if (!esp32CcmTransform(
+        ciphertext, plaintext, ciphertextLength, counter, stream, maximumPolls
+    ) || !esp32CcmStartAuthentication(
+        nonce, aad, aadLength, ciphertextLength, tagLength,
+        state, block, maximumPolls
+    ) || !esp32CcmAuthenticateData(
+        state, plaintext, ciphertextLength, block, maximumPolls
+    )) {
+        esp32CcmClearData(plaintext, ciphertextLength)
+        return false
+    }
+    counter.store(14, 0)
+    counter.store(15, 0)
+    if (!esp32AesEncryptCurrent32(
+        u32(counter.addressValue()), u32(stream.addressValue()), maximumPolls
+    )) {
+        esp32CcmClearData(plaintext, ciphertextLength)
+        return false
+    }
+    var difference = 0
+    index = 0
+    while (index < tagLength) {
+        difference = difference |
+            (tag.load(index) ^ state.load(index) ^ stream.load(index))
+        index = index + 1
+    }
+    if (difference != 0) {
+        esp32CcmClearData(plaintext, ciphertextLength)
+        return false
+    }
+    true
+}
+
+@inline
+trusted fun esp32AesCcmDecrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer,
+    aad: NativeBuffer,
+    plaintext: NativeBuffer
+): bool = esp32AesCcmDecryptWithPollLimit(
+    key, nonce, authenticatedCiphertext, aad, plaintext,
+    esp32CcmDefaultMaximumPolls
+)
+
+trusted fun esp32AesCcm128Decrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer,
+    aad: NativeBuffer,
+    plaintext: NativeBuffer
+): bool = if (key.capacity() < 16) false else esp32AesCcmDecrypt(
+    nativeBufferAt(key.addressValue(), 16), nonce, authenticatedCiphertext,
+    aad, plaintext
+)
+
+trusted fun esp32AesCcm256Decrypt(
+    key: NativeBuffer,
+    nonce: NativeBuffer,
+    authenticatedCiphertext: NativeBuffer,
+    aad: NativeBuffer,
+    plaintext: NativeBuffer
+): bool = if (key.capacity() < 32) false else esp32AesCcmDecrypt(
+    nativeBufferAt(key.addressValue(), 32), nonce, authenticatedCiphertext,
+    aad, plaintext
+)
+
+// Stable 32-bit Xtensa entry points for callers which keep several buffers
+// live at once. The request is nine little-endian u32 fields: key address,
+// key bytes, nonce address, input address, message bytes, AAD address,
+// AAD bytes, output address, and tag bytes. Encryption writes ciphertext then
+// tag; decryption reads that same combined representation.
+trusted fun esp32AesCcmEncryptRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967260) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val keyAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestKeyAddressOffset)
+    )
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestKeyBytesOffset)
+    ))
+    val nonceAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestNonceAddressOffset)
+    )
+    val inputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestInputAddressOffset)
+    )
+    val messageBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestMessageBytesOffset)
+    ))
+    val aadAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestAadAddressOffset)
+    )
+    val aadBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestAadBytesOffset)
+    ))
+    val outputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestOutputAddressOffset)
+    )
+    val tagBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestTagBytesOffset)
+    ))
+    if (keyAddress == u32(0) || nonceAddress == u32(0) ||
+        inputAddress == u32(0) || outputAddress == u32(0) ||
+        (aadBytes > 0 && aadAddress == u32(0))) return false
+    esp32AesCcmEncrypt(
+        nativeBufferAt(int(keyAddress), keyBytes),
+        nativeBufferAt(int(nonceAddress), 13),
+        nativeBufferAt(int(inputAddress), messageBytes),
+        nativeBufferAt(int(aadAddress), aadBytes),
+        nativeBufferAt(int(outputAddress), messageBytes + tagBytes)
+    )
+}
+
+trusted fun esp32AesCcmDecryptRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) ||
+        requestAddress > u32(4294967260) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val keyAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestKeyAddressOffset)
+    )
+    val keyBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestKeyBytesOffset)
+    ))
+    val nonceAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestNonceAddressOffset)
+    )
+    val inputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestInputAddressOffset)
+    )
+    val messageBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestMessageBytesOffset)
+    ))
+    val aadAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestAadAddressOffset)
+    )
+    val aadBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestAadBytesOffset)
+    ))
+    val outputAddress = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestOutputAddressOffset)
+    )
+    val tagBytes = int(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + esp32CcmRequestTagBytesOffset)
+    ))
+    if (keyAddress == u32(0) || nonceAddress == u32(0) ||
+        inputAddress == u32(0) || outputAddress == u32(0) ||
+        (aadBytes > 0 && aadAddress == u32(0))) return false
+    esp32AesCcmDecrypt(
+        nativeBufferAt(int(keyAddress), keyBytes),
+        nativeBufferAt(int(nonceAddress), 13),
+        nativeBufferAt(int(inputAddress), messageBytes + tagBytes),
+        nativeBufferAt(int(aadAddress), aadBytes),
+        nativeBufferAt(int(outputAddress), messageBytes)
+    )
+}
