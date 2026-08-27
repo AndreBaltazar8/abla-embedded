@@ -169,15 +169,21 @@ It has no unresolved call. A separate target-only Abla module now owns the
 classic ESP32's 64-entry interrupt table, 128-entry exception table, 32-byte
 interrupt-level table, all six dispatcher compatibility functions, and all six
 public names covering the five interrupt-register HAL operations. It also owns
-the two non-windowed 48-byte extra-state save/restore leaves. `make
+the two non-windowed 48-byte extra-state save/restore leaves and all three ABI
+names for the register-window spill unit. `make
 check-xtensa-dispatcher-ownership` links that object against the installed
 archives and proves the vendor dispatcher assembly, C, interrupt-level, and
-five register-access plus two extra-state objects are not selected. The two
+five register-access plus two extra-state and window-spill objects are not
+selected. The two
 dispatcher tables occupy the exact required 1,024 bytes and the level table the
 exact 32 bytes.
 Abla's mask helpers tie the vendor assembly. Its 8-byte/3-instruction register
 access and 62-byte/25-instruction extra-state leaves are byte-identical to the
-HAL. The management/default unit is 222 bytes versus vendor C at 253. The
+HAL. The 273-byte window-spill entry is raw-byte-identical; the 35-byte wrapper
+matches after normalizing its identical literal/call relocation slots. The
+compatibility alias shares the primary address and the complete unit remains
+315 runtime bytes including its literal. The management/default unit is 222
+bytes versus vendor C at 253. The
 handler query is 5 bytes/2 instructions smaller, the interrupt setter 3 bytes
 smaller at the same 28 instructions, and the exception setter one byte smaller
 at the same 21 instructions.

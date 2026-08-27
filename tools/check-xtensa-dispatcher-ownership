@@ -24,6 +24,7 @@ vendor_set_pending_object=$vendor_hal_directory/int_asm--set_intset.o
 vendor_clear_pending_object=$vendor_hal_directory/int_asm--set_intclear.o
 vendor_save_extra_object=$vendor_hal_directory/state_asm--save_extra_nw.o
 vendor_restore_extra_object=$vendor_hal_directory/state_asm--restore_extra_nw.o
+vendor_window_spill_object=$vendor_hal_directory/windowspill_asm.o
 runner=()
 
 if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
@@ -69,7 +70,7 @@ mkdir -p "$output_directory" "$vendor_directory" "$vendor_hal_directory"
         int_asm--get_intenable.o int_asm--set_intenable.o \
         int_asm--get_interrupt.o int_asm--set_intset.o \
         int_asm--set_intclear.o state_asm--save_extra_nw.o \
-        state_asm--restore_extra_nw.o)
+        state_asm--restore_extra_nw.o windowspill_asm.o)
 
 if rg -q 'xtensa_intr_asm\.S\.obj' "$link_map"; then
     echo 'vendor dispatcher assembly was still selected from libxtensa.a' >&2
@@ -86,7 +87,7 @@ fi
 for member in int_asm--get_intenable.o int_asm--set_intenable.o \
     int_asm--get_interrupt.o int_asm--set_intset.o \
     int_asm--set_intclear.o state_asm--save_extra_nw.o \
-    state_asm--restore_extra_nw.o
+    state_asm--restore_extra_nw.o windowspill_asm.o
 do
     if rg -q "${member//./\\.}" "$link_map"; then
         printf 'vendor interrupt-register HAL was still selected: %s\n' \
@@ -100,6 +101,13 @@ symbol_size() {
     local symbol=$2
     "${runner[@]}" "$nm" -S --radix=d "$object" |
         awk -v wanted="$symbol" '$4 == wanted { print $2 + 0 }'
+}
+
+symbol_address() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$nm" --radix=d "$object" |
+        awk -v wanted="$symbol" '$NF == wanted { print $1 + 0 }'
 }
 
 interrupt_bytes=$(symbol_size "$linked_object" _xt_interrupt_table)
@@ -119,7 +127,9 @@ for symbol in _xt_interrupt_table _xt_exception_table Xthal_intlevel \
     xt_set_exception_handler \
     xthal_get_intenable xthal_set_intenable xthal_get_intread \
     xthal_get_interrupt xthal_set_intset xthal_set_intclear \
-    xthal_save_extra_nw xthal_restore_extra_nw
+    xthal_save_extra_nw xthal_restore_extra_nw \
+    xthal_window_spill_nw xthal_spill_registers_into_stack_nw \
+    xthal_window_spill
 do
     if ! "${runner[@]}" "$nm" "$linked_object" |
         awk -v wanted="$symbol" \
@@ -159,6 +169,69 @@ machine_code() {
     local symbol=$2
     "${runner[@]}" "$objdump" -d --disassemble="$symbol" "$object" |
         awk '/^[[:space:]]*[[:xdigit:]]+:/ { print $2 }'
+}
+
+section_hex() {
+    local object=$1
+    local section=$2
+    "${runner[@]}" "$objdump" -s -j "$section" "$object" |
+        awk '{
+            for (field = 2; field <= 5; field += 1) {
+                if ($field ~ /^[[:xdigit:]]+$/ &&
+                    length($field) <= 8 && length($field) % 2 == 0) {
+                    printf "%s", tolower($field)
+                }
+            }
+        } END { print "" }'
+}
+
+symbol_hex() {
+    local object=$1
+    local symbol=$2
+    local section=${3:-.text}
+    local address size bytes
+    address=$(symbol_address "$object" "$symbol")
+    size=$(symbol_size "$object" "$symbol")
+    bytes=$(section_hex "$object" "$section")
+    printf '%s\n' "${bytes:$((address * 2)):$((size * 2))}"
+}
+
+normalized_window_wrapper_hex() {
+    local object=$1
+    local bytes
+    bytes=$(symbol_hex "$object" xthal_window_spill)
+    # The L32R literal and CALL0 targets carry the same relocations, but LLVM's
+    # direct emitter and the archived assembler encode different placeholders.
+    printf '%s000000%s000000%s\n' \
+        "${bytes:0:6}" "${bytes:12:32}" "${bytes:50}"
+}
+
+compare_window_spill() {
+    local abla_primary vendor_primary abla_wrapper vendor_wrapper
+    abla_primary=$(symbol_hex "$abla_object" xthal_window_spill_nw)
+    vendor_primary=$(symbol_hex \
+        "$vendor_window_spill_object" xthal_window_spill_nw)
+    abla_wrapper=$(normalized_window_wrapper_hex "$abla_object")
+    vendor_wrapper=$(normalized_window_wrapper_hex \
+        "$vendor_window_spill_object")
+    if [[ $abla_primary != "$vendor_primary" ||
+          $abla_wrapper != "$vendor_wrapper" ]]; then
+        echo 'Abla window-spill instruction bytes differ from vendor HAL' >&2
+        exit 1
+    fi
+    for object in "$abla_object" "$vendor_window_spill_object"; do
+        if ! "${runner[@]}" "$objdump" -r -j .text "$object" |
+            awk '$1 == "00000117" && $2 == "R_XTENSA_SLOT0_OP" &&
+                     $3 == ".literal" { literal = 1 }
+                 $1 == "0000012a" && $2 == "R_XTENSA_SLOT0_OP" &&
+                     $3 == "xthal_window_spill_nw" { call = 1 }
+                 END { exit !(literal && call) }'
+        then
+            printf 'window-spill relocation contract differs: %s\n' \
+                "$object" >&2
+            exit 1
+        fi
+    done
 }
 
 abla_on_bytes=$(symbol_size "$abla_object" xt_ints_on)
@@ -301,6 +374,30 @@ compare_hal_leaf xthal_set_intset "$vendor_set_pending_object"
 compare_hal_leaf xthal_set_intclear "$vendor_clear_pending_object"
 compare_hal_leaf xthal_save_extra_nw "$vendor_save_extra_object"
 compare_hal_leaf xthal_restore_extra_nw "$vendor_restore_extra_object"
+compare_window_spill
+abla_window_address=$(symbol_address \
+    "$abla_object" xthal_window_spill_nw)
+abla_window_alias_address=$(symbol_address \
+    "$abla_object" xthal_spill_registers_into_stack_nw)
+vendor_window_address=$(symbol_address \
+    "$vendor_window_spill_object" xthal_window_spill_nw)
+vendor_window_alias_address=$(symbol_address \
+    "$vendor_window_spill_object" xthal_spill_registers_into_stack_nw)
+if [[ $abla_window_address != "$abla_window_alias_address" ||
+      $vendor_window_address != "$vendor_window_alias_address" ]]; then
+    echo 'window-spill compatibility alias does not share the primary entry' >&2
+    exit 1
+fi
+abla_window_runtime=$(runtime_sections "$abla_object" .literal .text)
+vendor_window_runtime=$(runtime_sections \
+    "$vendor_window_spill_object" .literal .text)
+if [[ $abla_window_runtime != "$vendor_window_runtime" ]]; then
+    printf 'window-spill runtime differs: Abla=%s vendor=%s\n' \
+        "$abla_window_runtime" "$vendor_window_runtime" >&2
+    exit 1
+fi
+printf 'window-spill unit: Abla %s bytes, vendor HAL %s bytes; alias exact\n' \
+    "$abla_window_runtime" "$vendor_window_runtime"
 printf 'dispatcher management runtime: Abla %s bytes, vendor C %s bytes\n' \
     "$abla_management_bytes" "$vendor_management_bytes"
 printf 'unhandled fallback: Abla %s bytes, vendor C+ROM format %s bytes\n' \
@@ -314,4 +411,4 @@ printf 'interrupt setter: Abla %s bytes/%s instructions, vendor C %s/%s\n' \
 printf 'exception setter: Abla %s bytes/%s instructions, vendor C %s/%s\n' \
     "$abla_set_exception_bytes" "$abla_set_exception_instructions" \
     "$vendor_set_exception_bytes" "$vendor_set_exception_instructions"
-echo 'vendor Xtensa dispatcher assembly, C, interrupt-level, five interrupt-register, and two extra-state objects excluded; all 17 ABI names are Abla-owned'
+echo 'vendor Xtensa dispatcher assembly, C, interrupt-level, five interrupt-register, two extra-state, and window-spill objects excluded; all 20 ABI names are Abla-owned'

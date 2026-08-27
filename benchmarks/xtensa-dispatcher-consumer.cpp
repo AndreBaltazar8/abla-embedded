@@ -18,6 +18,9 @@ void xthal_set_intset(uint32_t mask);
 void xthal_set_intclear(uint32_t mask);
 void xthal_save_extra_nw(void *state);
 void xthal_restore_extra_nw(void *state);
+int xthal_window_spill_nw(void);
+int xthal_spill_registers_into_stack_nw(void);
+void xthal_window_spill(void);
 }
 
 static uint32_t extra_state[12];
@@ -43,5 +46,10 @@ extern "C" uintptr_t abla_dispatcher_link_probe(uint32_t mask) {
     xthal_set_intclear(mask);
     xthal_save_extra_nw(extra_state);
     xthal_restore_extra_nw(extra_state);
+    // This is a link-only probe: the _nw entries require WOE disabled and are
+    // never executed by the ownership check.
+    result ^= static_cast<uintptr_t>(xthal_window_spill_nw());
+    result ^= static_cast<uintptr_t>(xthal_spill_registers_into_stack_nw());
+    xthal_window_spill();
     return result;
 }

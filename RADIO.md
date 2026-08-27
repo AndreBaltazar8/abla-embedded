@@ -90,6 +90,12 @@ direct `rsr` or `wsr` instruction, without a foreign call, box, allocation, or
 runtime helper. The two non-windowed context leaves save and restore the
 classic ESP32's 48-byte extra register state as compiler-owned naked functions;
 that ABI detail is automatic and is not a source-language annotation.
+The compiler also emits the classic ESP32 register-window spill implementation
+as module assembly, automatically and only when the ownership module is
+imported. Its three compatibility symbols follow Tensilica's permissively
+licensed [window-spill source](https://chromium.googlesource.com/chromiumos/third_party/sound-open-firmware/+/refs/heads/stabilize-13099.101.B%5E/src/arch/xtensa/smp/hal/windowspill_asm.S),
+specialized to the ESP32's 64 physical registers; applications declare no
+foreign ABI or source annotation.
 
 The Abla unhandled-interrupt fallback is automatically placed in IRAM with its
 direct call graph. Instead of calling ROM `printf` and returning to a possibly
@@ -99,16 +105,21 @@ complete saved-frame and crash-reporting policy.
 
 `make check-xtensa-dispatcher-ownership` performs a relocatable link against
 the installed classic-ESP32 `libxtensa.a` and `libxt_hal.a`, forcing references
-to all 17 owned ABI names. The link map proves `xtensa_intr_asm.S.obj`,
+to all 20 owned ABI names. The link map proves `xtensa_intr_asm.S.obj`,
 `xtensa_intr.c.obj`, `interrupts--intlevel.o`, and all five relevant
 `int_asm--*.o` register-access members are excluded, along with
-`state_asm--save_extra_nw.o` and `state_asm--restore_extra_nw.o`. The two
+`state_asm--save_extra_nw.o`, `state_asm--restore_extra_nw.o`, and
+`windowspill_asm.o`. The two
 dispatcher tables are exactly 1,024 bytes and the level table exactly 32 bytes
 in both implementations. Abla's enable/disable leaves are 24/27 bytes and 9/10
 instructions, exactly tying the vendor assembly. All six exported register
 access names are byte-identical at 8 bytes and 3 instructions apiece. The save
 and restore leaves are likewise byte-identical at 62 bytes and 25 instructions
-each. Its management/default unit is 222 runtime bytes versus vendor C at 253.
+each. The 273-byte primary window-spill entry is raw-byte-identical, while the
+35-byte wrapper matches after normalizing its identical literal/call relocation
+slots. Its compatibility alias has the exact primary address, and the full unit
+occupies 315 runtime bytes including the literal. The management/default unit
+is 222 runtime bytes versus vendor C at 253.
 The handler query is 38 bytes/12 instructions versus 43/14; the interrupt
 setter is 81/28 versus 84/28; and the exception setter is 60/21 versus 61/21.
 This is a build-only proof; the owned dispatcher is not linked into or flashed
@@ -188,9 +199,9 @@ at 21 bytes and 8 instructions. Both occupy 29 total code-plus-literal IRAM
 bytes. No export, boxed function value, C trampoline, registration call, or
 unresolved call remains. The optional Abla-owned dispatcher modules also close
 the table, interrupt-level data, mask-helper assembly, interrupt-register HAL,
-extra-state save/restore, and C management/default boundaries in a relocatable
-link. The Xtensa register-window spill and FreeRTOS vector/context objects,
-platform exception panic path, and startup still remain external boundaries.
+extra-state save/restore, register-window spill, and C management/default
+boundaries in a relocatable link. The FreeRTOS vector/context objects, platform
+exception panic path, and startup still remain external boundaries.
 
 The remaining dependency order is:
 
