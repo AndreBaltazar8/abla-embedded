@@ -56,8 +56,18 @@ including the Wi-Fi MAC source and its conventional CPU interrupt line. It has
 no import-time hardware side effect. `make compare-xtensa-interrupt-size`
 checks equivalent C++ leaves under identical flags: enable is 24 Abla bytes
 versus 25 C++ bytes and disable is 27 versus 28, with equal 9/10 instruction
-counts. Core ID is 11 bytes and four instructions in both languages. The Abla
-object has no unresolved calls.
+counts. Core ID is 11 bytes and four instructions in both languages.
+
+The compiler also exposes the linker-owned `_xt_interrupt_table` address as a
+native `u32`; no foreign registration function is declared or called. The
+target-only `src/esp32/interrupt_handler_esp32.ab` layer accepts only interrupts
+dispatched at levels 1 through 3, reads PRID once, and rejects cross-core
+installation. It disables only the selected line, writes the zero argument
+before publishing the handler address with ordered volatile stores, then
+restores the line only when it was previously enabled. The complete Wi-Fi-MAC
+installer is 97 bytes and 33 instructions for Abla versus 99 bytes and 33
+instructions for equivalent C++. The object has no unresolved calls; the
+dispatcher table is its sole unresolved data symbol.
 
 `src/esp32/radio/rx_esp32.ab` validates a completed RX descriptor before any
 frame is exposed: CPU ownership, successful EOF, 32-byte hardware header,
@@ -111,6 +121,11 @@ licensed source references:
 - [`esp32-open-mac`](https://github.com/esp32-open-mac/esp32-open-mac)
   at commit
   `20ce43d595be914b4d3f553b28352bc07e003fa1` (MIT)
+- [ESP-IDF `xtensa_intr.c`](https://github.com/espressif/esp-idf/blob/master/components/xtensa/xtensa_intr.c)
+  and
+  [`xtensa_intr_asm.S`](https://github.com/espressif/esp-idf/blob/master/components/xtensa/xtensa_intr_asm.S),
+  used to verify the public two-word dispatcher layout, interrupt-level gate,
+  and core-interleaved table indexing
 
 No vendor archive code or disassembly is copied into the project. Archive
 symbols, relocations, and instructions are evidence for dependency mapping and
@@ -119,17 +134,18 @@ permissively licensed open drivers, protocol specifications, and behavior
 measured on owned hardware.
 
 The compiler and framework now produce a typed, native no-argument Xtensa
-handler entry from a named top-level Abla function. The entry, its literal
-pool, and its direct Abla call graph reside in `.iram1.*`; the build-only Wi-Fi
-MAC acknowledge handler ties equivalent C++ at 21 bytes and 8 instructions.
-Both occupy 29 total code-plus-literal IRAM bytes. No export, boxed function
-value, C trampoline, or unresolved call remains.
+handler entry from a named top-level Abla function and install it directly.
+The entry, its literal pool, and its direct Abla call graph reside in
+`.iram1.*`; the build-only Wi-Fi MAC acknowledge handler ties equivalent C++
+at 21 bytes and 8 instructions. Both occupy 29 total code-plus-literal IRAM
+bytes. No export, boxed function value, C trampoline, registration call, or
+unresolved call remains. The linker-provided table itself remains an external
+data boundary.
 
 The remaining dependency order is:
 
-1. install the typed entry into the linker-owned Xtensa dispatcher table from
-   Abla, then replace the remaining vector/table assembly and add
-   interrupt-safe shared-clock ownership;
+1. replace the remaining linker-owned dispatcher table and vector assembly,
+   then add interrupt-safe shared-clock ownership;
 2. hardware-validate the implemented bounded RX removal/recycling path and TX
    ownership/outcomes, including the open driver's RX sentinel fallback;
 3. open 802.11 management, authentication, association, and remaining data

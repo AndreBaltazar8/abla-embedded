@@ -28,15 +28,17 @@ Named top-level Xtensa interrupt functions use a compiler-generated native
 entry instead of the boxed function dispatcher. The entry and every direct
 Abla callee are assigned to `.iram1.*` automatically; closure and alias inputs
 are compile errors. This is code generation rather than a hidden SDK service:
-the resulting object contains the handler implementation and literal pool, and
-the framework separately documents which vector/table implementation installs
-the address.
+the resulting object contains the handler implementation and literal pool. The
+framework installs the address directly into the current core's linker-owned
+two-word dispatcher slot while its interrupt line is disabled; vendor vector
+assembly and the table allocation remain a documented link boundary.
 
 ## Value and allocation model
 
 Board identities and immutable configurations use nominal scalar types. They
 remain distinct in Abla source and method resolution, then erase to their
-underlying integer before LLVM lowering. ESP32 I2S pin and device configurations
+underlying integer before LLVM lowering, including function ABIs, locals, and
+conditional joins. ESP32 I2S pin and device configurations
 are packed values; ESP-IDF 6 channel ownership lives with the physical port in
 the backend rather than forcing application code to borrow a heap object.
 

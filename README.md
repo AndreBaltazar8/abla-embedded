@@ -160,7 +160,13 @@ interrupt through direct MMIO; its entry is 21 bytes/8 instructions, exactly
 matching equivalent C++, with the same 29 total code-plus-literal IRAM bytes;
 its 12-byte/3-instruction address leaf also ties.
 Closures and aliases are rejected, and direct Abla helpers are placed in IRAM
-automatically.
+automatically. The same object installs that address directly into the
+linker-owned dispatcher table on the executing core: it validates the classic
+ESP32 interrupt level, disables only that line while publishing the two-word
+entry, and restores its prior mask state. The complete installer is 97 bytes
+and 33 instructions versus equivalent C++ at 99 bytes and 33 instructions.
+It has no unresolved call; `_xt_interrupt_table` is its sole unresolved data
+symbol.
 The RX descriptor/header validator checks ownership, EOF, capacity, address,
 and both hardware signal lengths before exposing a frame; its checked leaf is
 103 bytes/35 instructions versus 108 bytes/37 instructions for equivalent C++
