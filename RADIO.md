@@ -94,10 +94,11 @@ per-TID replay commit and rejection, MIC-failure rollback, and both direct and
 stateful ESP-NOW zero-tag decryption all passed.
 
 The `ieee80211_crypto_ccmp.o` row is complete at both the reusable and exact
-vendor boundaries. `src/esp32/wifi/crypto_ccmp_dispatch_esp32.ab` exports
-`ccmp_encap`, `ccmp_decap`, `ieee80211_ccmp_encrypt`,
-`ieee80211_ccmp_decrypt`, `ieee80211_decrypt_espnow_pkt`, and the exact
-24-byte `ccmp` descriptor. It reads the vendor-owned key/mbuf layout directly,
+vendor boundaries. `src/esp32/wifi/crypto_ccmp_dispatch_esp32.ab` supplies
+`ieee80211_ccmp_encrypt`, `ieee80211_ccmp_decrypt`,
+`ieee80211_decrypt_espnow_pkt`, and the exact 24-byte `ccmp` descriptor. Its
+encap and decap callbacks use module-private C-ABI addresses rather than public
+linker names. It reads the vendor-owned key/mbuf layout directly,
 uses the allocation-free Abla CCM engine instead of the original
 allocate-copy-free provider callbacks, and commits replay state only after
 authentication. The M5Echo link map assigns all six symbols to `abla_app.o`
@@ -116,8 +117,8 @@ M5Echo link map; the replacement added only 16 bytes to the application image
 and the device again completed WPA2, server authentication, speech, and
 playback. This boundary retains no opaque algorithm of its own.
 
-`src/esp32/wifi/legacy_crypto_esp32.ab` supplies the exact `wep`, `wep_encap`,
-`wep_decap`, `tkip`, `tkip_encap`, and `tkip_decap` symbols. It preserves the
+`src/esp32/wifi/legacy_crypto_esp32.ab` supplies the exact `wep` and `tkip`
+descriptors with module-private encap and decap callback addresses. It preserves the
 vendor key/mbuf offsets, 24-byte cipher descriptors, WEP and TKIP IV byte
 ordering, global software-crypto gate, 48-bit PN progression, per-TID replay
 state, and header/trailer pointer adjustment. Both original archive members
@@ -125,8 +126,8 @@ are absent from the M5Echo link map, and the combined image passed the full
 WPA2 voice smoke path. These replacements currently cost 368 bytes over the
 preceding image and therefore still need instruction-level size work.
 
-The same legacy module emits the exact 24-byte `sms4` descriptor and direct
-Abla callbacks for its 18-byte WAPI header, alternating PN step, fixed
+The same legacy module emits the exact 24-byte `sms4` descriptor and
+module-private Abla callbacks for its 18-byte WAPI header, alternating PN step, fixed
 `36 5c` suffix, per-TID replay commit, and 16-byte trailer decap. The original
 `ieee80211_crypto_sms4.o` is absent from the M5Echo link map and the
 replacement costs 64 bytes over the preceding image. The original stale-PN
