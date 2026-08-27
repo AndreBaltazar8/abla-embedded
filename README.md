@@ -57,6 +57,7 @@ make board-detect-c6
 make board-detect-s3
 make radio-mac-registers
 make compare-radio-power-size
+make compare-rx-chain-size
 make imu-calibration
 make imu-offsets
 make i2s-tone
@@ -140,8 +141,10 @@ DMA descriptor object so ownership publication can be inspected independently.
 The build also emits classic ESP32 radio power/clock/reset leaves, including a
 complete 10-microsecond CCOUNT-timed power-on sequence; none of the three
 objects performs initialization merely by being linked. The size comparison
-target checks that sequence against equivalent C under the same toolchain and
-flags.
+targets check that sequence and the null-terminated RX descriptor-chain
+initializer against equivalent C under the same toolchain and flags. The RX
+leaf retains all alignment, count, and 32-bit range checks and is three bytes
+smaller than the C reference (114 versus 117 bytes of text plus literals).
 The target neither links a firmware image nor initializes or transmits on the
 radio. See `RADIO.md` for the exact current boundary and provenance.
 The default ESP32 surface also includes zero-storage DMA handles and the native

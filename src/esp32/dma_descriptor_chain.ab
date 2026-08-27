@@ -1,0 +1,186 @@
+import "../dma.ab"
+import "abla/unsafe/mmio"
+import "./dma_descriptor.ab"
+import "./dma_descriptor_chain_logic.ab"
+
+// Native-width core used by radio drivers after their DMA allocation has
+// selected contiguous descriptor and buffer storage. It deliberately keeps
+// addresses, counts, and loop state in ESP's 32-bit address width.
+@inline
+trusted fun espDmaInitializeRxChain(
+    descriptorBase: u32,
+    descriptorCount: u32,
+    bufferBase: u32,
+    bufferStride: u32,
+    bufferCapacity: u32
+): bool {
+    val zero = u32(0)
+    val one = u32(1)
+    val alignmentMask = u32(3)
+    val descriptorBytes = u32(12)
+    val maximumAddress = u32(4294967295)
+    if (descriptorBase == zero) return false
+    val lastIndex = descriptorCount - one
+    if ((descriptorBase & alignmentMask) != zero ||
+        lastIndex >= u32(4095) ||
+        bufferBase == zero || (bufferBase & alignmentMask) != zero ||
+        bufferCapacity == zero || bufferCapacity > u32(4095) ||
+        bufferStride < bufferCapacity ||
+        (bufferStride & alignmentMask) != zero) return false
+    val descriptorSpan = lastIndex * descriptorBytes
+    if (descriptorBase > maximumAddress - descriptorSpan) return false
+    val capacityTail = bufferCapacity - one
+    if (lastIndex > (maximumAddress - capacityTail) / bufferStride) {
+        return false
+    }
+    val bufferSpan = lastIndex * bufferStride + capacityTail
+    if (bufferBase > maximumAddress - bufferSpan) return false
+    var descriptor = descriptorBase
+    var buffer = bufferBase
+    var nextIndex = one
+    while (true) {
+        mmioStoreU32(i64(descriptor + u32(4)), i64(buffer))
+        val followingDescriptor = descriptor + descriptorBytes
+        val next = if (nextIndex < descriptorCount) {
+            followingDescriptor
+        } else zero
+        mmioStoreU32(i64(descriptor + u32(8)), i64(next))
+        mmioStoreU32(
+            i64(descriptor),
+            i64(u32(2147483648) | bufferCapacity)
+        )
+        if (nextIndex == descriptorCount) return true
+        descriptor = followingDescriptor
+        buffer = buffer + bufferStride
+        nextIndex = nextIndex + one
+    }
+}
+
+// Allocation-free state for one contiguous, null-terminated ESP DMA chain.
+// The scalar packs a 32-bit descriptor base, a 12-bit checked count, and a
+// 12-bit current index. Index == count is the explicit exhausted state.
+fun espDmaDescriptorChain(
+    descriptorBase: int,
+    descriptorCount: int
+): DmaDescriptorChain = dmaDescriptorChainValue(
+    espDmaDescriptorChainPack(descriptorBase, descriptorCount, 0)
+)
+
+@inline
+fun DmaDescriptorChain.valid(): bool {
+    val value = this.rawValue()
+    val count = espDmaDescriptorChainCount(value)
+    value >= 0 && count > 0 &&
+        espDmaDescriptorChainPack(
+            espDmaDescriptorChainBase(value),
+            count,
+            espDmaDescriptorChainIndex(value)
+        ) == value
+}
+
+@inline
+fun DmaDescriptorChain.descriptorCount(): int =
+    if (this.valid()) espDmaDescriptorChainCount(this.rawValue()) else 0
+
+@inline
+fun DmaDescriptorChain.currentIndex(): int =
+    if (this.valid()) espDmaDescriptorChainIndex(this.rawValue()) else 0
+
+fun DmaDescriptorChain.descriptor(index: int): DmaDescriptor {
+    if (!this.valid() || index < 0 || index >= this.descriptorCount()) {
+        return dmaDescriptorAt(0)
+    }
+    dmaDescriptorAt(
+        espDmaDescriptorChainBase(this.rawValue()) +
+            index * espDmaDescriptorBytes
+    )
+}
+
+@inline
+fun DmaDescriptorChain.first(): DmaDescriptor = this.descriptor(0)
+
+@inline
+fun DmaDescriptorChain.current(): DmaDescriptor =
+    this.descriptor(this.currentIndex())
+
+@inline
+fun DmaDescriptorChain.exhausted(): bool =
+    !this.valid() || this.currentIndex() >= this.descriptorCount()
+
+@inline
+fun DmaDescriptorChain.remaining(): int =
+    if (this.exhausted()) 0
+    else this.descriptorCount() - this.currentIndex()
+
+fun DmaDescriptorChain.advance(): DmaDescriptorChain {
+    if (this.exhausted()) return this
+    dmaDescriptorChainValue(espDmaDescriptorChainPack(
+        espDmaDescriptorChainBase(this.rawValue()),
+        this.descriptorCount(),
+        this.currentIndex() + 1
+    ))
+}
+
+fun DmaDescriptorChain.restart(): DmaDescriptorChain {
+    if (!this.valid()) return this
+    dmaDescriptorChainValue(espDmaDescriptorChainPack(
+        espDmaDescriptorChainBase(this.rawValue()),
+        this.descriptorCount(),
+        0
+    ))
+}
+
+trusted fun DmaDescriptorChain.initializeRx(
+    bufferBase: int,
+    bufferStride: int,
+    bufferCapacity: int
+): bool {
+    if (!this.valid() || bufferBase <= 0 || bufferBase > 4294967295 ||
+        bufferStride <= 0 || bufferStride > 4294967295 ||
+        bufferCapacity <= 0 || bufferCapacity > 4294967295) return false
+    espDmaInitializeRxChain(
+        u32(espDmaDescriptorChainBase(this.rawValue())),
+        u32(this.descriptorCount()),
+        u32(bufferBase),
+        u32(bufferStride),
+        u32(bufferCapacity)
+    )
+}
+
+trusted fun DmaDescriptorChain.initializeTx(
+    bufferBase: int,
+    bufferStride: int,
+    frameLength: int,
+    successfulEof: bool
+): bool {
+    val descriptorBase = espDmaDescriptorChainBase(this.rawValue())
+    val count = this.descriptorCount()
+    if (!this.valid() || !espDmaDescriptorChainLayoutValid(
+        descriptorBase, count, bufferBase, bufferStride, frameLength
+    )) return false
+    var index = 0
+    while (index < count) {
+        val next = if (index + 1 < count) this.descriptor(index + 1)
+            else dmaDescriptorAt(0)
+        if (!this.descriptor(index).initializeTx(
+            bufferBase + index * bufferStride,
+            frameLength,
+            next,
+            successfulEof
+        )) return false
+        index = index + 1
+    }
+    true
+}
+
+trusted fun DmaDescriptorChain.currentReadyForCpu(
+    minimumLength: int
+): bool {
+    val descriptor = this.current()
+    if (descriptor.isNull() || minimumLength < 0) return false
+    val flags = descriptor.flags()
+    !espDmaDescriptorOwnedByDma(flags) &&
+        espDmaDescriptorSuccessfulEof(flags) &&
+        espDmaDescriptorLength(flags) >= minimumLength &&
+        espDmaDescriptorLength(flags) <= espDmaDescriptorCapacity(flags)
+}

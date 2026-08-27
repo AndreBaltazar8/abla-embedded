@@ -8,6 +8,20 @@ The common `src/esp32/dma_descriptor.ab` module implements the native 12-byte
 ESP peripheral-DMA descriptor layout with ordered volatile ownership transfer.
 It is reusable by radio, I2S, SPI, camera, and other DMA-backed drivers.
 
+`src/esp32/dma_descriptor_chain.ab` adds the null-terminated RX chain used by
+the open ESP Wi-Fi driver. Its native-width core validates aligned 32-bit
+descriptor and buffer ranges, rejects zero or excessive counts, proves both
+last descriptor and last buffer cannot wrap, and publishes buffer and next
+words before DMA ownership. The allocation-free packed chain handle remains
+available for stateful consumers, while drivers with an already validated DMA
+allocation can stay entirely in `u32` arithmetic. `make compare-rx-chain-size`
+checks the exported 1600-byte Wi-Fi-buffer leaf with the exact compiler and
+flags used for the C reference; the current Xtensa result is 114 bytes for
+Abla versus 117 bytes for C, with no unresolved calls. When an Espressif GCC
+`xtensa-esp32-elf-objdump` is available (or supplied as `XTENSA_OBJDUMP`), the
+same gate also disassembles just those symbols; the current result is 42 Abla
+instructions versus 43 C instructions.
+
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
 `src/xtensa/cpu.ab` supplies a compiler-lowered CCOUNT read and bounded delay,
@@ -52,7 +66,8 @@ measured on owned hardware.
 The remaining dependency order is:
 
 1. interrupt-safe shared-clock ownership and interrupt routing;
-2. bounded RX/TX ring ownership on top of the implemented descriptors;
+2. bounded RX consumption/recycling and TX ownership on top of the implemented
+   null-terminated descriptor chains;
 3. open 802.11 management, authentication, association, and data framing;
 4. hardware crypto plus WPA2 key management;
 5. PHY/AGC/channel setup, RF calibration, coexistence, and regulatory limits;
