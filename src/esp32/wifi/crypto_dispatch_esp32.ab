@@ -1,0 +1,395 @@
+import "./bip_packet_esp32.ab"
+import "../../xtensa/assembly.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Complete classic-ESP32 ieee80211_crypto.o compatibility surface. The
+// exported ABI is consumed by Espressif's MAC objects, while all packet and
+// cryptographic work below is Abla lowered directly through LLVM.
+
+val esp32VendorBipEngineLockAddress = nativeStaticAllocate(4)
+
+@inline
+trusted fun esp32VendorGlobalIcAddress(): u32 = xtensaAssemblyReadU32(
+    "l32r $0, .Labla_g_ic_address",
+    "=a"
+)
+
+@inline
+trusted fun esp32VendorActiveIgtkFunctionAddress(): u32 =
+    xtensaAssemblyReadU32(
+        "l32r $0, .Labla_active_igtk_address",
+        "=a"
+    )
+
+@inline
+trusted fun esp32VendorIgtkFunctionAddress(): u32 = xtensaAssemblyReadU32(
+    "l32r $0, .Labla_get_igtk_address",
+    "=a"
+)
+
+@inline
+trusted fun esp32VendorLoadU8(address: int): int =
+    ablaUnsafeVolatileLoadU8(address)
+
+@inline
+trusted fun esp32VendorLoadU16(address: int): int =
+    ablaUnsafeVolatileLoadU16(address)
+
+@inline
+trusted fun esp32VendorLoadU32(address: int): int =
+    ablaUnsafeVolatileLoadU32(address)
+
+@inline
+trusted fun esp32VendorStoreU16(address: int, value: int): void =
+    ablaUnsafeVolatileStoreU16(address, u16(value))
+
+@inline
+trusted fun esp32VendorCipherDescriptor(index: int): u32 {
+    if (index < 0 || index > 255) return u32(0)
+    val address = int(esp32VendorGlobalIcAddress()) + 320 + index * 4
+    u32(esp32VendorLoadU32(address))
+}
+
+@inline
+trusted fun esp32VendorMbufFrameAddress(mbuf: u32): u32 {
+    if (mbuf == u32(0)) return u32(0)
+    val storage = esp32VendorLoadU32(int(mbuf) + 4)
+    if (storage == 0) u32(0)
+    else u32(esp32VendorLoadU32(storage + 4))
+}
+
+@inline
+trusted fun esp32VendorMbufBodyLength(mbuf: u32): int =
+    if (mbuf == u32(0)) -1 else esp32VendorLoadU16(int(mbuf) + 22)
+
+@inline
+trusted fun esp32VendorActiveIgtk(interfaceIndex: u32): int =
+    callNativeI32Pointer(
+        int(esp32VendorActiveIgtkFunctionAddress()),
+        nativePointerFromAddress(int(interfaceIndex & u32(255)))
+    )
+
+@inline
+trusted fun esp32VendorIgtk(interfaceIndex: u32, keyIdentifier: int): u32 =
+    u32(callNativeI64PointerPointer(
+        int(esp32VendorIgtkFunctionAddress()),
+        nativePointerFromAddress(int(interfaceIndex & u32(255))),
+        nativePointerFromAddress(keyIdentifier & 65535)
+    ))
+
+trusted fun esp32VendorCopyPacketNumber(
+    destinationAddress: int,
+    sourceAddress: int
+): void {
+    var index = 0
+    while (index < 6) {
+        ablaUnsafeVolatileStoreU8(
+            destinationAddress + index,
+            esp32VendorLoadU8(sourceAddress + index)
+        )
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32VendorIncrementPacketNumber(keyAddress: u32): void {
+    var index = 5
+    var carry = true
+    while (index >= 0 && carry) {
+        val next = esp32VendorLoadU8(int(keyAddress) + 2 + index) + 1
+        ablaUnsafeVolatileStoreU8(
+            int(keyAddress) + 2 + index, next & 255
+        )
+        carry = next > 255
+        index = index - 1
+    }
+    return
+}
+
+trusted fun esp32VendorPacketNumberFresh(
+    receivedAddress: int,
+    storedAddress: int
+): bool {
+    var index = 0
+    while (index < 6) {
+        val received = esp32VendorLoadU8(receivedAddress + index)
+        val stored = esp32VendorLoadU8(storedAddress + index)
+        if (received > stored) return true
+        if (received < stored) return false
+        index = index + 1
+    }
+    false
+}
+
+trusted fun esp32VendorWriteGmacNonce(
+    frame: NativeBuffer,
+    mmieOffset: int,
+    nonce: NativeBuffer
+): void {
+    var index = 0
+    while (index < 6) {
+        nonce.store(index, frame.load(10 + index))
+        nonce.store(6 + index, frame.load(mmieOffset + 9 - index))
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32VendorBipCompute(
+    frame: NativeBuffer,
+    frameLength: int,
+    mmieOffset: int,
+    keyAddress: u32,
+    cipher: WifiBipCipher,
+    output: NativeBuffer
+): bool {
+    val workspace = nativeStackAllocate(32)
+    val aad = nativeBufferAt(workspace, 20)
+    val nonce = nativeBufferAt(workspace + 20, 12)
+    if (!wifiBipWriteAad(frame, frameLength, aad)) return false
+    val body = nativeBufferAt(
+        frame.addressValue() + 24, frameLength - 24
+    )
+    val key = nativeBufferAt(int(keyAddress) + 8, cipher.keyLength())
+    if (cipher == wifiBipCmac128) {
+        return esp32WifiBipCmac(key, aad, body, output, u32(100000))
+    }
+    if (cipher == wifiBipGmac128 || cipher == wifiBipGmac256) {
+        esp32VendorWriteGmacNonce(frame, mmieOffset, nonce)
+        return esp32WifiBipGmac(
+            key, nonce, aad, body, output, u32(100000)
+        )
+    }
+    false
+}
+
+// The companion wpa_crypto_funcs_init routine copies the configured 44-byte
+// provider table into this symbol. Section directives are assembly-time only;
+// this call emits no runtime instructions or initialization path.
+@export("ieee80211_crypto_attach")
+trusted fun esp32VendorCryptoAttach(): void {
+    xtensaAssemblyVoid(
+        ".literal .Labla_g_ic_address, g_ic\n.literal .Labla_active_igtk_address, ieee80211w_get_active_igtk_key_id\n.literal .Labla_get_igtk_address, ieee80211w_get_igtk_from_keyidx\n.pushsection .bss.wpa_crypto_funcs,\"aw\",@nobits\n.global wpa_crypto_funcs\n.type wpa_crypto_funcs,@object\n.balign 4\nwpa_crypto_funcs:\n.space 44\n.size wpa_crypto_funcs,44\n.popsection",
+        "~{memory}"
+    )
+    return
+}
+
+@export("ieee80211_crypto_available")
+fun esp32VendorCryptoAvailable(): i32 = i32(0)
+
+@export("ieee80211_crypto_setkey")
+fun esp32VendorCryptoSetKey(): i32 = i32(0)
+
+@export("ieee80211_get_cipher_mic_len")
+fun esp32VendorCipherMicLength(cipher: i32): i32 =
+    i32(wifiCipherMicLength(int(cipher)))
+
+@export("ieee80211_crypto_encap")
+trusted fun esp32VendorCryptoEncap(ic: u32, mbuf: u32): u32 {
+    if (ic == u32(0) || mbuf == u32(0)) return u32(0)
+    val metadata = esp32VendorLoadU32(int(mbuf) + 44)
+    if (metadata == 0) return u32(0)
+    val alternate = (esp32VendorLoadU32(metadata) & 2) != 0
+    val selected = esp32VendorLoadU8(
+        int(ic) + 256 + (if (alternate) 53 else 52)
+    )
+    var callbackFlags = 2
+    if (alternate) callbackFlags = if (selected < 2)
+        selected + 1 else selected - 1
+    val descriptor = esp32VendorCipherDescriptor(selected)
+    if (descriptor == u32(0)) return u32(0)
+    val operations = esp32VendorLoadU32(int(descriptor) + 160)
+    if (operations == 0) return u32(0)
+    val callback = esp32VendorLoadU32(operations + 16)
+    if (callback == 0) return u32(0)
+    val status = callNativeI32Pointer3(
+        callback,
+        nativePointerFromAddress(int(descriptor)),
+        nativePointerFromAddress(int(mbuf)),
+        nativePointerFromAddress((callbackFlags << 6) & 255)
+    )
+    if (status == 0) u32(0) else descriptor
+}
+
+@export("ieee80211_crypto_decap")
+trusted fun esp32VendorCryptoDecap(
+    ic: u32,
+    mbuf: u32,
+    headerLength: i32
+): u32 {
+    if (ic == u32(0) || mbuf == u32(0) || headerLength < 0) return u32(0)
+    val headBytes = esp32VendorLoadU16(int(mbuf) + 20)
+    val bodyBytes = esp32VendorMbufBodyLength(mbuf)
+    if (bodyBytes < 0 || headBytes + bodyBytes < 32) return u32(0)
+    val frame = esp32VendorMbufFrameAddress(mbuf)
+    if (frame == u32(0)) return u32(0)
+    val mode = esp32VendorLoadU8(int(ic) + 512 + 139)
+    var selected = 0
+    if ((esp32VendorLoadU8(int(frame) + 4) & 1) == 0) {
+        selected = esp32VendorLoadU8(int(ic) + 256 + 52)
+    } else {
+        val keyByteAddress = int(frame) + int(headerLength) + 3
+        val keyByte = esp32VendorLoadU8(keyByteAddress)
+        if (mode == 8) {
+            selected = esp32VendorLoadU8(
+                int(frame) + int(headerLength)
+            )
+        } else if ((keyByte & 32) == 0) {
+            selected = esp32VendorLoadU8(int(ic) + 256 + 53)
+        } else {
+            val slot = (keyByte >>> 6) & 3
+            selected = esp32VendorLoadU8(int(ic) + 311 + slot)
+            if (selected == 255) return u32(0)
+        }
+    }
+    val descriptor = esp32VendorCipherDescriptor(selected)
+    if (descriptor == u32(0)) return u32(0)
+    val operations = esp32VendorLoadU32(int(descriptor) + 160)
+    if (operations == 0) return u32(0)
+    val callback = esp32VendorLoadU32(operations + 20)
+    if (callback == 0) return u32(0)
+    val status = callNativeI32Pointer3(
+        callback,
+        nativePointerFromAddress(int(descriptor)),
+        nativePointerFromAddress(int(mbuf)),
+        nativePointerFromAddress(int(headerLength))
+    )
+    if (status == 0) u32(0) else descriptor
+}
+
+@export("ieee80211_crypto_bip_encrypt")
+trusted fun esp32VendorCryptoBipEncrypt(
+    interfaceIndex: u32,
+    mbuf: u32,
+    cipherValue: u16
+): i32 {
+    val frameAddress = esp32VendorMbufFrameAddress(mbuf)
+    val bodyLength = esp32VendorMbufBodyLength(mbuf)
+    val cipher = WifiBipCipher(int(cipherValue))
+    val micLength = cipher.micLength()
+    val mmieBytes = cipher.mmieBytes()
+    if (frameAddress == u32(0) || bodyLength < 0 || !cipher.valid()) {
+        return i32(-1)
+    }
+    val oldFrameLength = 24 + bodyLength
+    val frameLength = oldFrameLength + mmieBytes
+    val mmieOffset = oldFrameLength
+    val frame = nativeBufferAt(int(frameAddress), frameLength)
+    frame.store(mmieOffset, wifiBipMmieElementIdentifier)
+    frame.store(mmieOffset + 1, mmieBytes - 2)
+    esp32VendorStoreU16(int(mbuf) + 22, bodyLength + mmieBytes)
+    val keyIdentifier = esp32VendorActiveIgtk(interfaceIndex)
+    if (keyIdentifier != 4 && keyIdentifier != 5) return i32(-1)
+    frame.storeU16(mmieOffset + 2, keyIdentifier)
+    val keyAddress = esp32VendorIgtk(interfaceIndex, keyIdentifier)
+    if (keyAddress == u32(0)) return i32(-1)
+    esp32VendorIncrementPacketNumber(keyAddress)
+    esp32VendorCopyPacketNumber(
+        int(frameAddress) + mmieOffset + 4, int(keyAddress) + 2
+    )
+    var index = 0
+    while (index < micLength) {
+        frame.store(mmieOffset + 10 + index, 0)
+        index = index + 1
+    }
+    val lock = xtensaSpinLock(u32(esp32VendorBipEngineLockAddress))
+    if (!lock.acquire(100000)) return i32(-1)
+    val computed = nativeBufferAt(nativeStackAllocate(16), 16)
+    val valid = esp32VendorBipCompute(
+        frame, frameLength, mmieOffset, keyAddress, cipher, computed
+    )
+    if (valid) {
+        index = 0
+        while (index < micLength) {
+            frame.store(mmieOffset + 10 + index, computed.load(index))
+            index = index + 1
+        }
+    }
+    lock.release()
+    if (!valid) return i32(-1)
+    i32(0)
+}
+
+trusted fun esp32VendorCryptoBipVerify(
+    interfaceIndex: u32,
+    mbuf: u32,
+    cipher: WifiBipCipher
+): i32 {
+    val frameAddress = esp32VendorMbufFrameAddress(mbuf)
+    val bodyLength = esp32VendorMbufBodyLength(mbuf)
+    if (frameAddress == u32(0) || bodyLength < 0 || !cipher.valid()) {
+        return i32(-1)
+    }
+    val frameLength = 24 + bodyLength
+    if ((cipher == wifiBipCmac128 && bodyLength <= 19) ||
+        (cipher != wifiBipCmac128 && bodyLength <= 27)) return i32(-1)
+    val frame = nativeBufferAt(int(frameAddress), frameLength)
+    val mmieOffset = wifiBipMmieOffset(
+        frame, frameLength, cipher
+    )
+    if (mmieOffset < 0) return i32(-1)
+    val keyIdentifier = esp32VendorLoadU16(
+        int(frameAddress) + mmieOffset + 2
+    )
+    if (keyIdentifier != 4 && keyIdentifier != 5) return i32(-1)
+    val keyAddress = esp32VendorIgtk(interfaceIndex, keyIdentifier)
+    if (keyAddress == u32(0)) return i32(-1)
+    val packetNumberAddress = int(frameAddress) + mmieOffset + 4
+    if (!esp32VendorPacketNumberFresh(
+        packetNumberAddress, int(keyAddress) + 2
+    )) return i32(-1)
+    val micLength = cipher.micLength()
+    val workspace = nativeStackAllocate(32)
+    val received = nativeBufferAt(workspace, 16)
+    val computed = nativeBufferAt(workspace + 16, 16)
+    var index = 0
+    while (index < micLength) {
+        received.store(index, frame.load(mmieOffset + 10 + index))
+        frame.store(mmieOffset + 10 + index, 0)
+        index = index + 1
+    }
+    val lock = xtensaSpinLock(u32(esp32VendorBipEngineLockAddress))
+    var valid = lock.acquire(100000)
+    if (valid) {
+        valid = esp32VendorBipCompute(
+            frame, frameLength, mmieOffset, keyAddress, cipher, computed
+        )
+        lock.release()
+    }
+    index = 0
+    while (index < micLength) {
+        frame.store(mmieOffset + 10 + index, received.load(index))
+        index = index + 1
+    }
+    if (!valid || !cryptoConstantTimeEqual(
+        received, computed, micLength
+    )) return i32(-1)
+    esp32VendorCopyPacketNumber(
+        int(keyAddress) + 2, packetNumberAddress
+    )
+    i32(0)
+}
+
+@export("ieee80211_crypto_aes_128_cmac_decrypt")
+trusted fun esp32VendorCryptoBipCmacDecrypt(
+    interfaceIndex: u32,
+    mbuf: u32
+): i32 = esp32VendorCryptoBipVerify(
+    interfaceIndex, mbuf, wifiBipCmac128
+)
+
+@export("ieee80211_crypto_gmac_decrypt")
+trusted fun esp32VendorCryptoBipGmacDecrypt(
+    interfaceIndex: u32,
+    mbuf: u32
+): i32 {
+    val cipher = WifiBipCipher(esp32VendorLoadU8(
+        int(esp32VendorGlobalIcAddress()) + 512 + 10
+    ))
+    if (cipher != wifiBipGmac128 && cipher != wifiBipGmac256) {
+        return i32(-1)
+    }
+    esp32VendorCryptoBipVerify(interfaceIndex, mbuf, cipher)
+}

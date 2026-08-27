@@ -163,10 +163,13 @@ The same object now emits allocation-free AES-CMAC and AES-GMAC request
 entries plus stateful 802.11w BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256
 protect/verify entries. Their one-pointer records avoid overflowing the Xtensa
 register argument window. Standard tags, replay rejection, tamper rejection,
-state rollback, and retry all passed on the connected ESP32-PICO-D4. This is a
-verified partial replacement of `ieee80211_crypto.o`, not a completeness claim:
-its generic cipher dispatcher and complete 11-entry WPA crypto-provider surface
-remain open in the parity ledger.
+state rollback, and retry all passed on the connected ESP32-PICO-D4. The exact
+`ieee80211_crypto.o` ABI is now also Abla: cipher encap/decap dispatch, MIC
+lengths, BIP encrypt/verify, and the writable provider-table symbol. A real
+M5Echo link removed that opaque member, reducing the retained radio inventory
+from 62 to 61 objects, and then passed WPA2 association, authenticated server
+connection, speech request, and playback. The provider callbacks copied into
+that table remain separate replacement work.
 It also emits the classic ESP32 interrupt-matrix and Xtensa CPU-mask leaves.
 Core ID is 11 bytes/4 instructions in both Abla and C++. The race-safe
 enable/disable operations use 9/10 instructions with no call or allocation;

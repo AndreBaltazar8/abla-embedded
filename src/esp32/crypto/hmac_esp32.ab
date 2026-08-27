@@ -1,0 +1,182 @@
+import "./sha_esp32.ab"
+
+// HMAC request layout (u32 fields): algorithm, key address, key length,
+// SHA-vector descriptor address, descriptor count, MAC address, max polls.
+// SHA-1 matches hostap's five-fragment limit; SHA-256 matches its ten-fragment
+// limit. These fixed bounds keep the implementation allocation-free.
+val esp32HmacVectorRequestBytes = 32
+
+trusted fun esp32HmacClear(address: u32, length: int): void {
+    if (address == u32(0) || length < 0 ||
+        int(address) > 4294967295 - length) return
+    var index = 0
+    while (index < length) {
+        ablaUnsafeVolatileStoreU8(int(address + u32(index)), 0)
+        index = index + 1
+    }
+    return
+}
+
+trusted fun esp32HmacShaVectorRequest32(requestAddress: u32): bool {
+    if (requestAddress == u32(0) || requestAddress > u32(4294967264) ||
+        (requestAddress & u32(3)) != u32(0)) return false
+    val algorithm = ablaUnsafeVolatileLoadU32(int(requestAddress))
+    val keyAddress = u32(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(4))
+    ))
+    val keyLength = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(8))
+    )
+    val inputDescriptors = u32(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(12))
+    ))
+    val inputCount = ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(16))
+    )
+    val macAddress = u32(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(20))
+    ))
+    val maximumPolls = u32(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(24))
+    ))
+    val inputLengths = u32(ablaUnsafeVolatileLoadU32(
+        int(requestAddress + u32(28))
+    ))
+    val digestBytes = if (algorithm == esp32Sha1) 20 else 32
+    val maximumInputs = if (algorithm == esp32Sha1) 5 else 10
+    if ((algorithm != esp32Sha1 && algorithm != esp32Sha256) ||
+        keyLength < 0 || inputCount < 0 || inputCount > maximumInputs ||
+        maximumPolls == u32(0) || macAddress == u32(0) ||
+        int(macAddress) > 4294967295 - digestBytes ||
+        (keyLength > 0 && (keyAddress == u32(0) ||
+            int(keyAddress) > 4294967295 - keyLength)) ||
+        (inputCount > 0 && (inputDescriptors == u32(0) ||
+            (inputDescriptors & u32(3)) != u32(0) ||
+            int(inputDescriptors) > 4294967295 - inputCount *
+                (if (inputLengths == u32(0)) 8 else 4) ||
+            (inputLengths != u32(0) && ((inputLengths & u32(3)) != u32(0) ||
+                int(inputLengths) > 4294967295 - inputCount * 4))))) {
+        esp32HmacClear(macAddress, digestBytes)
+        return false
+    }
+
+    // 48-byte Xtensa outgoing area, 64-byte pad, 32-byte long-key digest,
+    // 88-byte descriptor table, and the 20-byte SHA request.
+    val workspace = nativeStackAllocate(256)
+    val keyPad = nativeBufferAt(workspace + 48, 64)
+    val hashedKey = nativeBufferAt(workspace + 112, 32)
+    val descriptors = nativeBufferAt(workspace + 144, 88)
+    val shaRequest = nativeBufferAt(workspace + 232, 24)
+    var effectiveKeyAddress = keyAddress
+    var effectiveKeyLength = keyLength
+    var valid = true
+    if (keyLength > 64) {
+        descriptors.storeU32(0, int(keyAddress))
+        descriptors.storeU32(4, keyLength)
+        shaRequest.storeU32(0, algorithm)
+        shaRequest.storeU32(4, descriptors.addressValue())
+        shaRequest.storeU32(8, 1)
+        shaRequest.storeU32(12, hashedKey.addressValue())
+        shaRequest.storeU32(16, int(maximumPolls))
+        shaRequest.storeU32(20, 0)
+        valid = esp32ShaVectorRequest32(u32(shaRequest.addressValue()))
+        effectiveKeyAddress = u32(hashedKey.addressValue())
+        effectiveKeyLength = digestBytes
+    }
+    var index = 0
+    while (index < 64) {
+        var value = 0
+        if (valid && index < effectiveKeyLength) {
+            value = ablaUnsafeVolatileLoadU8(
+                int(effectiveKeyAddress + u32(index))
+            )
+        }
+        keyPad.store(index, value ^ 54)
+        index = index + 1
+    }
+
+    descriptors.storeU32(0, keyPad.addressValue())
+    descriptors.storeU32(4, 64)
+    index = 0
+    while (valid && index < inputCount) {
+        val source = inputDescriptors + u32(index *
+            (if (inputLengths == u32(0)) 8 else 4))
+        descriptors.storeU32(
+            8 + index * 8, ablaUnsafeVolatileLoadU32(int(source))
+        )
+        descriptors.storeU32(
+            12 + index * 8,
+            ablaUnsafeVolatileLoadU32(
+                if (inputLengths == u32(0)) int(source + u32(4))
+                else int(inputLengths + u32(index * 4))
+            )
+        )
+        index = index + 1
+    }
+    shaRequest.storeU32(0, algorithm)
+    shaRequest.storeU32(4, descriptors.addressValue())
+    shaRequest.storeU32(8, inputCount + 1)
+    shaRequest.storeU32(12, int(macAddress))
+    shaRequest.storeU32(16, int(maximumPolls))
+    shaRequest.storeU32(20, 0)
+    valid = valid && esp32ShaVectorRequest32(u32(shaRequest.addressValue()))
+
+    index = 0
+    while (index < 64) {
+        keyPad.store(index, keyPad.load(index) ^ 106)
+        index = index + 1
+    }
+    descriptors.storeU32(0, keyPad.addressValue())
+    descriptors.storeU32(4, 64)
+    descriptors.storeU32(8, int(macAddress))
+    descriptors.storeU32(12, digestBytes)
+    shaRequest.storeU32(8, 2)
+    valid = valid && esp32ShaVectorRequest32(u32(shaRequest.addressValue()))
+    esp32HmacClear(u32(keyPad.addressValue()), 64)
+    esp32HmacClear(u32(hashedKey.addressValue()), 32)
+    if (!valid) esp32HmacClear(macAddress, digestBytes)
+    valid
+}
+
+@inline
+trusted fun esp32HmacShaBufferWithPollLimit(
+    algorithm: int,
+    key: NativeBuffer,
+    data: NativeBuffer,
+    mac: NativeBuffer,
+    maximumPolls: u32
+): bool {
+    val descriptor = nativeStackAllocate(8)
+    val request = nativeStackAllocate(esp32HmacVectorRequestBytes)
+    ablaUnsafeVolatileStoreU32(descriptor, data.addressValue())
+    ablaUnsafeVolatileStoreU32(descriptor + 4, data.capacity())
+    ablaUnsafeVolatileStoreU32(request, algorithm)
+    ablaUnsafeVolatileStoreU32(request + 4, key.addressValue())
+    ablaUnsafeVolatileStoreU32(request + 8, key.capacity())
+    ablaUnsafeVolatileStoreU32(request + 12, descriptor)
+    ablaUnsafeVolatileStoreU32(request + 16, 1)
+    ablaUnsafeVolatileStoreU32(request + 20, mac.addressValue())
+    ablaUnsafeVolatileStoreU32(request + 24, int(maximumPolls))
+    ablaUnsafeVolatileStoreU32(request + 28, 0)
+    esp32HmacShaVectorRequest32(u32(request))
+}
+
+@inline
+trusted fun esp32HmacSha1(
+    key: NativeBuffer,
+    data: NativeBuffer,
+    mac: NativeBuffer
+): bool = if (mac.capacity() < 20) false else
+    esp32HmacShaBufferWithPollLimit(
+        esp32Sha1, key, data, mac, u32(100000)
+    )
+
+@inline
+trusted fun esp32HmacSha256(
+    key: NativeBuffer,
+    data: NativeBuffer,
+    mac: NativeBuffer
+): bool = if (mac.capacity() < 32) false else
+    esp32HmacShaBufferWithPollLimit(
+        esp32Sha256, key, data, mac, u32(100000)
+    )

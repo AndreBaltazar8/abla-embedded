@@ -1,0 +1,271 @@
+import "../../src/esp32/crypto/sha_esp32.ab"
+import "../../src/esp32/crypto/hmac_esp32.ab"
+import "../../src/esp32/crypto/pbkdf2_esp32.ab"
+import "../../src/esp32/crypto/wpa_provider_esp32.ab"
+import "../../src/esp32/serial.ab"
+
+val log = serial()
+
+fun outputHexNibble(value: int): int =
+    if (value < 10) 48 + value else 55 + value
+
+trusted fun printDigest(buffer: NativeBuffer): void {
+    var index = 0
+    while (index < buffer.capacity()) {
+        val value = buffer.load(index)
+        log.writeByte(outputHexNibble((value >>> 4) & 15))
+        log.writeByte(outputHexNibble(value & 15))
+        index = index + 1
+    }
+    log.writeByte(10)
+    return
+}
+
+fun hexNibble(value: int): int {
+    if (value >= 48 && value <= 57) return value - 48
+    if (value >= 65 && value <= 70) return value - 55
+    if (value >= 97 && value <= 102) return value - 87
+    -1
+}
+
+trusted fun bufferMatchesHex(
+    buffer: NativeBuffer,
+    expected: string
+): bool {
+    if (expected.size != buffer.capacity() * 2) return false
+    var index = 0
+    while (index < buffer.capacity()) {
+        val high = hexNibble(expected[index * 2])
+        val low = hexNibble(expected[index * 2 + 1])
+        if (high < 0 || low < 0 || buffer.load(index) != high * 16 + low) {
+            return false
+        }
+        index = index + 1
+    }
+    true
+}
+
+trusted fun copyText(buffer: NativeBuffer, text: string): bool {
+    if (buffer.capacity() < text.size) return false
+    var index = 0
+    while (index < text.size) {
+        buffer.store(index, text[index])
+        index = index + 1
+    }
+    true
+}
+
+trusted fun copyHex(buffer: NativeBuffer, text: string): bool {
+    if (text.size != buffer.capacity() * 2) return false
+    var index = 0
+    while (index < buffer.capacity()) {
+        val high = hexNibble(text[index * 2])
+        val low = hexNibble(text[index * 2 + 1])
+        if (high < 0 || low < 0) return false
+        buffer.store(index, high * 16 + low)
+        index = index + 1
+    }
+    true
+}
+
+trusted fun shaVectorKat(): bool {
+    val workspace = nativeStackAllocate(256)
+    val first = nativeBufferAt(workspace + 48, 1)
+    val second = nativeBufferAt(workspace + 52, 1)
+    val third = nativeBufferAt(workspace + 56, 1)
+    val addresses = nativeBufferAt(workspace + 60, 12)
+    val lengths = nativeBufferAt(workspace + 72, 12)
+    val digest = nativeBufferAt(workspace + 84, 32)
+    first.store(0, 97)
+    second.store(0, 98)
+    third.store(0, 99)
+    addresses.storeU32(0, first.addressValue())
+    addresses.storeU32(4, second.addressValue())
+    addresses.storeU32(8, third.addressValue())
+    lengths.storeU32(0, 1)
+    lengths.storeU32(4, 1)
+    lengths.storeU32(8, 1)
+    esp32WpaSha256Vector(
+        u32(3), u32(addresses.addressValue()),
+        u32(lengths.addressValue()), u32(digest.addressValue())
+    ) == i32(0) &&
+        bufferMatchesHex(
+            digest,
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        )
+}
+
+trusted fun shaSingleKat(
+    algorithm: int,
+    message: string,
+    expected: string
+): bool {
+    val workspace = nativeStackAllocate(192)
+    val data = nativeBufferAt(workspace + 48, message.size)
+    val digestLength = if (algorithm == esp32Sha1) 20 else 32
+    val digest = nativeBufferAt(workspace + 112, digestLength)
+    val hashed = copyText(data, message) && esp32ShaBufferWithPollLimit(
+        algorithm, data, digest, u32(100000)
+    )
+    val matched = hashed && bufferMatchesHex(digest, expected)
+    if (!matched) {
+        log.write("SHA trace ")
+        log.writeByte(if (hashed) 49 else 48)
+        log.writeByte(32)
+        printDigest(digest)
+    }
+    matched
+}
+
+trusted fun hmacKat(algorithm: int, expected: string): bool {
+    val workspace = nativeStackAllocate(192)
+    val key = nativeBufferAt(workspace + 48, 20)
+    val data = nativeBufferAt(workspace + 68, 8)
+    val addresses = nativeBufferAt(workspace + 76, 4)
+    val lengths = nativeBufferAt(workspace + 80, 4)
+    val digestLength = if (algorithm == esp32Sha1) 20 else 32
+    val digest = nativeBufferAt(workspace + 84, digestLength)
+    var index = 0
+    while (index < 20) {
+        key.store(index, 11)
+        index = index + 1
+    }
+    copyText(data, "Hi There")
+    addresses.storeU32(0, data.addressValue())
+    lengths.storeU32(0, data.capacity())
+    val status = if (algorithm == esp32Sha1) esp32WpaHmacSha1Vector(
+        u32(key.addressValue()), u32(key.capacity()), u32(1),
+        u32(addresses.addressValue()), u32(lengths.addressValue()),
+        u32(digest.addressValue())
+    ) else esp32WpaHmacSha256Vector(
+        u32(key.addressValue()), u32(key.capacity()), u32(1),
+        u32(addresses.addressValue()), u32(lengths.addressValue()),
+        u32(digest.addressValue())
+    )
+    status == i32(0) && bufferMatchesHex(digest, expected)
+}
+
+trusted fun pbkdf2Kat(
+    iterations: int,
+    outputLength: int,
+    expected: string
+): bool {
+    val workspace = nativeStackAllocate(192)
+    val password = nativeBufferAt(workspace + 48, 9)
+    val salt = nativeBufferAt(workspace + 60, 4)
+    val output = nativeBufferAt(workspace + 64, outputLength)
+    copyText(password, "password")
+    password.store(8, 0)
+    copyText(salt, if (iterations == 4096) "IEEE" else "salt")
+    esp32WpaPbkdf2Sha1(
+        u32(password.addressValue()), u32(salt.addressValue()),
+        u32(salt.capacity()), i32(iterations), u32(output.addressValue()),
+        u32(outputLength)
+    ) == i32(0) &&
+        bufferMatchesHex(output, expected)
+}
+
+trusted fun aesCbcKat(): bool {
+    val workspace = nativeStackAllocate(192)
+    val key = nativeBufferAt(workspace + 48, 16)
+    val iv = nativeBufferAt(workspace + 64, 16)
+    val data = nativeBufferAt(workspace + 81, 32)
+    copyHex(key, "2B7E151628AED2A6ABF7158809CF4F3C")
+    copyHex(iv, "000102030405060708090A0B0C0D0E0F")
+    copyHex(
+        data,
+        "6BC1BEE22E409F96E93D7E117393172AAE2D8A571E03AC9C9EB76FAC45AF8E51"
+    )
+    val encrypted = esp32WpaAes128CbcEncrypt(
+        u32(key.addressValue()), u32(iv.addressValue()),
+        u32(data.addressValue()), u32(data.capacity())
+    ) == i32(0) && bufferMatchesHex(
+        data,
+        "7649ABAC8119B246CEE98E9B12E9197D5086CB9B507219EE95DB113A917678B2"
+    )
+    val decrypted = esp32WpaAes128CbcDecrypt(
+        u32(key.addressValue()), u32(iv.addressValue()),
+        u32(data.addressValue()), u32(data.capacity())
+    ) == i32(0) && bufferMatchesHex(
+        data,
+        "6BC1BEE22E409F96E93D7E117393172AAE2D8A571E03AC9C9EB76FAC45AF8E51"
+    )
+    encrypted && decrypted
+}
+
+trusted fun gmacAbiKat(): bool {
+    val workspace = nativeStackAllocate(128)
+    val key = nativeBufferAt(workspace + 48, 16)
+    val iv = nativeBufferAt(workspace + 64, 12)
+    val tag = nativeBufferAt(workspace + 76, 16)
+    var index = 0
+    while (index < 28) {
+        ablaUnsafeVolatileStoreU8(workspace + 48 + index, 0)
+        index = index + 1
+    }
+    esp32WpaAesGmac(
+        u32(key.addressValue()), u32(key.capacity()),
+        u32(iv.addressValue()), u32(iv.capacity()), u32(0), u32(0),
+        u32(tag.addressValue())
+    ) == i32(0) && bufferMatchesHex(
+        tag, "58E2FCCEFA7E3061367F1D57A4E7455A"
+    )
+}
+
+@export("app_main")
+trusted fun appMain(): void {
+    val sha1Empty = shaSingleKat(
+        esp32Sha1, "",
+        "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"
+    )
+    val sha1Long = shaSingleKat(
+        esp32Sha1,
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+        "84983E441C3BD26EBAAE4AA1F95129E5E54670F1"
+    )
+    val sha256Empty = shaSingleKat(
+        esp32Sha256, "",
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+    )
+    val sha256Long = shaSingleKat(
+        esp32Sha256,
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+        "248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1"
+    )
+    val vector = shaVectorKat()
+    val hmac1 = hmacKat(
+        esp32Sha1, "B617318655057264E28BC0B6FB378C8EF146BE00"
+    )
+    val hmac256 = hmacKat(
+        esp32Sha256,
+        "B0344C61D8DB38535CA8AFCEAF0BF12B881DC200C9833DA726E9376C2E32CFF7"
+    )
+    val pbkdf2One = pbkdf2Kat(
+        1, 20, "0C60C80F961F0E71F3A9B524AF6012062FE037A6"
+    )
+    val pbkdf2Wpa = pbkdf2Kat(
+        4096, 32,
+        "F42C6FC52DF0EBEF9EBB4B90B38A5F902E83FE1B135A70E23AED762E9710A12E"
+    )
+    val cbc = aesCbcKat()
+    val gmacAbi = gmacAbiKat()
+    if (sha1Empty && sha1Long && sha256Empty && sha256Long && vector &&
+        hmac1 && hmac256 && pbkdf2One && pbkdf2Wpa && cbc && gmacAbi) {
+        log.line("ESP32 WPA crypto ABI KAT: pass")
+    } else {
+        log.write("ESP32 SHA KAT: fail ")
+        log.writeByte(if (sha1Empty) 49 else 48)
+        log.writeByte(if (sha1Long) 49 else 48)
+        log.writeByte(if (sha256Empty) 49 else 48)
+        log.writeByte(if (sha256Long) 49 else 48)
+        log.writeByte(if (vector) 49 else 48)
+        log.writeByte(if (hmac1) 49 else 48)
+        log.writeByte(if (hmac256) 49 else 48)
+        log.writeByte(if (pbkdf2One) 49 else 48)
+        log.writeByte(if (pbkdf2Wpa) 49 else 48)
+        log.writeByte(if (cbc) 49 else 48)
+        log.writeByte(if (gmacAbi) 49 else 48)
+        log.writeByte(10)
+    }
+    return
+}

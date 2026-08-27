@@ -119,12 +119,18 @@ Xtensa register window and make later stack arguments unstable.
 Standard BIP-CMAC-128, BIP-GMAC-128, and BIP-GMAC-256 tags passed on the
 connected ESP32-PICO-D4. The same full packet KAT passed first verification,
 replay rejection, tamper rejection without committing replay state, and a
-successful retry after restoring the frame. This advances
-`ieee80211_crypto.o` only to `partial`. The generic encap/decap cipher
-dispatcher and the complete WPA crypto-provider table—HMAC-SHA256-vector,
-PBKDF2-SHA1, AES-CBC encrypt/decrypt, OMAC1, CCMP encrypt/decrypt, AES-GMAC,
-and SHA256-vector—must all be present and tested before that row can become
-`complete`.
+successful retry after restoring the frame.
+`src/esp32/wifi/crypto_dispatch_esp32.ab` now supplies the complete retained
+`ieee80211_crypto.o` ABI: attach/availability/key leaves, generic
+encap/decap callback dispatch, the exact seven-entry MIC-length table, all
+three BIP paths, and the writable 44-byte provider-table symbol. Its BIP path
+keeps Espressif's big-endian internal replay-counter ordering while using the
+allocation-free Abla CMAC/GMAC engine. The M5Echo link map assigns every ABI
+symbol and the table to `abla_app.o`, does not retain `ieee80211_crypto.o`,
+and the resulting image completed WPA2 association, server authentication,
+speech request, and playback on the connected device. This row is complete;
+the provider callbacks themselves remain separately tracked implementation
+work where their original definitions live.
 
 The opt-in `src/esp32/radio/power_esp32.ab` module implements classic ESP32
 power-domain, shared/Wi-Fi clock, reset, and MAC-state register primitives.
@@ -329,8 +335,9 @@ may prove whole-program elimination for one application, but never removes its
 row or changes replacement status. `tools/check-esp32-opaque-radio-parity`
 validates the fixed full inventory and can additionally reject an unknown
 opaque member in a supplied `ESP32_LINK_MAP`. A row reaches `complete` only
-with source, tests, and hardware evidence for its entire surface; only the
-six-symbol `ieee80211_crypto_ccmp.o` row currently meets that bar.
+with source, tests, and hardware evidence for its entire surface. The
+six-symbol `ieee80211_crypto_ccmp.o` and full `ieee80211_crypto.o` rows
+currently meet that bar.
 
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.

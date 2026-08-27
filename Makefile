@@ -1,7 +1,7 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu imu-calibration imu-offsets power-monitor pmic-axp192 pmic-axp2101 pmic-ip5306 pmic-m5pm1 charger-aw32001 led-m5pm1 led-powerhub led-paper-mono led-strip-rmt board-detect-s3 board-detect-c6 radio-mac-registers compare-radio-power-size compare-rx-chain-size compare-wifi-fcs-size compare-wifi-management-size compare-wifi-connection-size compare-esp32-aes-size compare-wifi-ccmp-size compare-xtensa-interrupt-size check-xtensa-dispatcher-ownership compare-radio-rx-size compare-radio-rx-queue-size compare-radio-tx-size i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu imu-calibration imu-offsets power-monitor pmic-axp192 pmic-axp2101 pmic-ip5306 pmic-m5pm1 charger-aw32001 led-m5pm1 led-powerhub led-paper-mono led-strip-rmt board-detect-s3 board-detect-c6 radio-mac-registers esp32-sha-kat compare-radio-power-size compare-rx-chain-size compare-wifi-fcs-size compare-wifi-management-size compare-wifi-connection-size compare-esp32-aes-size compare-wifi-ccmp-size compare-xtensa-interrupt-size check-xtensa-dispatcher-ownership compare-radio-rx-size compare-radio-rx-queue-size compare-radio-tx-size i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
 	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-rtc-rx8130 upload-rtc-powerhub upload-io-expander clean
 
@@ -109,6 +109,10 @@ board-detect-s3:
 
 radio-mac-registers:
 	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example radio-mac-registers'
+
+esp32-sha-kat:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run './tools/build-example esp32-sha-kat'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/esp32-sha-kat build'
 
 compare-radio-power-size: radio-mac-registers
 	nix-shell -p steam-run --run './tools/compare-radio-power-size'
