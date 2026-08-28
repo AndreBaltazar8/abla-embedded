@@ -407,6 +407,16 @@ member enters the Abla implementation; they are migration ABI boundaries, not
 public package APIs. Replacing each caller cluster removes the corresponding
 boundary and lets LLVM prune the entire unused path.
 
+`tools/check-linker-boundaries` enforces that distinction after the final
+link. It reads GNU ld's cross-reference table and rejects every linker-visible
+definition from the Abla object that has no caller outside that object. The
+M5Echo audit exposed and removed four stale data definitions (`s_tbttstart`,
+`ieee80211_opcap`, and two net80211 revision words); its remaining 142 visible
+function and data definitions all have concrete non-Abla callers. This is a
+migration count, not an API target: it must fall as those caller objects move
+into the same Abla/LLVM unit, leaving only unavoidable image entry and hardware
+vector roots.
+
 `src/esp32/wifi/ieee80211_phy_esp32.ab` now replaces the complete classic
 ESP32 `ieee80211_phy.o` policy layer. It preserves the 11b/11a/11g hardware
 rate order, user-supported-rate masks, PHY type and display modes, interface
