@@ -1,0 +1,221 @@
+import "./color.ab"
+import "./lcd_logic.ab"
+import "../esp32/gpio.ab"
+import "../esp32/spi_idf6.ab"
+import "../esp32/task.ab"
+import "../esp32/sdk/buffer.ab"
+
+// A display transport is the 32-bit ESP-IDF SPI handle plus three signed-byte
+// GPIOs and one backlight-polarity bit. It is a single allocation-free scalar.
+type SpiLcd = int
+
+fun spiLcdPinValue(number: int): int = number & 255
+fun spiLcdPin(value: int): Pin = pin(
+    if ((value & 255) == 255) -1 else value & 255
+)
+
+fun spiLcd(
+    device: SpiDevice,
+    dataCommandPin: int,
+    resetPin: int = -1,
+    backlightPin: int = -1,
+    backlightActiveLow: bool = false
+): SpiLcd = SpiLcd(
+    (device & 4294967295) |
+        (spiLcdPinValue(dataCommandPin) << 32) |
+        (spiLcdPinValue(resetPin) << 40) |
+        (spiLcdPinValue(backlightPin) << 48) |
+        (if (backlightActiveLow) 1 << 56 else 0)
+)
+
+fun SpiLcd.device(): SpiDevice = SpiDevice(this & 4294967295)
+fun SpiLcd.dataCommandPin(): Pin = spiLcdPin(this >>> 32)
+fun SpiLcd.resetPin(): Pin = spiLcdPin(this >>> 40)
+fun SpiLcd.backlightPin(): Pin = spiLcdPin(this >>> 48)
+fun SpiLcd.backlightActiveLow(): bool = (this & (1 << 56)) != 0
+fun SpiLcd.valid(): bool = this.device().valid() &&
+    this.dataCommandPin().number() >= 0
+
+trusted fun SpiBus.lcd(
+    chipSelectPin: int,
+    dataCommandPin: int,
+    resetPin: int = -1,
+    backlightPin: int = -1,
+    frequency: int = 40000000,
+    backlightActiveLow: bool = false
+): SpiLcd {
+    val device = this.device(chipSelectPin, frequency, 0, true)
+    val result = spiLcd(
+        device, dataCommandPin, resetPin, backlightPin,
+        backlightActiveLow
+    )
+    if (!result.valid()) {
+        if (device.valid()) device.close()
+        return spiLcd(SpiDevice(0), -1)
+    }
+    result.dataCommandPin().output()
+    result.dataCommandPin().write(true)
+    if (result.resetPin().number() >= 0) {
+        result.resetPin().output()
+        result.resetPin().write(true)
+    }
+    if (result.backlightPin().number() >= 0) {
+        result.backlightPin().output()
+        result.setBacklight(false)
+    }
+    result
+}
+
+trusted fun SpiLcd.close(): bool = this.valid() && this.device().close()
+
+trusted fun SpiLcd.setBacklight(enabled: bool): void {
+    val output = this.backlightPin()
+    if (output.number() >= 0) {
+        output.write(if (this.backlightActiveLow()) !enabled else enabled)
+    }
+    return
+}
+
+trusted fun SpiLcd.reset(): void {
+    val output = this.resetPin()
+    if (output.number() >= 0) {
+        output.write(false)
+        taskDelay(8)
+        output.write(true)
+        taskDelay(64)
+    }
+    return
+}
+
+trusted fun SpiLcd.writeCommandSelected(
+    command: int,
+    data: NativeBuffer,
+    length: int,
+    keepSelectedAfter: bool = false
+): bool {
+    if (!this.valid() || length < 0 || length > data.capacity()) return false
+    val commandBuffer = nativeBufferAt(nativeStackAllocate(1), 1)
+    commandBuffer.store(0, command)
+    this.dataCommandPin().write(false)
+    val commandFlags = if (length > 0 || keepSelectedAfter) {
+        spiKeepChipSelect
+    } else 0
+    if (!this.device().writeWithFlags(commandBuffer, 1, commandFlags)) {
+        this.dataCommandPin().write(true)
+        return false
+    }
+    this.dataCommandPin().write(true)
+    length == 0 || this.device().writeWithFlags(
+        data, length, if (keepSelectedAfter) spiKeepChipSelect else 0
+    )
+}
+
+trusted fun SpiLcd.writeCommand(
+    command: int,
+    data: NativeBuffer,
+    length: int
+): bool {
+    if (!this.valid() || !this.device().acquire()) return false
+    val written = this.writeCommandSelected(command, data, length)
+    this.device().release()
+    written
+}
+
+trusted fun SpiLcd.runCommandProgram(program: string): bool {
+    if (!this.valid() || !lcdCommandProgramValid(program) ||
+        !this.device().acquire()) return false
+    val arguments = nativeBufferAt(nativeStackAllocate(127), 127)
+    var index = 0
+    var valid = true
+    var complete = false
+    while (valid && !complete) {
+        val command = program[index]
+        val encodedCount = program[index + 1]
+        index = index + 2
+        if (command == 255 && encodedCount == 255) complete = true
+        else {
+            val count = encodedCount & 127
+            var argument = 0
+            while (argument < count) {
+                arguments.store(argument, program[index + argument])
+                argument = argument + 1
+            }
+            index = index + count
+            valid = this.writeCommandSelected(command, arguments, count)
+            if ((encodedCount & 128) != 0) {
+                val encodedDelay = program[index]
+                index = index + 1
+                taskDelay(if (encodedDelay == 255) 500 else encodedDelay)
+            }
+        }
+    }
+    this.device().release()
+    valid && complete
+}
+
+trusted fun SpiLcd.setWindowSelected(
+    view: LcdView,
+    x: int,
+    y: int,
+    width: int,
+    height: int
+): bool {
+    val columnStart = x + view.columnStart()
+    val rowStart = y + view.rowStart()
+    val columnEnd = columnStart + width - 1
+    val rowEnd = rowStart + height - 1
+    val address = nativeBufferAt(nativeStackAllocate(4), 4)
+    address.store(0, columnStart >>> 8)
+    address.store(1, columnStart)
+    address.store(2, columnEnd >>> 8)
+    address.store(3, columnEnd)
+    if (!this.writeCommandSelected(42, address, 4)) return false
+    address.store(0, rowStart >>> 8)
+    address.store(1, rowStart)
+    address.store(2, rowEnd >>> 8)
+    address.store(3, rowEnd)
+    this.writeCommandSelected(43, address, 4)
+}
+
+trusted fun SpiLcd.fillRect(
+    view: LcdView,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    color: Rgb565
+): bool {
+    if (!this.valid()) return false
+    val rectangle = clipDisplayRect(
+        x, y, width, height, view.width(), view.height()
+    )
+    if (rectangle.empty()) return true
+    if (!this.device().acquire()) return false
+    var valid = this.setWindowSelected(
+        view, rectangle.x(), rectangle.y(),
+        rectangle.width(), rectangle.height()
+    )
+    val empty = nativeBufferAt(0, 0)
+    if (valid) valid = this.writeCommandSelected(44, empty, 0, true)
+    val pixels = nativeBufferAt(nativeStackAllocate(512), 512)
+    var pixel = 0
+    while (pixel < 256) {
+        pixels.store(pixel * 2, color.value() >>> 8)
+        pixels.store(pixel * 2 + 1, color.value())
+        pixel = pixel + 1
+    }
+    var remaining = rectangle.width() * rectangle.height()
+    while (valid && remaining > 0) {
+        val count = if (remaining > 256) 256 else remaining
+        remaining = remaining - count
+        valid = this.device().writeWithFlags(
+            pixels, count * 2,
+            if (remaining > 0) spiKeepChipSelect else 0
+        )
+    }
+    this.device().release()
+    valid
+}
+
+trusted fun SpiLcd.fill(view: LcdView, color: Rgb565): bool =
+    this.fillRect(view, 0, 0, view.width(), view.height(), color)

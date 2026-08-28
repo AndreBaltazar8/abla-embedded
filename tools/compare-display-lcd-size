@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+esp_llvm_root=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
+output_directory=$project_root/build/benchmarks/display-lcd
+abla_object=$project_root/build/examples/st7789-fill/abla_benchmark.o
+cxx_object=$output_directory/reference.o
+runner=()
+
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+if [[ ! -x $esp_llvm_root/bin/clang || ! -x $esp_llvm_root/bin/llvm-size ]]; then
+    printf 'missing Espressif LLVM under %s; run make setup\n' \
+        "$esp_llvm_root" >&2
+    exit 1
+fi
+if [[ ! -f $abla_object ]]; then
+    compiler_root=${ABLA_COMPILER_ROOT:-$project_root/../ablac}
+    export ABLA_SYSROOT=$compiler_root
+    export ABLA_ESP_LLVM_ROOT=$esp_llvm_root
+    export PATH=$project_root/tools/esp-llvm-bin:$PATH
+    "$compiler_root/build/ablac" build \
+        "$project_root/examples/st7789-fill/build.ab" \
+        -o "$project_root/build/examples/st7789-fill/build-driver"
+    "$project_root/build/examples/st7789-fill/build-driver"
+fi
+
+mkdir -p "$output_directory"
+"${runner[@]}" "$esp_llvm_root/bin/clang" \
+    --target=xtensa-esp-elf -mcpu=esp32 -O2 -fomit-frame-pointer \
+    -ffunction-sections -fdata-sections -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -std=c++17 \
+    -c "$project_root/benchmarks/display-lcd-reference.cpp" -o "$cxx_object"
+
+section_bytes() {
+    local object=$1
+    local symbol=$2
+    "${runner[@]}" "$esp_llvm_root/bin/llvm-size" -A "$object" |
+        awk -v text=".text.$symbol" -v literal=".literal.$symbol" \
+            '$1 == text || $1 == literal { total += $2 } END { print total + 0 }'
+}
+
+instruction_count() {
+    local object=$1
+    local symbol=$2
+    local objdump=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin/xtensa-esp32-elf-objdump
+    "${runner[@]}" "$objdump" -d --disassemble="$symbol" "$object" |
+        awk '/^[[:space:]]*[[:xdigit:]]+:/ { count += 1 } END { print count + 0 }'
+}
+
+compare_leaf() {
+    local label=$1
+    local abla_symbol=$2
+    local cxx_symbol=$3
+    local abla_bytes cxx_bytes
+    abla_bytes=$(section_bytes "$abla_object" "$abla_symbol")
+    cxx_bytes=$(section_bytes "$cxx_object" "$cxx_symbol")
+    printf '%s (.text + .literal): Abla %s bytes, C++ %s bytes\n' \
+        "$label" "$abla_bytes" "$cxx_bytes"
+    (( abla_bytes <= cxx_bytes )) || return 1
+
+    local objdump=$project_root/.platformio/packages/toolchain-xtensa-esp32/bin/xtensa-esp32-elf-objdump
+    if [[ -x $objdump ]]; then
+        local abla_instructions cxx_instructions
+        abla_instructions=$(instruction_count "$abla_object" "$abla_symbol")
+        cxx_instructions=$(instruction_count "$cxx_object" "$cxx_symbol")
+        printf '%s instructions: Abla %s, C++ %s\n' \
+            "$label" "$abla_instructions" "$cxx_instructions"
+        (( abla_instructions <= cxx_instructions )) || return 1
+    fi
+}
+
+compare_leaf 'RGB565 conversion' abla_display_rgb565 cxx_display_rgb565
+compare_leaf 'Fixed M5StickC Plus2 display view' \
+    abla_display_view cxx_display_view
+
+"${runner[@]}" "$esp_llvm_root/bin/llvm-nm" -g "$abla_object" |
+    grep -Eq '(^|[[:space:]])abla_display_(rgb565|view)$' && {
+        echo 'display comparison leaves unexpectedly have external linkage' >&2
+        exit 1
+    }
+
+echo 'Abla display leaves match or beat C++ and remain internal'

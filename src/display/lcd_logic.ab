@@ -1,0 +1,183 @@
+// Six ten-bit values fit in one scalar: visible width/height, the panel's
+// origin inside controller memory, and the controller memory dimensions.
+type LcdGeometry = u64
+
+fun lcdGeometry(
+    width: int,
+    height: int,
+    offsetX: int = 0,
+    offsetY: int = 0,
+    memoryWidth: int = 0,
+    memoryHeight: int = 0
+): LcdGeometry {
+    val storedMemoryWidth = if (memoryWidth > 0) memoryWidth else width
+    val storedMemoryHeight = if (memoryHeight > 0) memoryHeight else height
+    LcdGeometry(
+        u64(width & 1023) | (u64(height & 1023) << u64(10)) |
+            (u64(offsetX & 1023) << u64(20)) |
+            (u64(offsetY & 1023) << u64(30)) |
+            (u64(storedMemoryWidth & 1023) << u64(40)) |
+            (u64(storedMemoryHeight & 1023) << u64(50))
+    )
+}
+
+fun LcdGeometry.width(): int = int(this & u64(1023))
+fun LcdGeometry.height(): int = int((this >> u64(10)) & u64(1023))
+fun LcdGeometry.offsetX(): int = int((this >> u64(20)) & u64(1023))
+fun LcdGeometry.offsetY(): int = int((this >> u64(30)) & u64(1023))
+fun LcdGeometry.memoryWidth(): int = int((this >> u64(40)) & u64(1023))
+fun LcdGeometry.memoryHeight(): int = int((this >> u64(50)) & u64(1023))
+fun LcdGeometry.valid(): bool = this.width() > 0 && this.height() > 0 &&
+    this.width() + this.offsetX() <= this.memoryWidth() &&
+    this.height() + this.offsetY() <= this.memoryHeight()
+
+// A resolved view is also one scalar: logical dimensions, controller column
+// and row starts, and the exact MADCTL byte for the selected rotation.
+type LcdView = u64
+
+@inline
+fun lcdViewValue32(
+    width: i32,
+    height: i32,
+    columnStart: i32,
+    rowStart: i32,
+    madctl: i32
+): LcdView = LcdView(
+    u64(u32(width) & u32(1023)) |
+        (u64(u32(height) & u32(1023)) << u64(10)) |
+        (u64(u32(columnStart) & u32(1023)) << u64(20)) |
+        (u64(u32(rowStart) & u32(1023)) << u64(30)) |
+        (u64(u32(madctl) & u32(255)) << u64(40))
+)
+
+fun lcdViewValue(
+    width: int,
+    height: int,
+    columnStart: int,
+    rowStart: int,
+    madctl: int
+): LcdView = lcdViewValue32(
+    i32(width), i32(height), i32(columnStart), i32(rowStart), i32(madctl)
+)
+
+fun LcdView.width(): int = int(this & u64(1023))
+fun LcdView.height(): int = int((this >> u64(10)) & u64(1023))
+fun LcdView.columnStart(): int = int((this >> u64(20)) & u64(1023))
+fun LcdView.rowStart(): int = int((this >> u64(30)) & u64(1023))
+fun LcdView.madctl(): int = int((this >> u64(40)) & u64(255))
+
+@inline
+fun lcdMadctl32(rotation: i32, bgrOrder: bool): i32 {
+    val selected = rotation & i32(7)
+    val packed = if (selected < i32(4)) {
+        u32(2966709248)
+    } else u32(4098105488)
+    val shift = (u32(selected) & u32(3)) * u32(8)
+    val orientation = i32((packed >> shift) & u32(255))
+    orientation | (if (bgrOrder) i32(8) else i32(0))
+}
+
+fun lcdMadctl(rotation: int, bgrOrder: bool): int =
+    int(lcdMadctl32(i32(rotation), bgrOrder))
+
+fun LcdGeometry.view(rotation: int, bgrOrder: bool = true): LcdView {
+    val selected = i32(rotation) & i32(7)
+    var width = i32(this.width())
+    var height = i32(this.height())
+    var offsetX = i32(this.offsetX())
+    var offsetY = i32(this.offsetY())
+    var memoryWidth = i32(this.memoryWidth())
+    var memoryHeight = i32(this.memoryHeight())
+    if ((selected & i32(1)) != i32(0)) {
+        val oldWidth = width
+        width = height
+        height = oldWidth
+        val oldOffset = offsetX
+        offsetX = offsetY
+        offsetY = oldOffset
+        val oldMemory = memoryWidth
+        memoryWidth = memoryHeight
+        memoryHeight = oldMemory
+    }
+    val columnStart = if ((selected & i32(2)) != i32(0)) {
+        memoryWidth - (width + offsetX)
+    } else offsetX
+    val reverseRow = ((i32(1) << selected) & i32(150)) != i32(0)
+    val rowStart = if (reverseRow) {
+        memoryHeight - (height + offsetY)
+    } else offsetY
+    lcdViewValue32(
+        width, height, columnStart, rowStart,
+        lcdMadctl32(selected, bgrOrder)
+    )
+}
+
+// A clipped rectangle uses four unsigned 16-bit lanes and remains a scalar.
+type DisplayRect = int
+
+fun displayRect(x: int, y: int, width: int, height: int): DisplayRect =
+    DisplayRect(
+        (x & 65535) | ((y & 65535) << 16) |
+            ((width & 65535) << 32) | ((height & 65535) << 48)
+    )
+
+fun DisplayRect.x(): int = this & 65535
+fun DisplayRect.y(): int = (this >>> 16) & 65535
+fun DisplayRect.width(): int = (this >>> 32) & 65535
+fun DisplayRect.height(): int = (this >>> 48) & 65535
+fun DisplayRect.empty(): bool = this.width() == 0 || this.height() == 0
+
+fun clipDisplayRect(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    boundsWidth: int,
+    boundsHeight: int
+): DisplayRect {
+    if (width <= 0 || height <= 0 || boundsWidth <= 0 ||
+        boundsHeight <= 0 || x >= boundsWidth || y >= boundsHeight ||
+        x + width <= 0 || y + height <= 0) return displayRect(0, 0, 0, 0)
+    val clippedX = if (x < 0) 0 else x
+    val clippedY = if (y < 0) 0 else y
+    var clippedWidth = width - (clippedX - x)
+    var clippedHeight = height - (clippedY - y)
+    if (clippedX + clippedWidth > boundsWidth) {
+        clippedWidth = boundsWidth - clippedX
+    }
+    if (clippedY + clippedHeight > boundsHeight) {
+        clippedHeight = boundsHeight - clippedY
+    }
+    displayRect(
+        clippedX, clippedY,
+        if (clippedWidth > 0) clippedWidth else 0,
+        if (clippedHeight > 0) clippedHeight else 0
+    )
+}
+
+// Command programs use the M5GFX/LovyanGFX compact representation: command,
+// argument count, arguments, and an optional delay byte when bit 7 is set.
+// 0xff,0xff is the exact terminator.
+fun lcdCommandProgramValid(program: string): bool {
+    var index = 0
+    while (index + 1 < program.size) {
+        val command = program[index]
+        val encodedCount = program[index + 1]
+        index = index + 2
+        if (command == 255 && encodedCount == 255) {
+            return index == program.size
+        }
+        val count = encodedCount & 127
+        if (index + count > program.size) return false
+        index = index + count
+        if ((encodedCount & 128) != 0) {
+            if (index >= program.size) return false
+            index = index + 1
+        }
+    }
+    false
+}
+
+// ST7789V initialization from M5GFX's current Panel_ST7789 implementation.
+// Panel-specific inversion, color order and rotation are sent separately.
+val st7789InitCommands = "\xb7\x01\x35\xbb\x01\x28\xc0\x01\x0c\xc2\x02\x01\xff\xc3\x01\x10\xc4\x01\x20\xd0\x02\xa4\xa1\xb0\x02\x00\xc0\xe0\x0e\xd0\x00\x02\x07\x0a\x28\x32\x44\x42\x06\x0e\x12\x14\x17\xe1\x0e\xd0\x00\x02\x07\x0a\x28\x31\x54\x47\x0e\x1c\x17\x1b\x1e\x11\x80\x82\x38\x00\x29\x00\xff\xff"
