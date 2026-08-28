@@ -453,6 +453,7 @@ def recover_instruction(
     instruction: Instruction,
     data: dict[str, bytes],
     relocations: dict[str, dict[int, tuple[str, str]]],
+    label_name: str = "",
 ) -> str:
     text = instruction.text
     mnemonic, _, operands = text.partition("\t")
@@ -491,7 +492,7 @@ def recover_instruction(
         target_offset = int(match.group(1), 16)
         description = match.group(2)
         if description == function or description.startswith(function + "+"):
-            return local_label(function, target_offset)
+            return local_label(label_name or function, target_offset)
         return clean_symbol(description)
 
     return TARGET.sub(replace_target, text)
@@ -504,6 +505,7 @@ def recovered_function_body(
     instructions: list[Instruction],
     data: dict[str, bytes],
     relocations: dict[str, dict[int, tuple[str, str]]],
+    label_name: str = "",
 ) -> list[str]:
     targets: set[int] = set()
     for instruction in instructions:
@@ -514,9 +516,9 @@ def recovered_function_body(
     body: list[str] = []
     for instruction in instructions:
         if instruction.offset in targets:
-            body.append(local_label(name, instruction.offset) + ":")
+            body.append(local_label(label_name or name, instruction.offset) + ":")
         body.append(recover_instruction(
-            name, section, instruction, data, relocations
+            name, section, instruction, data, relocations, label_name
         ))
     return body
 
@@ -555,6 +557,7 @@ def local_function_directives(
     data: dict[str, bytes],
     relocations: dict[str, dict[int, tuple[str, str]]],
     alignment: int,
+    emitted_name: str = "",
 ) -> list[str]:
     # A section-only local function has no separate ELF function symbol, so
     # objdump presents its literal pool under the section label as if it were
@@ -566,6 +569,7 @@ def local_function_directives(
                 start = instruction.offset
                 instructions = instructions[index:]
                 break
+    symbol = emitted_name or name
     safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
     lines = [
         f'.pushsection .text.abla_ioctl_local_{safe},"ax",@progbits',
@@ -573,15 +577,15 @@ def local_function_directives(
     if alignment > 0:
         lines.append(f".p2align {alignment}")
     lines.extend([
-        f".local {name}",
-        f".type {name}, @function",
-        f"{name}:",
+        f".local {symbol}",
+        f".type {symbol}, @function",
+        f"{symbol}:",
     ])
     lines.extend(recovered_function_body(
-        name, section, start, instructions, data, relocations
+        name, section, start, instructions, data, relocations, symbol
     ))
     lines.extend([
-        f".size {name}, .-{name}",
+        f".size {symbol}, .-{symbol}",
         ".popsection",
     ])
     return lines
@@ -604,6 +608,12 @@ def main() -> int:
     parser.add_argument("--namespace", default="ioctl")
     parser.add_argument("--link-selector", default="linkRecoveredOpaqueCallers")
     arguments = parser.parse_args()
+    namespace = re.sub(r"[^A-Za-z0-9_]", "_", arguments.namespace)
+    local_symbols = {
+        name: ".Labla_recovered_" + namespace + "_local_" +
+        re.sub(r"[^A-Za-z0-9_]", "_", name)
+        for name in arguments.local_function
+    }
     output = run_objdump(arguments.objdump, arguments.object)
     data = section_bytes(output)
     metadata = section_metadata(output)
@@ -625,7 +635,7 @@ def main() -> int:
                 section = recovered[0]
                 local_directives.extend(local_function_directives(
                     name, *recovered, data, relocations,
-                    metadata.get(section, (0, 2))[1]
+                    metadata.get(section, (0, 2))[1], local_symbols[name]
                 ))
             else:
                 recovered_functions.append((
@@ -636,6 +646,9 @@ def main() -> int:
             failures += 1
     if not failures:
         combined = "\n".join(source for _, source in recovered_functions)
+        for old, new in local_symbols.items():
+            combined = combined.replace(old, new)
+            local_directives = [line.replace(old, new) for line in local_directives]
         try:
             combined, prefix = recovered_data_prefix(
                 combined, arguments.global_data, arguments.internal_data,
@@ -659,9 +672,6 @@ def main() -> int:
                 combined = combined.replace(
                     '    "', f'    "{escaped_prefix}\\n', 1
                 )
-            namespace = re.sub(
-                r"[^A-Za-z0-9_]", "_", arguments.namespace
-            )
             if namespace != "ioctl":
                 combined = combined.replace(
                     ".Labla_recovered_ioctl_data_",
