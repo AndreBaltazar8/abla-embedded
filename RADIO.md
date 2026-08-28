@@ -411,11 +411,19 @@ boundary and lets LLVM prune the entire unused path.
 link. It reads GNU ld's cross-reference table and rejects every linker-visible
 definition from the Abla object that has no caller outside that object. The
 M5Echo audit exposed and removed four stale data definitions (`s_tbttstart`,
-`ieee80211_opcap`, and two net80211 revision words); its remaining 142 visible
-function and data definitions all have concrete non-Abla callers. This is a
-migration count, not an API target: it must fall as those caller objects move
-into the same Abla/LLVM unit, leaving only unavoidable image entry and hardware
-vector roots.
+`ieee80211_opcap`, and two net80211 revision words). After the A-MPDU migration,
+its 151 visible function and data definitions all have concrete non-Abla
+callers. These are not public framework APIs: they are exact temporary linker
+boundaries forced by still-opaque caller objects. This is a migration count,
+not an API target. It must fall as those callers move into the same Abla/LLVM
+unit, leaving only unavoidable image entry and hardware-vector roots.
+
+The compiler also determines lazy module-state initialization from each
+exported function's transitive call graph. A pure entry no longer pays or
+retains an initialization guard merely because an unrelated application module
+has runtime state. Only four such guards remain in the current M5Echo
+application IR, on paths that actually reach runtime-initialized globals. This
+is automatic and uses no platform-specific or statefulness annotation.
 
 `src/esp32/wifi/ieee80211_phy_esp32.ab` now replaces the complete classic
 ESP32 `ieee80211_phy.o` policy layer. It preserves the 11b/11a/11g hardware
@@ -440,6 +448,20 @@ functions. The 581-byte attributed archive member is absent from the M5Echo
 map, the application image fell another 208 bytes to 871,008 bytes, and the
 flashed Atom Echo completed boot, WPA2 association, DHCP, server
 authentication, speech transfer, and audio playback on 2026-08-28.
+
+`src/esp32/radio/ampdu_logic.ab` and
+`src/esp32/radio/ampdu_esp32.ab` now replace the complete classic ESP32
+`hal_ampdu.o` surface: RX block-ack agreement add, clear, and delete plus
+hardware session store, restore, and restore-by-index. The implementation owns
+the exact eight-session MMIO table, address packing, TID/sequence/window
+fields, validity transitions, and vendor-compatible diagnostic arguments.
+Its six exact linker names remain only because opaque `if_hwctrl.o`, `wdev.o`,
+and `ieee80211_ht.o` members still call them. The 1,009-byte attributed archive
+member is absent from the M5Echo map. Despite adding the full surface, automatic
+per-export initialization slicing reduced the application another 176 bytes to
+870,832 bytes. The flashed Atom Echo exercised two live block-ack additions,
+completed WPA2 association and DHCP, authenticated to the server, requested
+speech, and completed audio playback on 2026-08-28.
 
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
