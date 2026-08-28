@@ -407,5 +407,18 @@ member enters the Abla implementation; they are migration ABI boundaries, not
 public package APIs. Replacing each caller cluster removes the corresponding
 boundary and lets LLVM prune the entire unused path.
 
+`src/esp32/wifi/ieee80211_phy_esp32.ab` now replaces the complete classic
+ESP32 `ieee80211_phy.o` policy layer. It preserves the 11b/11a/11g hardware
+rate order, user-supported-rate masks, PHY type and display modes, interface
+trace mode, low-rate policy, and per-interface vendor-LoRa enable state. The
+success path constructs the twelve rate codes directly instead of allocating
+and copying a temporary 212-byte table. Deinitialization, rate construction,
+mode names, and user-rate handling are internal Abla; only `ieee80211_phy_init`,
+`ieee80211_phy_mode_show`, and `ieee80211_phy_type_get` retain exact names
+because other opaque net80211 members still call them. The original 1,496-byte
+member is absent from the M5Echo map, the image fell by 672 bytes to 871,216
+bytes, and the flashed Atom Echo completed WPA2 association, DHCP, server
+authentication, speech transfer, and audio playback on 2026-08-28.
+
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
