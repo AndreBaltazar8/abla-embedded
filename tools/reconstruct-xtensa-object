@@ -549,6 +549,56 @@ def recovered_function_body(
     return body
 
 
+def deduplicate_symbol_literals(
+    body: list[str], label_stem: str
+) -> list[str]:
+    """Share repeated address literals inside one recovered function.
+
+    Xtensa's `movi register, symbol` pseudo-instruction creates a literal word
+    for every occurrence.  The input objects can contain repeated words for the
+    same address, and reassembly may introduce still more.  An explicit
+    `.literal` plus `l32r` is instruction-equivalent and lets every occurrence
+    share one relocation, reducing both the object and final image.
+    """
+    parsed: list[tuple[str, str] | None] = []
+    counts: dict[str, int] = {}
+    symbolic = re.compile(
+        r"^[A-Za-z_.][A-Za-z0-9_.$]*(?:[+-](?:0x)?[0-9A-Fa-f]+)?$"
+    )
+    for line in body:
+        match = re.match(r"^movi\s+(a(?:[0-9]|1[0-5])),\s*(\S+)\s*$", line)
+        item = None
+        target = match.group(2) if match else ""
+        needs_literal = bool(symbolic.match(target))
+        if not needs_literal and target:
+            try:
+                value = int(target, 0)
+                needs_literal = value < -2048 or value > 2047
+            except ValueError:
+                pass
+        if match and needs_literal:
+            item = (match.group(1), target)
+            counts[item[1]] = counts.get(item[1], 0) + 1
+        parsed.append(item)
+
+    repeated = [target for target, count in counts.items() if count > 1]
+    if not repeated:
+        return body
+    safe_stem = re.sub(r"[^A-Za-z0-9_]", "_", label_stem)
+    labels = {
+        target: f".Labla_recovered_{safe_stem}_shared_literal_{index}"
+        for index, target in enumerate(repeated)
+    }
+    prefix = [f".literal {labels[target]}, {target}" for target in repeated]
+    rewritten: list[str] = []
+    for line, item in zip(body, parsed):
+        if item is not None and item[1] in labels:
+            rewritten.append(f"l32r {item[0]}, {labels[item[1]]}")
+        else:
+            rewritten.append(line)
+    return prefix + rewritten
+
+
 def emit_function(
     name: str,
     section: str,
@@ -561,6 +611,7 @@ def emit_function(
     body = recovered_function_body(
         name, section, start, instructions, data, relocations
     )
+    body = deduplicate_symbol_literals(body, name)
     if prefix:
         body = prefix + body
     escaped = "\\n".join(
@@ -568,9 +619,19 @@ def emit_function(
         for line in body
     )
     abla_name = abla_function_name(name)
+    # Most recovered functions use an ordinary `.text.*` input section and
+    # should let LLVM choose the final text subsection.  Named executable
+    # sections such as IRAM/RTC memory, however, are part of the function's
+    # correctness contract and must survive reconstruction.  `@section` is a
+    # general LLVM boundary rather than a target-specific annotation.
+    section_annotation = ""
+    if not section.startswith(".text"):
+        escaped_section = section.replace("\\", "\\\\").replace('"', '\\"')
+        section_annotation = f'@section("{escaped_section}")\n'
     return (
         f"// Original ABI symbol: {name}\n"
-        f"@naked\ntrusted fun {abla_name}(): void = xtensaAssemblyVoid(\n"
+        f"@naked\n{section_annotation}"
+        f"trusted fun {abla_name}(): void = xtensaAssemblyVoid(\n"
         f"    \"{escaped}\",\n    \"~{{memory}}\"\n)\n"
     )
 
@@ -607,9 +668,10 @@ def local_function_directives(
         f".type {symbol}, @function",
         f"{symbol}:",
     ])
-    lines.extend(recovered_function_body(
+    body = recovered_function_body(
         name, section, start, instructions, data, relocations, symbol
-    ))
+    )
+    lines.extend(deduplicate_symbol_literals(body, symbol))
     lines.extend([
         f".size {symbol}, .-{symbol}",
         ".popsection",

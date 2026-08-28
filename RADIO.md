@@ -419,6 +419,17 @@ boundaries forced by still-opaque caller objects. This is a migration count,
 not an API target. It must fall as those callers move into the same Abla/LLVM
 unit, leaving only unavoidable image entry and hardware-vector roots.
 
+At the `wl_chm.o` checkpoint the M5Echo audit reports 274 linker-visible Abla
+definitions and proves an outside caller for every one. The channel-manager
+replacement itself keeps ten named functions and `gChmCxt` local; twelve
+functions plus `g_chm` retain exact names only for NAN, mesh, ESP-NOW, packet
+engine, and supplicant objects. Removing `wl_chm.o` simultaneously made six
+older boundaries local: the regulatory max/min helpers, MAC init/deinit,
+current-channel programming, and the no-MAC PHY channel change. Thus importing
+the ESP32 implementation does not publish these names; only the private mixed
+firmware's explicit link selectors retain what its remaining opaque callers
+still need.
+
 The compiler also determines lazy module-state initialization from each
 exported function's transitive call graph. A pure entry no longer pays or
 retains an initialization guard merely because an unrelated application module
