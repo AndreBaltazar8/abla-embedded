@@ -408,9 +408,10 @@ public package APIs. Replacing each caller cluster removes the corresponding
 boundary and lets LLVM prune the entire unused path.
 
 `tools/check-linker-boundaries` enforces that distinction after the final
-link. It reads GNU ld's cross-reference table and rejects every linker-visible
-definition from the Abla object that has no caller outside that object. The
-M5Echo audit exposed and removed four stale data definitions (`s_tbttstart`,
+link. It intersects GNU ld's cross-reference table with the Abla object's
+actual global definitions, then rejects every linker-visible definition with
+no caller outside that object. Dead undefined references are not misreported.
+The M5Echo audit exposed and removed four stale data definitions (`s_tbttstart`,
 `ieee80211_opcap`, and two net80211 revision words). After the A-MPDU migration,
 its 151 visible function and data definitions all have concrete non-Abla
 callers. These are not public framework APIs: they are exact temporary linker
