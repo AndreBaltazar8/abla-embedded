@@ -430,5 +430,16 @@ member is absent from the M5Echo map, the image fell by 672 bytes to 871,216
 bytes, and the flashed Atom Echo completed WPA2 association, DHCP, server
 authentication, speech transfer, and audio playback on 2026-08-28.
 
+`src/esp32/radio/packet_timer_esp32.ab` now replaces the complete classic
+ESP32 `pp_timer.o`. Its callback slot and dispatch helpers have internal
+linkage. The three exact linker names that remain are each called by an opaque
+packet-processing or power-management member: timer dispatch, post-callback
+registration, and post-callback invocation. Direct typed dispatch eliminates
+the original writable 120-byte callback table and fourteen forwarding
+functions. The 581-byte attributed archive member is absent from the M5Echo
+map, the application image fell another 208 bytes to 871,008 bytes, and the
+flashed Atom Echo completed boot, WPA2 association, DHCP, server
+authentication, speech transfer, and audio playback on 2026-08-28.
+
 Nothing in this module transmits, initializes the radio, or changes the
 connected Atom Echo unless application code explicitly calls a trusted method.
