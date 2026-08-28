@@ -430,6 +430,19 @@ the ESP32 implementation does not publish these names; only the private mixed
 firmware's explicit link selectors retain what its remaining opaque callers
 still need.
 
+At the `ieee80211_supplicant.o` checkpoint the audit reports 273 linker-visible
+definitions, again with a proven outside caller for every one. The complete
+replacement contains all 115 named entry points, the section-local hardware-key
+helper, four private IGTK state objects, and the dormant header-check data. The
+current M5Echo path selects 49 named functions; their sizes and the local helper
+size match the input object, while all 66 dormant functions are absent from the
+final ELF. Thirty-nine exact names remain only because opaque WPA supplicant,
+ESP-NOW, mesh, and NAN objects call them. Removing the net80211 supplicant
+object simultaneously made 34 older functions and six data objects local, so
+the boundary count falls by one despite adding this entire caller frontier.
+The original member is absent from the map and the firmware is 878,560 bytes,
+32 bytes above the prior checkpoint.
+
 The compiler also determines lazy module-state initialization from each
 exported function's transitive call graph. A pure entry no longer pays or
 retains an initialization guard merely because an unrelated application module
