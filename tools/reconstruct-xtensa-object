@@ -286,15 +286,23 @@ def data_section_directives(
 ) -> list[str]:
     bss = section.startswith(".bss")
     writable = bss or section.startswith(".data") or section.startswith(".dram")
-    flags = "aw" if writable else "a"
+    merge_strings = ".str1." in section
+    flags = "aw" if writable else "aMS" if merge_strings else "a"
     kind = "@nobits" if bss else "@progbits"
-    output_section = section
-    if not global_symbol:
-        family = ".bss" if bss else ".data" if writable else ".rodata"
-        output_section = family + ".abla_ioctl_" + re.sub(
-            r"[^A-Za-z0-9_]", "_", section
-        )
-    lines = [f'.pushsection {output_section},"{flags}",{kind}']
+    # Preserve the input section family. ESP-IDF's linker fragment places
+    # Wi-Fi logging data by names such as `.rodata_wlog_debug.*`; folding all
+    # recovered constants into generic `.rodata.*` changes those placement
+    # rules and can add kilobytes of alignment padding. Local labels already
+    # carry the reconstruction namespace, so the original section name does
+    # not create a symbol collision when several objects are recovered into
+    # one Abla unit.
+    section_suffix = ",1" if merge_strings else ""
+    # LLVM inline assembly reserves `$` for operands; `$$` reaches the target
+    # assembler as the literal dollar used by compiler-generated section names.
+    assembly_section = section.replace("$", "$$")
+    lines = [
+        f'.pushsection {assembly_section},"{flags}",{kind}{section_suffix}'
+    ]
     if alignment > 0:
         lines.append(f".p2align {alignment}")
     if global_symbol:
@@ -326,6 +334,13 @@ def data_section_directives(
         lines.append(f".size {global_symbol}, {size}")
     lines.append(".popsection")
     return lines
+
+
+def replace_directive_reference(line: str, old: str, new: str) -> str:
+    """Replace a data reference without renaming its ELF input section."""
+    if line.startswith(".pushsection "):
+        return line
+    return line.replace(old, new)
 
 
 def recovered_data_prefix(
@@ -364,7 +379,10 @@ def recovered_data_prefix(
         section, symbol_size = symbols[name]
         size, alignment = metadata.get(section, (symbol_size, 2))
         label = data_label(section + "_" + name)
-        directives = [line.replace(name, label) for line in directives]
+        directives = [
+            replace_directive_reference(line, name, label)
+            for line in directives
+        ]
         directives.extend(data_section_directives(
             section, label, size, alignment, content.get(section, b""),
             relocations.get(section, {})
@@ -385,7 +403,10 @@ def recovered_data_prefix(
         ))
     for old, new in replacements.items():
         source = source.replace(old, new)
-        directives = [line.replace(old, new) for line in directives]
+        directives = [
+            replace_directive_reference(line, old, new)
+            for line in directives
+        ]
     for old, new in COMPATIBILITY_SYMBOLS.items():
         body_offset = compatibility_starts.get(old, 0)
         source = replace_compatibility_reference(
@@ -522,6 +543,16 @@ def local_function_directives(
     relocations: dict[str, dict[int, tuple[str, str]]],
     alignment: int,
 ) -> list[str]:
+    # A section-only local function has no separate ELF function symbol, so
+    # objdump presents its literal pool under the section label as if it were
+    # instructions.  Start at the Xtensa entry instruction; relocation
+    # expansion below has already converted every referenced literal.
+    if name.startswith(".text."):
+        for index, instruction in enumerate(instructions):
+            if instruction.text.strip().startswith("entry"):
+                start = instruction.offset
+                instructions = instructions[index:]
+                break
     safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
     lines = [
         f'.pushsection .text.abla_ioctl_local_{safe},"ax",@progbits',
@@ -552,6 +583,7 @@ def main() -> int:
     parser.add_argument("--local-data", action="append", default=[])
     parser.add_argument("--local-function", action="append", default=[])
     parser.add_argument("--link-output")
+    parser.add_argument("--export-function", action="append", default=[])
     parser.add_argument("--output")
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--namespace", default="ioctl")
@@ -634,13 +666,19 @@ def main() -> int:
                 selections = [
                     'import "abla/build"',
                     "",
-                    "// Temporary exact names required by opaque callers.",
-                    "// Recovered implementation and helper calls remain internal.",
+                    "// Exact names used by recovered assembly and mixed callers.",
+                    "// Internal linkage is the default; list only proven foreign roots",
+                    "// with --export-function while opaque callers remain.",
                     f"compile fun {arguments.link_selector}(): bool {{",
                 ]
+                exported = set(arguments.export_function)
                 for name, _ in recovered_functions:
+                    selector = (
+                        "exportFunction" if name in exported
+                        else "internalFunction"
+                    )
                     selections.append(
-                        "    if (!exportFunction(\"" +
+                        "    if (!" + selector + "(\"" +
                         abla_function_name(name) + "\", \"" +
                         compatibility_symbol(name) +
                         "\")) return false"
