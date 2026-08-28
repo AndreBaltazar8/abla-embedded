@@ -1,7 +1,7 @@
 ABLA_PROJECT_ROOT ?= $(abspath ../ablac)
 EMBEDDED_SHELL ?= $(abspath shell.nix)
 
-.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu imu-calibration imu-offsets power-monitor pmic-axp192 pmic-axp2101 pmic-ip5306 pmic-m5pm1 charger-aw32001 led-m5pm1 led-powerhub led-paper-mono led-strip-rmt board-detect-s3 board-detect-c6 st7789-fill radio-mac-registers esp32-sha-kat compare-display-lcd-size compare-radio-power-size compare-rx-chain-size compare-wifi-fcs-size compare-wifi-management-size compare-wifi-connection-size compare-esp32-aes-size compare-wifi-ccmp-size compare-xtensa-interrupt-size check-xtensa-dispatcher-ownership compare-radio-rx-size compare-radio-rx-queue-size compare-radio-tx-size i2s-tone wifi-connect atom-echo \
+.PHONY: setup check blink serial i2c-scan spi-jedec sd-card rtc-pcf8563 rtc-rx8130 rtc-powerhub io-expander imu imu-calibration imu-offsets power-monitor pmic-axp192 pmic-axp2101 pmic-ip5306 pmic-m5pm1 charger-aw32001 led-m5pm1 led-powerhub led-paper-mono led-strip-rmt board-detect-s3 board-detect-c6 st7735-fill st7789-fill ili9342-fill radio-mac-registers esp32-sha-kat compare-display-lcd-size compare-radio-power-size compare-rx-chain-size compare-wifi-fcs-size compare-wifi-management-size compare-wifi-connection-size compare-esp32-aes-size compare-wifi-ccmp-size compare-xtensa-interrupt-size check-xtensa-dispatcher-ownership compare-radio-rx-size compare-radio-rx-queue-size compare-radio-tx-size i2s-tone wifi-connect atom-echo \
 	upload-blink upload-serial upload-i2s-tone upload-wifi-connect \
 	upload-atom-echo upload-spi-jedec upload-rtc-pcf8563 upload-rtc-rx8130 upload-rtc-powerhub upload-io-expander clean
 
@@ -115,6 +115,24 @@ st7789-fill:
 		$(ABLA_PROJECT_ROOT)/build/ablac build examples/st7789-fill/build.ab -o build/examples/st7789-fill/build-driver; \
 		build/examples/st7789-fill/build-driver'
 	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/st7789-fill build'
+
+st7735-fill:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run '\
+		export ABLA_SYSROOT=$(ABLA_PROJECT_ROOT); \
+		export ABLA_ESP_LLVM_ROOT=$${ABLA_ESP_LLVM_ROOT:-$${XDG_CACHE_HOME:-$$HOME/.cache}/abla-embedded/esp-clang-21.1.3}; \
+		export PATH=$(CURDIR)/tools/esp-llvm-bin:$$PATH; \
+		$(ABLA_PROJECT_ROOT)/build/ablac build examples/st7735-fill/build.ab -o build/examples/st7735-fill/build-driver; \
+		build/examples/st7735-fill/build-driver'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/st7735-fill build'
+
+ili9342-fill:
+	nix-shell $(ABLA_PROJECT_ROOT)/shell.nix --run '\
+		export ABLA_SYSROOT=$(ABLA_PROJECT_ROOT); \
+		export ABLA_ESP_LLVM_ROOT=$${ABLA_ESP_LLVM_ROOT:-$${XDG_CACHE_HOME:-$$HOME/.cache}/abla-embedded/esp-clang-21.1.3}; \
+		export PATH=$(CURDIR)/tools/esp-llvm-bin:$$PATH; \
+		$(ABLA_PROJECT_ROOT)/build/ablac build examples/ili9342-fill/build.ab -o build/examples/ili9342-fill/build-driver; \
+		build/examples/ili9342-fill/build-driver'
+	nix-shell $(EMBEDDED_SHELL) --run './tools/idf-project examples/ili9342-fill build'
 
 compare-display-lcd-size: st7789-fill
 	nix-shell -p steam-run --run './tools/compare-display-lcd-size'

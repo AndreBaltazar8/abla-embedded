@@ -13,3 +13,13 @@ extern "C" __attribute__((noinline)) std::uint64_t cxx_display_view() {
     // M5StickC Plus2's fixed rotation resolves to this packed view.
     return 8839097467015ull;
 }
+
+extern "C" __attribute__((noinline)) std::uint64_t
+cxx_display_stickc_view() {
+    return 241893659279440ull;
+}
+
+extern "C" __attribute__((noinline)) std::uint64_t
+cxx_display_stack_view() {
+    return 8796093268288ull;
+}
