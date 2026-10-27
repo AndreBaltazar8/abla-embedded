@@ -1,0 +1,81 @@
+import "./fat_volume.ab"
+import "./fat_long_name.ab"
+// Stateless bounded enumeration. Start at0,0, then resume immediately after
+// each returned short entry. Caller must prevent directory mutations across
+// calls for a consistent listing; the volume gate covers each individual call.
+// Output544B: exact short entry32, UTF16 name512 (including terminator).
+// Non-ASCII OEM aliases without a valid LFN return nameUnits0, preserving raw
+// name bytes instead of inventing a Unicode codepage. Valid LFNs take priority.
+// Work2056B:sector512,FAT scratch1024,LFN assembly520. No heap.
+type FatDirectoryItem=int
+//1item2end3input4IO5corrupt6cycle7budget; index4@8,ordinal32@12,units9@44.
+fun FatDirectoryItem.status(): int = this&255
+fun FatDirectoryItem.entryIndex(): int = (this>>8)&15
+fun FatDirectoryItem.ordinal(): int = (this>>12)&0xffffffff
+fun FatDirectoryItem.nameUnits(): int = (this>>44)&511
+fun FatDirectoryItem.nextIndex(): int = (this.entryIndex()+1)&15
+fun FatDirectoryItem.nextOrdinal(): int = this.ordinal()+(if (this.entryIndex() == 15) 1 else 0)
+// budget bounds each sector seek; maxSectors bounds this entire scan. A seek
+// starts from directory head. Errors leave output unchanged; retry same cursor.
+trusted fun fatNextDirectoryOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,parent: int,
+    ordinal: int,index: int,budget: int,maxSectors: int,output: NativeBuffer,work: NativeBuffer): FatDirectoryItem {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || ordinal < 0 || ordinal > 0xffffffff || index < 0 || index > 15 ||
+        budget < 1 || budget > 1000000 || maxSectors < 1 || maxSectors > 1000000 ||
+        !output.hasAddressRange(0,544) || !work.hasAddressRange(0,2056) ||
+        fatBuffersOverlap(output,544,work,2056) || fatBuffersOverlap(output,544,reader,28) ||
+        fatBuffersOverlap(output,544,boot,512) || fatBuffersOverlap(work,2056,reader,28) ||
+        fatBuffersOverlap(work,2056,boot,512)) return FatDirectoryItem(3)
+    val sector=nativeBufferAt(work.addressValue(),512);val scratch=nativeBufferAt(work.addressValue()+512,1024)
+    val name=nativeBufferAt(work.addressValue()+1536,520)
+    var lfn=FatLongName(0);var current=ordinal;var slot=index;var visited=0
+    while (visited < maxSectors) {
+        val read=fatDirectoryReadOwned(reader,boot,first,sectors,parent,current,budget,sector,scratch)
+        if (read.status() != 1) return FatDirectoryItem(read.status())
+        visited=visited+1
+        while (slot < 16) {
+            val entry=fatDirectoryDecode(sector,slot,geometry.fatBits(),geometry.clusters())
+            if (entry.status() == 3) return FatDirectoryItem(2)
+            if (entry.status() == 7) return FatDirectoryItem(5)
+            if (entry.status() == 5) lfn=lfn.consume(nativeBufferAt(sector.addressValue()+slot*32,32),name)
+            else if (entry.isFile() || entry.isDirectory()) {
+                var units=0
+                if (lfn.matches(nativeBufferAt(sector.addressValue()+slot*32,32),name)) units=lfn.length()
+                else {
+                    var base=8;var extension=3
+                    while (base > 0 && fatShortNameByte(sector,slot,base-1) == 32) base=base-1
+                    while (extension > 0 && fatShortNameByte(sector,slot,8+extension-1) == 32) extension=extension-1
+                    var valid=base > 0;var part=0;val lower=sector.load(slot*32+12)
+                    while (part < base+extension) {
+                        var ch=fatShortNameByte(sector,slot,if (part < base) part else 8+part-base)
+                        if (ch < 32 || ch > 126) valid=false
+                        if (part == base && extension > 0) { name.storeU16(units*2,46);units=units+1 }
+                        if ((lower&(if (part < base) 8 else 16)) != 0 && ch >= 65 && ch <= 90) ch=ch+32
+                        name.storeU16(units*2,ch);units=units+1;part=part+1
+                    }
+                    if (!valid) units=0
+                }
+                var i=0;while (i < 32) { output.store(i,sector.load(slot*32+i));i=i+1 }
+                i=0;while (i < units) { output.storeU16(32+i*2,name.loadU16(i*2));i=i+1 }
+                output.storeU16(32+units*2,0)
+                return FatDirectoryItem(1|(slot<<8)|(current<<12)|(units<<44))
+            } else lfn=FatLongName(0)
+            slot=slot+1
+        }
+        if (current == 0xffffffff) return FatDirectoryItem(5)
+        current=current+1;slot=0
+    }
+    return FatDirectoryItem(7)
+}
+trusted fun FatVolume.nextDirectory(owner: u32,parent: int,ordinal: int,index: int,budget: int,maxSectors: int,
+    output: NativeBuffer,work: NativeBuffer): FatDirectoryItem {
+    val s=this.storage()
+    if (fatBuffersOverlap(s,32,output,544) || fatBuffersOverlap(s,32,work,2056)) return FatDirectoryItem(3)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatDirectoryItem(admitted)
+    val result=fatNextDirectoryOwned(nativeBufferAt(s.loadU32(16),28),nativeBufferAt(s.loadU32(20),512),
+        s.loadU32(24),s.loadU32(28),parent,ordinal,index,budget,maxSectors,output,work)
+    if (result.status() == 4) s.storeU32(12,3)
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatDirectoryItem(14)
+    return result
+}

@@ -1,0 +1,53 @@
+import "./fat_read_sequence.ab"
+import "./fat_directory_entry.ab"
+// Read one directory sector by ordinal. startCluster=0 selects the volume
+// root (fixed FAT12/16 region or FAT32 root chain). Caller owns disjoint
+// destination512 and scratch1024, pins immutable reader/BPB/media throughout.
+// This bounded seek restarts at the chain head; sequential cursor API can
+// avoid repeated FAT reads later. Success does not certify the unseen suffix.
+type FatDirectoryRead = int
+// 1read (LBA above bit8),2end,3invalid,4IO,5corrupt,6cycle,7budget.
+fun FatDirectoryRead.status(): int = this&255
+fun FatDirectoryRead.sector(): int = if (this.status() == 1) (this>>8)&0xffffffff else -1
+trusted fun fatDirectoryReadOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,startCluster: int,ordinal: int,budget: int,destination: NativeBuffer,scratch: NativeBuffer): FatDirectoryRead {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || ordinal < 0 || ordinal > 0xffffffff || budget < 1 || budget > 1000000 ||
+        !reader.hasAddressRange(0,28) || !destination.hasAddressRange(0,512) || !scratch.hasAddressRange(0,1024) ||
+        fatBuffersOverlap(destination,512,reader,28) || fatBuffersOverlap(destination,512,boot,512) ||
+        fatBuffersOverlap(destination,512,scratch,1024) || fatBuffersOverlap(scratch,1024,reader,28) || fatBuffersOverlap(scratch,1024,boot,512)) return FatDirectoryRead(3)
+    var address=0
+    var remaining=budget
+    if (startCluster == 0 && geometry.fatBits() != 32) {
+        if (ordinal >= (fatBootU16(boot,17)>>4)) return FatDirectoryRead(2)
+        address=first+fatBootU16(boot,14)+boot.load(16)*fatBootFatSectors(boot)+ordinal
+    } else {
+        var cluster=if (startCluster == 0) fatBootU32(boot,44) else startCluster
+        if (fatClusterFirstSector(boot,first,sectors,cluster) < 0) return FatDirectoryRead(3)
+        var steps=ordinal
+        var divisor=geometry.sectorsPerCluster()
+        while (divisor > 1) { steps=steps>>1; divisor=divisor>>1 }
+        if (steps >= geometry.clusters()) return FatDirectoryRead(5)
+        var anchor=cluster
+        var power=1
+        var distance=0
+        while (steps > 0) {
+            val location=fatLinkLocate(boot,first,sectors,cluster)
+            val cost=if (location.needsSecondSector()) 2 else 1
+            if (remaining < cost) return FatDirectoryRead(7)
+            remaining=remaining-cost
+            val link=fatReadLinkOwned(reader,boot,first,sectors,cluster,scratch)
+            if (link.status() == 8) return FatDirectoryRead(4)
+            if (link.status() == 2) return FatDirectoryRead(2)
+            if (link.status() != 1) return FatDirectoryRead(5)
+            cluster=link.nextCluster()
+            distance=distance+1
+            if (cluster == anchor) return FatDirectoryRead(6)
+            if (distance == power) { anchor=cluster; power=power*2; distance=0 }
+            steps=steps-1
+        }
+        address=fatClusterFirstSector(boot,first,sectors,cluster)+(ordinal&(geometry.sectorsPerCluster()-1))
+    }
+    if (remaining < 1) return FatDirectoryRead(7)
+    if (!fatStorageReadOwned(reader,address,destination)) return FatDirectoryRead(4)
+    return FatDirectoryRead((address<<8)|1)
+}

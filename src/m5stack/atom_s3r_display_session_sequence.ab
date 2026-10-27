@@ -1,0 +1,60 @@
+import "./atom_s3_panel_logic.ab"
+import "./atom_s3r_backlight.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "../spi/buffer_gate.ab"
+import "../spi/transaction_result.ab"
+// Fresh40B record: magic,state,panel,device,gate,owner,port,rotation,brightness,
+// last detail. State1initializing,2ready,3fault,4blanked,5backlight-init-fault.
+// No live reinitialize.
+// Caller exclusively owns the record, identified/reset panel, configured SPI
+// controller/pads and live internal0x30 I2C device throughout its lifetime.
+// This does not take over bus/pad/clock ownership or clear a SPI gate fault.
+// prepareHardware=true additionally requires stable PLL80MHz and exclusive
+// control of every old SPI/pad consumer; it configures40MHz and pulses reset.
+fun atomS3RDisplayRecordRange(r: NativeBuffer): bool = r.hasAddressRange(0,40) &&
+    (r.addressValue()&3) == 0 && (r.addressValue()+40 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun atomS3RDisplaySessionBeginOwned(r: NativeBuffer,panel: AtomS3Panel,device: I2cDevice,
+    gate: PeripheralGate,owner: u32,port: int,rotation: int,brightness: int,exclusive: bool,
+    prepareHardware: bool = false,polls: int = 100000): int {
+    if (!exclusive || !atomS3RDisplayRecordRange(r) || r.loadU32(0) != 0 || !panel.valid() ||
+        (panel&255) != (m5BoardAtomS3R|0) || !device.valid() || !gate.bufferDisjoint(r,40) ||
+        gate.word().address() > 4294967292 || (gate.word().address() >= 0x60000000 && gate.word().address() < 0x60100000) ||
+        !peripheralOwnerValid(owner) || (port != 2 && port != 3) || rotation < 0 || rotation > 7 || brightness < 0 || brightness > 255 || polls < 1 || polls > 1000000) return 2
+    r.storeU32(0,0x41534433);r.storeU32(4,1);r.storeU32(8,panel|0);r.storeU32(12,device|0)
+    r.storeU32(16,gate.word().address());r.storeU32(20,int(owner));r.storeU32(24,port)
+    r.storeU32(28,rotation);r.storeU32(32,0);r.storeU32(36,0)
+    // Blank before panel commands. Failed initialization may leave uncertain
+    // backlight/controller state; retain both devices, do not replay.
+    val dark=atomS3RBacklightBeginOwned(device,0,true)
+    if ((dark&255) != 1) { r.storeU32(4,5);r.storeU32(36,dark);return 3 }
+    if (prepareHardware) {
+        val prepared=atomS3RDisplayPrepareOwned(gate,owner,port,polls)
+        if (prepared != 1) { r.storeU32(4,3);r.storeU32(36,prepared);return 6 }
+    }
+    val initialized=panel.beginNativeChecked(gate,owner,port,rotation)
+    if (!initialized.valid()) { r.storeU32(4,3);r.storeU32(36,(initialized.status()<<29)|(initialized&0x1fffffff));return 4 }
+    val lit=atomS3RBacklightSetOwned(device,brightness,true)
+    if (lit != 1) { r.storeU32(4,3);r.storeU32(36,lit);return 5 }
+    r.storeU32(32,brightness);r.storeU32(4,2);return 1
+}
+// Ready-only brightness updates. Failed writes do not publish requested value
+// as actual brightness: state becomes fault, stored brightness is last success.
+trusted fun atomS3RDisplaySessionBrightnessOwned(r: NativeBuffer,brightness: int,exclusive: bool): int {
+    if (!exclusive || !atomS3RDisplayRecordRange(r) || r.loadU32(0) != 0x41534433 || r.loadU32(4) != 2 || brightness < 0 || brightness > 255) return 2
+    val result=atomS3RBacklightSetOwned(I2cDevice(r.loadU32(12)),brightness,true)
+    r.storeU32(36,result)
+    if (result != 1) { r.storeU32(4,3);return 5 }
+    r.storeU32(32,brightness);return 1
+}
+// Explicit blank/stop from ready/fault/blanked; failed backlight initialization
+// is explicitly reinitialized at brightness0. No panel-init/reset replay and
+// no gate recovery. Blanked is NOT released: caller must separately quiesce and
+// restore SPI/reset/pad resources before disposing record or closing handles.
+trusted fun atomS3RDisplaySessionBlankOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !atomS3RDisplayRecordRange(r) || r.loadU32(0) != 0x41534433 || r.loadU32(4) < 2 || r.loadU32(4) > 5) return 2
+    val reinitialize=r.loadU32(4) == 5
+    val result=if (reinitialize) atomS3RBacklightBeginOwned(I2cDevice(r.loadU32(12)),0,true) else atomS3RBacklightSetOwned(I2cDevice(r.loadU32(12)),0,true)
+    r.storeU32(36,result)
+    if ((result&255) != 1) { r.storeU32(4,if (reinitialize) 5 else 3);return 5 }
+    r.storeU32(32,0);r.storeU32(4,4);return 1
+}

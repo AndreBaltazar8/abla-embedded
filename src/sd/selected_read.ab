@@ -1,0 +1,55 @@
+import "./selected_command.ab"
+// Status1complete2invalid3command4transport5tokenTimeout6dataToken7CRC.
+// Card response/token detail8bits@8, published prefix10bits@16,
+// raw transport detail32bits@32. Only complete+CRC-valid payload is usable.
+type SdSpiReadResult=int
+fun SdSpiReadResult.status(): int = this&255
+fun SdSpiReadResult.valid(): bool = this.status() == 1
+fun SdSpiReadResult.cardDetail(): int = (this>>>8)&255
+fun SdSpiReadResult.receivedBytes(): int = (this>>>16)&1023
+fun SdSpiReadResult.transportDetail(): int = (this>>>32)&4294967295
+fun sdSpiReadStorageValid(scratch: NativeBuffer,destination: NativeBuffer,bytes: int): bool =
+    bytes >= 1 && bytes <= 512 && scratch.hasAddressRange(0,2) && destination.hasAddressRange(0,bytes) &&
+    (scratch.addressValue()+2 <= destination.addressValue() || destination.addressValue()+bytes <= scratch.addressValue())
+// Selected command's token/payload/CRC phase, also suitable for CID/CSD.
+// Gate, CS, card initialization and lifetime remain caller-owned.
+trusted fun sdSpiReadPayloadSelected(context: int,scratch: NativeBuffer,destination: NativeBuffer,
+    bytes: int,tokenPolls: int = 250): SdSpiReadResult {
+    if (!sdSpiReadStorageValid(scratch,destination,bytes) || tokenPolls < 1 || tokenPolls > 1000000 ||
+        !sdSpiSelectedAdmission(context,scratch,destination,bytes)) return SdSpiReadResult(2)
+    var remaining=tokenPolls
+    var token=255
+    while (remaining > 0 && token == 255) {
+        val result=sdSpiSelectedExchange(context,255,scratch)
+        if ((result>>>32) != 1) return SdSpiReadResult(4|((result&4294967295)<<32))
+        token=result&255;remaining=remaining-1
+        if (token == 255 && remaining > 0) sdSpiSelectedDelay(1000)
+    }
+    if (token == 255) return SdSpiReadResult(5)
+    if (token != 254) return SdSpiReadResult(6|(token<<8))
+    var crc=0
+    var index=0
+    while (index < bytes) {
+        val result=sdSpiSelectedExchange(context,255,scratch)
+        if ((result>>>32) != 1) return SdSpiReadResult(4|(index<<16)|((result&4294967295)<<32))
+        val value=result&255
+        destination.store(index,value)
+        crc=sdSpiCrc16Byte(crc,value)
+        index=index+1
+    }
+    val high=sdSpiSelectedExchange(context,255,scratch)
+    if ((high>>>32) != 1) return SdSpiReadResult(4|(bytes<<16)|((high&4294967295)<<32))
+    val low=sdSpiSelectedExchange(context,255,scratch)
+    if ((low>>>32) != 1) return SdSpiReadResult(4|(bytes<<16)|((low&4294967295)<<32))
+    if (crc != (((high&255)<<8)|(low&255))) return SdSpiReadResult(7|(bytes<<16))
+    return SdSpiReadResult(1|(bytes<<16))
+}
+trusted fun sdSpiReadBlockSelected(context: int,highCapacity: bool,block: int,scratch: NativeBuffer,
+    destination: NativeBuffer,tokenPolls: int = 250): SdSpiReadResult {
+    if (!sdSpiBlockAddressValid(highCapacity,block) || !sdSpiReadStorageValid(scratch,destination,512) ||
+        tokenPolls < 1 || tokenPolls > 1000000 || !sdSpiSelectedAdmission(context,scratch,destination,512)) return SdSpiReadResult(2)
+    val command=sdSpiCommandSelected(context,17,sdSpiBlockArgument(highCapacity,block),scratch,NativeBuffer(0),0)
+    if (command.status() == 4) return SdSpiReadResult(4|(command.transportDetail()<<32))
+    if (!command.valid() || command.r1() != 0) return SdSpiReadResult(3|(command.r1()<<8))
+    return sdSpiReadPayloadSelected(context,scratch,destination,512,tokenPolls)
+}

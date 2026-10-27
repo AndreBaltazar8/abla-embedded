@@ -1,0 +1,147 @@
+import "../atomic.ab"
+import "../esp32/sdk/raw_buffer.ab"
+
+// Caller-provided storage, no allocator/runtime dependency. Header: atomic
+// lock and capacity; each12-byte slot holds generation/live +64-bit descriptor.
+// Handles remain32-bit for drivers packing calibration beside a handle.
+// Generation24bits, slot8bits. Exhausted slots retire rather than wrap.
+type I2cDeviceSlots = int
+fun i2cDeviceSlotsAt(address: int): I2cDeviceSlots = I2cDeviceSlots(address)
+fun I2cDeviceSlots.address(): int = this
+fun I2cDeviceSlots.valid(): bool = this.address() > 0 && (this.address() & 3) == 0
+fun i2cDeviceSlotsBytes(capacity: int): int =
+    if (capacity >= 1 && capacity <= 256) 8 + capacity * 12 else 0
+fun i2cDeviceSlotHandleValid(handle: int): bool = handle >= 256 && (handle >>> 32) == 0
+
+// Only before publication; caller owns the full storage extent and lifetime.
+trusted fun i2cInitializeDeviceSlots(address: int, capacity: int): I2cDeviceSlots {
+    val size = i2cDeviceSlotsBytes(capacity)
+    if (address <= 0 || (address & 3) != 0 || size == 0 || address > 9223372036854775807 - size) return I2cDeviceSlots(0)
+    var offset = 0
+    while (offset < size) {
+        nativeAddressStoreU32(address, offset, 0)
+        offset = offset + 4
+    }
+    nativeAddressStoreU32(address, 4, capacity)
+    I2cDeviceSlots(address)
+}
+
+// Each call takes the pool lock once, nonblocking. Resolving a descriptor is
+// only a snapshot: the peripheral owner must separately serialize transfers
+// against device close. This pool alone does not grant hardware ownership.
+trusted fun I2cDeviceSlots.allocate(descriptor: int): int {
+    if (!this.valid()) return 0
+    val address = this.address()
+    val lock = atomicU32At(address)
+    if (descriptor == 0 || !lock.tryClaim(u32(1))) return 0
+    val capacity = nativeAddressLoadU32(address, 4)
+    var result = 0
+    if (capacity >= 1 && capacity <= 256) {
+        var index = 0
+        while (index < capacity && result == 0) {
+            val slot = address + 8 + index * 12
+            val state = u32(nativeAddressLoadU32(slot, 0))
+            val generation = int(state & u32(0xffffff))
+            if ((state & u32(0x80000000)) == u32(0) && generation < 16777215) {
+                nativeAddressStoreU32(slot, 4, descriptor & 4294967295)
+                nativeAddressStoreU32(slot, 8, (descriptor >>> 32) & 4294967295)
+                nativeAddressStoreU32(slot, 0, 2147483648 | (generation + 1))
+                result = ((generation + 1) << 8) | index
+            }
+            index = index + 1
+        }
+    }
+    if (!lock.releaseClaim(u32(1))) return 0
+    result
+}
+
+trusted fun I2cDeviceSlots.resolve(handle: int): int {
+    if (!this.valid()) return 0
+    val lock = atomicU32At(this.address())
+    if (!i2cDeviceSlotHandleValid(handle) || !lock.tryClaim(u32(1))) return 0
+    val capacity = nativeAddressLoadU32(this.address(), 4)
+    val index = handle & 255
+    var descriptor = 0
+    if (capacity >= 1 && capacity <= 256 && index < capacity) {
+        val slot = this.address() + 8 + index * 12
+        if (nativeAddressLoadU32(slot, 0) == (2147483648 | (handle >>> 8))) {
+            descriptor = nativeAddressLoadU32(slot, 4) | (nativeAddressLoadU32(slot, 8) << 32)
+        }
+    }
+    if (!lock.releaseClaim(u32(1))) return 0
+    descriptor
+}
+
+trusted fun I2cDeviceSlots.release(handle: int): bool {
+    if (!this.valid()) return false
+    val lock = atomicU32At(this.address())
+    if (!i2cDeviceSlotHandleValid(handle) || !lock.tryClaim(u32(1))) return false
+    val capacity = nativeAddressLoadU32(this.address(), 4)
+    val index = handle & 255
+    var released = false
+    if (capacity >= 1 && capacity <= 256 && index < capacity) {
+        val slot = this.address() + 8 + index * 12
+        if (nativeAddressLoadU32(slot, 0) == (2147483648 | (handle >>> 8))) {
+            nativeAddressStoreU32(slot, 4, 0)
+            nativeAddressStoreU32(slot, 8, 0)
+            nativeAddressStoreU32(slot, 0, handle >>> 8)
+            released = true
+        }
+    }
+    val unlocked = lock.releaseClaim(u32(1))
+    released && unlocked
+}
+
+// Replace one live descriptor without changing its generation or allocating.
+// Caller also owns the peripheral gate; expected protects snapshot races.
+trusted fun I2cDeviceSlots.replace(handle: int,expected: int,replacement: int): bool {
+    if (!this.valid() || !i2cDeviceSlotHandleValid(handle) || expected == 0 || replacement == 0) return false
+    val lock=atomicU32At(this.address())
+    if (!lock.tryClaim(u32(1))) return false
+    val capacity=nativeAddressLoadU32(this.address(),4);val index=handle&255
+    var changed=false
+    if (capacity >= 1 && capacity <= 256 && index < capacity) {
+        val slot=this.address()+8+index*12
+        if (nativeAddressLoadU32(slot,0) == (2147483648|(handle>>>8)) &&
+            (nativeAddressLoadU32(slot,4)|(nativeAddressLoadU32(slot,8)<<32)) == expected) {
+            nativeAddressStoreU32(slot,4,replacement&4294967295)
+            nativeAddressStoreU32(slot,8,replacement>>>32)
+            changed=true
+        }
+    }
+    val released=lock.releaseClaim(u32(1))
+    return changed && released
+}
+
+// Revoke all devices owned by one controller epoch without resetting slot
+// generations. Caller must hold that controller's gate, excluding transfers
+// and new device publication. Returns count, or -1 for invalid/busy storage.
+// A nonzero mask is mandatory to avoid accidentally revoking the whole pool.
+trusted fun I2cDeviceSlots.releaseMatching(mask: int, expected: int): int {
+    if (!this.valid() || mask == 0 || (expected & mask) != expected) return -1
+    val address = this.address()
+    val lock = atomicU32At(address)
+    if (!lock.tryClaim(u32(1))) return -1
+    val capacity = nativeAddressLoadU32(address, 4)
+    var count = -1
+    if (capacity >= 1 && capacity <= 256) {
+        count = 0
+        var index = 0
+        while (index < capacity) {
+            val slot = address + 8 + index * 12
+            val state = nativeAddressLoadU32(slot, 0)
+            if ((state & 2147483648) != 0) {
+                val descriptor = nativeAddressLoadU32(slot, 4) | (nativeAddressLoadU32(slot, 8) << 32)
+                if ((descriptor & mask) == expected) {
+                    nativeAddressStoreU32(slot, 4, 0)
+                    nativeAddressStoreU32(slot, 8, 0)
+                    nativeAddressStoreU32(slot, 0, state & 16777215)
+                    count = count + 1
+                }
+            }
+            index = index + 1
+        }
+    }
+    if (!lock.releaseClaim(u32(1))) return -1
+    count
+}

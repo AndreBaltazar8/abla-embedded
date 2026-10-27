@@ -1,0 +1,61 @@
+import "./mmc_dma_s3_sequence.ab"
+// Exclusive, clocked SDMMC host; caller serializes both slots and IRQ users.
+// Descriptor/payload storage remains pinned until stop has completed. These
+// operations neither submit SD commands nor establish card/data success.
+// Arm: 1armed,3invalid,4busy,5readback failure (may be partially enabled).
+trusted fun sdMmcDmaArmOwned(descriptors: NativeBuffer,payload: NativeBuffer,bytes: int,blockBytes: int,exclusive: bool): int {
+    if (!exclusive || blockBytes < 4 || blockBytes > 4096 || (blockBytes&3) != 0 ||
+        !sdMmcDmaRegionsValid(descriptors,payload,bytes)) return 3
+    if (u32(bytes)%u32(blockBytes) != u32(0)) return 3
+    val control=sdMmcS3Read(0)
+    val mode=sdMmcS3Read(128)
+    if ((control&0x02000037) != 0 || (mode&0x83) != 0 ||
+        (sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0x3ffe06f0) != 0 ||
+        (sdMmcS3Read(140)&0x1e000) != 0) return 4
+    if (sdMmcDmaInspectOwned(descriptors,payload,bytes) != 2) return 3
+    // Inspect says at least one pending: arm requires EVERY descriptor owned.
+    var index=0
+    val count=sdMmcDmaDescriptorCount(bytes)
+    while (index < count) {
+        if ((sdMmcDmaS3Read(descriptors.addressValue()+index*16)&0x80000000) == 0) return 3
+        index=index+1
+    }
+    sdMmcS3Write(140,0x337)
+    if ((sdMmcS3Read(140)&0x337) != 0) return 5
+    sdMmcS3Write(32,bytes); sdMmcS3Write(28,blockBytes)
+    sdMmcS3Write(136,descriptors.addressValue())
+    if (sdMmcS3Read(32) != bytes || sdMmcS3Read(28) != blockBytes || sdMmcS3Read(136) != descriptors.addressValue()) return 5
+    sdMmcS3Write(0,control|0x02000020)
+    if ((sdMmcS3Read(0)&0x02000027) != 0x02000020) return 5
+    sdMmcS3Write(128,mode|130)
+    if ((sdMmcS3Read(128)&0x83) != 130) return 5
+    sdMmcS3Write(132,1)
+    return 1
+}
+// Caller has completed or explicitly abandoned its transfer and stopped IRQ
+// consumers. This does NOT abort the card command or reset the data FIFO.
+// 2stop pending,3invalid preconditions,5readback failure; failure retains lease.
+trusted fun sdMmcDmaStopOwned(exclusive: bool,clocksReady: bool): int {
+    if (!exclusive || !clocksReady) return 3
+    val control=sdMmcS3Read(0)
+    sdMmcS3Write(0,control&~0x02000020)
+    if ((sdMmcS3Read(0)&0x02000020) != 0) return 5
+    sdMmcS3Write(128,sdMmcS3Read(128)&~130)
+    if ((sdMmcS3Read(128)&130) != 0) return 5
+    // Do not restart an in-flight DMA reset on retry.
+    val disabled=sdMmcS3Read(0)
+    if ((disabled&4) == 0) sdMmcS3Write(0,disabled|4)
+    return 2
+}
+// 1DMA quiescent,2pending,3invalid state,5DMA reenabled/readback failure.
+// Even 1 does not release HOST/card ownership: command/FIFO recovery and card
+// readiness remain the transfer owner's job. Polling must be time-bounded by
+// the caller, and a timeout never authorizes freeing descriptors or payloads.
+trusted fun sdMmcDmaStopPollOwned(state: int): int {
+    if (state != 2) return 3
+    val control=sdMmcS3Read(0)
+    val mode=sdMmcS3Read(128)
+    if ((control&0x02000020) != 0 || (mode&130) != 0) return 5
+    if ((control&7) != 0 || (mode&1) != 0 || (sdMmcS3Read(140)&0x1e000) != 0) return 2
+    return 1
+}

@@ -1,0 +1,41 @@
+import "./pmic_shutdown_sequence.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Cooperative equivalent of upstream C5/C61 PM1 powerOff: up to three
+// commands, separated by10ms AFTER each failed synchronous transaction.
+// Caller owns24B record and PMIC for the entire operation, with consumers
+// quiescent. This never sleeps, closes a device, or guesses wake pin routing.
+// tag0,handle4,attempts8,status12,delay-anchor16,reserved20.
+// Status1acknowledged,2pending,3invalid,4exhausted (wake fallback required).
+// Internal5 arms delay on next poll, so slow I2C is not counted as waiting.
+trusted fun m5Pm1ShutdownRetryStatus(record: NativeBuffer): int {
+    if (!record.hasAddressRange(0,24) || record.loadU32(0) != 0x50315331) return 3
+    val status=record.loadU32(12)
+    return if (status == 5) 2 else if (status >= 1 && status <= 4) status else 3
+}
+trusted fun m5Pm1ShutdownAttempt(record: NativeBuffer): int {
+    val attempts=record.loadU32(8)+1
+    record.storeU32(8,attempts)
+    val accepted=m5PmicShutdownWrite(record.loadU32(4),5,false)
+    val status=if (accepted) 1 else if (attempts == 3) 4 else 5
+    record.storeU32(12,status)
+    return if (status == 5) 2 else status
+}
+trusted fun M5PmicOpen.beginShutdownRetryOwned(record: NativeBuffer,quiescedExclusive: bool): int {
+    if (!quiescedExclusive || !this.ready() || this.kind() != 5 || !record.hasAddressRange(0,24)) return 3
+    // Never overwrite an in-flight command/delay, even if called twice.
+    if (m5Pm1ShutdownRetryStatus(record) == 2) return 3
+    record.storeU32(0,0x50315331);record.storeU32(4,this.deviceHandle())
+    record.storeU32(8,0);record.storeU32(12,2);record.storeU32(16,0);record.storeU32(20,0)
+    m5Pm1ShutdownAttempt(record)
+}
+// Wrapping milliseconds; caller polls within half the u32 period and does
+// not alter the PMIC handle. Exhaustion is NOT permission to sleep without a
+// wake source: caller must release/arm its verified board wake route first.
+trusted fun m5Pm1ShutdownRetryPoll(record: NativeBuffer,now: u32): int {
+    val status=m5Pm1ShutdownRetryStatus(record)
+    if (status != 2) return status
+    if (record.loadU32(8) < 1 || record.loadU32(8) > 2 || record.loadU32(4) == 0) return 3
+    if (record.loadU32(12) == 5) { record.storeU32(16,int(now));record.storeU32(12,2);return 2 }
+    if (now-u32(record.loadU32(16)) < u32(10)) return 2
+    m5Pm1ShutdownAttempt(record)
+}

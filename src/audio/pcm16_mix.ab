@@ -1,0 +1,86 @@
+import "./pcm16.ab"
+
+// Interleaved sample counts: stereo callers supply twice their frame count.
+// Caller-owned signed32 accumulators permit mixing before signed16 clipping.
+// No allocation, channel scheduling, resampling, or hardware side effects.
+trusted fun clearPcm16Mix(accumulator: NativeBuffer, samples: int): bool {
+    if (samples < 0 || samples > 536870911 || !accumulator.hasAddressRange(0,samples*4)) return false
+    var offset=0
+    while (offset < samples*4) {
+        accumulator.storeU32(offset,0)
+        offset=offset+4
+    }
+    true
+}
+
+fun pcmMixSpansOverlap(left: NativeBuffer,leftBytes: int,right: NativeBuffer,rightBytes: int): bool =
+    leftBytes > 0 && rightBytes > 0 &&
+    left.addressValue() < right.addressValue()+rightBytes &&
+    right.addressValue() < left.addressValue()+leftBytes
+
+// Add one signed16 LE source at Q15 gain0..32768. Accumulator must first be
+// cleared. Source stays immutable; overlap and invalid spans fail before writes.
+// Saturating signed32 addition prevents wrap even for excessive channel counts.
+trusted fun addPcm16ToMix(
+    accumulator: NativeBuffer,source: NativeBuffer,samples: int,gainQ15: int=32768
+): bool {
+    if (samples < 0 || samples > 536870911 || gainQ15 < 0 || gainQ15 > 32768 ||
+        !accumulator.hasAddressRange(0,samples*4) || !source.hasAddressRange(0,samples*2) ||
+        pcmMixSpansOverlap(accumulator,samples*4,source,samples*2)) return false
+    var sample=0
+    while (sample < samples) {
+        val raw=source.loadU16(sample*2)
+        val signed=if (raw >= 32768) raw-65536 else raw
+        val word=accumulator.loadU32(sample*4)
+        val previous=if (word >= 2147483648) word-4294967296 else word
+        val sum=previous+pcm16AttenuatedSample(signed,gainQ15)
+        val bounded=if (sum < -2147483648) -2147483648 else if (sum > 2147483647) 2147483647 else sum
+        accumulator.storeU32(sample*4,bounded)
+        sample=sample+1
+    }
+    true
+}
+
+// Apply master gain BEFORE final clipping. Rounding matches PCM attenuation:
+// nearest, ties away from zero. Accumulator is preserved for further mixing.
+trusted fun finishPcm16Mix(
+    accumulator: NativeBuffer,destination: NativeBuffer,samples: int,masterGainQ15: int=32768
+): bool {
+    if (samples < 0 || samples > 536870911 || masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !accumulator.hasAddressRange(0,samples*4) || !destination.hasAddressRange(0,samples*2) ||
+        pcmMixSpansOverlap(accumulator,samples*4,destination,samples*2)) return false
+    var sample=0
+    while (sample < samples) {
+        val raw=accumulator.loadU32(sample*4)
+        val signed=if (raw >= 2147483648) raw-4294967296 else raw
+        val magnitude=if (signed < 0) -signed else signed
+        val scaled=(magnitude*masterGainQ15+16384) >>> 15
+        val output=if (signed < 0) -scaled else scaled
+        val bounded=if (output < -32768) -32768 else if (output > 32767) 32767 else output
+        destination.storeU16(sample*2,bounded)
+        sample=sample+1
+    }
+    true
+}
+
+// Average stereo signed32 accumulators BEFORE master gain/clipping. This
+// preserves opposing-channel headroom; averaging already-clipped PCM does not.
+// Wide integer intermediates, nearest ties away from zero, signed16 LE mono.
+trusted fun finishPcm16MixMono(accumulator: NativeBuffer,destination: NativeBuffer,
+    frames: int,masterGainQ15: int=32768): bool {
+    if (frames < 0 || frames > 268435455 || masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !accumulator.hasAddressRange(0,frames*8) || !destination.hasAddressRange(0,frames*2) ||
+        pcmMixSpansOverlap(accumulator,frames*8,destination,frames*2)) return false
+    var frame=0
+    while (frame < frames) {
+        val left=accumulator.loadU32(frame*8);val right=accumulator.loadU32(frame*8+4)
+        val sum=(if (left >= 2147483648) left-4294967296 else left)+
+            (if (right >= 2147483648) right-4294967296 else right)
+        val magnitude=if (sum < 0) -sum else sum
+        val scaled=(magnitude*masterGainQ15+32768)>>>16
+        val value=if (sum < 0) -scaled else scaled
+        destination.storeU16(frame*2,if (value < -32768) -32768 else if (value > 32767) 32767 else value)
+        frame=frame+1
+    }
+    return true
+}

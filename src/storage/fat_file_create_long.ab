@@ -1,0 +1,113 @@
+import "./fat_file_create.ab"
+import "./fat_long_name_encode.ab"
+import "./fat_directory_slots.ab"
+import "./fat_allocate.ab"
+// Empty VFAT file or initialized directory with caller-selected ASCII8.3 alias. Both full name and
+// alias spelling are collision-checked against existing LFNs/short entries.
+// No automatic alias generation or parent-directory extension here. Volume ownership
+// spans ALL reads/writes.3768B workspace stages up to3sectors, FAT scratch,
+// LFN assembly/encoding, alias and LBA table. No heap or hidden exports.
+// Multi-sector publication: preserve following end marker, write short-entry
+// sector with deleted placeholder, write earlier LFN sectors backwards, then
+// publish real short entry LAST. Failures can leave orphan LFNs/tombstones;
+// they must fault the volume. This is not sector/power-loss atomicity.
+trusted fun fatFileCreateLongOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    parent: int,name: NativeBuffer,units: int,aliasText: NativeBuffer,aliasLength: int,budget: int,
+    modified: RtcDateTime,workspace: NativeBuffer,makeDirectory: bool = false,sourceEntry: NativeBuffer = NativeBuffer(0),excludedEntry: int = -1): FatFileCreate {
+    val timestamp=fatModifiedTimestamp(modified)
+    // Rename publication: immutable already-validated entry metadata, distinct
+    // from workspace. Preserve allocation/size/timestamps, not old alias casing.
+    if ((sourceEntry|0) != 0 && (makeDirectory || !sourceEntry.hasAddressRange(0,32) ||
+        fatBuffersOverlap(sourceEntry,32,workspace,3768) || sourceEntry.load(0) == 0 || sourceEntry.load(0) == 229 ||
+        (sourceEntry.load(11)&200) != 0)) return FatFileCreate(2)
+    if (!fatLongNameCreateValid(name,units) || timestamp < 0 || aliasLength < 1 || aliasLength > 12 ||
+        !aliasText.hasAddressRange(0,aliasLength) || !workspace.hasAddressRange(0,3768) ||
+        fatBuffersOverlap(workspace,3768,name,units*2) || fatBuffersOverlap(workspace,3768,aliasText,aliasLength) ||
+        fatBuffersOverlap(workspace,3768,reader,28) || fatBuffersOverlap(workspace,3768,boot,512)) return FatFileCreate(2)
+    val stage=nativeBufferAt(workspace.addressValue(),1536);val scratch=nativeBufferAt(workspace.addressValue()+1536,1024)
+    val assembly=nativeBufferAt(workspace.addressValue()+2560,520);val encoded=nativeBufferAt(workspace.addressValue()+3080,640)
+    val alias=nativeBufferAt(workspace.addressValue()+3720,11);val aliasWide=nativeBufferAt(workspace.addressValue()+3732,24)
+    val addresses=nativeBufferAt(workspace.addressValue()+3756,12)
+    if (!fatShortNameEncode(aliasText,aliasLength,alias) || alias.load(0) == 46) return FatFileCreate(2)
+    val count=fatLongNameEncodeEntries(name,units,alias,encoded)
+    if (count == 0) return FatFileCreate(2)
+    var i=0
+    while (i < aliasLength) { aliasWide.storeU16(i*2,aliasText.load(i));i=i+1 }
+    var pass=0
+    while (pass < 2) {
+        val lookup=fatLookupNameOwned(reader,boot,first,sectors,parent,if (pass == 0) name else aliasWide,
+            if (pass == 0) units else aliasLength,true,assembly,budget,nativeBufferAt(stage.addressValue(),512),scratch,alias,true,NativeBuffer(0),excludedEntry)
+        if (lookup.isFile() || lookup.isDirectory()) return FatFileCreate(3)
+        if (lookup.status() != 9) return FatFileCreate(if (lookup.status() == 11) 4 else if (lookup.status() == 14) 6 else 5)
+        pass=pass+1
+    }
+    val slots=fatFindDirectorySlotsOwned(reader,boot,first,sectors,parent,count+1,budget,nativeBufferAt(stage.addressValue(),512),scratch)
+    if (slots.status() != 1) return FatFileCreate(if (slots.status() == 2) 7 else if (slots.status() == 3) 2 else slots.status())
+    val shortPosition=slots.entryIndex()+count;val shortSector=shortPosition>>4
+    val markerSector=(shortPosition+1)>>4
+    var sectorsToRead=shortSector+1
+    if (slots.consumesEnd() && markerSector > shortSector) sectorsToRead=markerSector+1
+    var part=0
+    while (part < sectorsToRead) {
+        val read=fatDirectoryReadOwned(reader,boot,first,sectors,parent,slots.ordinal()+part,budget,
+            nativeBufferAt(stage.addressValue()+part*512,512),scratch)
+        if (read.status() == 2 && part > shortSector) sectorsToRead=part
+        else {
+            if (read.status() != 1) return FatFileCreate(if (read.status() == 4) 4 else if (read.status() == 7) 6 else 5)
+            addresses.storeU32(part*4,read.sector())
+        }
+        part=part+1
+    }
+    i=0
+    while (i < count*32) { stage.store(slots.entryIndex()*32+i,encoded.load(i));i=i+1 }
+    val shortOffset=shortPosition*32;i=0
+    while (i < 32) { stage.store(shortOffset+i,0);i=i+1 }
+    i=0
+    while (i < 11) { stage.store(shortOffset+i,alias.load(i));i=i+1 }
+    stage.store(shortOffset+11,32);stage.storeU32(shortOffset+14,timestamp);stage.storeU32(shortOffset+22,timestamp)
+    if ((sourceEntry|0) != 0) {
+        i=11;while (i < 32) { stage.store(shortOffset+i,sourceEntry.load(i));i=i+1 }
+        stage.store(shortOffset+12,0)
+    }
+    if (makeDirectory) {
+        // LFNs are already staged. Reuse their encoding/assembly space for
+        // allocation, without touching staged sectors, alias or LBA table.
+        //17allocation,21dot-sector-write; any failure faults the volume and
+        // may leave an orphan reservation. Never publish an uninitialized dir.
+        val allocation=fatAllocateClusterOwned(reader,boot,first,sectors,2,budget,budget,
+            nativeBufferAt(workspace.addressValue()+1536,2048))
+        if (allocation.status() != 1) return FatFileCreate(17|(allocation.cluster()<<8)|(allocation.status()<<44))
+        val geometry=fatBootValidate(boot,first,sectors);val cluster=allocation.cluster()
+        val dot=nativeBufferAt(workspace.addressValue()+1536,512)
+        i=0;while (i < 512) { dot.store(i,0);i=i+1 }
+        var entry=0
+        while (entry < 2) {
+            val offset=entry*32;i=0
+            while (i < 11) { dot.store(offset+i,32);i=i+1 }
+            dot.store(offset,46);if (entry == 1) dot.store(offset+1,46)
+            dot.store(offset+11,16);dot.storeU32(offset+14,timestamp);dot.storeU32(offset+22,timestamp)
+            val target=if (entry == 0) cluster else if (parent == 0 || (geometry.fatBits() == 32 && parent == fatBootU32(boot,44))) 0 else parent
+            dot.storeU16(offset+26,target&65535)
+            if (geometry.fatBits() == 32) dot.storeU16(offset+20,target>>16)
+            entry=entry+1
+        }
+        if (!fatStorageWriteOwned(reader,fatClusterFirstSector(boot,first,sectors,cluster),dot)) return FatFileCreate(21|(cluster<<8))
+        stage.store(shortOffset+11,16);stage.storeU16(shortOffset+26,cluster&65535)
+        if (geometry.fatBits() == 32) stage.storeU16(shortOffset+20,cluster>>16)
+    }
+    if (slots.consumesEnd() && markerSector < sectorsToRead) stage.store((shortPosition+1)*32,0)
+    if (sectorsToRead > shortSector+1 && !fatStorageWriteOwned(reader,addresses.loadU32(markerSector*4),
+        nativeBufferAt(stage.addressValue()+markerSector*512,512))) return FatFileCreate(8)
+    if (shortSector > 0) {
+        stage.store(shortOffset,229)
+        if (!fatStorageWriteOwned(reader,addresses.loadU32(shortSector*4),nativeBufferAt(stage.addressValue()+shortSector*512,512))) return FatFileCreate(8)
+        part=shortSector-1
+        while (part >= 0) {
+            if (!fatStorageWriteOwned(reader,addresses.loadU32(part*4),nativeBufferAt(stage.addressValue()+part*512,512))) return FatFileCreate(8)
+            part=part-1
+        }
+        stage.store(shortOffset,alias.load(0))
+    }
+    if (!fatStorageWriteOwned(reader,addresses.loadU32(shortSector*4),nativeBufferAt(stage.addressValue()+shortSector*512,512))) return FatFileCreate(8)
+    return FatFileCreate(1|((shortPosition&15)<<8)|((slots.ordinal()+shortSector)<<12))
+}

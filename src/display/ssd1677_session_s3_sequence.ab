@@ -1,0 +1,45 @@
+import "./ssd1677_session.ab"
+import "./ssd1677_init_s3_sequence.ab"
+// Serialize the complete ownership record, drawing/history, bus/pads/clocks.
+// Logical4gray profile; inversion changes request a full new optical baseline.
+trusted fun Ssd1677Session.refreshOwned(gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,
+    select: Pin,dc: Pin,busy: Pin,requestedMode: int,polls: int,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || owner == u32(0) || !this.valid() || requestedMode < 1 || requestedMode > 4 || polls < 1 || polls > 10000 ||
+        !busy.valid() || busy == select || busy == dc || busy.number() == pins.clockPin() ||
+        busy.number() == pins.mosiPin() || busy.number() == pins.misoPin() ||
+        !esp32s3SpiCommandPinsValid(peripheral,pins,select,dc,false)) return SpiTransactionResult(3<<32)
+    val r=this.buffer();val canvas=this.canvas();val history=this.history()
+    if (r.loadU32(4) == 2) return SpiTransactionResult(4<<32)
+    if (r.loadU32(4) != 1 || r.loadU32(24) > 31 ||
+        !esp32s3SpiMemoryRangeValid(peripheral,canvas,96000) || !esp32s3SpiMemoryRangeValid(peripheral,history,96000) ||
+        !gate.bufferDisjoint(r,64) || !gate.bufferDisjoint(canvas,96000) || !gate.bufferDisjoint(history,96000) ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292) return SpiTransactionResult(3<<32)
+    if (r.loadU32(36) == 0 && r.loadU32(40) == 0) return SpiTransactionResult((1<<32)|1)
+    val x=r.loadU32(28);val y=r.loadU32(32);val w=r.loadU32(36);val h=r.loadU32(40)
+    if (!ssd1677DirtyValid(800,480,x,y,w,h)) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    var flags=r.loadU32(24)
+    var detail=1
+    if ((flags&1) == 0) {
+        detail=esp32s3Ssd1677InitializeOwned(peripheral,select,dc,busy,polls)
+        flags=1|(flags&16)
+    }
+    val mode=if (requestedMode == 4 && (flags&8) == 0) 3 else requestedMode
+    r.storeU32(52,mode)
+    if ((detail&255) == 1) detail=ssd1677WaitReadyOwned(busy,polls)
+    if (detail == 1) detail=esp32s3Ssd1677UploadOwned(peripheral,select,dc,canvas,history,800,480,mode,(flags&2) != 0,(flags&16) != 0,x,y,w,h)
+    if ((detail&255) == 1) detail=esp32s3Ssd1677ActivateOwned(peripheral,select,dc,busy,mode,(flags&4) != 0,polls)
+    var healthy=(detail&255) == 1
+    // Admission already checked complete spans/disjointness; commit cannot
+    // race drawing or lose dirty updates under the required caller ownership.
+    if (healthy && !ssd1677RememberOwned(history,canvas,800,480,x,y,w,h,mode == 4,true)) { healthy=false;detail=2 }
+    val released=gate.finish(owner,healthy)
+    val result=SpiTransactionResult(((if (!released) 5 else if (healthy) 1 else 6)<<32)|detail)
+    r.storeU32(44,result&4294967295);r.storeU32(48,result>>>32)
+    if (healthy && released) {
+        r.storeU32(24,(flags&16)|(if (mode <= 2) 9 else 13|(if ((flags&2) == 0) 2 else 0)))
+        r.storeU32(36,0);r.storeU32(40,0)
+    } else { r.storeU32(24,flags&16);r.storeU32(4,2) }
+    return result
+}

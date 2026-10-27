@@ -1,0 +1,71 @@
+import "./rmt_strip_state.ab"
+import "./rmt_rgb_frame.ab"
+import "../esp32/gpio/snapshot_s3_sequence.ab"
+// Exclusive40-byte record. Caller owns ALL stopped RMT channels, a parked
+// GDMA TX channel, stable APB80MHz, calibrated delay and pad owners/holds/sleep.
+// This is exclusive initialization, not preservation of other RMT users.
+// Close restores the original digital pad and makes buffers reclaimable;
+// shared clock/memory/channel configuration remains prepared, never gated.
+// Status0invalid,1ready,2closed,3cleanup required. Keep record/strip/descriptors/
+// waveform immutable while cleanup is pending. No ISR/SMP sharing.
+trusted fun rmtLedSessionValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,40) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x524C5333
+fun rmtLedRangesOverlap(a: int,an: int,b: int,bn: int): bool = a < b+bn && b < a+an
+trusted fun rmtLedSessionStrip(r: NativeBuffer): RmtLedStrip =
+    RmtLedStrip(r.loadU32(16)|(r.loadU32(20)<<32))
+
+trusted fun rmtLedSessionCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!rmtLedSessionValid(r) || !exclusive || polls < 1 || polls > 1000000) return 0
+    val status=r.loadU32(4)
+    if (status == 2) return 2
+    if (status != 1 && status != 3) return 0
+    r.storeU32(4,3)
+    if (r.loadU32(36) != 0) {
+        val recovered=esp32s3RmtRecoverDmaOwned(r.loadU32(12),polls)
+        r.storeU32(32,recovered)
+        if (recovered != 1) return 3
+        // Persist quiescence so a pad restore retry doesn't touch DMA again.
+        r.storeU32(36,0)
+    }
+    if (S3GpioSnapshot(r.loadU32(8)).restoreOwned(true) != 1) return 3
+    r.storeU32(4,2)
+    return 2
+}
+
+trusted fun rmtLedSessionBeginOwned(r: NativeBuffer,strip: RmtLedStrip,dma: int,owner: u32,exclusive: bool): int {
+    val storage=strip.storage()
+    if (!exclusive || owner == u32(0) || dma < 0 || dma > 4 ||
+        !r.hasAddressRange(0,40) || (r.addressValue()&3) != 0 ||
+        !storage.hasAddressRange(0,40) || !rmtLedStorageValid(storage,storage.loadU16(16)) ||
+        storage.load(20) != 0 || !espChipS3().gpioOutputValid(strip.pin()) ||
+        rmtLedRangesOverlap(r.addressValue(),40,storage.addressValue(),storage.capacity())) return 0
+    if (r.loadU32(0) != 0 && (!rmtLedSessionValid(r) || r.loadU32(4) != 2)) return 0
+    val saved=esp32S3GpioSnapshotOwned(strip.pin(),true)
+    if (!saved.valid()) return 0
+    r.storeU32(0,0x524C5333);r.storeU32(4,3);r.storeU32(8,saved|0);r.storeU32(12,dma)
+    r.storeU32(16,storage.addressValue());r.storeU32(20,storage.capacity())
+    r.storeU32(24,0);r.storeU32(28,0);r.storeU32(32,0);r.storeU32(36,0)
+    val prepared=esp32s3RmtPrepareRgbDmaOwned(pin(strip.pin()),dma,owner)
+    r.storeU32(24,prepared)
+    if (prepared != 1) return 3
+    r.storeU32(4,1)
+    return 1
+}
+
+// Returns complete low-level transfer flags, or2 invalid/notready. A failure
+// is retained and prevents further display until close/rebegin; never force
+// success or silently reuse potentially DMA-owned buffers.
+trusted fun rmtLedSessionDisplayOwned(r: NativeBuffer,descriptors: int,waveform: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !rmtLedSessionValid(r) || r.loadU32(4) != 1 || polls < 1 || polls > 1000000) return 2
+    val strip=rmtLedSessionStrip(r)
+    val bytes=rmtRgbFrameBytes(strip.count())
+    if (!waveform.hasAddressRange(0,bytes) || !esp32s3GdmaLinearTxLayoutValid(descriptors,waveform.addressValue(),bytes)) return 2
+    val descriptorBytes=esp32s3GdmaLinearTxCount(bytes)*12
+    if (rmtLedRangesOverlap(r.addressValue(),40,descriptors,descriptorBytes) ||
+        rmtLedRangesOverlap(r.addressValue(),40,waveform.addressValue(),bytes)) return 2
+    r.storeU32(4,3);r.storeU32(36,1)
+    val result=strip.displayDmaOwned(r.loadU32(12),descriptors,waveform,polls)
+    r.storeU32(28,result)
+    if ((result&255) == 1) { r.storeU32(36,0);r.storeU32(4,1) }
+    return result
+}

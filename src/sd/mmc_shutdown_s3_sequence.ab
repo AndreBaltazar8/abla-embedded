@@ -1,0 +1,59 @@
+import "./mmc_startup_s3_sequence.ab"
+// Close the host resources acquired by startup. This never aborts live card
+// traffic or stops somebody else's DMA. Caller has drained/cancelled its IO,
+// retains exclusive BOTH-slot/IRQ/SYSTEM ownership and keeps clocks/pads alive.
+// Startup status6closing,7closed,8clock-update failure. context44 close phase
+// 1clock update/2RCC restore; primitive32 and lease28 retained through errors.
+// No pad detach, PMIC/power change, or upstream PLL/source lease release:
+// after7 the caller may restore its own pads/power/source in the proper order.
+// Bound polling externally; a timeout keeps the context and leases alive.
+// Return1closed2pending3invalid4busy/retryable release failure5clock failure.
+trusted fun sdMmcStartupCloseBeginOwned(context: NativeBuffer,quiescent: bool): int {
+    val status=sdMmcStartupStatus(context)
+    if (status == 7) return 1
+    if (!quiescent || (status != 1 && status != 4 && status != 5 && status != 8)) return 3
+    val lease=SdMmcBus(context.loadU32(28))
+    if (lease == 0) { context.store(0,7); return 1 }
+    val clock=sdMmcS3SystemRead(0x600c001c)
+    val reset=sdMmcS3SystemRead(0x600c0024)
+    if ((clock&128) != 0 && (reset&128) == 0) {
+        val slot=context.load(5)
+        if (slot > 1 || context.loadU32(8) > 255) return 3
+        if ((sdMmcS3Read(0)&0x02000037) != 0 || (sdMmcS3Read(128)&0x83) != 0 ||
+            (sdMmcS3Read(140)&0x1e000) != 0 || (sdMmcS3Read(44)&0x80000000) != 0 ||
+            (sdMmcS3Read(72)&0x3ffe06f0) != 0 || (sdMmcS3Read(16)&(65535&~(1<<slot))) != 0) return 4
+        val stopped=sdMmcClockStartOwned(slot,context.loadU32(8),false,false)
+        context.storeU32(32,stopped|0)
+        if (stopped.status() != 2) {
+            context.store(0,8); context.storeU32(36,stopped.status())
+            return 5
+        }
+        context.storeU32(44,1)
+    } else {
+        // Partial RCC acquisition can leave the peripheral gated or held in
+        // reset. Do not read its registers merely to clean up its clock lease.
+        context.storeU32(44,2)
+    }
+    context.store(0,6)
+    return 2
+}
+trusted fun sdMmcStartupClosePollOwned(context: NativeBuffer): int {
+    val status=sdMmcStartupStatus(context)
+    if (status == 7) return 1
+    if (status != 6) return 3
+    val phase=context.loadU32(44)
+    if (phase == 1) {
+        val clock=SdMmcClock(context.loadU32(32)).pollOwned()
+        context.storeU32(32,clock|0)
+        if (clock.status() == 2) return 2
+        if (clock.status() != 1) { context.store(0,8); context.storeU32(36,clock.status()); return 5 }
+        context.storeU32(44,2)
+        return 2
+    }
+    if (phase != 2) return 3
+    val lease=SdMmcBus(context.loadU32(28)).closeOwned(true)
+    context.storeU32(28,lease|0)
+    if (lease != 0) { context.storeU32(36,lease.status()); return 4 }
+    context.store(0,7); context.storeU32(36,0)
+    return 1
+}

@@ -1,0 +1,49 @@
+import "./command_buffer.ab"
+import "../peripheral_gate.ab"
+import "../spi/transaction_result.ab"
+import "../spi/buffer_gate.ab"
+
+// Execute the existing M5GFX encoded program using initialized hardware SPI.
+// Validate every byte before mutation, hold one canonical gate across all
+// commands/delays, and stop at the first controller failure without retry.
+// Shared D/C is released by each command before any millisecond delay.
+trusted fun esp32s3LcdRunProgram(gate: PeripheralGate, owner: u32,
+    peripheral: int, pins: SpiPins, select: Pin, dataCommand: Pin,
+    program: NativeBuffer, length: int, sharedDataCommand: bool = false): SpiTransactionResult {
+    if (!esp32s3SpiCommandPinsValid(peripheral, pins, select, dataCommand, sharedDataCommand) ||
+        !esp32s3SpiMemoryRangeValid(peripheral, program, length) ||
+        !gate.bufferDisjoint(program, length) || !lcdCommandBufferValid(program, length))
+        return SpiTransactionResult(3 << 32)
+    val gateAddress = gate.word().address()
+    if (gateAddress <= 0 || gateAddress > 4294967292) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    val detail = esp32s3LcdRunProgramOwned(peripheral, select, dataCommand, program, length, sharedDataCommand)
+    val healthy = (detail & 255) == 1
+    if (!gate.finish(owner, healthy)) return SpiTransactionResult((5 << 32) | detail)
+    SpiTransactionResult(((if (healthy) 1 else 6) << 32) | detail)
+}
+
+// Internal: the full immutable program has been validated and gate is held.
+trusted fun esp32s3LcdRunProgramOwned(peripheral: int, select: Pin, dataCommand: Pin,
+    program: NativeBuffer, length: int, sharedDataCommand: bool): int {
+    var offset = 0
+    var detail = 1
+    while (offset + 1 < length) {
+        val command = program.load(offset)
+        val encoded = program.load(offset + 1)
+        offset = offset + 2
+        if (command == 255 && encoded == 255) return detail
+        val count = encoded & 127
+        detail = esp32s3SpiCommandOwned(peripheral, select, dataCommand, command,
+            nativeBufferAt(program.addressValue() + offset, count), count, sharedDataCommand)
+        if ((detail & 255) != 1) return detail
+        offset = offset + count
+        if ((encoded & 128) != 0) {
+            val wait = program.load(offset)
+            offset = offset + 1
+            if (wait != 0) peripheralDelayMilliseconds(if (wait == 255) 500 else wait)
+        }
+    }
+    2
+}

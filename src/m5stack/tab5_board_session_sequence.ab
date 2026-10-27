@@ -1,0 +1,98 @@
+import "./board_id.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// 40B caller-owned cold-board session: magic0,phase4,bus64at8,prepare64at16,
+// scan64at24,expander address32,word36:cleanup bit0/layout bits8..9.
+// Fresh initialize only.
+// Phase1bus attempt,2board preparation,3scan,4ready,5closing,6child panel,0closed.
+// In phase6 only, scan highword28 holds the child DSI-owner pointer (the probe
+// handle was already released before phase4); lowword keeps touch evidence.
+// Keeps complete stage reports and all partial handle/clock ownership.
+type Tab5BoardSession = int
+fun tab5BoardSessionAt(storage: NativeBuffer): Tab5BoardSession = Tab5BoardSession(storage|0)
+fun Tab5BoardSession.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun Tab5BoardSession.valid(): bool = this.buffer().hasAddressRange(0,40) &&
+    (this.buffer().addressValue()&3) == 0 && this.buffer().loadU32(0) == 0x54425345
+trusted fun Tab5BoardSession.value(offset: int): int = this.buffer().loadU32(offset)|(this.buffer().loadU32(offset+4)<<32)
+trusted fun Tab5BoardSession.save(offset: int,value: int): void {
+    this.buffer().storeU32(offset,value&4294967295); this.buffer().storeU32(offset+4,value>>>32); return
+}
+trusted fun Tab5BoardSession.initialize(): bool {
+    if (!this.buffer().hasAddressRange(0,40) || (this.buffer().addressValue()&3) != 0) return false
+    var offset=4
+    while (offset < 40) { this.buffer().storeU32(offset,0); offset=offset+4 }
+    this.buffer().storeU32(0,0x54425345); return true
+}
+trusted fun Tab5BoardSession.ready(): bool = this.valid() && (this.buffer().loadU32(4) == 4 || this.buffer().loadU32(4) == 6)
+trusted fun Tab5BoardSession.touchProbe(): int = if (this.ready()) (this.value(24)>>>8)&65535 else 0
+trusted fun Tab5BoardSession.layout(): int = if (this.valid()) (this.buffer().loadU32(36)>>>8)&3 else 0
+// Session and expander owner remain alive while child display/sensor owners
+// use the bus. Child storage cannot corrupt either parent's ownership records.
+trusted fun Tab5BoardSession.childBufferSafe(buffer: NativeBuffer,length: int): bool {
+    if (!this.ready() || !buffer.hasAddressRange(0,length)) return false
+    val a=buffer.addressValue(); val o=this.buffer().addressValue(); val e=this.buffer().loadU32(32)
+    return !(a < o+40 && o < a+length) && !(a < e+32 && e < a+length)
+}
+// Compose known touch evidence with a fresh DSI owner. Retains its pointer on
+// startup success or partial hardware failure; storage must outlive this lease.
+// Close child video/IRQ before session.closeOwned; it then closes the host before
+// releasing bus children. Caller may close host early but must retain its record.
+// Returns detected-panel status with full diagnostics in the child DSI owner.
+trusted fun Tab5BoardSession.openPanelOwned(owner: NativeBuffer,reference: NativeBuffer,scratch: NativeBuffer,
+    cfg: int,ref: int,div: int,khz: int,vc: int,polls: int,settleUs: int): int {
+    if (!this.valid() || this.buffer().loadU32(4) != 4 || !this.childBufferSafe(owner,40) || !this.childBufferSafe(reference,4) ||
+        !this.childBufferSafe(scratch,32)) return 2
+    val result=tab5SessionPanelOpen(owner,reference,this.touchProbe(),scratch,this.layout(),cfg,ref,div,khz,vc,polls,settleUs)
+    if (result != 2) {
+        this.buffer().storeU32(28,owner.addressValue())
+        this.buffer().storeU32(4,6)
+    }
+    return result
+}
+// Caller owns provider/GPIO31/32/23, fresh expander owner and all peripherals
+// affected by Tab5 power/reset; clocks/delays calibrated and pad holds released.
+// Excludes all concurrent lifecycle users. No DSI/video/IRQ startup here.
+// 1ready,2invalid,3control bus,4power/reset,5touch scan/cleanup failure.
+trusted fun Tab5BoardSession.openOwned(board: M5BoardId,layout: int,expanders: NativeBuffer,scratch: NativeBuffer,attempts: int = 60): int {
+    if (!this.valid() || this.buffer().loadU32(4) != 0 ||
+        (board != m5BoardTab5 && board != m5BoardTab5X) || (layout != 1 && layout != 3) ||
+        attempts < 1 || attempts > 60 || !expanders.hasAddressRange(0,32) ||
+        (expanders.addressValue()&3) != 0 || !scratch.hasAddressRange(0,32)) return 2
+    val o=this.buffer().addressValue(); val e=expanders.addressValue(); val s=scratch.addressValue()
+    if ((o < e+32 && e < o+40) || (o < s+32 && s < o+40) || (e < s+32 && s < e+32) ||
+        !tab5SessionStorageSafe(this.buffer(),expanders,scratch)) return 2
+    this.buffer().storeU32(32,e); this.buffer().storeU32(36,layout<<8); this.buffer().storeU32(4,1)
+    val bus=tab5SessionBusOpen(layout); this.save(8,bus)
+    if (((bus>>>40)&255) != 1) return 3
+    this.buffer().storeU32(4,2); this.buffer().storeU32(36,(layout<<8)|1)
+    val prepared=tab5SessionPrepare(bus,board,expanders,scratch); this.save(16,prepared)
+    if ((prepared&255) != 1) return 4
+    this.buffer().storeU32(4,3)
+    val scan=tab5SessionScan(prepared,board,bus,attempts); this.save(24,scan)
+    if ((scan&255) != 1 || (scan>>>32) != 0) return 5
+    this.buffer().storeU32(4,4); return 1
+}
+// Stop/join display video/IRQ, touch and all other child users first. Closes
+// retained display host -> probe -> expanders -> control bus/clock. Does NOT
+// undo board power/reset outputs or release GPIO23: those require board policy.
+// 1closed,2invalid,3probe close,4expander close,5control bus close,6child active/failure.
+trusted fun Tab5BoardSession.closeOwned(polls: int = 10000): int {
+    if (!this.valid() || polls < 1 || polls > 1000000) return 2
+    if (this.buffer().loadU32(4) == 0) return 1
+    if (this.buffer().loadU32(4) == 6) {
+        if (tab5SessionPanelClose(nativeBufferAt(this.buffer().loadU32(28),40),polls) != 1) return 6
+        // Restore the scan union BEFORE entering ordinary parent teardown.
+        this.buffer().storeU32(28,0)
+    }
+    this.buffer().storeU32(4,5)
+    if ((this.value(24)>>>32) != 0) {
+        val scan=tab5SessionScanClose(this.value(24)); this.save(24,scan)
+        if ((scan>>>32) != 0) return 3
+    }
+    if ((this.buffer().loadU32(36)&1) != 0) {
+        if (!tab5SessionExpandersClose(nativeBufferAt(this.buffer().loadU32(32),32))) return 4
+        this.buffer().storeU32(36,this.buffer().loadU32(36)&(-2))
+    }
+    val bus=tab5SessionBusClose(this.value(8)); this.save(8,bus)
+    if (bus != 0) return 5
+    this.buffer().storeU32(4,0); return 1
+}

@@ -1,0 +1,51 @@
+import "../display/dpi_clock_p4_logic.ab"
+import "../display/dsi_timing_logic.ab"
+import "../esp32/cache_writeback_p4_sequence.ab"
+// Open video on a detected, powered, command-initialized Tab5 panel (1..3).
+// Caller owns ready DSI bus, inactive DMA channel/controller, pinned PLL240M,
+// framebuffer/descriptor and cache/RCC serialization. No service may run yet.
+// RGB565 native orientation,720x1280. Panel reset/init/detection stays separate.
+type Tab5VideoStart = int
+fun Tab5VideoStart.status(): int = this&15
+fun Tab5VideoStart.ownsDpiClock(): bool = (this&16) != 0
+fun Tab5VideoStart.ownsBridge(): bool = (this&32) != 0
+fun Tab5VideoStart.mayOwnDma(): bool = (this&64) != 0
+fun Tab5VideoStart.detail(): int = this>>>8
+// Status1startissued,2invalid,3preexisting/busy,4clock,5timings,6RGB,
+// 7bridgeDMAconfig,8bridgeenable,9publication,10video. Preserve returned
+// ownership on failure and use checked shutdown before releasing resources.
+trusted fun tab5VideoOpenOwned(panel: int,hwVersion: int,laneKbps: int,vc: int,dmaChannel: int,descriptor: NativeBuffer,frame: NativeBuffer,line: int,polls: int): Tab5VideoStart {
+    if (panel < 1 || panel > 3 || (hwVersion != 1 && hwVersion != 3) || vc < 0 || vc > 3 ||
+        dmaChannel < 0 || dmaChannel > 3 || laneKbps < 80000 || laneKbps > 1500000 ||
+        polls < 1 || polls > 1000000) return Tab5VideoStart(2)
+    val expected=if (panel == 2) 70000 else 80000
+    val plan=esp32P4DpiClockPlan(1,240000,expected)
+    val horizontal=dsiHorizontalTiming(if (panel == 1) 40 else 2,if (panel == 1) 140 else 40,720,40,laneKbps,expected,plan.floorKhz())
+    val desc=descriptor.addressValue()
+    val pixels=frame.addressValue()
+    val span=esp32P4CacheWritebackSpan(frame,1843200,line)
+    if (!horizontal.valid() || desc < 1341128704 || desc > 1341915072 ||
+        esp32P4CacheWritebackSpan(descriptor,64,line) != 64 || span == 0 ||
+        (desc < pixels+span && pixels < desc+64)) return Tab5VideoStart(2)
+    val bit=u32(1)<<u32(dmaChannel)
+    if ((p4DsiClockRead(24)&u32(4096)) == u32(0) || (p4DsiClockRead(60)&u32(128)) != u32(0)) return Tab5VideoStart(3)
+    if ((p4DsiRead(52)&u32(1)) == u32(0) || (p4DsiBridgeRead(4)&u32(1)) != u32(0) ||
+        (p4DsiBridgeRead(64)&u32(1)) != u32(0) || (p4DwDmaRead(16)&u32(1)) == u32(0) ||
+        ((p4DwDmaRead(24)|p4DwDmaRead(28))&bit) != u32(0) || p4DwDmaRead(392+dmaChannel*256) != u32(0) ||
+        (p4CacheSyncRead(152)&u32(15)) != u32(0)) return Tab5VideoStart(3)
+    val clock=p4Tab5VideoClock(plan)
+    if (clock != 1) return Tab5VideoStart(4|(if (clock == 5) 16 else 0)|(clock<<8))
+    val timing=p4Tab5VideoTiming(panel,laneKbps,plan.floorKhz(),polls)
+    if ((timing&15) != 1) return Tab5VideoStart(21|(timing<<8))
+    val rgb=p4Tab5VideoRgb(hwVersion,vc,polls)
+    if ((rgb&15) != 1) return Tab5VideoStart(22|(rgb<<8))
+    val bridgeConfig=p4Tab5VideoDmaConfig()
+    if (bridgeConfig != 1) return Tab5VideoStart(23|(bridgeConfig<<8))
+    val bridge=p4Tab5VideoBridge()
+    if (bridge != 1) return Tab5VideoStart(56|(bridge<<8))
+    val published=p4Tab5VideoPublish(dmaChannel,descriptor,frame,line,polls)
+    if (published != 1) return Tab5VideoStart(121|(published<<8))
+    val video=p4Tab5VideoStart(dmaChannel)
+    if (video != 1) return Tab5VideoStart(122|(video<<8))
+    return Tab5VideoStart(113)
+}

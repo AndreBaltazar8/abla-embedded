@@ -1,0 +1,41 @@
+import "../esp32/cache_writeback_p4_sequence.ab"
+// Refresh an already-published immutable framebuffer (or another independently
+// published immutable buffer). Do NOT use this for dirty pixels: publish first.
+// Caller owns descriptor/channel/cache serialization and pins all memory/clocks.
+// Low8:0notdone,1startissued,2invalid,3busy,4fault,5prepare,6cache,7ack,
+// 8configuration,9start. Sub-result bits8..15, observed DMA events bits16..47.
+// Every failure retains all resources; cache timeout retains engine ownership.
+// Rebuilding all 64 descriptor bytes avoids using cached DMA-written status.
+// Only the descriptor is written back, never the unchanged framebuffer.
+trusted fun esp32P4DsiFrameRearmImmutableOwned(channel: int,descriptor: NativeBuffer,frame: NativeBuffer,bytes: int,line: int,polls: int): int {
+    if (channel < 0 || channel > 3 || polls < 1 || polls > 1000000 ||
+        bytes < 8 || bytes > 33554432 || (bytes&7) != 0) return 2
+    val desc=descriptor.addressValue()
+    val pixels=frame.addressValue()
+    val span=esp32P4CacheWritebackSpan(frame,bytes,line)
+    if (desc < 1341128704 || desc > 1341915072 || span == 0 ||
+        esp32P4CacheWritebackSpan(descriptor,64,line) != 64 ||
+        (desc < pixels+span && pixels < desc+64)) return 2
+    if ((p4DwDmaRead(16)&u32(1)) == u32(0) || (p4DwDmaRead(88)&u32(1)) != u32(0)) return 3
+    val events=p4DwDmaRead(392+channel*256)
+    val report=int(events)<<16
+    if ((events&u32(4294967268)) != u32(0) || (p4DsiBridgeRead(88)&u32(1)) != u32(0)) return report|4
+    val bit=u32(1)<<u32(channel)
+    if (((p4DwDmaRead(24)|p4DwDmaRead(28))&bit) != u32(0)) return report|3
+    if ((events&u32(2)) == u32(0)) return report
+    if ((p4CacheSyncRead(152)&u32(15)) != u32(0)) return report|3
+    if (!p4DsiPrepareFrame(descriptor,frame,bytes)) return report|5
+    p4DsiPublicationFence()
+    val cached=p4DsiWritebackFrame(descriptor,64,line,polls)
+    if (cached != 1) return report|6|(cached<<8)
+    p4DsiPublicationFence()
+    // Acknowledge only the captured benign events, after successful preparation.
+    val ack=p4DsiAcknowledgeFrameChannel(channel,int(events))
+    if (ack != 1) return report|7|(ack<<8)
+    val configured=p4DsiConfigureFrameChannel(channel,desc)
+    if (configured != 1) return report|8|(configured<<8)
+    p4DsiPublicationFence()
+    val started=p4DsiStartFrameChannel(channel)
+    if (started != 1) return report|9|(started<<8)
+    return report|1
+}

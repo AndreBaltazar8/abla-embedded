@@ -1,0 +1,35 @@
+import "../audio/microphone_process.ab"
+// Full GDMA detail stays in session120/124. Return low8 status (1 processed,
+// 2 preflight,3 busy,4..8 pump fault,9 processing fault), output SAMPLE count
+// above bit32. Busy/preflight never changes DSP/output or consumes input.
+type CoreS3MicrophoneBlockResult=int
+fun CoreS3MicrophoneBlockResult.status(): int = this&255
+fun CoreS3MicrophoneBlockResult.samples(): int = this>>>32
+trusted fun coreS3MicrophoneStorageDisjoint(r: NativeBuffer,buffer: NativeBuffer,bytes: int): bool {
+    val address=buffer.addressValue();val count=r.loadU32(48)
+    val desc=r.loadU32(24);val payload=r.loadU32(112);val block=r.loadU32(52)
+    if (!buffer.hasAddressRange(0,bytes)) return false
+    return bytes == 0 || !((address < r.addressValue()+128 && r.addressValue() < address+bytes) ||
+        (address < desc+count*12 && desc < address+bytes) ||
+        (address < payload+count*block && payload < address+bytes))
+}
+// Caller owns running CoreS3 RX session,40B initialized processing state,
+// one full raw stereo16 DMA block and output. ES7210 uses inputStereo=true,
+// adc=false/swap=false. Hardware rate must be desired output rate*oversampling;
+// actual rate is session28/oversampling. This never reconfigures live clocks.
+trusted fun coreS3MicrophoneProcessBlockOwned(r: NativeBuffer,state: NativeBuffer,
+    raw: NativeBuffer,output: NativeBuffer,stereo: bool,bits16: bool,polls: int,exclusive: bool): CoreS3MicrophoneBlockResult {
+    if (!exclusive || !coreS3AudioSessionValid(r) || r.loadU32(4) != 2 || r.loadU32(8) != 0 ||
+        polls < 1 || polls > 1000000 || !state.hasAddressRange(0,40) || (state.loadU32(4)&7340032) != 1048576) return CoreS3MicrophoneBlockResult(2)
+    val bytes=r.loadU32(52)
+    if (bytes < 4 || (bytes&3) != 0 || !esp32s3GdmaRingLayoutValid(r.loadU32(24),r.loadU32(48),r.loadU32(112),bytes,bytes)) return CoreS3MicrophoneBlockResult(2)
+    val samples=microphoneProcessRequiredSamples(state,raw,bytes/4,output,stereo,bits16)
+    if (samples < 0 || !coreS3MicrophoneStorageDisjoint(r,state,40) ||
+        !coreS3MicrophoneStorageDisjoint(r,raw,bytes) ||
+        !coreS3MicrophoneStorageDisjoint(r,output,samples*(if (bits16) 2 else 1))) return CoreS3MicrophoneBlockResult(2)
+    val pumped=coreS3AudioSessionPumpOwned(r,raw,polls,true)
+    if (pumped.status() != 1) return CoreS3MicrophoneBlockResult(pumped.status())
+    val written=microphoneProcess(state,raw,bytes/4,output,stereo,bits16)
+    if (written != samples) { r.storeU32(4,3);return CoreS3MicrophoneBlockResult(9) }
+    return CoreS3MicrophoneBlockResult(1|(written<<32))
+}

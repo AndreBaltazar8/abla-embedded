@@ -1,0 +1,76 @@
+import "./expander_owner_sequence.ab"
+import "./pmic_open_sequence.ab"
+// Borrowed bus, owned PM1+IOE handles. Fresh caller-exclusive72B storage:
+// magic/status/bus64/board/retained RTC device32, PMIC64, expanders32, failure/detail.
+// Keep the matching board bus, pads/clocks and this storage alive until close.
+// No copying/reinitializing live ownership; caller serializes the entire record
+// and joins all borrowed users before closing. No implicit bus close/recovery.
+type M5Pm1Control=int
+fun m5Pm1ControlAt(storage: NativeBuffer): M5Pm1Control =
+    if (storage.hasAddressRange(0,72) && (storage.addressValue()&3) == 0 &&
+        pm1ControlStorageSafe(storage)) M5Pm1Control(storage|0) else M5Pm1Control(0)
+fun M5Pm1Control.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5Pm1Control.valid(): bool = m5Pm1ControlAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x504d4332
+trusted fun M5Pm1Control.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5Pm1Control.openFailure(): int = if (this.valid()) this.buffer().loadU32(64)&255 else -1
+// Optional retained IMU uses bit8 and an extra word at72. Legacy72B records
+// remain valid; only the opt-in IMU owner API requires76B storage.
+trusted fun M5Pm1Control.imuRetained(): bool = this.valid() && (this.buffer().loadU32(64)&256) != 0
+trusted fun M5Pm1Control.detail(): int = if (this.valid()) this.buffer().loadU32(68) else -1
+trusted fun M5Pm1Control.rtcRetained(): bool = this.valid() && this.buffer().loadU32(20) != 0
+// S3 bus keys are33 bits; retain both words, including the last valid epoch.
+trusted fun M5Pm1Control.bus(): int = if (this.valid()) this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32) else 0
+trusted fun M5Pm1Control.board(): M5BoardId = M5BoardId(if (this.valid()) this.buffer().loadU32(16) else 0)
+trusted fun M5Pm1Control.pmic(): M5PmicOpen = M5PmicOpen(if (this.valid()) this.buffer().loadU32(24)|(this.buffer().loadU32(28)<<32) else 0)
+trusted fun M5Pm1Control.expanders(): M5Expanders = m5ExpandersAt(if (this.valid()) nativeBufferAt(this.buffer().addressValue()+32,32) else NativeBuffer(0))
+trusted fun M5Pm1Control.savePmic(value: M5PmicOpen): void {
+    this.buffer().storeU32(24,value&4294967295);this.buffer().storeU32(28,value>>>32);return
+}
+trusted fun M5Pm1Control.initialize(): bool {
+    if (m5Pm1ControlAt(this.buffer()) == 0) return false
+    var offset=4
+    while (offset < 72) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x504d4332)
+    return this.expanders().initialize()
+}
+// 0closed1configured2admission3expander4PMIC5power6audio7closefailure.
+// Configured is NOT full-board readiness: CPU wake pads, codecs and display
+// remain explicit. PaperMono requires desired wake events consumed beforehand.
+trusted fun M5Pm1Control.ready(): bool = this.status() == 1 && this.pmic().ready() &&
+    this.expanders().ready() && pm1ControlBusReady(this.bus(),this.board())
+trusted fun M5Pm1Control.openOwned(bus: int,board: M5BoardId,exclusive: bool,wakeEventsConsumed: bool): int {
+    if (!exclusive || (board != m5BoardChainCaptain && board != m5BoardPaperMono && board != m5BoardStopWatch) ||
+        (board == m5BoardPaperMono && !wakeEventsConsumed) || this.status() != 0 ||
+        this.pmic().ownsDevice() || this.expanders().status() != 0 || this.rtcRetained() || this.imuRetained() || !pm1ControlBusReady(bus,board)) return 2
+    this.buffer().storeU32(8,bus&4294967295);this.buffer().storeU32(12,bus>>>32);this.buffer().storeU32(16,board|0)
+    this.buffer().storeU32(64,0);this.buffer().storeU32(68,0)
+    var result=this.expanders().openOwned(bus,board)
+    var failure=if (result == 1) 0 else 3
+    if (failure == 0) {
+        val pmic=board.openPmicOwned(bus)
+        this.savePmic(pmic)
+        result=pmic.status()
+        if (!pmic.ready()) failure=4
+    }
+    if (failure == 0) {
+        result=pm1ControlPower(this.expanders(),this.pmic(),wakeEventsConsumed)
+        if ((result&255) != 1) failure=5
+    }
+    if (failure == 0 && (board == m5BoardChainCaptain || board == m5BoardStopWatch)) {
+        result=pm1ControlAudio(this.expanders())
+        if ((result&255) != 1) failure=6
+    }
+    this.buffer().storeU32(64,failure);this.buffer().storeU32(68,result)
+    this.buffer().storeU32(4,if (failure == 0) 1 else failure)
+    return this.status()
+}
+// Release both groups even when one fails, retaining exact failed handles.
+// Does NOT undo rails/IRQ effects or stop hardware users. Caller quiesces them.
+trusted fun M5Pm1Control.closeOwned(exclusiveChildrenQuiesced: bool): bool {
+    if (!exclusiveChildrenQuiesced || !this.valid() || this.rtcRetained() || this.imuRetained()) return false
+    this.savePmic(this.pmic().releaseOwned())
+    val closed=this.expanders().closeOwned()
+    if (this.pmic().ownsDevice() || !closed) { this.buffer().storeU32(4,7);return false }
+    this.buffer().storeU32(8,0);this.buffer().storeU32(12,0);this.buffer().storeU32(4,0)
+    return true
+}

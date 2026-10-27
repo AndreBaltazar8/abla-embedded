@@ -1,0 +1,50 @@
+// Finite16kHz stereo16 capture. Caller meets coreS3PrepareAudioDma resource/
+// PLL/power prerequisites and supplies disjoint capture/ring storage. Six
+// 960-byte DMA buffers (15ms each). No allocation, playback or handle close.
+// status1 complete,2 invalid,16+preparation status,32+start status,
+// 64+pump status,80 short block,96 final stop failure. Bytes are a valid
+// contiguous prefix even on failure. DMA/codec fields preserve cleanup state;
+// only DMA stop status1 proves storage can be reclaimed after running.
+type CoreS3CaptureResult = int
+fun CoreS3CaptureResult.status(): int = this & 255
+fun CoreS3CaptureResult.bytes(): int = (this >>> 8) & 16777215
+fun CoreS3CaptureResult.dmaStatus(): int = (this >>> 32) & 65535
+fun CoreS3CaptureResult.codecStatus(): int = (this >>> 48) & 1023
+
+trusted fun cores3CaptureBlocks(microphone: Es7210, channel: int, descriptors: int,
+    buffers: int, capture: NativeBuffer, blocks: int, owner: u32,
+    idlePollsPerBlock: int): CoreS3CaptureResult {
+    if (!microphone.valid() || blocks < 1 || blocks > 4095 || idlePollsPerBlock < 1 ||
+        idlePollsPerBlock > 1000 || !capture.hasAddressRange(0, blocks * 960) ||
+        !esp32s3GdmaRingLayoutValid(descriptors, 6, buffers, 960, 960)) return CoreS3CaptureResult(2)
+    val destination = capture.addressValue()
+    val end = destination + blocks * 960
+    if ((destination < descriptors + 72 && end > descriptors) ||
+        (destination < buffers + 5760 && end > buffers)) return CoreS3CaptureResult(2)
+    val prepared = coreS3PrepareAudioDma(false, 16000, channel, descriptors, 6, buffers, 960, owner)
+    if (!prepared.valid()) return CoreS3CaptureResult(16 + prepared.status())
+    val started = cores3StartMicrophoneStream(microphone, channel, descriptors, 1000)
+    if (!started.valid()) return CoreS3CaptureResult((32 + started.status()) |
+        (started.dmaStatus() << 32) | (started.codecStatus() << 48))
+    var copied = 0
+    var index = 0
+    var idle = 0
+    var status = 1
+    while (copied < blocks * 960 && status == 1) {
+        val result = esp32s3GdmaPumpBlock(channel, false, descriptors, 6, index,
+            nativeBufferAt(destination + copied, 960), 0, 1)
+        if (result.status() == 1) {
+            copied = copied + result.transferredBytes()
+            index = result.nextIndex()
+            idle = 0
+            if (result.transferredBytes() != 960) status = 80
+        } else if (result.status() == 3) {
+            idle = idle + 1
+            if (idle >= idlePollsPerBlock) status = 67
+            else peripheralDelayMicroseconds(1000)
+        } else status = 64 + result.status()
+    }
+    val stopped = cores3StopMicrophoneStream(microphone, channel, 1000)
+    if (status == 1 && !stopped.valid()) status = 96
+    CoreS3CaptureResult(status | (copied << 8) | (stopped.dmaStatus() << 32) | (stopped.codecStatus() << 48))
+}

@@ -1,0 +1,163 @@
+import "../audio/wav_pcm16_block.ab"
+import "../audio/wav_mix.ab"
+import "../audio/pcm_channels.ab"
+
+// Raw input is16k stereo16; WAV input uses its8..96k source rate. Caller owns powered
+// board, disabled microphone/amplifier, I2S1/GDMA/pads/stablePLL160M and memory.
+// Source/staging are disjoint from the entire6x960DMA ring and each other.
+// Six leading silence blocks cover amplifier setup; at least eight trailing
+// blocks are DMA-completed before shutdown (at least120ms at the actual rate).
+// This is not a claim of physical codec latency or verified analog playback.
+// status1 complete,2 invalid,16+prepare,31clockerror,32+start,64+pump,80short,81conversion,96stopfail.
+// bytes count DMA-completed source data, not merely queued data. Fields retain
+// DMA16bit cleanup and amplifier11bit cleanup independently of primary error.
+type CoreS3PlaybackResult = int
+fun CoreS3PlaybackResult.status(): int = this & 255
+fun CoreS3PlaybackResult.bytes(): int = (this >>> 8) & 16777215
+fun CoreS3PlaybackResult.dmaStatus(): int = (this >>> 32) & 65535
+fun CoreS3PlaybackResult.amplifierStatus(): int = (this >>> 48) & 2047
+fun coreS3PlaybackSpansOverlap(a: int, sizeA: int, b: int, sizeB: int): bool = a < b + sizeB && b < a + sizeA
+
+trusted fun cores3PlaybackBlocks(amplifier: Aw88298, expander: Aw9523, channel: int,
+    descriptors: int, buffers: int, source: NativeBuffer, blocks: int,
+    staging: NativeBuffer, owner: u32, idlePollsPerBlock: int,
+    wav: PcmWav = PcmWav(0), mix: PcmWavMix = PcmWavMix(0),
+    mixAccumulator: NativeBuffer = NativeBuffer(0), mixScratch: NativeBuffer = NativeBuffer(0),
+    masterGainQ15: int = 32768, mixOutputRate: int = 0,
+    bank: PcmChannels = PcmChannels(0)): CoreS3PlaybackResult {
+    var sourceBytes=blocks*960
+    var outputBytes=blocks*960
+    var sampleRate=16000
+    val converted=wav != PcmWav(0) || mix != PcmWavMix(0) || bank != PcmChannels(0)
+    if (bank != PcmChannels(0)) {
+        if (wav != PcmWav(0) || mix != PcmWavMix(0) || !bank.valid() || source != bank.storage() ||
+            masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+            pcmMixSpansOverlap(mixAccumulator,1920,mixScratch,960) ||
+            pcmMixSpansOverlap(mixAccumulator,1920,staging,960) ||
+            pcmMixSpansOverlap(mixScratch,960,staging,960)) return CoreS3PlaybackResult(2)
+        var voice=0
+        while (voice < bank.count()) {
+            val entry=bank.channel(voice)
+            if (!entry.disjointFrom(mixAccumulator,1920) || !entry.disjointFrom(mixScratch,960) ||
+                !entry.disjointFrom(staging,960) || !entry.disjointFrom(nativeBufferAt(descriptors,72),72) ||
+                !entry.disjointFrom(nativeBufferAt(buffers,5760),5760)) return CoreS3PlaybackResult(2)
+            voice=voice+1
+        }
+        var work=0
+        while (work < 2) {
+            val span=if (work == 0) mixAccumulator else mixScratch
+            val bytes=if (work == 0) 1920 else 960
+            if (pcmMixSpansOverlap(span,bytes,nativeBufferAt(descriptors,72),72) ||
+                pcmMixSpansOverlap(span,bytes,nativeBufferAt(buffers,5760),5760)) return CoreS3PlaybackResult(2)
+            work=work+1
+        }
+        sampleRate=bank.channel(0).storage().loadU32(0)
+        sourceBytes=source.capacity()
+    }
+    if (mix != PcmWavMix(0)) {
+        val frames=mix.frames(mixOutputRate)
+        if (wav != PcmWav(0) || frames < 1 || frames > 982800 ||
+            mix.sampleRate(mixOutputRate) < 8000 || mix.sampleRate(mixOutputRate) > 96000 || source != mix.storage() ||
+            blocks != int((u32(frames)+u32(239))/u32(240)) || masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+            !mix.disjointFrom(staging,960,mixOutputRate) || !mix.disjointFrom(mixAccumulator,1920,mixOutputRate) ||
+            !mix.disjointFrom(mixScratch,960,mixOutputRate) || !mix.disjointFrom(nativeBufferAt(descriptors,72),72,mixOutputRate) ||
+            !mix.disjointFrom(nativeBufferAt(buffers,5760),5760,mixOutputRate)) return CoreS3PlaybackResult(2)
+        if (pcmMixSpansOverlap(mixAccumulator,1920,mixScratch,960) ||
+            pcmMixSpansOverlap(mixAccumulator,1920,staging,960) ||
+            pcmMixSpansOverlap(mixScratch,960,staging,960) ||
+            pcmMixSpansOverlap(mixAccumulator,1920,nativeBufferAt(descriptors,72),72) ||
+            pcmMixSpansOverlap(mixAccumulator,1920,nativeBufferAt(buffers,5760),5760) ||
+            pcmMixSpansOverlap(mixScratch,960,nativeBufferAt(descriptors,72),72) ||
+            pcmMixSpansOverlap(mixScratch,960,nativeBufferAt(buffers,5760),5760)) return CoreS3PlaybackResult(2)
+        sourceBytes=source.capacity()
+        outputBytes=frames*4
+        sampleRate=mix.sampleRate(mixOutputRate)
+    }
+    if (wav != PcmWav(0)) {
+        val frames=wav.frames()
+        if (frames < 1 || frames > 982800 || wav.sampleRate() < 8000 || wav.sampleRate() > 96000 ||
+            wav.samples() != source || blocks != int((u32(frames)+u32(239))/u32(240))) return CoreS3PlaybackResult(2)
+        sampleRate=wav.sampleRate()
+        sourceBytes=source.capacity()
+        outputBytes=frames*4
+        if (coreS3PlaybackSpansOverlap(wav,20,staging.addressValue(),960) ||
+            coreS3PlaybackSpansOverlap(wav,20,descriptors,72) ||
+            coreS3PlaybackSpansOverlap(wav,20,buffers,5760)) return CoreS3PlaybackResult(2)
+    }
+    if (!amplifier.valid() || !expander.valid() || blocks < 1 || blocks > 4095 ||
+        idlePollsPerBlock < 1 || idlePollsPerBlock > 1000 ||
+        !source.hasAddressRange(0, sourceBytes) || !staging.hasAddressRange(0, 960) ||
+        (staging.addressValue() & 3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(descriptors, 6, buffers, 960, 960)) return CoreS3PlaybackResult(2)
+    val s = source.addressValue()
+    val t = staging.addressValue()
+    if (coreS3PlaybackSpansOverlap(s, sourceBytes, t, 960) ||
+        coreS3PlaybackSpansOverlap(s, sourceBytes, descriptors, 72) ||
+        coreS3PlaybackSpansOverlap(s, sourceBytes, buffers, 5760) ||
+        coreS3PlaybackSpansOverlap(t, 960, descriptors, 72) ||
+        coreS3PlaybackSpansOverlap(t, 960, buffers, 5760)) return CoreS3PlaybackResult(2)
+    val prepared = coreS3PrepareAudioDma(true, sampleRate, channel, descriptors, 6, buffers, 960, owner)
+    if (!prepared.valid()) return CoreS3PlaybackResult(16 + prepared.status())
+    // Refuse more than0.1% clock error before DMA starts. Preparation may
+    // configure clocks/pins, but does not enable either DMA or the amplifier.
+    val actualRate=prepared.sampleRate()
+    val error=if (actualRate >= sampleRate) actualRate-sampleRate else sampleRate-actualRate
+    if (converted && error*1000 > sampleRate) return CoreS3PlaybackResult(31)
+    val tailBlocks=if (converted && actualRate > 16000)
+        int((u32(actualRate)+u32(1999))/u32(2000)) else 8
+    // Preparation proved the channel parked. Initialize payloads BEFORE start.
+    var ringIndex = 0
+    while (ringIndex < 6) {
+        coreS3LoadPlaybackBlock(buffers + ringIndex * 960, source, 0, 0)
+        ringIndex = ringIndex + 1
+    }
+    val started = cores3StartSpeakerStream(amplifier, expander, prepared.sampleRate(), channel, descriptors, 1000)
+    if (!started.valid()) return CoreS3PlaybackResult((32 + started.status()) |
+        (started.dmaStatus() << 32) | (started.amplifierStatus() << 48))
+    var completed = 0
+    var index = 0
+    var idle = 0
+    var status = 1
+    while (completed < blocks + 6 + tailBlocks && status == 1) {
+        // Busy leaves staging and the cursor untouched. Reuse the prepared
+        // block until ownership returns instead of copying 960 bytes per poll.
+        if (idle == 0) {
+            if (bank != PcmChannels(0)) {
+                if (completed < blocks) {
+                    if (!bank.render(240,mixAccumulator,mixScratch,staging,masterGainQ15)) { status=81; break }
+                } else {
+                    var offset=0
+                    while (offset < 960) { staging.storeU32(offset,0); offset=offset+4 }
+                }
+            }
+            else if (mix != PcmWavMix(0)) {
+                if (!mix.copyStereo16(completed*240,240,mixAccumulator,mixScratch,staging,masterGainQ15,mixOutputRate)) {
+                    status=81
+                    break
+                }
+            }
+            else if (wav == PcmWav(0)) coreS3LoadPlaybackBlock(t, source, completed, blocks)
+            else if (!wav.copyStereo16Block(if (completed < blocks) completed else blocks,staging)) {
+                status=81
+                break
+            }
+        }
+        val result = esp32s3GdmaPumpBlock(channel, true, descriptors, 6, index, staging, 960, 1)
+        if (result.status() == 1) {
+            completed = completed + 1
+            index = result.nextIndex()
+            idle = 0
+            if (result.transferredBytes() != 960) status = 80
+        } else if (result.status() == 3) {
+            idle = idle + 1
+            if (idle >= idlePollsPerBlock) status = 67
+            else peripheralDelayMicroseconds(1000)
+        } else status = 64 + result.status()
+    }
+    val stopped = cores3StopSpeakerStream(amplifier, expander, channel, 1000)
+    if (status == 1 && !stopped.valid()) status = 96
+    val sourceBlocks = if (completed < 6) 0 else if (completed - 6 > blocks) blocks else completed - 6
+    val completedBytes=if (converted && sourceBlocks*960 > outputBytes) outputBytes else sourceBlocks*960
+    CoreS3PlaybackResult(status | (completedBytes << 8) |
+        (stopped.dmaStatus() << 32) | (stopped.amplifierStatus() << 48))
+}

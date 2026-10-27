@@ -1,0 +1,48 @@
+import "./toughc5_buzzer.ab"
+import "../esp32/sdk/raw_buffer.ab"
+//32B retained:tag0,state4,device8,deadline12,primary16,cleanup20,
+// old shared PWM frequency24,captured28. Own PM1 GPIO4/PWM1 and shared
+// frequency for the entire lease; other PWM users must be quiesced.
+// Requires successful boot buzzer configuration, not degraded GPIO fallback.
+// Cooperative deadline: caller must poll; PM1 continues while ESP sleeps.
+fun toughToneStorage(r: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0
+trusted fun toughToneStartOwned(r: NativeBuffer,pmic: M5PmicOpen,setup: M5ToughBuzzerSetup,frequency: int,duty12: int,now: int,duration: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !toughToneStorage(r) || r.loadU32(0) != 0 || !pmic.ready() || pmic.kind() != 5 ||
+        !setup.valid() || !setup.pwmStopped() || !setup.pinsNormalized() || frequency < 1 || frequency > 65535 || duty12 < 1 || duty12 > 4095 || now < 0 || now > 0xffffffff || duration < 1 || duration > 0x7fffffff) return 2
+    var at=0
+    while (at < 32) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x544f4e45);r.storeU32(4,4);r.storeU32(8,pmic.deviceHandle());r.storeU32(12,int(u32(now)+u32(duration)))
+    val chip=M5Pm1(pmic.deviceHandle())
+    val old=chip.device().readRegister16LittleEndianChecked(52)
+    if (!old.valid()) { r.storeU32(16,1);return 4 }
+    r.storeU32(24,old.value());r.storeU32(28,1)
+    if (!chip.setPwmDuty12(1,0,false,false)) { r.storeU32(16,2);return 4 }
+    if (!chip.setPwmFrequency(frequency)) { r.storeU32(16,3);return 4 }
+    if (!chip.setPwmDuty12(1,duty12,false,true)) { r.storeU32(16,4);return 4 }
+    r.storeU32(4,1);return 1
+}
+//6silent/frequency restored,2invalid,4retry needed. Silence MUST be
+// acknowledged before restoring frequency. Primary failure never overwritten.
+trusted fun toughToneStopOwned(r: NativeBuffer,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !toughToneStorage(r) || r.loadU32(0) != 0x544f4e45) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 4 && r.loadU32(4) != 5) return 2
+    r.storeU32(4,5)
+    if (r.loadU32(28) != 0) {
+        val chip=M5Pm1(r.loadU32(8))
+        if (!chip.setPwmDuty12(1,0,false,false)) { r.storeU32(20,1);return 4 }
+        if (!chip.setPwmFrequency(r.loadU32(24))) { r.storeU32(20,2);return 4 }
+    }
+    r.storeU32(20,0);r.storeU32(4,6);return 6
+}
+//5pending,6finished,4latched start failure/cleanup retry,2invalid. Poll at
+// least once per2^31 milliseconds; unsigned subtraction handles timer wrap.
+trusted fun toughTonePollOwned(r: NativeBuffer,now: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !toughToneStorage(r) || r.loadU32(0) != 0x544f4e45 || now < 0 || now > 0xffffffff) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) == 5) return toughToneStopOwned(r,true)
+    if (r.loadU32(4) != 1) return 2
+    if (((u32(now)-u32(r.loadU32(12)))&u32(0x80000000)) != u32(0)) return 5
+    return toughToneStopOwned(r,true)
+}

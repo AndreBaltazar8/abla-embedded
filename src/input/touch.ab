@@ -1,0 +1,418 @@
+import "abla/unsafe/memory/raw"
+
+// Hardware-independent touch and gesture tracking. A controller adapter starts
+// an update, feeds each converted point, then finishes the update. The tracker
+// therefore has no dependency on M5GFX, ESP-IDF, I2C, or a C callback.
+
+type GesturePoint = int
+type TouchState = int
+type TouchDetail = int
+type TouchTracker = int
+
+val touchNone = TouchState(0)
+val touchPressed = TouchState(1)
+val touchEnd = TouchState(2)
+val touchBegin = TouchState(3)
+val touchHold = TouchState(5)
+val touchHoldEnd = TouchState(6)
+val touchHoldBegin = TouchState(7)
+val touchFlick = TouchState(9)
+val touchFlickEnd = TouchState(10)
+val touchFlickBegin = TouchState(11)
+val touchDrag = TouchState(13)
+val touchDragEnd = TouchState(14)
+val touchDragBegin = TouchState(15)
+
+val touchMaskPressed = 1
+val touchMaskChanged = 2
+val touchMaskHolding = 4
+val touchMaskMoving = 8
+val touchMaximumPoints = 5
+val touchMinimumUpdateMilliseconds = 4
+
+val touchDetailBytes = 32
+val touchTrackerCountOffset = touchDetailBytes * touchMaximumPoints
+val touchTrackerLastMillisecondsOffset = touchTrackerCountOffset + 4
+val touchTrackerFrameMillisecondsOffset = touchTrackerCountOffset + 8
+val touchTrackerUpdatedMaskOffset = touchTrackerCountOffset + 12
+val touchTrackerHoldMillisecondsOffset = touchTrackerCountOffset + 16
+val touchTrackerFlickThresholdOffset = touchTrackerCountOffset + 20
+val touchTrackerBytes = touchTrackerCountOffset + 24
+
+fun touchSigned16(value: int): int {
+    val selected = value & 65535
+    if (selected >= 32768) selected - 65536 else selected
+}
+
+// Coordinates and size use the signed-16/unsigned-16 widths normally exposed
+// by touch controllers. ID and validity still fit in one scalar, so moving a
+// point never allocates or boxes it.
+fun gesturePoint(
+    x: int,
+    y: int,
+    size: int = 0,
+    id: int = 0
+): GesturePoint = GesturePoint(
+    (x & 65535) | ((y & 65535) << 16) | ((size & 65535) << 32) |
+        ((id & 7) << 48) | ((id & 8) << 49) | (1 << 51)
+)
+
+fun GesturePoint.valid(): bool = (this & (1 << 51)) != 0
+fun GesturePoint.x(): int = touchSigned16(this)
+fun GesturePoint.y(): int = touchSigned16(this >>> 16)
+fun GesturePoint.size(): int = (this >>> 32) & 65535
+// Bit52 extends IDs to15 without changing any old0..7 encoding/validity bit.
+fun GesturePoint.id(): int = ((this >>> 48) & 7) | ((this >>> 49) & 8)
+
+fun touchAbsolute(value: int): int = if (value < 0) -value else value
+// Upstream configuration is uint16. Saturate the wider Abla API instead of
+// wrapping into negative native flick distances or zero hold durations.
+fun touchThreshold(value: int): int = if (value < 0) 0 else if (value > 65535) 65535 else value
+
+fun touchElapsedMilliseconds(now: int, previous: int): int =
+    (now - previous) & 4294967295
+
+trusted fun touchAddress(address: int, offset: int): i64* =
+    nativePointerFromAddress(address + offset)
+
+trusted fun touchLoad64(address: int, offset: int): int =
+    ablaUnsafeLoadI64(touchAddress(address, offset))
+
+trusted fun touchStore64(address: int, offset: int, value: int): void {
+    ablaUnsafeStoreI64(touchAddress(address, offset), value)
+    return
+}
+
+trusted fun touchLoad32(address: int, offset: int): int =
+    ablaUnsafeLoadU32(touchAddress(address, offset))
+
+trusted fun touchStore32(address: int, offset: int, value: int): void {
+    ablaUnsafeStoreU32(touchAddress(address, offset), value)
+    return
+}
+
+trusted fun TouchDetail.point(): GesturePoint = GesturePoint(touchLoad64(this, 0))
+trusted fun TouchDetail.previous(): GesturePoint =
+    GesturePoint(touchLoad64(this, 8))
+trusted fun TouchDetail.base(): GesturePoint = GesturePoint(touchLoad64(this, 16))
+trusted fun TouchDetail.baseMilliseconds(): int = touchLoad32(this, 24)
+trusted fun TouchDetail.state(): TouchState = TouchState(touchLoad32(this, 28) & 255)
+trusted fun TouchDetail.getClickCount(): int =
+    (touchLoad32(this, 28) >>> 8) & 255
+
+trusted fun TouchDetail.setPoint(value: GesturePoint): void {
+    touchStore64(this, 0, value)
+    return
+}
+
+trusted fun TouchDetail.setPrevious(value: GesturePoint): void {
+    touchStore64(this, 8, value)
+    return
+}
+
+trusted fun TouchDetail.setBase(value: GesturePoint): void {
+    touchStore64(this, 16, value)
+    return
+}
+
+trusted fun TouchDetail.setBaseMilliseconds(value: int): void {
+    touchStore32(this, 24, value)
+    return
+}
+
+trusted fun TouchDetail.setStateAndClickCount(
+    state: TouchState,
+    clickCount: int
+): void {
+    touchStore32(this, 28, (state & 255) | ((clickCount & 255) << 8))
+    return
+}
+
+trusted fun TouchDetail.setState(state: TouchState): void =
+    this.setStateAndClickCount(state, this.getClickCount())
+
+trusted fun TouchDetail.setClickCount(clickCount: int): void =
+    this.setStateAndClickCount(this.state(), clickCount)
+
+trusted fun TouchDetail.deltaX(): int = this.point().x() - this.previous().x()
+trusted fun TouchDetail.deltaY(): int = this.point().y() - this.previous().y()
+trusted fun TouchDetail.distanceX(): int = this.point().x() - this.base().x()
+trusted fun TouchDetail.distanceY(): int = this.point().y() - this.base().y()
+trusted fun TouchDetail.isPressed(): bool =
+    (this.state() & touchMaskPressed) != 0
+trusted fun TouchDetail.wasPressed(): bool = this.state() == touchBegin
+trusted fun TouchDetail.wasClicked(): bool = this.state() == touchEnd
+trusted fun TouchDetail.isReleased(): bool = !this.isPressed()
+trusted fun TouchDetail.wasReleased(): bool =
+    (this.state() & (touchMaskPressed | touchMaskChanged)) == touchMaskChanged
+trusted fun TouchDetail.isHolding(): bool =
+    (this.state() & (touchMaskPressed | touchMaskHolding)) ==
+        (touchMaskPressed | touchMaskHolding)
+trusted fun TouchDetail.wasHold(): bool = this.state() == touchHoldBegin
+trusted fun TouchDetail.wasFlickStart(): bool = this.state() == touchFlickBegin
+trusted fun TouchDetail.isFlicking(): bool =
+    (this.state() & touchDrag) == touchFlick
+trusted fun TouchDetail.wasFlicked(): bool = this.state() == touchFlickEnd
+trusted fun TouchDetail.wasDragStart(): bool = this.state() == touchDragBegin
+trusted fun TouchDetail.isDragging(): bool =
+    (this.state() & touchDrag) == touchDrag
+trusted fun TouchDetail.wasDragged(): bool = this.state() == touchDragEnd
+
+// Narrow native widths let LLVM use the target's pointer and register ABI all
+// the way through the hot transition. The generic scalar-handle method below
+// is only a checked conversion into this board-independent implementation.
+trusted noescape fun touchDetailUpdateNative(
+    address: i64*,
+    nowMilliseconds: u32,
+    pressed: bool,
+    next: u64,
+    holdMilliseconds: u32,
+    flickThreshold: i32
+): bool {
+    var mode = u8(ablaUnsafeLoadU8(
+        ablaUnsafePointerOffset(address, 28)
+    ))
+    if (mode == u8(0)) {
+        if (!pressed) return false
+    }
+    val current = u64(ablaUnsafeLoadI64(address))
+    mode = mode & u8(253)
+    if (pressed) {
+        ablaUnsafeStoreI64(
+            ablaUnsafePointerOffset(address, 8), int(current)
+        )
+        ablaUnsafeStoreU32(
+            ablaUnsafePointerOffset(address, 4),
+            int(next >> u64(32)) & 2097151
+        )
+        if ((mode & u8(8)) == u8(0)) {
+            if ((mode & u8(1)) != u8(0)) {
+                val base = u64(ablaUnsafeLoadI64(
+                    ablaUnsafePointerOffset(address, 16)
+                ))
+                val dx = i32(i16(base)) - i32(i16(next))
+                val dy = i32(i16(base >> u64(16))) -
+                    i32(i16(next >> u64(16)))
+                val absoluteX = if (dx < i32(0)) i32(0) - dx else dx
+                val absoluteY = if (dy < i32(0)) i32(0) - dy else dy
+                if (absoluteX > flickThreshold ||
+                    absoluteY > flickThreshold) {
+                    ablaUnsafeStoreI64(
+                        ablaUnsafePointerOffset(address, 8), int(base)
+                    )
+                    mode = mode | u8(11)
+                } else if (mode == u8(1) &&
+                    nowMilliseconds - u32(ablaUnsafeLoadU32(
+                        ablaUnsafePointerOffset(address, 24)
+                    )) >
+                        holdMilliseconds) {
+                    mode = u8(7)
+                }
+            } else {
+                ablaUnsafeStoreI64(address, int(next))
+                mode = u8(3)
+                val base = u64(ablaUnsafeLoadI64(
+                    ablaUnsafePointerOffset(address, 16)
+                ))
+                val dx = i32(i16(base)) - i32(i16(next))
+                val dy = i32(i16(base >> u64(16))) -
+                    i32(i16(next >> u64(16)))
+                val absoluteX = if (dx < i32(0)) i32(0) - dx else dx
+                val absoluteY = if (dy < i32(0)) i32(0) - dy else dy
+                val repeatThreshold = (flickThreshold + i32(1)) << i32(2)
+                if (nowMilliseconds - u32(
+                        ablaUnsafeLoadU32(
+                            ablaUnsafePointerOffset(address, 24)
+                        )
+                    ) > holdMilliseconds ||
+                    absoluteX > repeatThreshold ||
+                    absoluteY > repeatThreshold) {
+                    ablaUnsafeStoreU8(
+                        ablaUnsafePointerOffset(address, 29), 0
+                    )
+                }
+                ablaUnsafeStoreU32(
+                    ablaUnsafePointerOffset(address, 24), int(nowMilliseconds)
+                )
+                ablaUnsafeStoreI64(
+                    ablaUnsafePointerOffset(address, 16), int(next)
+                )
+                ablaUnsafeStoreI64(
+                    ablaUnsafePointerOffset(address, 8), int(next)
+                )
+            }
+        }
+        if ((mode & u8(8)) != u8(0)) {
+            ablaUnsafeStoreI64(address, int(next))
+        }
+    } else {
+        mode = if ((mode & u8(1)) != u8(0))
+            (mode | u8(2)) & u8(254)
+        else u8(0)
+        if (mode == u8(2)) {
+            ablaUnsafeStoreU32(
+                ablaUnsafePointerOffset(address, 24), int(nowMilliseconds)
+            )
+            ablaUnsafeStoreU8(
+                ablaUnsafePointerOffset(address, 29),
+                ablaUnsafeLoadU8(
+                    ablaUnsafePointerOffset(address, 29)
+                ) + 1
+            )
+        }
+    }
+    ablaUnsafeStoreU8(
+        ablaUnsafePointerOffset(address, 28), int(mode)
+    )
+    true
+}
+
+// Returning true means the detail remains visible for this frame, including
+// the one-frame release event.
+trusted fun TouchDetail.update(
+    nowMilliseconds: int,
+    pressed: bool,
+    next: GesturePoint,
+    holdMilliseconds: int,
+    flickThreshold: int
+): bool = touchDetailUpdateNative(
+    nativePointerFromAddress(this), u32(nowMilliseconds), pressed, u64(next | 0),
+    u32(touchThreshold(holdMilliseconds)), i32(touchThreshold(flickThreshold))
+)
+
+// Advance transient begin/end states without asking the controller for a new
+// sample. This preserves events when callers poll faster than 250 Hz.
+trusted fun TouchDetail.advance(
+    nowMilliseconds: int,
+    holdMilliseconds: int
+): bool {
+    var mode = this.state()
+    if (mode == touchNone) return false
+    mode = TouchState(mode & ~touchMaskChanged)
+    if ((mode & touchMaskPressed) != 0) {
+        this.setPrevious(this.point())
+        if (mode == touchPressed && touchElapsedMilliseconds(
+                nowMilliseconds, this.baseMilliseconds()
+            ) > touchThreshold(holdMilliseconds)) mode = touchHoldBegin
+    } else mode = touchNone
+    this.setState(mode)
+    true
+}
+
+trusted fun touchTrackerAt(
+    address: int,
+    holdMilliseconds: int = 500,
+    flickThreshold: int = 8
+): TouchTracker {
+    ablaUnsafeSetMemory(
+        nativePointerFromAddress(address), 0, touchTrackerBytes
+    )
+    val tracker = TouchTracker(address)
+    tracker.setHoldThreshold(holdMilliseconds)
+    tracker.setFlickThreshold(flickThreshold)
+    tracker
+}
+
+// A call site owns one statically allocated tracker. Use touchTrackerAt() when
+// an application wants to place several trackers in its own arena.
+trusted fun touchTracker(
+    holdMilliseconds: int = 500,
+    flickThreshold: int = 8
+): TouchTracker = touchTrackerAt(
+    nativeStaticAllocate(184), holdMilliseconds, flickThreshold
+)
+
+fun TouchTracker.valid(): bool = this != 0
+trusted fun TouchTracker.getCount(): int =
+    touchLoad32(this, touchTrackerCountOffset)
+trusted fun TouchTracker.lastMilliseconds(): int =
+    touchLoad32(this, touchTrackerLastMillisecondsOffset)
+trusted fun TouchTracker.frameMilliseconds(): int =
+    touchLoad32(this, touchTrackerFrameMillisecondsOffset)
+trusted fun TouchTracker.updatedMask(): int =
+    touchLoad32(this, touchTrackerUpdatedMaskOffset)
+trusted fun TouchTracker.holdMilliseconds(): int =
+    touchLoad32(this, touchTrackerHoldMillisecondsOffset)
+trusted fun TouchTracker.flickThreshold(): int =
+    touchLoad32(this, touchTrackerFlickThresholdOffset)
+
+trusted fun TouchTracker.detail(id: int = 0): TouchDetail {
+    val selected = if (id >= 0 && id < touchMaximumPoints) id else 0
+    TouchDetail(this + selected * touchDetailBytes)
+}
+
+trusted fun TouchTracker.setHoldThreshold(milliseconds: int): void {
+    touchStore32(
+        this, touchTrackerHoldMillisecondsOffset,
+        touchThreshold(milliseconds)
+    )
+    return
+}
+
+trusted fun TouchTracker.setFlickThreshold(distance: int): void {
+    touchStore32(
+        this, touchTrackerFlickThresholdOffset,
+        touchThreshold(distance)
+    )
+    return
+}
+
+// Controllers with an explicit not-ready status may use this without
+// inventing an empty contact report. It does not change last report time.
+trusted fun TouchTracker.advanceWithoutReport(nowMilliseconds: int): int {
+    touchStore32(this, touchTrackerFrameMillisecondsOffset, nowMilliseconds)
+    var visible = 0
+    var id = 0
+    while (id < touchMaximumPoints) {
+        if (this.detail(id).advance(nowMilliseconds, this.holdMilliseconds())) {
+            visible = visible + 1
+        }
+        id = id + 1
+    }
+    touchStore32(this, touchTrackerCountOffset, visible)
+    visible
+}
+
+// True asks the adapter to read and feed hardware points. False means the
+// tracker advanced transient states itself and deliberately skipped I/O.
+trusted fun TouchTracker.startUpdate(nowMilliseconds: int): bool {
+    touchStore32(this, touchTrackerFrameMillisecondsOffset, nowMilliseconds)
+    if (touchElapsedMilliseconds(
+            nowMilliseconds, this.lastMilliseconds()
+        ) <= touchMinimumUpdateMilliseconds) {
+        this.advanceWithoutReport(nowMilliseconds)
+        return false
+    }
+    touchStore32(this, touchTrackerLastMillisecondsOffset, nowMilliseconds)
+    touchStore32(this, touchTrackerUpdatedMaskOffset, 0)
+    true
+}
+
+trusted fun TouchTracker.updatePoint(point: GesturePoint): bool {
+    if (!point.valid() || point.id() >= touchMaximumPoints) return false
+    val id = point.id()
+    touchStore32(
+        this, touchTrackerUpdatedMaskOffset,
+        this.updatedMask() | int(u32(1) << u32(id))
+    )
+    this.detail(id).update(
+        this.frameMilliseconds(), true, point,
+        this.holdMilliseconds(), this.flickThreshold()
+    )
+}
+
+trusted fun TouchTracker.finishUpdate(): int {
+    var visible = 0
+    var id = 0
+    val empty = GesturePoint(0)
+    while (id < touchMaximumPoints) {
+        if ((this.updatedMask() & int(u32(1) << u32(id))) != 0) visible = visible + 1
+        else if (this.detail(id).update(
+                this.frameMilliseconds(), false, empty,
+                this.holdMilliseconds(), this.flickThreshold()
+            )) visible = visible + 1
+        id = id + 1
+    }
+    touchStore32(this, touchTrackerCountOffset, visible)
+    visible
+}

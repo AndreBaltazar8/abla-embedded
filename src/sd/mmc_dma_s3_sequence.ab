@@ -1,0 +1,81 @@
+import "../esp32/sdk/raw_buffer.ab"
+// S3 SDMMC IDMAC descriptors, NOT the 12-byte general-purpose GDMA format.
+// Source: soc/sdmmc_struct.h and sd_trans_sdmmc.c (IDF 6.0.2).
+// Four LE words: flags, length13, payload pointer, next descriptor pointer.
+// flags: OWN31,card-error30,chain4,first3,last2,disable-completion-IRQ1.
+// Volatile memory hooks use the same ordering as peripheral MMIO; actual S3
+// adapter admits internal DMA SRAM only, never PSRAM/cache-backed buffers.
+fun sdMmcDmaS3Range(address: int,bytes: int): bool = bytes > 0 &&
+    address >= 0x3fc88000 && (address&3) == 0 && bytes <= 0x78000 && address <= 0x3fd00000-bytes
+fun sdMmcDmaDescriptorCount(bytes: int): int = if (bytes < 1 || bytes > 0x78000 || (bytes&3) != 0) 0 else (bytes+4095)>>12
+fun sdMmcDmaRegionsValid(descriptors: NativeBuffer,payload: NativeBuffer,bytes: int): bool {
+    val count=sdMmcDmaDescriptorCount(bytes)
+    if (count == 0 || !descriptors.hasAddressRange(0,count*16) || !payload.hasAddressRange(0,bytes)) return false
+    val base=descriptors.addressValue()
+    val data=payload.addressValue()
+    return sdMmcDmaS3Range(base,count*16) && sdMmcDmaS3Range(data,bytes) &&
+        (base+count*16 <= data || data+bytes <= base)
+}
+// Returns descriptor count, -1 invalid, -2 caller has not quiesced/released
+// the entire chain. Does NOT launch DMA. Caller owns both regions exclusively.
+// The explicit release proof is required even for uninitialized memory: random
+// OWN bits cannot establish whether an engine still has a reference to it.
+trusted fun sdMmcDmaPrepareOwned(descriptors: NativeBuffer,payload: NativeBuffer,bytes: int,released: bool): int {
+    if (!sdMmcDmaRegionsValid(descriptors,payload,bytes)) return -1
+    if (!released) return -2
+    val count=sdMmcDmaDescriptorCount(bytes)
+    val base=descriptors.addressValue()
+    val data=payload.addressValue()
+    var index=0
+    while (index < count) {
+        val address=base+index*16
+        val remaining=bytes-index*4096
+        sdMmcDmaS3Write(address,0)
+        sdMmcDmaS3Write(address+4,if (remaining > 4096) 4096 else remaining)
+        sdMmcDmaS3Write(address+8,data+index*4096)
+        sdMmcDmaS3Write(address+12,if (index+1 < count) address+16 else 0)
+        index=index+1
+    }
+    // Publish tail to head after every pointer/length has been initialized.
+    // No interrupt masking/release of another driver's lease is implied.
+    index=count-1
+    while (index >= 0) {
+        val flags=0x80000010|(if (index == 0) 8 else 0)|(if (index+1 == count) 4 else 0)
+        sdMmcDmaS3Write(base+index*16,flags)
+        index=index-1
+    }
+    return count
+}
+// Completion inspection only; NEVER releases/rearms buffers or returns a byte
+// count on the strength of OWN alone. Controller command/data/error status and
+// engine quiescence must ALSO be checked by the transfer owner before use.
+// 1 all returned/error-free with exact expected metadata; 2 still DMA-owned;
+// 3 invalid regions; 4 card error; 5 corrupt descriptor. Scan the entire chain
+// so an earlier pending descriptor cannot hide a later error/corruption.
+trusted fun sdMmcDmaInspectOwned(descriptors: NativeBuffer,payload: NativeBuffer,bytes: int): int {
+    if (!sdMmcDmaRegionsValid(descriptors,payload,bytes)) return 3
+    val count=sdMmcDmaDescriptorCount(bytes)
+    val base=descriptors.addressValue()
+    val data=payload.addressValue()
+    var pending=false
+    var failed=false
+    var corrupt=false
+    var index=0
+    while (index < count) {
+        val address=base+index*16
+        val flags=sdMmcDmaS3Read(address)
+        val expected=16|(if (index == 0) 8 else 0)|(if (index+1 == count) 4 else 0)
+        val remaining=bytes-index*4096
+        if ((flags&0x80000000) != 0) pending=true
+        if ((flags&0x40000000) != 0) failed=true
+        if ((flags&0x3fffffff) != expected ||
+            sdMmcDmaS3Read(address+4) != (if (remaining > 4096) 4096 else remaining) ||
+            sdMmcDmaS3Read(address+8) != data+index*4096 ||
+            sdMmcDmaS3Read(address+12) != (if (index+1 < count) address+16 else 0)) corrupt=true
+        index=index+1
+    }
+    if (corrupt) return 5
+    if (failed) return 4
+    if (pending) return 2
+    return 1
+}

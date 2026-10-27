@@ -1,0 +1,57 @@
+import "./ssd1677_transport_s3_sequence.ab"
+// All command helpers return only after actual SPI completion. BUSY may rise
+// late: ALWAYS settle2ms before sampling it (LovyanGFX SSD1677 wait_busy).
+// Bounded1ms polls, not a hard wall-clock deadline under preemption. Keep
+// timing calibrated; no ISR/interrupt-masked calls. Native adapter busy-waits.
+// Returns1ready,2invalid,14BUSY exhausted; no automatic replay/reset.
+trusted fun ssd1677WaitReadyOwned(busy: Pin,polls: int): int {
+    if (!busy.valid() || polls < 1 || polls > 10000) return 2
+    peripheralDelayMilliseconds(2)
+    var remaining=polls
+    while (busy.read()) {
+        if (remaining == 0) return 14
+        peripheralDelayMilliseconds(1)
+        remaining=remaining-1
+    }
+    return 1
+}
+// Canonical SPI gate held, uploaded complete planes/LUT, configured BUSY
+// input/pullup. mode1/2 useMode1(07,powerdown),mode3/4 useMode2(0c).
+// Do not update optical history or RAM-face state unless this returns1.
+trusted fun esp32s3Ssd1677ActivateOwned(peripheral: int,select: Pin,dc: Pin,busy: Pin,
+    mode: int,screenOn: bool,polls: int): int {
+    if (mode < 1 || mode > 4 || !busy.valid() || polls < 1 || polls > 10000) return 2
+    var result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x21,u32(0),1,false)
+    if ((result&255) != 1) return result
+    val control=(if (mode <= 2) 7 else 12)|(if (screenOn) 0 else 192)
+    result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x22,u32(control),1,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandOwned(peripheral,select,dc,0x20,NativeBuffer(0),0,false)
+    if ((result&255) != 1) return result
+    return ssd1677WaitReadyOwned(busy,polls)
+}
+// Upload+activation under ONE gate. Established/reset RAM face required; for
+// mode4 caller provides valid optical history or selects mode3 fallback first.
+// No initialization, physical wake/reset, history commit or implicit recovery.
+// A failure quarantines the gate and INVALIDATES caller's face/history state.
+trusted fun esp32s3Ssd1677Refresh(gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,select: Pin,dc: Pin,busy: Pin,
+    canvas: NativeBuffer,history: NativeBuffer,width: int,height: int,mode: int,odd: bool,invert: bool,screenOn: bool,
+    x: int,y: int,w: int,h: int,polls: int,exclusive: bool): SpiTransactionResult {
+    val plane=ssd1677PlaneBytes(width,height)
+    if (!exclusive || !busy.valid() || busy == select || busy == dc || busy.number() == pins.clockPin() ||
+        busy.number() == pins.mosiPin() || busy.number() == pins.misoPin() || polls < 1 || polls > 10000 ||
+        width > 1024 || !ssd1677DirtyValid(width,height,x,y,w,h) || mode < 1 || mode > 4 ||
+        !esp32s3SpiCommandPinsValid(peripheral,pins,select,dc,false) ||
+        !esp32s3SpiMemoryRangeValid(peripheral,canvas,plane*2) || !gate.bufferDisjoint(canvas,plane*2) ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292) return SpiTransactionResult(3<<32)
+    if (mode == 4 && (!esp32s3SpiMemoryRangeValid(peripheral,history,plane*2) ||
+        !gate.bufferDisjoint(history,plane*2) || !ssd1677FrameDisjoint(canvas,plane*2,history,plane*2))) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    var result=ssd1677WaitReadyOwned(busy,polls)
+    if (result == 1) result=esp32s3Ssd1677UploadOwned(peripheral,select,dc,canvas,history,width,height,mode,odd,invert,x,y,w,h)
+    if ((result&255) == 1) result=esp32s3Ssd1677ActivateOwned(peripheral,select,dc,busy,mode,screenOn,polls)
+    val healthy=(result&255) == 1
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5<<32)|result)
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|result)
+}

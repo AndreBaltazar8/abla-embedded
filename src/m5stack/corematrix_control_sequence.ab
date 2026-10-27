@@ -1,0 +1,100 @@
+import "../esp32/i2c/software_session_c61_sequence.ab"
+import "./expander_owner_sequence.ab"
+import "./pmic_open_sequence.ab"
+import "./i2c_pin_map.ab"
+// Caller-owned64B: magic/status, session64, PMIC64, expanders32,
+// retained IMU address32, original failure8 + matrix/SD/tone bits8/9/10 at60.
+// Fresh storage only; no ownership copies.
+// Ready means control transport + IOE/PM1 begin, NOT complete board startup.
+// No rail table, battery policy, wake-event clearing or implicit bus recovery.
+// Caller serializes all operations and joins borrowed driver users before close.
+type M5CoreMatrixControl=int
+fun m5CoreMatrixControlAt(storage: NativeBuffer): M5CoreMatrixControl =
+    if (storage.hasAddressRange(0,64) && (storage.addressValue()&3) == 0 &&
+        softwareI2cProviderBufferSafe(storage,64)) M5CoreMatrixControl(storage|0) else M5CoreMatrixControl(0)
+fun M5CoreMatrixControl.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5CoreMatrixControl.valid(): bool =
+    m5CoreMatrixControlAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x434d4331
+trusted fun M5CoreMatrixControl.expanders(): M5Expanders =
+    m5ExpandersAt(if (this.valid()) nativeBufferAt(this.buffer().addressValue()+24,32) else NativeBuffer(0))
+trusted fun M5CoreMatrixControl.session(): Esp32C61I2cSession =
+    Esp32C61I2cSession(if (this.valid()) this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32) else 0)
+trusted fun M5CoreMatrixControl.pmic(): M5PmicOpen =
+    M5PmicOpen(if (this.valid()) this.buffer().loadU32(16)|(this.buffer().loadU32(20)<<32) else 0)
+trusted fun M5CoreMatrixControl.saveSession(value: Esp32C61I2cSession): void {
+    this.buffer().storeU32(8,value&4294967295);this.buffer().storeU32(12,value>>>32);return
+}
+trusted fun M5CoreMatrixControl.savePmic(value: M5PmicOpen): void {
+    this.buffer().storeU32(16,value&4294967295);this.buffer().storeU32(20,value>>>32);return
+}
+// 0closed1ready2admission3transport4expander5PMIC6childclose7transportclose.
+trusted fun M5CoreMatrixControl.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5CoreMatrixControl.openFailure(): int = if (this.valid()) this.buffer().loadU32(60)&255 else -1
+trusted fun M5CoreMatrixControl.matrixRetained(): bool = this.valid() && (this.buffer().loadU32(60)&256) != 0
+trusted fun M5CoreMatrixControl.sdRetained(): bool = this.valid() && (this.buffer().loadU32(60)&512) != 0
+trusted fun M5CoreMatrixControl.toneRetained(): bool = this.valid() && (this.buffer().loadU32(60)&1024) != 0
+trusted fun M5CoreMatrixControl.retainTone(): bool {
+    if (!this.ready() || this.toneRetained()) return false
+    this.buffer().storeU32(60,this.buffer().loadU32(60)|1024);return true
+}
+trusted fun M5CoreMatrixControl.releaseTone(): void {
+    this.buffer().storeU32(60,this.buffer().loadU32(60)&4294966271);return
+}
+trusted fun M5CoreMatrixControl.retainSd(): bool {
+    if (!this.ready() || this.sdRetained()) return false
+    this.buffer().storeU32(60,this.buffer().loadU32(60)|512);return true
+}
+trusted fun M5CoreMatrixControl.releaseSd(): void {
+    this.buffer().storeU32(60,this.buffer().loadU32(60)&4294966783);return
+}
+trusted fun M5CoreMatrixControl.retainMatrix(): bool {
+    if (!this.ready() || this.matrixRetained()) return false
+    this.buffer().storeU32(60,this.buffer().loadU32(60)|256);return true
+}
+trusted fun M5CoreMatrixControl.releaseMatrix(): void {
+    this.buffer().storeU32(60,this.buffer().loadU32(60)&4294967039);return
+}
+trusted fun M5CoreMatrixControl.imuRetained(): bool = this.valid() && this.buffer().loadU32(56) != 0
+trusted fun M5CoreMatrixControl.ready(): bool =
+    this.status() == 1 && this.session().ready() && this.expanders().ready() && this.pmic().ready()
+trusted fun M5CoreMatrixControl.initialize(): bool {
+    if (m5CoreMatrixControlAt(this.buffer()) == 0) return false
+    var offset=4
+    while (offset < 64) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x434d4331)
+    return this.expanders().initialize()
+}
+trusted fun M5CoreMatrixControl.openOwned(xtalHz: int,rcFastHz: int,exclusive: bool): int {
+    if (!exclusive || this.status() != 0 || this.session() != 0 || this.pmic().ownsDevice() ||
+        this.expanders().status() != 0 || this.imuRetained() || this.matrixRetained() || this.sdRetained() || this.toneRetained()) return 2
+    this.buffer().storeU32(60,0)
+    val pins=m5BoardCoreMatrix.i2cPins()
+    val session=esp32C61I2cSessionOpenOwned(pins.internalData(),pins.internalClock(),xtalHz,rcFastHz,true)
+    this.saveSession(session)
+    var failure=if (session.ready()) 0 else 3
+    // Match upstream expander-before-Power.begin ordering.
+    if (failure == 0 && this.expanders().openOwned(session.bus()|0,m5BoardCoreMatrix) != 1) failure=4
+    if (failure == 0) {
+        val pmic=m5BoardCoreMatrix.openPmicOwned(session.bus()|0)
+        this.savePmic(pmic)
+        if (!pmic.ready()) failure=5
+    }
+    this.buffer().storeU32(60,failure)
+    val status=if (failure == 0) 1 else failure
+    this.buffer().storeU32(4,status)
+    return status
+}
+// Release both child groups even if one fails, retaining each failed owner.
+// Gate teardown is forbidden until ALL children have released their handles.
+// Does not undo peripheral begin/board power effects or clear pending IRQs.
+trusted fun M5CoreMatrixControl.closeOwned(exclusiveChildrenQuiesced: bool): bool {
+    if (!this.valid() || !exclusiveChildrenQuiesced || this.imuRetained() || this.matrixRetained() || this.sdRetained() || this.toneRetained()) return false
+    this.savePmic(this.pmic().releaseOwned())
+    val expandersClosed=this.expanders().closeOwned()
+    if (this.pmic().ownsDevice() || !expandersClosed) { this.buffer().storeU32(4,6);return false }
+    val session=this.session().closeOwned(true)
+    this.saveSession(session)
+    val closed=session == 0
+    this.buffer().storeU32(4,if (closed) 0 else 7)
+    return closed
+}

@@ -1,0 +1,78 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Streaming VFAT LFN assembly across directory-sector boundaries. Caller
+// owns immutable32-byte entries and a separate520-byte UTF-16LE scratch area.
+// No allocation, OEM conversion, case folding, or filesystem mutation.
+// Feed consecutive LFN entries in disk order, then match the immediately
+// following short entry. Reset state to0 after every ordinary/deleted/end
+// entry, even if it does not match. Invalid fragments return0; scratch may
+// contain old/partial data and must never be consumed without a match.
+type FatLongName=int
+fun FatLongName.length(): int = (this>>>13)&511
+fun FatLongName.remaining(): int = (this>>>8)&31
+fun FatLongName.valid(): bool = (this & (1<<22)) != 0 && (this & ~0x7FFFFF) == 0 &&
+    this.length() > 0 && this.length() <= 255 && this.remaining() <= 20 &&
+    this.remaining() < (this.length()+12)/13
+fun fatLongNameUnitOffset(index: int): int = if (index < 5) 1+index*2 else if (index < 11) 14+(index-5)*2 else 28+(index-11)*2
+trusted fun FatLongName.consume(entry: NativeBuffer,name: NativeBuffer): FatLongName {
+    if (!entry.hasAddressRange(0,32) || !name.hasAddressRange(0,520) ||
+        (entry.addressValue() < name.addressValue()+520 && name.addressValue() < entry.addressValue()+32)) return FatLongName(0)
+    val sequence=entry.load(0); val ordinal=sequence&31; val last=(sequence&64)!=0
+    if ((sequence & ~95) != 0 || ordinal < 1 || ordinal > 20 || entry.load(11) != 15 ||
+        entry.load(12) != 0 || entry.loadU16(26) != 0) return FatLongName(0)
+    val checksum=entry.load(13)
+    if (!last && (!this.valid() || this.remaining() != ordinal || (this&255) != checksum)) return FatLongName(0)
+    val base=(ordinal-1)*13
+    var length=if (last) base+13 else this.length()
+    var ended=false
+    var unit=0
+    // Validate the entire fragment before storing it. Only the last fragment
+    // may contain NUL + FFFF padding; exact13-unit tails need no terminator.
+    while (unit < 13) {
+        val value=entry.loadU16(fatLongNameUnitOffset(unit))
+        if (ended) { if (value != 65535) return FatLongName(0) }
+        else if (value == 0) {
+            if (!last || unit == 0) return FatLongName(0)
+            length=base+unit; ended=true
+        } else if (value == 65535 || base+unit >= 255) return FatLongName(0)
+        unit=unit+1
+    }
+    if (length < 1 || length > 255) return FatLongName(0)
+    unit=0
+    while (unit < 13 && base+unit < length) {
+        name.storeU16((base+unit)*2,entry.loadU16(fatLongNameUnitOffset(unit)))
+        unit=unit+1
+    }
+    name.storeU16(length*2,0)
+    FatLongName((1<<22) | checksum | ((ordinal-1)<<8) | (length<<13))
+}
+// Checksum uses the stored short-name bytes, including the escaped05 byte,
+// not display-decoded E5. UTF-16 validation waits for complete assembly so
+// surrogate pairs may straddle separate LFN entries/sectors.
+trusted fun FatLongName.matches(entry: NativeBuffer,name: NativeBuffer): bool {
+    if (!this.valid() || this.remaining() != 0 || !entry.hasAddressRange(0,32) || !name.hasAddressRange(0,520)) return false
+    val first=entry.load(0); val attributes=entry.load(11)
+    if (first == 0 || first == 229 || (attributes&200) != 0) return false
+    var sum=0; var position=0
+    while (position < 11) {
+        sum=(((sum&1)<<7)+(sum>>>1)+entry.load(position))&255
+        position=position+1
+    }
+    if (sum != (this&255) || name.loadU16(this.length()*2) != 0) return false
+    fatLongNameUtf16Valid(name,this.length())
+}
+trusted fun fatLongNameUtf16Valid(name: NativeBuffer,units: int): bool {
+    if (units < 1 || units > 255 || !name.hasAddressRange(0,units*2)) return false
+    var position=0
+    while (position < units) {
+        val value=name.loadU16(position*2)
+        if (value == 0 || value == 65535 || (value >= 56320 && value <= 57343)) return false
+        if (value >= 55296 && value <= 56319) {
+            position=position+1
+            if (position >= units) return false
+            val low=name.loadU16(position*2)
+            if (low < 56320 || low > 57343) return false
+        }
+        position=position+1
+    }
+    true
+}

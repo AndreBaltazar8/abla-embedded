@@ -1,0 +1,106 @@
+import "./fat_remove_plan.ab"
+import "./fat_file_create_long.ab"
+import "./fat_alias_select.ab"
+import "./fat_volume.ab"
+import "./fat_directory_parent.ab"
+import "./fat_directory_extend_long.ab"
+import "./fat_rename_case.ab"
+type FatRename=int
+//1renamed2input3source-stale4IO5corrupt6cycle7budget8readonly9notfile
+//10destinationexists11destinationfull12busy13mount-stale14fault15publish
+//16unlink17parent-update18descendant19growth20aliastrials. Not crash atomic: failure can leave both names live.
+fun FatRename.status(): int = this&255
+// Files by default; renameDirectory opts into checked directory moves.
+// No replacement. Existing LFNs support in-place case-only rename.5352B workspace:
+// old parent1548,padding4,new publication3768,alias12,padding20.
+// Same gate covers all operations. Optional growthPlan permits destination
+// directory allocation; never allocate/free source data or copy file contents.
+// Directory mode adds512B retained dot-sector snapshot (5864B total).
+trusted fun FatVolume.renameFile(owner: u32,parent: int,ordinal: int,index: int,expected: NativeBuffer,
+    destinationParent: int,name: NativeBuffer,units: int,startAlias: int,trials: int,budget: int,
+    work: NativeBuffer,directoryMode: bool = false,growthPlan: NativeBuffer = NativeBuffer(0)): FatRename {
+    val s=this.storage()
+    val bytes=if (directoryMode) 5864 else 5352
+    if (!work.hasAddressRange(0,bytes) || !expected.hasAddressRange(0,32) || !fatLongNameCreateValid(name,units) ||
+        fatBuffersOverlap(s,32,work,bytes) || fatBuffersOverlap(s,32,expected,32) || fatBuffersOverlap(s,32,name,units*2) ||
+        fatBuffersOverlap(work,bytes,expected,32) || fatBuffersOverlap(work,bytes,name,units*2)) return FatRename(2)
+    if ((growthPlan|0) != 0 && (!growthPlan.hasAddressRange(0,growthPlan.capacity()) || growthPlan.capacity() < 8 || growthPlan.capacity() > 8000000 ||
+        fatBuffersOverlap(growthPlan,growthPlan.capacity(),s,32) || fatBuffersOverlap(growthPlan,growthPlan.capacity(),work,bytes) ||
+        fatBuffersOverlap(growthPlan,growthPlan.capacity(),expected,32) || fatBuffersOverlap(growthPlan,growthPlan.capacity(),name,units*2))) return FatRename(2)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatRename(admitted)
+    val reader=nativeBufferAt(s.loadU32(16),28);val boot=nativeBufferAt(s.loadU32(20),512)
+    var result=FatRename(2)
+    if (!fatBuffersOverlap(work,bytes,reader,28) && !fatBuffersOverlap(work,bytes,boot,512) &&
+        !fatBuffersOverlap(growthPlan,growthPlan.capacity(),reader,28) && !fatBuffersOverlap(growthPlan,growthPlan.capacity(),boot,512)) {
+        result=fatRenameFileOwned(reader,boot,s.loadU32(24),s.loadU32(28),parent,ordinal,index,expected,
+            destinationParent,name,units,startAlias,trials,budget,work,directoryMode,growthPlan)
+    }
+    if (result.status() == 4 || result.status() == 15 || result.status() == 16 || result.status() == 17 || result.status() == 19) s.storeU32(12,3)
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatRename(14)
+    return result
+}
+// Internal helper: admission and buffer validation are supplied by wrapper.
+trusted fun fatRenameFileOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,parent: int,
+    ordinal: int,index: int,expected: NativeBuffer,destinationParent: int,name: NativeBuffer,units: int,
+    startAlias: int,trials: int,budget: int,work: NativeBuffer,directoryMode: bool = false,growthPlan: NativeBuffer = NativeBuffer(0)): FatRename {
+    val old=nativeBufferAt(work.addressValue(),1548)
+    val scratch=nativeBufferAt(work.addressValue()+1552,3768)
+    val planned=fatPlanRemovalOwned(reader,boot,first,sectors,parent,ordinal,index,expected,budget,old,
+        nativeBufferAt(scratch.addressValue(),1544),true)
+    if (planned.status() != 1) return FatRename(planned.status())
+    val geometry=fatBootValidate(boot,first,sectors)
+    val file=fatDirectoryDecode(nativeBufferAt(old.addressValue()+(planned.lastSlot()>>4)*512,512),planned.lastSlot()&15,geometry.fatBits(),geometry.clusters())
+    if (if (directoryMode) !file.isDirectory() else !file.isFile()) return FatRename(9)
+    val dot=nativeBufferAt(work.addressValue()+5352,512)
+    val normalizedParent=if (geometry.fatBits() == 32 && parent == fatBootU32(boot,44)) 0 else parent
+    val normalizedDestination=if (geometry.fatBits() == 32 && destinationParent == fatBootU32(boot,44)) 0 else destinationParent
+    if (directoryMode) {
+        val checked=fatCheckDirectoryMoveOwned(reader,boot,first,sectors,file.firstCluster(),parent,destinationParent,budget,
+            dot,nativeBufferAt(scratch.addressValue(),512))
+        if (checked != 1) return FatRename(if (checked == 3) 4 else if (checked == 4) 5 else if (checked == 5) 6
+            else if (checked == 6) 7 else if (checked == 7) 18 else checked)
+    }
+    var excludedEntry=-1
+    if (normalizedParent == normalizedDestination) {
+        val recased=fatRenameLongCaseOwned(reader,planned,old,expected,name,units,scratch)
+        if (recased == 21) excludedEntry=ordinal*16+index
+        else if (recased != 0) return FatRename(recased)
+    }
+    val alias=nativeBufferAt(work.addressValue()+5320,12)
+    val chosen=fatSelectLongAliasOwned(reader,boot,first,sectors,destinationParent,name,units,startAlias,trials,budget,
+        alias,nativeBufferAt(scratch.addressValue(),2104),excludedEntry)
+    if (chosen.status() != 1) return FatRename(if (chosen.status() == 3) 10 else if (chosen.status() == 7) 20
+        else if (chosen.status() == 6) 7 else chosen.status())
+    // Timestamp argument is only validation scaffolding here: all source
+    // timestamp bytes are copied exactly by sourceEntry publication mode.
+    val published=if ((growthPlan|0) != 0) fatFileCreateLongGrowingOwned(reader,boot,first,sectors,destinationParent,name,units,alias,chosen.length(),budget,
+        rtcCalendarDateTime(1980,1,1,0,0,0),growthPlan,scratch,false,expected,excludedEntry)
+        else fatFileCreateLongOwned(reader,boot,first,sectors,destinationParent,name,units,alias,chosen.length(),budget,
+            rtcCalendarDateTime(1980,1,1,0,0,0),scratch,false,expected,excludedEntry)
+    if (published.status() >= 16) return FatRename((published&~255)|19)
+    if (published.status() != 1) return FatRename(if (published.status() == 8) 15 else if (published.status() == 3) 10
+        else if (published.status() == 7) 11 else if (published.status() == 6) 7 else published.status())
+    if (directoryMode && normalizedParent != normalizedDestination) {
+        val sector=fatClusterFirstSector(boot,first,sectors,file.firstCluster())
+        val current=nativeBufferAt(scratch.addressValue(),512)
+        if (!fatStorageReadOwned(reader,sector,current)) return FatRename(17)
+        var i=0;while (i < 512) { if (current.load(i) != dot.load(i)) return FatRename(17);i=i+1 }
+        dot.storeU16(58,normalizedDestination&65535)
+        if (geometry.fatBits() == 32) dot.storeU16(52,(dot.loadU16(52)&61440)|(normalizedDestination>>16))
+        if (!fatStorageWriteOwned(reader,sector,dot)) return FatRename(17)
+    }
+    // Re-read source sectors: destination may share them. Reusing old sector
+    // snapshots would overwrite the newly published name in same-dir renames.
+    var part=planned.lastSlot()>>4
+    while (part >= (planned.firstSlot()>>4)) {
+        val sector=nativeBufferAt(old.addressValue()+part*512,512)
+        if (!fatStorageReadOwned(reader,old.loadU32(1536+part*4),sector)) return FatRename(16)
+        var slot=if (part == (planned.firstSlot()>>4)) planned.firstSlot()&15 else 0
+        val last=if (part == (planned.lastSlot()>>4)) planned.lastSlot()&15 else 15
+        while (slot <= last) { sector.store(slot*32,229);slot=slot+1 }
+        if (!fatStorageWriteOwned(reader,old.loadU32(1536+part*4),sector)) return FatRename(16)
+        part=part-1
+    }
+    return FatRename(1)
+}

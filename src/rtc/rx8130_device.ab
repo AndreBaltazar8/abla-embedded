@@ -1,0 +1,210 @@
+// Import alongside the selected I2cBus/I2cDevice backend.
+import "../esp32/sdk/raw_buffer.ab"
+import "./types.ab"
+import "./calendar.ab"
+import "./pcf8563_logic.ab"
+import "./rx8130_logic.ab"
+import "./timer_result.ab"
+import "./alarm_result.ab"
+import "abla/unsafe/memory/raw"
+
+type Rx8130 = int
+
+// Partial reads do not depend on the validity of unrelated date/time fields.
+trusted fun Rx8130.time(): RtcTime = this.timeWithBuffer(nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun Rx8130.timeWithBuffer(bytes: NativeBuffer): RtcTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,3) || !this.device().readRegister(16,bytes,3)) return RtcTime(0)
+    rx8130DecodeDateTime(bytes.load(0),bytes.load(1),bytes.load(2),1,1,1,0).time()
+}
+trusted fun Rx8130.date(): RtcDate = this.dateWithBuffer(nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun Rx8130.dateWithBuffer(bytes: NativeBuffer): RtcDate {
+    if (!this.valid() || !bytes.hasAddressRange(0,4) || !this.device().readRegister(19,bytes,4)) return RtcDate(0)
+    rx8130DecodeDateTime(0,0,0,bytes.load(0),bytes.load(1),bytes.load(2),bytes.load(3)).date()
+}
+
+trusted fun rx8130(bus: I2cBus): Rx8130 =
+    Rx8130(if (bus.valid()) bus.device(50, 400000) & 4294967295 else 0)
+
+// No upper metadata bits: reject malformed casts rather than aliasing a live
+// low32 device during reads, writes, or close.
+fun Rx8130.valid(): bool = this > 0 && this <= 4294967295
+fun Rx8130.device(): I2cDevice = I2cDevice(this & 4294967295)
+
+trusted fun Rx8130.begin(): bool = this.valid() &&
+    this.device().updateRegister8(31, 48, 48) &&
+    this.device().writeRegister8(48, 0) &&
+    this.device().writeRegister8(30, 0)
+
+trusted fun Rx8130.close(): bool = this.valid() && this.device().close()
+
+trusted fun Rx8130.lowVoltageChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val result=this.device().readRegister8Checked(29)
+    if (result.valid()) I2cByteResult(256 | (if ((result.value() & 128) != 0) 1 else 0)) else I2cByteResult(0)
+}
+trusted fun Rx8130.lowVoltage(): bool {
+    val result=this.lowVoltageChecked()
+    result.valid() && result.value() != 0
+}
+
+trusted fun Rx8130.dateTime(): RtcDateTime = this.dateTimeWithBuffer(nativeBufferAt(nativeStackAllocate(7),7))
+trusted fun Rx8130.dateTimeWithBuffer(bytes: NativeBuffer): RtcDateTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,7)) return RtcDateTime(0)
+    if (!this.device().readRegister(16, bytes, 7)) return RtcDateTime(0)
+    rx8130DecodeDateTime(
+        bytes.load(0), bytes.load(1), bytes.load(2), bytes.load(3),
+        bytes.load(4), bytes.load(5), bytes.load(6)
+    )
+}
+
+trusted fun Rx8130.setDateTime(value: RtcDateTime): bool {
+    if (!this.valid() || !value.calendarValid() || value.year() < 2000 || value.year() > 2099) return false
+    this.setDateTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(7),7))
+}
+trusted fun Rx8130.setDateTimeWithBuffer(value: RtcDateTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,7) || value.year() < 2000 ||
+        value.year() > 2099) return false
+    bytes.store(0, bcdEncode(value.second()))
+    bytes.store(1, bcdEncode(value.minute()))
+    bytes.store(2, bcdEncode(value.hour()))
+    bytes.store(3, 1 << value.weekday())
+    bytes.store(4, bcdEncode(value.day()))
+    bytes.store(5, bcdEncode(value.month()))
+    bytes.store(6, bcdEncode(value.year() - 2000))
+    this.device().writeRegister(16, bytes, 7)
+}
+
+trusted fun Rx8130.setTime(value: RtcTime): bool = this.setTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun Rx8130.setTimeWithBuffer(value: RtcTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.valid() || !bytes.hasAddressRange(0,3)) return false
+    bytes.store(0,bcdEncode(value.second())); bytes.store(1,bcdEncode(value.minute())); bytes.store(2,bcdEncode(value.hour()))
+    this.device().writeRegister(16,bytes,3)
+}
+trusted fun Rx8130.setDate(value: RtcDate): bool = this.setDateWithBuffer(value,nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun Rx8130.setDateWithBuffer(value: RtcDate,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,4) || value.year() < 2000 || value.year() > 2099) return false
+    bytes.store(0,1<<value.weekday()); bytes.store(1,bcdEncode(value.day()))
+    bytes.store(2,bcdEncode(value.month())); bytes.store(3,bcdEncode(value.year()-2000))
+    this.device().writeRegister(19,bytes,4)
+}
+
+trusted fun Rx8130.stopTimer(): bool {
+    if (!this.valid()) return false
+    var stopped = false
+    var retry = 0
+    while (!stopped && retry < 3) {
+        val extensionStopped = this.device().updateRegister8(28, 16, 0)
+        val controlStopped = this.device().updateRegister8(30, 16, 0)
+        val extension = this.device().readRegister8Checked(28)
+        val control = this.device().readRegister8Checked(30)
+        stopped = extensionStopped && controlStopped && extension.valid() &&
+            control.valid() && (extension.value() & 16) == 0 &&
+            (control.value() & 16) == 0
+        retry = retry + 1
+    }
+    stopped
+}
+
+trusted fun Rx8130.setTimerInterrupt(milliseconds: int): int {
+    val result=this.setTimerInterruptChecked(milliseconds)
+    if (result.valid()) result.milliseconds() else 0
+}
+
+trusted fun Rx8130.setTimerInterruptChecked(milliseconds: int): RtcTimerResult {
+    val preset=nativeBufferAt(nativeStackAllocate(2),2)
+    val verify=nativeBufferAt(nativeStackAllocate(2),2)
+    this.setTimerInterruptWithBuffers(milliseconds,preset,verify)
+}
+
+// Caller-owned scratch variant for static-memory applications. Both2-byte
+// regions must be disjoint, writable and exclusive until this call returns.
+trusted fun Rx8130.setTimerInterruptWithBuffers(milliseconds: int,preset: NativeBuffer,verify: NativeBuffer): RtcTimerResult {
+    if (!this.valid()) return RtcTimerResult(2)
+    if (milliseconds <= 0) {
+        val stopped=this.stopTimer()
+        val cleared=this.device().writeRegister8(29,175)
+        return RtcTimerResult(if (stopped && cleared) 1 else 5)
+    }
+    if (!preset.hasAddressRange(0,2) || !verify.hasAddressRange(0,2) ||
+        (preset.addressValue() < verify.addressValue()+2 && verify.addressValue() < preset.addressValue()+2)) return RtcTimerResult(2)
+    val plan = rx8130TimerPlan(milliseconds)
+    if (!rx8130TimerEnabled(plan)) return RtcTimerResult(2)
+    val extensionRead = this.device().readRegister8Checked(28)
+    if (!extensionRead.valid()) return RtcTimerResult(3)
+    val extension = (extensionRead.value() & 232) |
+        rx8130TimerSelector(plan)
+    var configured = this.device().writeRegister8(28, extension) &&
+        this.device().writeRegister8(29, 175) &&
+        this.device().updateRegister8(30, 16, 16)
+    preset.storeU16(0, rx8130TimerCount(plan))
+    var verified = false
+    var retry = 0
+    while (configured && !verified && retry < 3) {
+        verified = this.device().writeRegister(26, preset, 2) &&
+            this.device().readRegister(26, verify, 2) &&
+            verify.loadU16(0) == preset.loadU16(0)
+        retry = retry + 1
+    }
+    configured = configured && verified &&
+        this.device().writeRegister8(28, extension | 16)
+    if (!configured) {
+        return RtcTimerResult(if (this.stopTimer()) 4 else 5)
+    }
+    RtcTimerResult(1 | (rx8130TimerMilliseconds(plan) << 8))
+}
+
+trusted fun Rx8130.setAlarmInterrupt(
+    minute: int = -1,
+    hour: int = -1,
+    day: int = -1,
+    weekday: int = -1
+): bool {
+    this.setAlarmInterruptChecked(minute,hour,day,weekday).valid()
+}
+
+trusted fun Rx8130.setAlarmInterruptChecked(minute: int=-1,hour: int=-1,
+    day: int=-1,weekday: int=-1): RtcAlarmResult =
+    this.setAlarmInterruptWithBuffer(nativeBufferAt(nativeStackAllocate(3),3),minute,hour,day,weekday)
+
+// Caller owns3-byte scratch and serializes RTC access. Disable AIE before
+// changing WADA or comparators; clear AF with W0C (preserve TF/other flags).
+// A failed step attempts AIE-off cleanup, never restores a partial alarm.
+trusted fun Rx8130.setAlarmInterruptWithBuffer(bytes: NativeBuffer,minute: int=-1,
+    hour: int=-1,day: int=-1,weekday: int=-1): RtcAlarmResult {
+    if (!this.valid() || minute < -1 || minute > 59 || hour < -1 ||
+        hour > 23 || day < -1 || day > 31 || weekday < -1 || weekday > 6 ||
+        day == 0 || (day >= 0 && weekday >= 0) || !bytes.hasAddressRange(0,3)) return RtcAlarmResult(2)
+    val enabled = minute >= 0 || hour >= 0 || day >= 0 || weekday >= 0
+    var configured=this.device().updateRegister8(30,8,0)
+    if (configured && day >= 0) configured=this.device().updateRegister8(28,8,8)
+    if (configured && weekday >= 0) configured=this.device().updateRegister8(28,8,0)
+    bytes.store(0, if (minute < 0) 128 else bcdEncode(minute) & 127)
+    bytes.store(1, if (hour < 0) 128 else bcdEncode(hour) & 63)
+    bytes.store(
+        2,
+        if (day >= 0) bcdEncode(day) & 63 else
+            if (weekday >= 0) 1 << weekday else 128
+    )
+    configured=configured && this.device().writeRegister(23,bytes,3) &&
+        this.device().writeRegister8(29,183) &&
+        this.device().updateRegister8(30,8,if (enabled) 8 else 0)
+    if (configured) return RtcAlarmResult(1)
+    RtcAlarmResult(if (this.device().updateRegister8(30,8,0)) 4 else 5)
+}
+
+trusted fun Rx8130.interruptPendingChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val status=this.device().readRegister8Checked(29)
+    if (status.valid()) I2cByteResult(256 | (if ((status.value() & 24) != 0) 1 else 0)) else I2cByteResult(0)
+}
+trusted fun Rx8130.interruptPending(): bool {
+    val status=this.interruptPendingChecked()
+    status.valid() && status.value() != 0
+}
+
+trusted fun Rx8130.clearInterrupt(): bool =
+    this.valid() && this.device().writeRegister8(29, 167)
+
+trusted fun Rx8130.disableInterrupts(): bool =
+    this.valid() && this.device().updateRegister8(30, 24, 0) &&
+        this.device().writeRegister8(29, 167)

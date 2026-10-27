@@ -1,0 +1,57 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "./dsi_events_p4_sequence.ab"
+// Caller-owned 28B internal RAM, disjoint from IRQ stack/dispatcher/DMA data.
+// Single owning core, all accesses with MIE off; no other-core access. Fresh
+// initialize only before registration. Retain until source disabled, dispatcher
+// unregistered and deferred worker joined. No allocator or interrupt masking.
+// magic0,core4,layout8,line12,coalesced report16,pending20,sticky fault24.
+type P4DsiMailbox = int
+fun p4DsiMailboxAt(storage: NativeBuffer): P4DsiMailbox = P4DsiMailbox(storage|0)
+fun P4DsiMailbox.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun P4DsiMailbox.valid(): bool {
+    val b=this.buffer()
+    return b.hasAddressRange(0,28) && (b.addressValue()&3) == 0 && b.loadU32(0) == 0x44534945 &&
+        b.loadU32(4) < 2 && esp32P4DsiEventMask(b.loadU32(8)) != 0 && b.loadU32(12) >= 16 && b.loadU32(12) <= 47
+}
+trusted fun P4DsiMailbox.initialize(core: int,layout: int,line: int): bool {
+    val b=this.buffer()
+    if (!b.hasAddressRange(0,28) || (b.addressValue()&3) != 0 || core < 0 || core > 1 ||
+        esp32P4DsiEventMask(layout) == 0 || line < 16 || line > 47) return false
+    b.storeU32(4,core); b.storeU32(8,layout); b.storeU32(12,line)
+    b.storeU32(16,0); b.storeU32(20,0); b.storeU32(24,0); b.storeU32(0,0x44534945)
+    return true
+}
+trusted fun P4DsiMailbox.owned(): bool = this.valid() && p4DsiMailboxMasked() && this.buffer().loadU32(4) == p4DsiMailboxCore()
+// 1captured,2invalid/owner,4hardware mask failure. Faults survive takeOwned.
+trusted fun P4DsiMailbox.captureOwned(line: int,core: int): int {
+    if (!this.owned() || core != this.buffer().loadU32(4) || line != this.buffer().loadU32(12)) return 2
+    val b=this.buffer()
+    val report=esp32P4DsiEventsCaptureOwned(b.loadU32(8))
+    val status=report&255
+    val prior=b.loadU32(16)
+    val merged=((prior|report)&0xffffff00)|(if ((prior&255) == 4 || status == 4) 4 else status)
+    b.storeU32(16,merged); b.storeU32(20,1)
+    if (status != 1 || (report&256) != 0) b.storeU32(24,1)
+    return status
+}
+// 0empty,2invalid/owner, otherwise complete coalesced capture report. Worker
+// takes under MIEoff, then restores IRQs before expensive service/cache work.
+trusted fun P4DsiMailbox.takeOwned(): int {
+    if (!this.owned()) return 2
+    val b=this.buffer()
+    if (b.loadU32(20) == 0) return 0
+    val report=b.loadU32(16)
+    b.storeU32(20,0); b.storeU32(16,0)
+    return report
+}
+// Explicit after successful deferred work. Never resumes an underrun or mask
+// failure; teardown/recovery must handle sticky fault before fresh initialize.
+// 1enabled,2invalid,3pending/fault; otherwise hardware enable status.
+trusted fun P4DsiMailbox.resumeOwned(): int {
+    if (!this.owned()) return 2
+    val b=this.buffer()
+    if (b.loadU32(20) != 0 || b.loadU32(24) != 0) return 3
+    val result=esp32P4DsiEventsEnableOwned(b.loadU32(8),0,esp32P4DsiEventMask(b.loadU32(8)))
+    if (result != 1) b.storeU32(24,1)
+    return result
+}

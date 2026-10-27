@@ -1,0 +1,52 @@
+import "./pm1_shutdown_retry_sequence.ab"
+import "../esp32/power/wake_session_c5_sequence.ab"
+// Caller120B:tag0,status4,PM1handle8,touch12,retry24B@16,wake40B@40,
+// last clear bitmap80,attempts84,anchor88,delay phase92,touch scratch22B@96.
+//1shutdown acknowledged2pending3invalid4hardware failure5wake armed
+//6release exhausted7closed. Neither1 nor5 proves poweroff or sleep occurred.
+// Exclusive PM1/CHSC6540/bus, GPIO4/EXT1 and shared LP GPIO clock users;
+// LP power and PCR IOMUX stay on, global holds already released.
+// consumers quiescent. No device closing, rail restoration or sleep entry.
+trusted fun toughC5ShutdownStatus(record: NativeBuffer): int =
+    if (!record.hasAddressRange(0,120) || record.loadU32(0) != 0x54433531) 3 else record.loadU32(4)
+trusted fun toughC5ShutdownResult(record: NativeBuffer,status: int): int { record.storeU32(4,status);return status }
+trusted fun toughC5ShutdownBeginOwned(record: NativeBuffer,pmic: M5PmicOpen,touch: int,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,120) || !pmic.ready() || pmic.kind() != 5 || touch <= 0 || touch > 4294967295) return 3
+    if (record.loadU32(0) == 0x54433531 && record.loadU32(4) != 7) return 3
+    var i=0;while (i < 120) { record.storeU32(i,0);i=i+4 }
+    record.storeU32(0,0x54433531);record.storeU32(8,pmic.deviceHandle());record.storeU32(12,touch)
+    val started=pmic.beginShutdownRetryOwned(nativeBufferAt(record.addressValue()+16,24),true)
+    toughC5ShutdownResult(record,if (started == 1) 1 else if (started == 2) 2 else 4)
+}
+trusted fun toughC5ShutdownPollOwned(record: NativeBuffer,now: u32): int {
+    val status=toughC5ShutdownStatus(record)
+    if (status != 2 && status != 5) return status
+    val retry=nativeBufferAt(record.addressValue()+16,24)
+    val power=m5Pm1ShutdownRetryPoll(retry,now)
+    if (power == 1) return toughC5ShutdownResult(record,1)
+    if (power == 2) return 2
+    if (power != 4) return toughC5ShutdownResult(record,4)
+    val wake=nativeBufferAt(record.addressValue()+40,40)
+    val wakeStatus=if (wake.loadU32(0) == 0) esp32C5WakeSessionOpenOwned(wake,4,true) else esp32C5WakeSessionArmOwned(wake)
+    if (wakeStatus == 1) return toughC5ShutdownResult(record,5)
+    if (wakeStatus != 2) return toughC5ShutdownResult(record,4)
+    record.storeU32(4,2)
+    val attempts=record.loadU32(84)
+    val phase=record.loadU32(92)
+    if (phase == 1) { record.storeU32(88,int(now));record.storeU32(92,2);return 2 }
+    // Matches the bounded upstream inner8x5ms/outer40x10ms release budget.
+    val delay=if (attempts%8 == 0) 15 else 5
+    if (phase == 2 && now-u32(record.loadU32(88)) < u32(delay)) return 2
+    if (attempts >= 320) return toughC5ShutdownResult(record,6)
+    val cleared=toughC5ShutdownClearSources(record.loadU32(8),record.loadU32(12),nativeBufferAt(record.addressValue()+96,22))
+    record.storeU32(80,cleared);record.storeU32(84,attempts+1);record.storeU32(92,1)
+    // Next poll verifies actual LP_GPIO level. Clear ACK never substitutes it.
+    2
+}
+trusted fun toughC5ShutdownCloseOwned(record: NativeBuffer): int {
+    val status=toughC5ShutdownStatus(record)
+    if (status == 3 || status == 7) return status
+    val wake=nativeBufferAt(record.addressValue()+40,40)
+    if (wake.loadU32(0) != 0 && esp32C5WakeSessionCloseOwned(wake) != 5) return toughC5ShutdownResult(record,4)
+    toughC5ShutdownResult(record,7)
+}

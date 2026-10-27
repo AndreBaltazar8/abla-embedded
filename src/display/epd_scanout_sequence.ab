@@ -1,0 +1,107 @@
+import "./epd_gate_sequence.ab"
+import "./epd_waveform.ab"
+import "./i80_session_s3_sequence.ab"
+import "../esp32/gpio/snapshot_s3_logic.ab"
+// Consumes exclusive ownership of an initialized8-bit i80 session and five
+// separately prepared, initially powered-OFF GPIO gates. Record32:magic,state,transport,gates,
+// lineBytes,height,completedLines,primary. Keep payload immutable while sending.
+// States1off2powered3frame4sending5fault6closing7closed.
+// Results1ready/completed2pending3invalid4fault5closed6cleanup pending.
+// Gate pads remain caller-owned after close; caller restores them AFTER rails
+// are safely off. No framebuffer/waveform inference: payload is already encoded.
+fun epdScanoutValid(r: NativeBuffer,t: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0 &&
+    r.loadU32(0) == 0x45504453 && s3I80SessionValid(t) && r.loadU32(8) == t.addressValue()
+trusted fun epdScanoutAttachOwned(r: NativeBuffer,t: NativeBuffer,gates: EpdGatePins,lineBytes: int,height: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || !s3I80SessionValid(t) ||
+        t.loadU32(4) != 1 || t.loadU32(12) != 8 || s3I80SessionCount(lineBytes) == 0 || lineBytes > t.loadU32(32) ||
+        height < 1 || height > 65535 || !gates.prepared()) return 3
+    var index=0
+    while (index < 3) {
+        val start=if (index == 0) t.addressValue() else if (index == 1) t.loadU32(20) else t.loadU32(28)
+        val size=if (index == 0) 160 else if (index == 1) t.loadU32(24) else t.loadU32(32)
+        if (r.addressValue() < start+size && start < r.addressValue()+32) return 3
+        index=index+1
+    }
+    // Gate pins cannot also be LCD-driven pads (especially the dummy DC pin
+    // in upstream's API setup). Require the actual live pin owner's snapshots.
+    if (t.loadU32(64) != 0x49385053 || t.loadU32(68) != 1 || t.loadU32(72) < 9 || t.loadU32(72) > 11) return 3
+    index=0
+    while (index < t.loadU32(72)) {
+        val snapshot=S3GpioSnapshot(t.loadU32(80+index*4))
+        if (!snapshot.valid()) return 3
+        var gate=0
+        while (gate < 5) { if (snapshot.pin() == gates.pin(gate)) return 3;gate=gate+1 }
+        index=index+1
+    }
+    r.storeU32(0,0x45504453);r.storeU32(4,1);r.storeU32(8,t.addressValue());r.storeU32(12,gates|0)
+    r.storeU32(16,lineBytes);r.storeU32(20,height);r.storeU32(24,0);r.storeU32(28,0);return 1
+}
+trusted fun epdScanoutBeginFrameOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || (r.loadU32(4) != 1 && r.loadU32(4) != 2) || t.loadU32(4) != 1) return 3
+    val state=r.loadU32(4);val gates=EpdGatePins(r.loadU32(12))
+    r.storeU32(4,5)
+    if (state == 1 && gates.powerOwned(true,true) != 1) { r.storeU32(28,1);return 4 }
+    if (gates.beginFrameOwned(true) != 1) { r.storeU32(28,2);return 4 }
+    r.storeU32(24,0);r.storeU32(4,3);return 1
+}
+trusted fun epdScanoutSendLineOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || r.loadU32(4) != 3 || r.loadU32(24) >= r.loadU32(20) || t.loadU32(4) != 1) return 3
+    r.storeU32(4,5)
+    if (EpdGatePins(r.loadU32(12)).lineOwned(0,true) != 1) { r.storeU32(28,3);return 4 }
+    val sent=esp32S3I80SessionSendOwned(t,r.loadU32(16),true)
+    if (sent != 2) { r.storeU32(28,256+sent);return 4 }
+    r.storeU32(4,4);return 2
+}
+// Stage directly into the transport's internal DMA payload, then launch once.
+// Results7pending/active waveform,2pending/all inactive,3invalid/no render,
+// 4fault (state may have advanced; close/recover, never blindly replay).
+// Accumulate result7 across the frame to decide whether another waveform frame
+// is required. Use the normal PollLine and EndFrame completion sequence.
+trusted fun epdScanoutRenderLineOwned(r: NativeBuffer,t: NativeBuffer,row: NativeBuffer,pixels: int,padding: int,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || r.loadU32(4) != 3 || t.loadU32(4) != 1 ||
+        r.loadU32(24) >= r.loadU32(20) || pixels < 16 || pixels > 1073741808 || (pixels&15) != 0 ||
+        padding < 0 || padding > 65535 || pixels/4+padding != r.loadU32(16) ||
+        !row.hasAddressRange(0,pixels*2)) return 3
+    val descriptor=nativeBufferAt(t.loadU32(20),t.loadU32(24))
+    if (!epdWaveformDisjoint(row,pixels*2,r,32) || !epdWaveformDisjoint(row,pixels*2,t,160) ||
+        !epdWaveformDisjoint(row,pixels*2,descriptor,descriptor.capacity())) return 3
+    val payload=nativeBufferAt(t.loadU32(28),t.loadU32(32))
+    val active=epdWaveformRenderOwned(row,payload,pixels,padding,true)
+    if (active < 0) return 3
+    val sent=epdScanoutSendLineOwned(r,t,true)
+    if (sent != 2) return sent
+    return if (active == 1) 7 else 2
+}
+trusted fun epdScanoutPollLineOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || r.loadU32(4) != 4) return 3
+    val result=esp32S3I80SessionPollOwned(t,true)
+    if (result == 2) return 2
+    r.storeU32(4,5)
+    if (result != 1) { r.storeU32(28,512+result);return 4 }
+    if (EpdGatePins(r.loadU32(12)).lineOwned(1,true) != 1) { r.storeU32(28,4);return 4 }
+    r.storeU32(24,r.loadU32(24)+1);r.storeU32(4,3);return 1
+}
+trusted fun epdScanoutEndFrameOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || r.loadU32(4) != 3 || r.loadU32(24) != r.loadU32(20) || t.loadU32(4) != 1) return 3
+    r.storeU32(4,5)
+    if (EpdGatePins(r.loadU32(12)).lineOwned(2,true) != 1) { r.storeU32(28,5);return 4 }
+    r.storeU32(4,2);return 1
+}
+// Between completed frames only; keep the LCD session/pads for later updates.
+trusted fun epdScanoutPowerOffOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t) || (r.loadU32(4) != 1 && r.loadU32(4) != 2) || t.loadU32(4) != 1) return 3
+    if (r.loadU32(4) == 1) return 1
+    r.storeU32(4,5)
+    if (!EpdGatePins(r.loadU32(12)).prepared() || EpdGatePins(r.loadU32(12)).powerOwned(false,true) != 1) { r.storeU32(28,6);return 4 }
+    r.storeU32(4,1);return 1
+}
+trusted fun epdScanoutCloseOwned(r: NativeBuffer,t: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdScanoutValid(r,t)) return 3
+    if (r.loadU32(4) == 7) return 5
+    if (r.loadU32(4) < 1 || r.loadU32(4) > 6) return 3
+    r.storeU32(4,6)
+    // Close/abort LCD first. Never lower the EPD rail under active scanout.
+    if (esp32S3I80SessionCloseOwned(t,true) != 5) return 6
+    if (EpdGatePins(r.loadU32(12)).powerOwned(false,true) != 1) return 6
+    r.storeU32(4,7);return 5
+}

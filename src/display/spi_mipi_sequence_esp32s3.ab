@@ -1,0 +1,43 @@
+import "./lcd_logic.ab"
+import "./command_buffer.ab"
+import "../peripheral_gate.ab"
+import "../spi/transaction_result.ab"
+import "../spi/buffer_gate.ab"
+
+// Board owns power/reset/initialized SPI and CS/pad prerequisites. Validate
+// both immutable programs before any I/O, then retain one bus gate through
+// programs, RGB565 format, MADCTL and inversion. Never enable a backlight on
+// failure; caller may enable it only after success. No implicit retry/reset.
+trusted fun esp32s3LcdBeginRgb565(gate: PeripheralGate, owner: u32,
+    peripheral: int, pins: SpiPins, select: Pin, dataCommand: Pin,
+    geometry: LcdGeometry, rotation: int, program: NativeBuffer,
+    extraProgram: NativeBuffer, inverted: bool = false, bgrOrder: bool = true,
+    sharedDataCommand: bool = false): SpiTransactionResult {
+    if (!geometry.valid() || rotation < 0 || rotation > 7 ||
+        !esp32s3SpiCommandPinsValid(peripheral, pins, select, dataCommand, sharedDataCommand) ||
+        !esp32s3SpiMemoryRangeValid(peripheral, program, program.capacity()) ||
+        !esp32s3SpiMemoryRangeValid(peripheral, extraProgram, extraProgram.capacity()) ||
+        !gate.bufferDisjoint(program, program.capacity()) ||
+        !gate.bufferDisjoint(extraProgram, extraProgram.capacity()) ||
+        !lcdCommandBufferValid(program, program.capacity()) ||
+        (extraProgram.capacity() != 0 && !lcdCommandBufferValid(extraProgram, extraProgram.capacity())))
+        return SpiTransactionResult(3 << 32)
+    val gateAddress = gate.word().address()
+    if (gateAddress <= 0 || gateAddress > 4294967292) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    var detail = esp32s3LcdRunProgramOwned(peripheral, select, dataCommand,
+        program, program.capacity(), sharedDataCommand)
+    if ((detail & 255) == 1 && extraProgram.capacity() != 0)
+        detail = esp32s3LcdRunProgramOwned(peripheral, select, dataCommand,
+            extraProgram, extraProgram.capacity(), sharedDataCommand)
+    if ((detail & 255) == 1) detail = esp32s3SpiCommandWordOwned(peripheral,
+        select, dataCommand, 58, u32(85), 1, sharedDataCommand)
+    if ((detail & 255) == 1) detail = esp32s3SpiCommandWordOwned(peripheral,
+        select, dataCommand, 54, u32(geometry.view(rotation, bgrOrder).madctl()), 1, sharedDataCommand)
+    if ((detail & 255) == 1) detail = esp32s3SpiCommandOwned(peripheral,
+        select, dataCommand, if (inverted) 33 else 32, nativeBufferAt(0, 0), 0, sharedDataCommand)
+    val healthy = (detail & 255) == 1
+    if (!gate.finish(owner, healthy)) return SpiTransactionResult((5 << 32) | detail)
+    SpiTransactionResult(((if (healthy) 1 else 6) << 32) | detail)
+}

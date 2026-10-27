@@ -1,182 +1,26 @@
 import "./detect_logic.ab"
+import "./detect_s3_sequence.ab"
+import "./detect_s3_observations_sequence.ab"
 import "../esp32/gpio_probe_esp32s3.ab"
+import "../esp32/gpio/snapshot_esp32s3.ab"
 
-trusted noescape extern:"c" fun esp_efuse_get_pkg_ver(): u32
+import "../esp32/soc/identity_esp32s3.ab"
 
-trusted fun m5ProbeI2cEsp32S3(
-    sda: int,
-    scl: int,
-    firstAddress: int,
-    secondAddress: int = -1
-): int {
-    val sdaState = gpioProbeCaptureEsp32S3(sda)
-    val sclState = gpioProbeCaptureEsp32S3(scl)
-    if (!gpioProbeStateValid(sdaState) || !gpioProbeStateValid(sclState)) {
-        return 0
-    }
-    var observations = 0
-    if (gpioProbeI2cAddress(sda, scl, firstAddress)) {
-        observations = observations | 1
-    }
-    if (secondAddress >= 0 && gpioProbeI2cAddress(
-            sda, scl, secondAddress
-        )) observations = observations | 2
-    // Also recover the bus after a partially completed failed transaction.
-    gpioProbeI2cStop(sda, scl)
-    sdaState.restore(sda)
-    sclState.restore(scl)
-    observations
+trusted fun m5DetectCurrentEsp32S3Owned(record: NativeBuffer,current: M5BoardId,exclusive: bool): int {
+    // Preserve explicit board selection and denied ownership without MMIO.
+    val package=if (current == m5BoardUnknown && exclusive) esp32S3PackageVersion() else -1
+    return m5S3OwnedDetectBegin(record,current,package,exclusive)
 }
 
-trusted fun m5DetectEsp32S3Qfn56Hardware(): M5BoardId {
-    val state4 = gpioProbeCaptureEsp32S3(4)
-    val state8 = gpioProbeCaptureEsp32S3(8)
-    val state10 = gpioProbeCaptureEsp32S3(10)
-    val state12 = gpioProbeCaptureEsp32S3(12)
-    val state38 = gpioProbeCaptureEsp32S3(38)
-    val captured = gpioProbeStateValid(state4) &&
-        gpioProbeStateValid(state8) && gpioProbeStateValid(state10) &&
-        gpioProbeStateValid(state12) && gpioProbeStateValid(state38)
-    var observations = 0
-    if (captured && gpioProbeInput(4, 1) && gpioProbeInput(12, 1) &&
-        gpioProbeInput(38, 1) && gpioProbeInput(8, 1) &&
-        gpioProbeInput(10, 1) && gpioProbeInput(4, 0) &&
-        gpioProbeInput(12, 0) && gpioProbeInput(38, 0)) {
-        if (gpioProbeRead(8)) observations = observations | 1
-        if (gpioProbeRead(10)) observations = observations | 2
-        if (gpioProbeRead(4)) observations = observations | 4
-        if (gpioProbeRead(12)) observations = observations | 8
-        if (gpioProbeRead(38)) observations = observations | 16
-        gpioProbeInput(38, 3)
-        gpioProbeDelayMicroseconds(1000)
-        if (gpioProbeRead(38)) observations = observations | 32
-    }
-    if (gpioProbeStateValid(state4)) state4.restore(4)
-    if (gpioProbeStateValid(state8)) state8.restore(8)
-    if (gpioProbeStateValid(state10)) state10.restore(10)
-    if (gpioProbeStateValid(state12)) state12.restore(12)
-    if (gpioProbeStateValid(state38)) state38.restore(38)
-    if (!captured) return m5BoardUnknown
 
-    var board = m5DetectEsp32S3Qfn56(m5BoardUnknown, observations)
-    if (board == m5BoardCapsule) {
-        val sdaState = gpioProbeCaptureEsp32S3(13)
-        val sclState = gpioProbeCaptureEsp32S3(15)
-        if (gpioProbeStateValid(sdaState) && gpioProbeStateValid(sclState)) {
-            gpioProbeI2cStop(13, 15)
-            sdaState.restore(13)
-            sclState.restore(15)
-        }
-    }
-    if (board == m5BoardUnknown) {
-        gpioProbeDelayMicroseconds(50000)
-        val powerHub = m5ProbeI2cEsp32S3(45, 48, 80) != 0
-        board = m5DetectEsp32S3Qfn56(
-            m5BoardUnknown, observations, powerHub
-        )
-    }
-    board
-}
-
-trusted fun m5DetectEsp32S3PicoHardware(): M5BoardId {
-    // Onboard devices need one power-stabilization wait, not one per address.
-    gpioProbeDelayMicroseconds(50000)
-    val internal = m5ProbeI2cEsp32S3(45, 0, 104, 105)
-    val bmi270Present = internal != 0
-    var voiceCodecPresent = false
-    var stampBatteryControllerPresent = false
-    if (!bmi270Present) {
-        voiceCodecPresent = m5ProbeI2cEsp32S3(45, 0, 24) != 0
-    }
-    if (!bmi270Present && !voiceCodecPresent) {
-        stampBatteryControllerPresent =
-            m5ProbeI2cEsp32S3(48, 47, 110) != 0
-    }
-    var board = m5DetectEsp32S3Pico(
-        m5BoardUnknown, bmi270Present, voiceCodecPresent,
-        stampBatteryControllerPresent
-    )
-    if (board == m5BoardAtomS3RExt && m5ProbeEsp32S3Camera()) {
-        board = m5BoardAtomS3RCam
-    }
-    board
-}
-
-// The AtomS3R camera needs XCLK before it will acknowledge. This mirrors
-// M5Unified's two-address GPIO transaction, but captures and restores GPIO18
-// too so detection leaves all four pins exactly as it found them.
-trusted fun m5ProbeEsp32S3Camera(): bool {
-    val sclState = gpioProbeCaptureEsp32S3(9)
-    val sdaState = gpioProbeCaptureEsp32S3(12)
-    val powerState = gpioProbeCaptureEsp32S3(18)
-    val clockState = gpioProbeCaptureEsp32S3(21)
-    val captured = gpioProbeStateValid(sclState) &&
-        gpioProbeStateValid(sdaState) && gpioProbeStateValid(powerState) &&
-        gpioProbeStateValid(clockState)
-    var detected = false
-    if (captured) {
-        val configured = gpio_set_level(18, 0) == 0 &&
-            gpio_set_direction(18, 2) == 0 &&
-            gpio_set_level(9, 0) == 0 &&
-            gpio_set_direction(9, 2) == 0 &&
-            gpio_set_level(12, 0) == 0 &&
-            gpio_set_direction(12, 2) == 0 &&
-            gpio_set_level(21, 0) == 0 &&
-            gpio_set_direction(21, 2) == 0 &&
-            gpioProbeEsp32S3FastHigh(9) &&
-            gpioProbeEsp32S3FastHigh(21) &&
-            gpioProbeEsp32S3FastHigh(12)
-        if (configured) {
-            gpioProbeEsp32S3ClockCycles(21, 1769472)
-            val ov3660Nack = m5ProbeEsp32S3CameraAddress(60)
-            val gc0308Nack = m5ProbeEsp32S3CameraAddress(33)
-            // Exactly one expected address acknowledging is M5Unified's
-            // established camera-module signature.
-            detected = ov3660Nack != gc0308Nack
-        }
-    }
-    if (gpioProbeStateValid(sclState)) sclState.restore(9)
-    if (gpioProbeStateValid(sdaState)) sdaState.restore(12)
-    if (gpioProbeStateValid(powerState)) powerState.restore(18)
-    if (gpioProbeStateValid(clockState)) clockState.restore(21)
-    detected
-}
-
-trusted fun m5ProbeEsp32S3CameraAddress(address: int): bool {
-    var shiftedAddress = address << 1
-    gpioProbeEsp32S3FastLow(12) // SDA low while SCL is high: START.
-    var nack = true
-    var cycle = 0
-    while (cycle < 20) {
-        var half = 0
-        while (half < 2) {
-            gpioProbeEsp32S3ClockCycles(21, 8)
-            if ((cycle & 1) != 0) gpioProbeEsp32S3FastHigh(9)
-            else gpioProbeEsp32S3FastLow(9)
-            half = half + 1
-        }
-        if ((cycle & 1) != 0) {
-            if (cycle == 17) nack = gpioProbeRead(12)
-        } else {
-            if ((shiftedAddress & 128) != 0) {
-                gpioProbeEsp32S3FastHigh(12)
-            } else gpioProbeEsp32S3FastLow(12)
-            shiftedAddress = shiftedAddress << 1
-            if (cycle >= 16) {
-                gpio_set_direction(12, if (cycle == 16) 1 else 2)
-            }
-        }
-        cycle = cycle + 1
-    }
-    gpioProbeEsp32S3FastHigh(12) // SDA low-to-high while SCL is high: STOP.
-    nack
-}
-
+// Legacy prepared-pad entry: caller must already own/configure GPIO mux and
+// matrix routing. Prefer the Owned entry above when original routing must be
+// restored and cleanup failures retained for retry.
 trusted fun m5DetectCurrentEsp32S3(
     current: M5BoardId = m5BoardUnknown
 ): M5BoardId {
     if (current != m5BoardUnknown) return current
-    val packageVersion = esp_efuse_get_pkg_ver()
+    val packageVersion = esp32S3PackageVersion()
     if (packageVersion == 0) return m5DetectEsp32S3Qfn56Hardware()
     if (packageVersion == 1) return m5DetectEsp32S3PicoHardware()
     m5BoardUnknown

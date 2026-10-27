@@ -1,0 +1,91 @@
+import "./fat_remove_plan.ab"
+import "./fat_chain_plan.ab"
+import "./fat_link_write.ab"
+import "./fat_fsinfo.ab"
+import "./fat_volume.ab"
+type FatRemoval=int
+//1removed2input3stale4readIO5corrupt6cycle7budget8readonly9special/root
+//10nonempty11FSInfo12busy13mount-stale14mountfault15unlink16free.
+// Confirmed fully-mirrored freed count20@8. No rollback/secure erase/journal.
+fun FatRemoval.status(): int = this&255
+fun FatRemoval.freedClusters(): int = (this>>8)&0xfffff
+// Caller holds volume gate throughout.3600B work:1548 staged parent+LBAs,
+//4padding,2048 scratch. Separate8B/targetcluster chain plan. budget bounds
+// each parent seek, entire chain planning and directory-content scan separately.
+trusted fun fatRemoveOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,parent: int,
+    ordinal: int,index: int,expected: NativeBuffer,budget: int,plan: NativeBuffer,work: NativeBuffer): FatRemoval {
+    if (!work.hasAddressRange(0,3600) || !plan.hasAddressRange(0,plan.capacity()) || plan.capacity() < 8 || plan.capacity() > 8000000 ||
+        fatBuffersOverlap(work,3600,reader,28) || fatBuffersOverlap(work,3600,boot,512) || fatBuffersOverlap(work,3600,expected,32) ||
+        fatBuffersOverlap(plan,plan.capacity(),work,3600) || fatBuffersOverlap(plan,plan.capacity(),reader,28) ||
+        fatBuffersOverlap(plan,plan.capacity(),boot,512) || fatBuffersOverlap(plan,plan.capacity(),expected,32)) return FatRemoval(2)
+    val staged=nativeBufferAt(work.addressValue(),1548);val scratch=nativeBufferAt(work.addressValue()+1552,2048)
+    val removal=fatPlanRemovalOwned(reader,boot,first,sectors,parent,ordinal,index,expected,budget,staged,nativeBufferAt(scratch.addressValue(),1544))
+    if (removal.status() != 1) return FatRemoval(removal.status())
+    val geometry=fatBootValidate(boot,first,sectors)
+    val file=fatDirectoryDecode(nativeBufferAt(staged.addressValue()+(removal.lastSlot()>>4)*512,512),removal.lastSlot()&15,geometry.fatBits(),geometry.clusters())
+    val chain=fatPlanChainOwned(reader,boot,first,sectors,file.firstCluster(),budget,plan,nativeBufferAt(scratch.addressValue(),1024))
+    if (chain.status() != 1) return FatRemoval(if (chain.status() == 3) 4 else if (chain.status() >= 5) 7 else 5)
+    if (file.isFile() && chain.count()*geometry.sectorsPerCluster()*512 < file.byteSize()) return FatRemoval(5)
+    var c=0
+    while (c < chain.count()) {
+        val cluster=plan.loadU32(c*8)
+        if (cluster == parent || (geometry.fatBits() == 32 && cluster == fatBootU32(boot,44))) return FatRemoval(9)
+        c=c+1
+    }
+    if (file.isDirectory()) {
+        if (chain.count() == 0) return FatRemoval(9)
+        var ended=false;var reads=0;c=0
+        val data=nativeBufferAt(scratch.addressValue(),512)
+        while (c < chain.count() && !ended) {
+            var sector=0
+            while (sector < geometry.sectorsPerCluster() && !ended) {
+                if (reads >= budget) return FatRemoval(7)
+                if (!fatStorageReadOwned(reader,fatClusterFirstSector(boot,first,sectors,plan.loadU32(c*8))+sector,data)) return FatRemoval(4)
+                reads=reads+1;var entry=0
+                while (entry < 16 && !ended) {
+                    val offset=entry*32
+                    if (c == 0 && sector == 0 && entry < 2) {
+                        if (data.load(offset) != 46 || data.load(offset+1) != (if (entry == 0) 32 else 46) || data.load(offset+11) != 16 ||
+                            data.loadU32(offset+28) != 0) return FatRemoval(5)
+                        var n=2;while (n < 11) { if (data.load(offset+n) != 32) return FatRemoval(5);n=n+1 }
+                        val target=data.loadU16(offset+26)|(if (geometry.fatBits() == 32) (data.loadU16(offset+20)&4095)<<16 else 0)
+                        val wanted=if (entry == 0) file.firstCluster() else if (geometry.fatBits() == 32 && parent == fatBootU32(boot,44)) 0 else parent
+                        if (target != wanted) return FatRemoval(5)
+                    } else if (data.load(offset) == 0) ended=true
+                    else if (data.load(offset) != 229) return FatRemoval(10)
+                    entry=entry+1
+                }
+                sector=sector+1
+            }
+            c=c+1
+        }
+    }
+    if (chain.count() > 0 && fatInvalidateFreeHintsOwned(reader,boot,first,sectors,nativeBufferAt(scratch.addressValue(),1024)) != 1) return FatRemoval(11)
+    var slot=removal.firstSlot()
+    while (slot <= removal.lastSlot()) { staged.store(slot*32,229);slot=slot+1 }
+    // Unpublish short entry before earlier LFN sectors; free only after ALL
+    // unlink writes succeed. Partial unlink can orphan LFNs, never free live data.
+    var part=removal.lastSlot()>>4
+    while (part >= (removal.firstSlot()>>4)) {
+        if (!fatStorageWriteOwned(reader,staged.loadU32(1536+part*4),nativeBufferAt(staged.addressValue()+part*512,512))) return FatRemoval(15)
+        part=part-1
+    }
+    var freed=0;c=0
+    while (c < chain.count()) {
+        if (fatWriteLinkOwned(reader,boot,first,sectors,plan.loadU32(c*8),plan.loadU32(c*8+4),0,scratch).status() != 1) return FatRemoval(16|(freed<<8))
+        freed=freed+1;c=c+1
+    }
+    return FatRemoval(1|(freed<<8))
+}
+trusted fun FatVolume.removeEntry(owner: u32,parent: int,ordinal: int,index: int,expected: NativeBuffer,budget: int,
+    plan: NativeBuffer,work: NativeBuffer): FatRemoval {
+    val s=this.storage()
+    if (fatBuffersOverlap(s,32,expected,32) || fatBuffersOverlap(s,32,plan,plan.capacity()) || fatBuffersOverlap(s,32,work,3600)) return FatRemoval(2)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatRemoval(admitted)
+    val result=fatRemoveOwned(nativeBufferAt(s.loadU32(16),28),nativeBufferAt(s.loadU32(20),512),s.loadU32(24),s.loadU32(28),
+        parent,ordinal,index,expected,budget,plan,work)
+    if (result.status() == 4 || result.status() == 11 || result.status() == 15 || result.status() == 16) s.storeU32(12,3)
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatRemoval(14|(result.freedClusters()<<8))
+    return result
+}

@@ -1,0 +1,49 @@
+import "../esp32/spi/quad_pins_sequence_esp32s3.ab"
+import "../esp32/spi/quad_transfer_sequence_esp32s3.ab"
+import "../esp32/spi/select_sequence_esp32s3.ab"
+import "../peripheral_gate.ab"
+import "../spi/transaction_result.ab"
+import "../spi/buffer_gate.ab"
+// CO5300 / M5GFX Panel_AMOLED: single-line 02 00 command 00 register
+// prefix, or single-line32 00 2c 00 then quad RGB565 wire-order pixels.
+// Initialized powered SPI/panel, correct quad pads, stable clock and inactive
+// manual CS required. Caller serializes panel windows/rotation with drawing.
+// No window clipping, color conversion or framebuffer hidden in transport.
+trusted fun esp32s3Co5300Transfer(gate: PeripheralGate,owner: u32,peripheral: int,
+    pins: QuadSpiPins,select: Pin,command: int,data: NativeBuffer,bytes: int,pixels: bool): SpiTransactionResult {
+    if (!esp32s3SpiQuadTransmitPinsValid(peripheral,pins,select) || command < 0 || command > 255 ||
+        (pixels && (command != 44 || bytes < 2 || (bytes&1) != 0)) ||
+        (!pixels && bytes > 65536) || !esp32s3SpiMemoryRangeValid(peripheral,data,bytes) ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292 || !gate.bufferDisjoint(data,bytes))
+        return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val detail=esp32s3Co5300TransferOwned(peripheral,select,command,data,bytes,pixels)
+    val healthy=(detail&255) == 1
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5<<32)|detail)
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|detail)
+}
+// Validated internal entry. Canonical gate held; one CS assertion for the
+// entire stream. Continuations have no prefix, including across64-byte chunks.
+trusted fun esp32s3Co5300TransferOwned(peripheral: int,select: Pin,command: int,
+    data: NativeBuffer,bytes: int,pixels: bool): int {
+    var detail=esp32s3SpiExchangeReady(peripheral)
+    if (detail != 1) return detail
+    detail=esp32s3SpiSelectBegin(select)
+    var offset=0
+    var first=true
+    while (first || offset < bytes) {
+        if ((detail&255) != 1) break
+        val count=if (bytes-offset < 64) bytes-offset else 64
+        val chunk=nativeBufferAt(data.addressValue()+offset,count)
+        val prefix=if (first) (if (pixels) 50 else 2) else 0
+        val commandBits=if (first) 8 else 0
+        val address=if (first) command<<8 else 0
+        val addressBits=if (first) 24 else 0
+        if (pixels) detail=esp32s3SpiQuadTransmitOwned(peripheral,prefix,commandBits,address,addressBits,0,chunk,count,100000)
+        else detail=esp32s3SpiPhasesOwned(peripheral,prefix,commandBits,address,addressBits,0,
+            if (count == 0) 0 else 1,chunk,count,100000)
+        offset=offset+count;first=false
+    }
+    return esp32s3SpiSelectEnd(select,detail)
+}

@@ -1,0 +1,64 @@
+import "./tough_display_startup_components_c5_sequence.ab"
+import "./tough_display_startup_admission_c5_sequence.ab"
+//72B caller-owned RAM: tag0,state4,master64@8,bus64@16,pmic24,io28,
+// canonical gate32,token36,original startup record32@40. Keep storage and
+// borrowed children alive until quiesced. No allocations or implicit closes.
+// State1ready3partial4quiescing5quiesced6asleep7sleep/wake uncertain.
+// Status2 means rejected. Original startup evidence remains immutable.
+fun toughDisplaySessionStorage(session: NativeBuffer): bool =
+    session.hasAddressRange(0,72) && (session.addressValue()&3) == 0 &&
+    (session.addressValue()+72 <= 0x60000000 || session.addressValue() >= 0x60100000)
+fun toughDisplaySessionWord64(session: NativeBuffer,at: int): int =
+    session.loadU32(at)|(session.loadU32(at+4)<<32)
+trusted fun toughDisplaySessionBeginOwned(session: NativeBuffer,master: int,bus: int,
+    pmic: int,io: int,gate: PeripheralGate,owner: u32,rotation: int,brightness: int,
+    exclusiveQuiesced: bool): int {
+    if (!exclusiveQuiesced || !toughDisplaySessionStorage(session) || session.loadU32(0) != 0 ||
+        rotation < 0 || rotation > 7 || brightness < 0 || brightness > 255 ||
+        !peripheralOwnerValid(owner) || !gate.word().valid() || gate.word().address() > 0xffffffff ||
+        !gate.bufferDisjoint(session,72) || !toughDisplayStartupAdmission(master,bus,pmic,io,gate)) return 2
+    session.storeU32(0,0x54445353);session.storeU32(4,3)
+    session.storeU32(8,master&0xffffffff);session.storeU32(12,master>>>32)
+    session.storeU32(16,bus&0xffffffff);session.storeU32(20,bus>>>32)
+    session.storeU32(24,pmic);session.storeU32(28,io)
+    session.storeU32(32,gate.word().address());session.storeU32(36,int(owner))
+    val record=nativeBufferAt(session.addressValue()+40,32)
+    var at=0
+    while (at < 32) { record.storeU32(at,0);at=at+4 }
+    val result=toughDisplayStartupOwned(record,master,bus,pmic,io,gate,owner,rotation,brightness,true)
+    if (result == 1) session.storeU32(4,1)
+    return if (result == 1) 1 else 3
+}
+// Cache-on only; caller stops all display/touch/PWM users and retains clocks.
+// Blank first, then wait for a genuinely idle controller and deselect. No
+// forced reset, command replay, power-down, pad release or child destruction.
+// Failed blanking remains uncertain and is retried. FIFO evidence is never
+// discarded without explicit permission. Original startup evidence is intact.
+// Return5quiesced,4pending,2invalid. Quiescing permanently withdraws the view.
+trusted fun toughDisplaySessionQuiesceOwned(session: NativeBuffer,exclusiveQuiesced: bool,
+    discardFifoErrors: bool = false): int {
+    if (!exclusiveQuiesced || !toughDisplaySessionStorage(session) || session.loadU32(0) != 0x54445353) return 2
+    val state=session.loadU32(4)
+    if (state == 5) return 5
+    if (state != 1 && state != 3 && state != 4 && state != 6 && state != 7) return 2
+    val master=Esp32C5SpiMaster(toughDisplaySessionWord64(session,8))
+    val bus=toughDisplaySessionWord64(session,16)
+    val gate=peripheralGateAt(session.loadU32(32));val owner=u32(session.loadU32(36))
+    if (!master.ready() || master.pins().pinAt(3) != 25 || !peripheralOwnerValid(owner) ||
+        !c5SpiGateValid(gate) || !gate.bufferDisjoint(session,72) ||
+        !toughDisplayStartupDeviceMatches(bus,session.loadU32(28),79)) return 2
+    session.storeU32(4,4)
+    if (toughBacklightSetOwned(M5Ioe1(session.loadU32(28)),0,true) != 1) return 4
+    val gateState=gate.word().compareExchange(u32(0),u32(0))
+    if (gateState == u32(0x80000000)) {
+        if (!master.recover(gate,owner,true,discardFifoErrors)) return 4
+    } else if (gateState != u32(0)) return 4
+    if (gate.tryBegin(owner) != 0) return 4
+    val healthy=c5SpiMasterDataReady(master,true) && (c5SpiRead(0x6008103c)&u32(0x60003)) == u32(0)
+    if (!gate.finish(owner,healthy) || !healthy) return 4
+    session.storeU32(4,5);return 5
+}
+// Never expose the preserved startup view while quiescing or quiesced.
+fun toughDisplaySessionView(session: NativeBuffer): LcdView =
+    if (toughDisplaySessionStorage(session) && session.loadU32(0) == 0x54445353 && session.loadU32(4) == 1)
+        LcdView(u64(toughDisplaySessionWord64(session,64))) else LcdView(u64(0))

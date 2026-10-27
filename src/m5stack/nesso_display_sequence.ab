@@ -1,0 +1,69 @@
+import "./nesso_display_owner_sequence.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "../peripheral_gate.ab"
+// Caller-owned 40B state; borrows calibrated C6 I2C session, SPI pads/clocks
+// and canonical SPI gate. Exclusive means all SPI/E1 users are quiesced for
+// the whole call. Single caller; this state is not an SMP lock. Never close
+// the borrowed session or change clocks while this display remains retained.
+// Phase: 0 closed, 1 ready, 2 failed/retained, 3 operating, 4 closing, 5 asleep.
+// Initialization clears pixels before enabling backlight. Failure never
+// forces success or silently replays reset. Explicit close then reopen only.
+type NessoDisplay=int
+fun nessoDisplayAt(storage: NativeBuffer): NessoDisplay =
+    if (storage.hasAddressRange(0,40) && (storage.addressValue()&3) == 0 && nessoDisplayStorageSafe(storage)) NessoDisplay(storage|0) else NessoDisplay(0)
+fun NessoDisplay.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun NessoDisplay.valid(): bool = nessoDisplayAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x4e534431
+trusted fun NessoDisplay.phase(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun NessoDisplay.ready(): bool = this.phase() == 1
+// Fresh storage only. Reinitializing a live owner would leak its lease.
+trusted fun NessoDisplay.initialize(): bool {
+    if (nessoDisplayAt(this.buffer()) == 0) return false
+    var at=4;while (at < 40) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x4e534431);return true
+}
+trusted fun NessoDisplay.powerOwner(): NessoDisplayPower = NessoDisplayPower(this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32))
+trusted fun NessoDisplay.savePower(power: NessoDisplayPower): void {
+    this.buffer().storeU32(8,power&0xffffffff);this.buffer().storeU32(12,power>>>32);return
+}
+trusted fun NessoDisplay.gate(): PeripheralGate = peripheralGateAt(this.buffer().loadU32(16))
+trusted fun NessoDisplay.owner(): u32 = u32(this.buffer().loadU32(20))
+trusted fun NessoDisplay.rotation(): int = this.buffer().loadU32(24)&7
+trusted fun NessoDisplay.bgrOrder(): bool = (this.buffer().loadU32(24)&256) != 0
+trusted fun NessoDisplay.failure(): int = if (this.valid()) this.buffer().loadU32(28) else 2
+trusted fun NessoDisplay.saveSpi(result: int): void {
+    this.buffer().storeU32(32,result&0xffffffff);this.buffer().storeU32(36,result>>>32);return
+}
+trusted fun NessoDisplay.spiResult(): int = if (this.valid()) this.buffer().loadU32(32)|(this.buffer().loadU32(36)<<32) else 3<<32
+trusted fun NessoDisplay.fail(status: int): int {
+    this.buffer().storeU32(28,status);this.buffer().storeU32(4,2);return status
+}
+// 1ready 2admission 3pads 4E1 5panel-init 6clear 7backlight.
+trusted fun NessoDisplay.openOwned(bus: int,gate: PeripheralGate,owner: u32,rotation: int,bgrOrder: bool,exclusive: bool): int {
+    if (!exclusive || this.phase() != 0 || rotation < 0 || rotation > 7 ||
+        !nessoDisplayOwnerBusCurrent(bus) || !nessoDisplayGateSafe(this.buffer(),gate,owner)) return 2
+    this.buffer().storeU32(4,3);this.buffer().storeU32(16,gate|0);this.buffer().storeU32(20,int(owner))
+    this.buffer().storeU32(24,rotation|(if (bgrOrder) 256 else 0)|(255<<16));this.buffer().storeU32(28,0)
+    var spi=nessoDisplayPreparePins(gate,owner);this.saveSpi(spi)
+    if (spi>>>32 != 1) return this.fail(3)
+    val power=nessoDisplayPowerOpenOwned(bus,true);this.savePower(power)
+    if (!power.ready()) return this.fail(4)
+    spi=nessoDisplayInitializePanel(gate,owner,rotation,bgrOrder);this.saveSpi(spi)
+    if (spi>>>32 != 1) return this.fail(5)
+    spi=nessoDisplayClearPanel(gate,owner,rotation,bgrOrder);this.saveSpi(spi)
+    if (spi>>>32 != 1) return this.fail(6)
+    if (!power.setBacklightOwned(255,true)) return this.fail(7)
+    this.buffer().storeU32(4,1);return 1
+}
+// Close parks/recover-checks the borrowed SPI pads before E1 backlight-off
+// and release. It does NOT gate clocks, switch EXT power or put ST7789 to
+// sleep. Pads remain configured and caller-owned. Failed close retains state.
+trusted fun NessoDisplay.closeOwned(exclusive: bool): bool {
+    val phase=this.phase()
+    if (!exclusive || phase < 0 || phase == 3 || phase == 4) return false
+    if (phase == 0) return true
+    this.buffer().storeU32(4,4)
+    if (!nessoDisplayParkPins(this.gate(),this.owner())) { this.fail(8);return false }
+    val power=this.powerOwner().closeOwned(true);this.savePower(power)
+    if (power != 0) { this.fail(9);return false }
+    this.buffer().storeU32(4,0);return true
+}

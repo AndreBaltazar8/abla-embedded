@@ -1,0 +1,99 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "../esp32/revision_p4.ab"
+// Command-host startup owner,40B: magic0,phase4,lastresult8/12,LDO16,
+// reference lease/failed-acquire cleanup20,DSI24/28,authoritative ref address32.
+// Word36: lane code1=900Mbps/2=1040Mbps, VC bits2..3, layout bits4..5,
+// video DMA channel bits8..9. Phases7partial video,8video active,9stopped.
+// Caller owns configuration/panel/host and excludes competing RCC/PMU writers;
+// stable source clocks and calibrated delay required. Do not mask interrupts
+// or hold a spinlock across settling. Reference record is shared, never copied.
+// This owner is for command mode. Close video/DMA separately before closeOwned.
+type Tab5DsiOwner = int
+fun tab5DsiOwnerAt(storage: NativeBuffer): Tab5DsiOwner =
+    if (storage.hasAddressRange(0,40) && (storage.addressValue()&3) == 0) Tab5DsiOwner(storage|0) else Tab5DsiOwner(0)
+fun Tab5DsiOwner.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun Tab5DsiOwner.valid(): bool = this.buffer().hasAddressRange(0,40) &&
+    (this.buffer().addressValue()&3) == 0 && this.buffer().loadU32(0) == 0x54445349
+trusted fun Tab5DsiOwner.wide(offset: int): int = this.buffer().loadU32(offset)|(this.buffer().loadU32(offset+4)<<32)
+trusted fun Tab5DsiOwner.save(offset: int,value: int): void {
+    this.buffer().storeU32(offset,value&4294967295); this.buffer().storeU32(offset+4,value>>>32); return
+}
+trusted fun Tab5DsiOwner.initialize(): bool {
+    if (!this.buffer().hasAddressRange(0,40) || (this.buffer().addressValue()&3) != 0) return false
+    var offset=4
+    while (offset < 40) { this.buffer().storeU32(offset,0); offset=offset+4 }
+    this.buffer().storeU32(0,0x54445349); return true
+}
+trusted fun Tab5DsiOwner.ready(): bool = this.valid() && (this.buffer().loadU32(4) == 4 || this.buffer().loadU32(4) == 6)
+trusted fun Tab5DsiOwner.panelReady(): bool = this.valid() && this.buffer().loadU32(4) == 6
+// 1ready,2invalid,3rail failure/refusal,4reference failure,5host failure.
+// Configuration preflight MUST precede rail/clock side effects.
+trusted fun Tab5DsiOwner.openOwned(reference: NativeBuffer,layout: int,revision: int,cfg: int,ref: int,div: int,khz: int,lane: int,vc: int,polls: int,settleUs: int): int {
+    if (!this.valid() || this.buffer().loadU32(4) != 0 || layout == 0 || layout != esp32P4RegisterLayout(revision) ||
+        !reference.hasAddressRange(0,4) || (reference.addressValue()&3) != 0 ||
+        (reference.addressValue() < this.buffer().addressValue()+40 && reference.addressValue()+4 > this.buffer().addressValue()) ||
+        settleUs < 1 || settleUs > 1000000 || !tab5DsiOwnerPreflight(reference.loadU32(0),layout,revision,cfg,ref,div,khz,lane,vc,polls)) return 2
+    this.buffer().storeU32(32,reference.addressValue())
+    this.buffer().storeU32(36,(if (lane == 900000) 1 else 2)|(vc<<2)|(layout<<4))
+    this.buffer().storeU32(4,1)
+    val rail=tab5DsiOwnerRailOpen(revision)
+    this.buffer().storeU32(16,rail); this.save(8,rail)
+    if ((rail&15) != 1) return 3
+    tab5DsiOwnerSettle(settleUs)
+    val acquired=tab5DsiOwnerReferenceAcquire(reference.loadU32(0))
+    reference.storeU32(0,acquired&4294967295)
+    this.buffer().storeU32(20,(acquired>>>32)&1); this.save(8,acquired)
+    if ((acquired&(1<<33)) == 0) return 4
+    this.buffer().storeU32(4,2)
+    val dsi=tab5DsiOwnerHostOpen(layout,cfg,ref,div,khz,lane,vc,polls)
+    this.save(24,dsi); this.save(8,dsi)
+    this.buffer().storeU32(4,if ((dsi&15) == 1) 4 else 3)
+    return if ((dsi&15) == 1) 1 else 5
+}
+// Returns the full Tab5PanelStart result;2 means preflight/state mismatch.
+// Caller owns stopped/reset panel. One initialization per fresh host lifetime:
+// phase5 retains failed/partial initialization until explicit host cleanup.
+trusted fun Tab5DsiOwner.initializePanelOwned(probe: int,scratch: NativeBuffer,polls: int): int {
+    if (!this.valid() || this.buffer().loadU32(4) != 4 || polls < 1 || polls > 1000000 ||
+        !scratch.hasAddressRange(0,32) || !tab5DsiOwnerScratchSafe(scratch)) return 2
+    val start=scratch.addressValue()
+    val record=this.buffer().addressValue()
+    val reference=this.buffer().loadU32(32)
+    if ((start < record+40 && start+32 > record) || (start < reference+4 && start+32 > reference)) return 2
+    val config=this.buffer().loadU32(36)
+    val lane=tab5DsiOwnerProbeLane(probe)
+    if (lane == 0 || lane != (if ((config&3) == 1) 900000 else 1040000)) return 2
+    this.buffer().storeU32(4,5)
+    val result=tab5DsiOwnerPanelStart(probe,(config>>>2)&3,scratch,polls)
+    this.save(8,result)
+    if ((result&15) == 1) this.buffer().storeU32(4,6)
+    return result
+}
+// 1closed,2invalid,3host blocked,4reference blocked,5rail blocked.
+// 6video must be stopped through stopVideoOwned first.
+// No resource is released beneath an unclosed child. Completed steps are
+// erased from this owner, so retries cannot double-return a shared reference.
+trusted fun Tab5DsiOwner.closeOwned(polls: int): int {
+    if (!this.valid() || polls < 1 || polls > 1000000) return 2
+    if (this.buffer().loadU32(4) == 7 || this.buffer().loadU32(4) == 8) return 6
+    if (this.buffer().loadU32(4) == 0) return 1
+    // Closing invalidates ready even when host shutdown is temporarily busy.
+    this.buffer().storeU32(4,3)
+    val old=this.wide(24)
+    if (old != 0) {
+        val dsi=tab5DsiOwnerHostClose(old,polls)
+        this.save(24,dsi); this.save(8,dsi)
+        if (dsi != 0) return 3
+    }
+    if (this.buffer().loadU32(20) != 0) {
+        val reference=nativeBufferAt(this.buffer().loadU32(32),4)
+        val released=tab5DsiOwnerReferenceRelease(reference.loadU32(0))
+        reference.storeU32(0,released&4294967295); this.save(8,released)
+        if ((released>>>32) != 1) return 4
+        this.buffer().storeU32(20,0)
+    }
+    val rail=tab5DsiOwnerRailClose(this.buffer().loadU32(16))
+    this.buffer().storeU32(16,rail); this.save(8,rail)
+    if (rail != 0) return 5
+    this.buffer().storeU32(4,0); return 1
+}

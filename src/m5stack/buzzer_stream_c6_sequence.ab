@@ -1,0 +1,117 @@
+import "./buzzer_pcm_c6_sequence.ab"
+import "../esp32/i2s/buzzer_start_c6_sequence.ab"
+import "../esp32/i2s/buzzer_stream_end_c6_sequence.ab"
+// 640B retained: header16, board436@16, startup56@452, cursor32@508,
+// drain64@540, producer24@604, sources64@628, rate636. No heap.
+// States1setup2prefill3streaming4draining5drained6failed7closing8closed
+// 9cancelling10cancelled. Child playback owns setup/start/cancellation, but
+// NEVER call its finite poll: startup and completion are circular here.
+// Caller retains exclusive source bank, workspaces, ring, IRQ/ETM and roots.
+// Returns1streaming2invalid3failed4drained5pending6closed7blocked8cancelled.
+fun c6BuzzerStreamStorage(r: NativeBuffer): bool = r.hasAddressRange(0,640) && (r.addressValue()&3) == 0 && (r.addressValue()+640 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6BuzzerStreamValid(r: NativeBuffer): bool = c6BuzzerStreamStorage(r) && r.loadU32(0) == 0x43364254
+trusted fun c6BuzzerStreamFail(r: NativeBuffer,detail: int): int {
+    r.storeU32(4,6);r.storeU32(8,detail)
+    r.storeU32(20,3);r.storeU32(24,detail);r.storeU32(76,7);r.storeU32(80,detail);return 3
+}
+trusted fun M5BoardId.openC6BuzzerStreamOwned(r: NativeBuffer,sources: PcmSourceQueues,channel: int,source: int,rootHz: int,rate: int,maxPpm: int,descriptors: int,count: int,buffers: int,stride: int,bytes: int,polls: int,discard: bool,exclusivePinnedRoots: bool): int {
+    if (!exclusivePinnedRoots || !discard || !c6BuzzerStreamStorage(r) || r.loadU32(0) != 0 || (this != m5BoardArduinoNessoN1 && this != m5BoardUnitC6L) ||
+        channel < 0 || channel > 2 || source < 0 || source > 2 || polls < 1 || polls > 1000000 || count < 2 || !c6GdmaRingValid(descriptors,count,buffers,stride,bytes) || !sources.valid() || sources.queue(0).storage().loadU32(4) != rate) return 2
+    if ((source == 1 && rootHz != 240000000) || (source == 2 && rootHz != 160000000) || !c6I2sRatePlan(rootHz,rate,32,0).withinPpm(rootHz,rate,32,maxPpm)) return 2
+    val ring=nativeBufferAt(buffers,(count-1)*stride+bytes);val desc=nativeBufferAt(descriptors,count*12)
+    if (!sources.disjointFrom(r,640) || !sources.disjointFrom(desc,count*12) || !sources.disjointFrom(ring,ring.capacity()) || pcmMixSpansOverlap(r,640,desc,count*12) || pcmMixSpansOverlap(r,640,ring,ring.capacity())) return 2
+    var at=0
+    while (at < 640) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43364254);r.storeU32(4,1);r.storeU32(628,sources|0);r.storeU32(632,sources>>>32);r.storeU32(636,rate)
+    val address=r.addressValue();val child=nativeBufferAt(address+72,348)
+    r.storeU32(16,0x43364250);r.storeU32(20,1)
+    child.storeU32(0,0x43365053);child.storeU32(4,1);child.storeU32(16,descriptors);child.storeU32(20,count);child.storeU32(24,buffers);child.storeU32(28,stride);child.storeU32(32,bytes);child.storeU32(36,channel)
+    if (!buzzerSourceBlockInitOwned(nativeBufferAt(address+604,24),0,true)) return c6BuzzerStreamFail(r,0x10003)
+    val platform=c6AudioPlatformOpenOwned(nativeBufferAt(address+32,40),channel,source,true,true)
+    if (platform != 1) return c6BuzzerStreamFail(r,0x20000|platform)
+    val setup=c6AudioSetupAtRateOwned(nativeBufferAt(address+112,172),channel,source,rootHz,rate,0,maxPpm,-1,-1,this.speakerProfile().dataPin(),-1,16,16,16,false,polls,true)
+    if (setup != 1 && setup != 5) return c6BuzzerStreamFail(r,0x30000|setup)
+    return 5
+}
+// Full aggregate exclusion supplements the lower-level child span checks.
+trusted fun c6BuzzerStreamWorkspaces(r: NativeBuffer,acc: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,staging: NativeBuffer): bool {
+    val frames=r.loadU32(104)>>>2
+    return !pcmMixSpansOverlap(r,640,acc,frames*8) && !pcmMixSpansOverlap(r,640,scratch,frames*4) && !pcmMixSpansOverlap(r,640,mono,frames*2) && !pcmMixSpansOverlap(r,640,staging,frames*4)
+}
+trusted fun c6BuzzerStreamAdvanceOwned(r: NativeBuffer,acc: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,staging: NativeBuffer,volume: PcmVolume,budget: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6BuzzerStreamValid(r) || budget < 1 || budget > 1024 || polls < 1 || polls > 1000000) return 2
+    val state=r.loadU32(4)
+    if (state == 6) return 3
+    if (state == 5) return 4
+    if (state == 8) return 6
+    if (state == 10) return 8
+    if (state < 1 || state > 4) return 2
+    val address=r.addressValue();val start=nativeBufferAt(address+284,72);val cursor=nativeBufferAt(address+508,32);val producer=nativeBufferAt(address+604,24)
+    val sources=PcmSourceQueues(r.loadU32(628)|(r.loadU32(632)<<32))
+    if (state != 4 && (!sources.valid() || !sources.disjointFrom(r,640) || !c6BuzzerStreamWorkspaces(r,acc,scratch,mono,staging))) return 2
+    if (state == 1) {
+        val setup=if (r.loadU32(116) == 2) 1 else c6AudioSetupWaitOwned(nativeBufferAt(address+112,172),polls,true)
+        if (setup == 5) return 5
+        if (setup != 1) return c6BuzzerStreamFail(r,0x30000|setup)
+        val begun=c6BuzzerStartBeginOwned(nativeBufferAt(address+452,56),start,producer,sources,r.loadU32(636),r.loadU32(108),r.loadU32(88),r.loadU32(92),r.loadU32(96),r.loadU32(100),r.loadU32(104),true)
+        if (begun != 5) return c6BuzzerStreamFail(r,0x40000|begun)
+        r.storeU32(4,2);r.storeU32(76,2)
+    }
+    if (r.loadU32(4) == 2) {
+        val begun=c6BuzzerStartAdvanceOwned(nativeBufferAt(address+452,56),start,producer,sources,acc,scratch,mono,staging,volume,budget,polls,true)
+        if (begun == 5 || begun == 2) return begun
+        if (begun != 1) return c6BuzzerStreamFail(r,0x40000|begun)
+        r.storeU32(4,3);r.storeU32(76,3);return 1
+    }
+    if (r.loadU32(4) == 3) {
+        val refill=c6BuzzerStreamRefillOwned(start,cursor,producer,sources,r.loadU32(636),acc,scratch,mono,staging,volume,true)
+        return if (refill == 3) c6BuzzerStreamFail(r,0x50003) else refill
+    }
+    val drained=c6I2sStreamDrainPollOwned(start,cursor,nativeBufferAt(address+540,64),budget,polls,true)
+    if (drained == 4) return 7
+    if (drained == 3) return c6BuzzerStreamFail(r,0x60003)
+    if (drained != 1) return drained
+    if (!buzzerSourceBlockReleaseOwned(producer,true,true)) return c6BuzzerStreamFail(r,0x60004)
+    r.storeU32(4,5);r.storeU32(20,2);r.storeU32(76,4);return 4
+}
+trusted fun c6BuzzerStreamEndOwned(r: NativeBuffer,acc: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,staging: NativeBuffer,volume: PcmVolume,exclusive: bool): int {
+    if (!exclusive || !c6BuzzerStreamValid(r) || r.loadU32(4) != 3 || !c6BuzzerStreamWorkspaces(r,acc,scratch,mono,staging)) return 2
+    val address=r.addressValue();val sources=PcmSourceQueues(r.loadU32(628)|(r.loadU32(632)<<32))
+    if (!sources.valid() || !sources.disjointFrom(r,640)) return 2
+    val result=c6BuzzerStreamEndBeginOwned(nativeBufferAt(address+284,72),nativeBufferAt(address+508,32),nativeBufferAt(address+540,64),nativeBufferAt(address+604,24),sources,r.loadU32(636),acc,scratch,mono,staging,volume,true)
+    if (result == 3) return c6BuzzerStreamFail(r,0x60003)
+    if (result == 5 && r.loadU32(540) != 0) r.storeU32(4,4)
+    return result
+}
+trusted fun c6BuzzerStreamCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6BuzzerStreamValid(r) || (r.loadU32(4) != 5 && r.loadU32(4) != 6 && r.loadU32(4) != 7 && r.loadU32(4) != 8 && r.loadU32(4) != 10)) return 2
+    val result=c6BuzzerPcmCloseOwned(nativeBufferAt(r.addressValue()+16,436),polls,true)
+    if (result == 6) r.storeU32(4,8)
+    else if (result != 2) r.storeU32(4,7)
+    r.storeU32(12,r.loadU32(28));return result
+}
+trusted fun c6BuzzerStreamCancelOwned(r: NativeBuffer,budget: int,polls: int,handledErrors: int,discard: bool,exclusive: bool): int {
+    if (!exclusive || !c6BuzzerStreamValid(r) || budget < 1 || budget > 1024 || polls < 1 || polls > 1000000 || handledErrors < 0 || (handledErrors&~0x34) != 0) return 2
+    if (r.loadU32(4) == 8) return 6
+    if (r.loadU32(4) == 10) return 8
+    if (r.loadU32(4) != 9) {
+        // Drain may already have submitted STOP. Transfer that exact retained
+        // stop token to cancellation before taking over; never issue STOP twice.
+        if (r.loadU32(572) != 0) {
+            var at=0
+            while (at < 24) { r.storeU32(392+at,r.loadU32(572+at));at=at+4 }
+        }
+        r.storeU32(4,9)
+    }
+    val result=c6BuzzerPcmCancelOwned(nativeBufferAt(r.addressValue()+16,436),budget,polls,handledErrors,discard,true)
+    r.storeU32(12,r.loadU32(28))
+    if (result == 8 || result == 6) {
+        if (r.loadU32(608) == 2 && !buzzerSourceBlockReleaseOwned(nativeBufferAt(r.addressValue()+604,24),true,true)) return 7
+        r.storeU32(4,10)
+    }
+    return result
+}
+trusted fun c6BuzzerStreamRetryStopOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6BuzzerStreamValid(r) || r.loadU32(4) != 9) return 2
+    return c6BuzzerPcmRetryStopOwned(nativeBufferAt(r.addressValue()+16,436),polls,true)
+}

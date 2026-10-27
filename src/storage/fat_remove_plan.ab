@@ -1,0 +1,61 @@
+import "./fat_directory_read.ab"
+import "./fat_long_name.ab"
+// Read-only removal preflight, under caller-held volume ownership. Preserve
+// all up-to3 sectors containing the target and its <=20 precedingLFNs.
+// output1548:sector snapshots1536 +3LBA32. work1544:FAT1024+LFN520.
+// Caller must keep ownership through subsequent mutation; this is not a lease.
+type FatRemovalPlan=int
+//1ready2input3stale4IO5corrupt6cycle7budget8readonly9dot/root.
+// first slot6@8,last slot6@14,starting directory ordinal32@20,sectors2@52.
+fun FatRemovalPlan.status(): int = this&255
+fun FatRemovalPlan.firstSlot(): int = (this>>8)&63
+fun FatRemovalPlan.lastSlot(): int = (this>>14)&63
+fun FatRemovalPlan.ordinal(): int = (this>>20)&0xffffffff
+fun FatRemovalPlan.sectors(): int = (this>>52)&3
+// Output is scratch until success; expected snapshot and media remain intact.
+// Read budget applies independently to each of at most3 directory seeks.
+// allowReadOnly is for rename preflight; actual deletion keeps the defaultfalse.
+trusted fun fatPlanRemovalOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,parent: int,
+    ordinal: int,index: int,expected: NativeBuffer,budget: int,output: NativeBuffer,work: NativeBuffer,allowReadOnly: bool = false): FatRemovalPlan {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || ordinal < 0 || ordinal > 0xffffffff || index < 0 || index > 15 ||
+        budget < 1 || budget > 1000000 || !expected.hasAddressRange(0,32) || !output.hasAddressRange(0,1548) ||
+        !work.hasAddressRange(0,1544) || fatBuffersOverlap(output,1548,work,1544) ||
+        fatBuffersOverlap(output,1548,expected,32) || fatBuffersOverlap(work,1544,expected,32) ||
+        fatBuffersOverlap(output,1548,reader,28) || fatBuffersOverlap(output,1548,boot,512) ||
+        fatBuffersOverlap(work,1544,reader,28) || fatBuffersOverlap(work,1544,boot,512)) return FatRemovalPlan(2)
+    val flat=ordinal*16+index
+    val earliest=if (flat > 20) flat-20 else 0
+    val start=earliest>>4;val count=ordinal-start+1
+    var part=0
+    while (part < count) {
+        val read=fatDirectoryReadOwned(reader,boot,first,sectors,parent,start+part,budget,
+            nativeBufferAt(output.addressValue()+part*512,512),nativeBufferAt(work.addressValue(),1024))
+        if (read.status() != 1) return FatRemovalPlan(if (read.status() == 2) 3 else read.status())
+        output.storeU32(1536+part*4,read.sector());part=part+1
+    }
+    val last=(ordinal-start)*16+index;var i=0
+    while (i < 32) { if (output.load(last*32+i) != expected.load(i)) return FatRemovalPlan(3);i=i+1 }
+    val decoded=fatDirectoryDecode(nativeBufferAt(output.addressValue()+(count-1)*512,512),index,geometry.fatBits(),geometry.clusters())
+    if (!decoded.isFile() && !decoded.isDirectory()) return FatRemovalPlan(5)
+    if (!allowReadOnly && (expected.load(11)&1) != 0) return FatRemovalPlan(8)
+    if (expected.load(0) == 46) return FatRemovalPlan(9)
+    val name=nativeBufferAt(work.addressValue()+1024,520)
+    var lfn=FatLongName(0);var previousLong=false
+    var slot=earliest-start*16
+    while (slot < last) {
+        val entry=nativeBufferAt(output.addressValue()+slot*32,32)
+        if (entry.load(0) == 0) return FatRemovalPlan(5)
+        previousLong=entry.load(0) != 0 && entry.load(0) != 229 && entry.load(11) == 15
+        lfn=if (previousLong) lfn.consume(entry,name) else FatLongName(0)
+        slot=slot+1
+    }
+    var firstSlot=last
+    if (previousLong) {
+        if (!lfn.matches(nativeBufferAt(output.addressValue()+last*32,32),name)) return FatRemovalPlan(5)
+        val entries=int((u32(lfn.length())+u32(12))/u32(13))
+        firstSlot=last-entries
+        if (firstSlot < 0 || firstSlot < earliest-start*16) return FatRemovalPlan(5)
+    }
+    return FatRemovalPlan(1|(firstSlot<<8)|(last<<14)|(start<<20)|(count<<52))
+}

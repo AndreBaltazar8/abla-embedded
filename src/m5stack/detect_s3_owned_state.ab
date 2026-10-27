@@ -1,0 +1,58 @@
+import "../esp32/gpio/probe_owned_s3_sequence.ab"
+import "../esp32/gpio_probe_logic.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "./detect_logic.ab"
+
+// Exclusive88-byte record: header32 and up to14 original routing snapshots.
+// Pins are captured/prepared lazily, only when the selected detection branch
+// uses them. Caller quiesces all possible pad owners for its package, releases
+// holds, prevents sleep and serializes configuration. No implicit ownership.
+// Status2 detected+restored,3 cleanup required,4 failed+restored,0 invalid.
+trusted fun m5S3OwnedDetectValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,88) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x4D533331 && r.loadU32(12) <= 14
+
+trusted fun m5S3OwnedCapture(r: NativeBuffer,pin: int): GpioProbePinState {
+    if (r == NativeBuffer(0)) return gpioProbeCaptureEsp32S3(pin)
+    if (!m5S3OwnedDetectValid(r) || r.loadU32(4) != 3 || r.loadU32(16) != 0) return GpioProbePinState(0)
+    val count=r.loadU32(12)
+    var index=0
+    var found=false
+    while (index < count) {
+        if (S3GpioSnapshot(r.loadU32(32+index*4)).pin() == pin) found=true
+        index=index+1
+    }
+    if (!found) {
+        val saved=esp32S3GpioSnapshotOwned(pin,true)
+        if (!saved.valid() || count >= 14) { r.storeU32(16,1); return GpioProbePinState(0) }
+        // Persist BEFORE the first write, including preparation failures.
+        r.storeU32(32+count*4,saved|0); r.storeU32(12,count+1)
+        if (saved.prepareProbeInputOwned(3,true) != 1) { r.storeU32(16,2); return GpioProbePinState(0) }
+    }
+    val captured=gpioProbeCaptureEsp32S3(pin)
+    if (!gpioProbeStateValid(captured)) r.storeU32(16,3)
+    return captured
+}
+
+trusted fun m5S3OwnedDetectCleanup(r: NativeBuffer,exclusive: bool): int {
+    if (!m5S3OwnedDetectValid(r) || !exclusive) return 0
+    if (r.loadU32(4) == 2 || r.loadU32(4) == 4) return r.loadU32(4)
+    if (r.loadU32(4) != 3) return 0
+    var index=r.loadU32(12)-1
+    var okay=true
+    while (index >= 0) {
+        val saved=S3GpioSnapshot(r.loadU32(32+index*4))
+        if (saved != S3GpioSnapshot(0)) {
+            if (saved.restoreOwned(true) == 1) r.storeU32(32+index*4,0)
+            else okay=false
+        }
+        index=index-1
+    }
+    if (!okay) return 3
+    val status=if (r.loadU32(24) == 1 && r.loadU32(16) == 0) 2 else 4
+    r.storeU32(8,if (status == 2) r.loadU32(20) else 0)
+    r.storeU32(4,status)
+    return status
+}
+
+trusted fun m5S3OwnedDetectResult(r: NativeBuffer): M5BoardId =
+    if (m5S3OwnedDetectValid(r) && r.loadU32(4) == 2) M5BoardId(r.loadU32(8)) else m5BoardUnknown

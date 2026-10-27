@@ -1,0 +1,78 @@
+import "./fat_lookup.ab"
+import "./fat_short_name.ab"
+import "./fat_file_overwrite_checked.ab"
+// Create an empty ASCII8.3 file in existing directory capacity. No aliases
+// generated, LFN creation, directory extension, or overwrite of existingfiles.
+// Caller owns whole volume transaction. Two bounded passes: case-insensitive
+// LFN+short-alias collision lookup, then free-slot search. Each phase <=budget
+// reads, plus one successor seek bounded bybudget and final sector writes.
+// Preserve following end marker BEFORE replacing an end slot at sectoredge.
+// Never attach an orphan live LFN to the newly inserted short entry.
+type FatFileCreate=int
+//1created2input3exists4readIO5corrupt6budget7directoryfull8write-uncertain.
+// Entry index4@8,directory ordinal32@12 (valid only on success).
+fun FatFileCreate.status(): int = this&255
+fun FatFileCreate.entryIndex(): int = (this>>8)&15
+fun FatFileCreate.ordinal(): int = (this>>12)&0xffffffff
+trusted fun fatFileCreateShortOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    parent: int,name: NativeBuffer,length: int,budget: int,modified: RtcDateTime,workspace: NativeBuffer): FatFileCreate {
+    val geometry=fatBootValidate(boot,first,sectors);val timestamp=fatModifiedTimestamp(modified)
+    if (!geometry.valid() || timestamp < 0 || length < 1 || length > 12 || budget < 1 || budget > 1000000 ||
+        !name.hasAddressRange(0,length) || !workspace.hasAddressRange(0,2624) ||
+        fatBuffersOverlap(workspace,2624,name,length) || fatBuffersOverlap(workspace,2624,reader,28) ||
+        fatBuffersOverlap(workspace,2624,boot,512)) return FatFileCreate(2)
+    val sector=nativeBufferAt(workspace.addressValue(),512)
+    val scratch=nativeBufferAt(workspace.addressValue()+512,1024)
+    val assembly=nativeBufferAt(workspace.addressValue()+1536,520)
+    val alias=nativeBufferAt(workspace.addressValue()+2056,11)
+    val wide=nativeBufferAt(workspace.addressValue()+2068,24)
+    val next=nativeBufferAt(workspace.addressValue()+2112,512)
+    if (!fatShortNameEncode(name,length,alias) || alias.load(0) == 46) return FatFileCreate(2)
+    var i=0
+    while (i < length) { wide.storeU16(i*2,name.load(i));i=i+1 }
+    val duplicate=fatLookupNameOwned(reader,boot,first,sectors,parent,wide,length,true,assembly,budget,sector,scratch,alias,true)
+    if (duplicate.isFile() || duplicate.isDirectory()) return FatFileCreate(3)
+    if (duplicate.status() != 9) return FatFileCreate(if (duplicate.status() == 11) 4 else if (duplicate.status() == 14) 6 else 5)
+    var ordinal=0;var remaining=budget;var previousLong=false
+    val fixed=parent == 0 && geometry.fatBits() != 32
+    while (remaining > 0) {
+        var steps=ordinal;var divisor=geometry.sectorsPerCluster()
+        while (divisor > 1) { steps=steps>>1;divisor=divisor>>1 }
+        // Conservative bound includes possible FAT12 straddles while seeking.
+        val cost=if (fixed) 1 else 1+steps*2
+        if (remaining < cost) return FatFileCreate(6)
+        remaining=remaining-cost
+        val read=fatDirectoryReadOwned(reader,boot,first,sectors,parent,ordinal,cost,sector,scratch)
+        if (read.status() == 2) return FatFileCreate(7)
+        if (read.status() != 1) return FatFileCreate(if (read.status() == 4) 4 else 5)
+        i=0
+        while (i < 16) {
+            val entry=fatDirectoryDecode(sector,i,geometry.fatBits(),geometry.clusters())
+            if (entry.status() == 7) return FatFileCreate(5)
+            val end=entry.status() == 3
+            if (end && previousLong) return FatFileCreate(5)
+            if ((entry.status() == 4 || end) && !previousLong) {
+                if (end && i == 15) {
+                    val following=fatDirectoryReadOwned(reader,boot,first,sectors,parent,ordinal+1,budget,next,scratch)
+                    if (following.status() != 1 && following.status() != 2) return FatFileCreate(if (following.status() == 4) 4 else if (following.status() == 7) 6 else 5)
+                    if (following.status() == 1) {
+                        next.store(0,0)
+                        if (!fatStorageWriteOwned(reader,following.sector(),next)) return FatFileCreate(8)
+                    }
+                } else if (end) sector.store((i+1)*32,0)
+                var byte=0
+                while (byte < 32) { sector.store(i*32+byte,0);byte=byte+1 }
+                byte=0
+                while (byte < 11) { sector.store(i*32+byte,alias.load(byte));byte=byte+1 }
+                sector.store(i*32+11,32)
+                sector.storeU32(i*32+14,timestamp);sector.storeU32(i*32+22,timestamp)
+                if (!fatStorageWriteOwned(reader,read.sector(),sector)) return FatFileCreate(8)
+                return FatFileCreate(1|(i<<8)|(ordinal<<12))
+            }
+            previousLong=entry.status() == 5
+            i=i+1
+        }
+        ordinal=ordinal+1
+    }
+    return FatFileCreate(6)
+}

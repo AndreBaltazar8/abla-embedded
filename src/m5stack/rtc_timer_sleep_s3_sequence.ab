@@ -1,0 +1,73 @@
+import "./rtc_profile.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Configuration64 bytes, LE: bias:u64@0, I/D tag plans:u64@8/16,
+// UART mask24, options28(bit0 octal flash,1 small D-cache,2 SAR monitor),
+// RAM kind32(-1/2/3), protocol36, ROM baseline40, polls44,
+// sleep flags48, calibrated slow-clock periodQ19@52, reject mask56, RTC ms60.
+// Report72 bytes: status0, last stage4, RTC begin report8..31,
+// preparation report32..47, run report48..63, failure cleanup detail64..71.
+// Return1 woke/restored,2 invalid/no mutation,3 setup failed/fully cleaned,
+// 4 sleep rejected/fully cleaned,5 cleanup incomplete (retain all ownership).
+// Stage1 initialize storage,2 retention init,3 RTC wake,4 clock/retention
+// preparation,5 entry/finish. Do not retry the cycle after5; retry the failing
+// cancellation/finish instead, using its retained records and exact report.
+// Caller has configured board supplies and RTC GPIO input sampling, reserved
+// this RTC timer, and quiesced peers/interrupts/radio/peripherals. All buffers,
+// stack and the complete execution closure must meet the retained internal
+// RAM/IRAM contract. No automatic quiescence or physical power-off implied.
+fun m5RtcSleepCycleRegion(index: int,sleep: NativeBuffer,wake: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,report: NativeBuffer): NativeBuffer =
+    if (index == 0) sleep else if (index == 1) wake else if (index == 2) cpu else if (index == 3) tags else if (index == 4) config else report
+trusted fun m5RtcSleepCycleReport(report: NativeBuffer,status: int): int { report.storeU32(0,status); status }
+@section(".iram1.abla.s3BoardRtcTimerSleep")
+@noinline
+trusted fun m5RtcTimerSleepS3Owned(board: M5BoardId,rtc: int,pmic: int,sleep: NativeBuffer,wake: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,report: NativeBuffer,quiescedExclusive: bool): int {
+    if (!quiescedExclusive || !config.hasAddressRange(0,64) || !report.hasAddressRange(0,72)) return 2
+    val tagSize=m5RtcCycleValidate(board,rtc,pmic,cpu,tags,config)
+    if (tagSize <= 0) return 2
+    // Validate every required span and pair before initializing even RAM.
+    var a=0
+    while (a < 6) {
+        val left=m5RtcSleepCycleRegion(a,sleep,wake,cpu,tags,config,report)
+        val count=if (a == 0) 128 else if (a == 1) 176 else if (a == 2) 8800 else if (a == 3) tagSize else if (a == 4) 64 else 72
+        if (!left.hasAddressRange(0,count) || (left.addressValue() & 3) != 0) return 2
+        var b=a+1
+        while (b < 6) {
+            val right=m5RtcSleepCycleRegion(b,sleep,wake,cpu,tags,config,report)
+            val other=if (b == 1) 176 else if (b == 2) 8800 else if (b == 3) tagSize else if (b == 4) 64 else 72
+            if (left.addressValue() < right.addressValue()+other && right.addressValue() < left.addressValue()+count) return 2
+            b=b+1
+        }
+        a=a+1
+    }
+    if (sleep.loadU32(0) != 0 || wake.loadU32(0) != 0) return 2
+    var offset=0
+    while (offset < 72) { report.storeU32(offset,0); offset=offset+4 }
+    report.storeU32(4,1)
+    if (!m5RtcCycleWakeInit(wake)) return m5RtcSleepCycleReport(report,3)
+    report.storeU32(4,2)
+    if (!m5RtcCycleRetentionInit(cpu,tags,config)) return m5RtcSleepCycleReport(report,3)
+    report.storeU32(4,3)
+    val begin=m5RtcCycleBegin(board,rtc,pmic,wake,nativeBufferAt(report.addressValue()+8,24),config)
+    if (begin != 1) return m5RtcSleepCycleReport(report,if (begin == 4) 5 else 3)
+    report.storeU32(4,4)
+    val preparation=nativeBufferAt(report.addressValue()+32,16)
+    val prepared=m5RtcCyclePrepare(sleep,cpu,tags,config,preparation)
+    if (prepared != 1) {
+        // Invalid/UART admission did not acquire clock snapshots. All later
+        // stages use the checked board finish, including manual recovery.
+        val raw=preparation.loadU32(0)
+        val cleanup=if (prepared == 2 || raw == 0 || raw == 2)
+            m5RtcCycleCancel(board,rtc,pmic,wake) else m5RtcCycleFinish(board,rtc,pmic,sleep,wake,config)
+        report.storeU32(64,cleanup); report.storeU32(68,cleanup>>>32)
+        return m5RtcSleepCycleReport(report,if (cleanup == 1) 3 else 5)
+    }
+    report.storeU32(4,5)
+    val run=m5RtcCycleRun(board,rtc,pmic,sleep,wake,nativeBufferAt(report.addressValue()+48,16),config)
+    if (run == 1) return m5RtcSleepCycleReport(report,1)
+    if (run == 3) return m5RtcSleepCycleReport(report,4)
+    if (run == 4) return m5RtcSleepCycleReport(report,5)
+    // Run admission refused an already prepared cycle: still own snapshots.
+    val cleanup=m5RtcCycleFinish(board,rtc,pmic,sleep,wake,config)
+    report.storeU32(64,cleanup); report.storeU32(68,cleanup>>>32)
+    m5RtcSleepCycleReport(report,if (cleanup == 1) 3 else 5)
+}

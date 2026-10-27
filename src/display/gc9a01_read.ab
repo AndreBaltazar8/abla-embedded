@@ -1,0 +1,76 @@
+import "./software_rgb565_checked.ab"
+// GC9A01 RAMRD: RGB888 wire pixels after16 dummy bits (M5GFX Panel_LCD /
+// Panel_GC9A01). Default path requires separately wired readable MISO/SDO.
+// sharedDataLine explicitly uses MOSI for input, with checked direction and
+// CS release before restoring GPIO output-low. Caller owns
+// configured pins, powered/initialized panel and matching hardware rotation.
+// RGB888 bytes are returned in controller wire channel order; RGB565 mode
+// packs the same channels, big-endian. No synthetic zero data for unreadable
+// panels and no claim that completion acknowledges a physically present LCD.
+// Nonempty preclipped rectangle, explicit destination stride, no heap/NOP.
+trusted fun gc9a01ReadRectChecked(gate: PeripheralGate,owner: u32,clock: Pin,mosi: Pin,miso: Pin,cs: Pin,dc: Pin,
+    rotation: int,x: int,y: int,width: int,height: int,destination: NativeBuffer,stride: int,
+    rgb565Output: bool = false,halfPeriod: int = 1,sharedDataLine: bool = false): SpiTransactionResult {
+    val pixelBytes=if (rgb565Output) 2 else 3
+    if (rotation < 0 || rotation > 7 || x < 0 || y < 0 || width < 1 || height < 1 ||
+        width > 240 || height > 240 || x > 240-width || y > 240-height ||
+        stride < width*pixelBytes || stride > 2147483647 ||
+        !softwareSpiCommandPinsValid(clock,mosi,cs,dc,0,halfPeriod) || !miso.valid() ||
+        miso == clock || (if (sharedDataLine) miso != mosi else miso == mosi) || miso == cs || miso == dc) return SpiTransactionResult(3<<32)
+    val span=(height-1)*stride+width*pixelBytes
+    if (!gate.bufferDisjoint(destination,span)) return SpiTransactionResult(3<<32)
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return SpiTransactionResult((if (admitted == 1) 2 else if (admitted == 2) 4 else 3)<<32)
+    var result=softwareLcdWindowCheckedOwned(clock,mosi,cs,dc,x,y,width,height,halfPeriod,false,(rotation&1) != 0)
+    if (result.valid()) {
+        // Match upstream setWindow's RAMWR, followed by RAMRD under one CS.
+        clock.write(false);dc.write(false);cs.write(false)
+        val writeCommand=softwareSpiExchangeWordOwned(clock,mosi,Pin(-1),u32(44),8,0,halfPeriod)
+        val readCommand=softwareSpiExchangeWordOwned(clock,mosi,Pin(-1),u32(46),8,0,halfPeriod)
+        dc.write(true)
+        val inputReady=if (sharedDataLine) mosi.inputOwned() else true
+        if (inputReady) {
+        val dummy=softwareSpiExchangeWordOwned(clock,Pin(-1),miso,u32(0),16,0,halfPeriod)
+        var row=0
+        while (row < height) {
+            var column=0
+            while (column < width) {
+                val red=int(softwareSpiExchangeWordOwned(clock,Pin(-1),miso,u32(0),8,0,halfPeriod))
+                val green=int(softwareSpiExchangeWordOwned(clock,Pin(-1),miso,u32(0),8,0,halfPeriod))
+                val blue=int(softwareSpiExchangeWordOwned(clock,Pin(-1),miso,u32(0),8,0,halfPeriod))
+                val offset=row*stride+column*pixelBytes
+                if (rgb565Output) {
+                    val packed=rgb565(red,green,blue).value()
+                    destination.store(offset,packed>>>8);destination.store(offset+1,packed&255)
+                } else {
+                    destination.store(offset,red);destination.store(offset+1,green);destination.store(offset+2,blue)
+                }
+                column=column+1
+            }
+            row=row+1
+        }
+        }
+        if (sharedDataLine) {
+            // Setup failure may partially change the pad. Always attempt CS
+            // release, but NEVER drive shared data unless release is confirmed.
+            val released=cs.writeLevelOwned(true)
+            val restored=if (released) mosi.outputLevelOwned(false) else false
+            val detail=(if (inputReady) 0 else 1)|(if (released) 0 else 2)|(if (restored) 0 else 4)
+            result=SpiTransactionResult(((if (detail == 0) 1 else 6)<<32)|detail)
+        } else cs.write(true)
+    }
+    if (!gate.finish(owner,result.valid())) return SpiTransactionResult((5<<32)|(result&0xffffffff))
+    return result
+}
+// Explicit recovery ONLY for this failed shared-data transaction. Caller
+// quiesces every bus user and rules out unrelated faults; no command replay.
+// Destination may already contain a full read when cleanup fails.
+trusted fun gc9a01SharedReadRecover(gate: PeripheralGate,owner: u32,cs: Pin,data: Pin,exclusiveUsersQuiesced: bool): bool {
+    if (!exclusiveUsersQuiesced || !cs.outputCapable() || !data.outputCapable() || cs == data ||
+        !gate.tryBeginRecovery(owner)) return false
+    val released=cs.writeLevelOwned(true)
+    val restored=if (released) data.outputLevelOwned(false) else false
+    val healthy=released && restored
+    val finished=gate.finishRecovery(owner,healthy)
+    return healthy && finished
+}

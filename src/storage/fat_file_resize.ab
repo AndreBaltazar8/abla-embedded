@@ -1,0 +1,47 @@
+import "./fat_file_handle.ab"
+import "./fat_file_grow.ab"
+import "./fat_file_shrink.ab"
+// Status mirrors selected grow/shrink operation (1success,2input,3snapshot
+// stale,4..10operation failure,11readonly), plus12busy13handle-stale14fault.
+// Bit60 identifies growth, with underlying candidate/detail or freed count
+// preserved below it. Equal-size calls use shrink's validated no-op path.
+type FatFileResize=int
+fun FatFileResize.status(): int = this&255
+fun FatFileResize.isGrowth(): bool = (this&(1<<60)) != 0
+fun FatFileResize.freedClusters(): int = if (this.isGrowth()) 0 else (this>>8)&0xfffff
+fun FatFileResize.candidateCluster(): int = if (this.isGrowth()) (this>>8)&0xfffffff else 0
+//2560B workspace; shrink requires separate8B/currentcluster plan. Growth
+// accepts null plan, zero-fills and is bounded to65536bytes per call.
+// No implicit retries. Snapshot refresh only after complete success; partial
+// shrink may already publish smaller metadata but faults the mount instead.
+trusted fun FatFile.resize(owner: u32,newSize: int,budget: int,modified: RtcDateTime,
+    plan: NativeBuffer,work: NativeBuffer): FatFileResize {
+    val s=this.storage()
+    if (this.status() != 1 || !s.hasAddressRange(0,80) || s.loadU32(0) != 0x46464831 ||
+        newSize < 0 || newSize > 4294967295 || !work.hasAddressRange(0,2560) ||
+        fatBuffersOverlap(s,80,work,2560) || fatBuffersOverlap(s,80,plan,plan.capacity())) return FatFileResize(2)
+    val volume=FatVolume(s.loadU32(16)|(s.loadU32(20)<<32));val v=volume.storage()
+    if (fatBuffersOverlap(v,32,work,2560) || fatBuffersOverlap(v,32,plan,plan.capacity())) return FatFileResize(2)
+    val admitted=volume.begin(owner)
+    if (admitted != 0) return FatFileResize(admitted)
+    var result=FatFileResize(13)
+    if (this.currentLocked()) {
+        val reader=nativeBufferAt(v.loadU32(16),28);val boot=nativeBufferAt(v.loadU32(20),512)
+        val expected=nativeBufferAt(s.addressValue()+40,32)
+        if (newSize > expected.loadU32(28)) {
+            val grown=fatFileGrowOwned(reader,boot,v.loadU32(24),v.loadU32(28),s.loadU32(24),s.loadU32(28),
+                s.loadU32(32),expected,newSize,budget,modified,work)
+            result=FatFileResize((grown|0)|(1<<60))
+        } else {
+            val shrunk=fatFileShrinkOwned(reader,boot,v.loadU32(24),v.loadU32(28),s.loadU32(24),s.loadU32(28),
+                s.loadU32(32),expected,newSize,budget,modified,plan,work)
+            result=FatFileResize(shrunk|0)
+        }
+        if (result.status() == 1) {
+            var i=0;while (i < 32) { s.store(40+i,work.load(s.loadU32(32)*32+i));i=i+1 }
+        }
+    }
+    if (result.status() >= 4 && result.status() <= 10) v.storeU32(12,3)
+    if (!peripheralGateAt(v.addressValue()).finish(owner,true)) return FatFileResize((result&~255)|14)
+    return result
+}

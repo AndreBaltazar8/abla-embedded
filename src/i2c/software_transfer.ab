@@ -1,0 +1,77 @@
+import "./software_lines.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Return1 ACK,5 NACK,otherwise line error. MSB first, exactly nine clocks.
+trusted fun SoftwareI2cLines.writeByte(value: int): int {
+    if (!this.valid() || value < 0 || value > 255) return 2
+    var bit=u32(128)
+    while (bit != u32(0)) {
+        val result=this.writeBit((u32(value)&bit) != u32(0))
+        if (result != 1) return result
+        bit=bit>>u32(1)
+    }
+    val ack=this.readBit()
+    if ((ack&255) != 1) return ack&255
+    return if ((ack&256) == 0) 1 else 5
+}
+// Low8status,high8received byte. ACK all but final byte; final byte sends NACK.
+trusted fun SoftwareI2cLines.readByte(acknowledge: bool): int {
+    if (!this.valid()) return 2
+    var value=u32(0)
+    var count=0
+    while (count < 8) {
+        val result=this.readBit()
+        if ((result&255) != 1) return result&255
+        value=(value<<u32(1))|u32((result>>>8)&1)
+        count=count+1
+    }
+    val sent=this.writeBit(!acknowledge)
+    if (sent != 1) return sent
+    return 1|(int(value)<<8)
+}
+// Data status low8; STOP status bits8..15 (0 means no STOP attempted), number
+// of acknowledged TX bytes16..31, completed RX bytes32..47. Address/prefix bytes are
+// not included. A partial RX prefix exists on failure, not a complete result.
+type SoftwareI2cTransfer = int
+fun SoftwareI2cTransfer.status(): int = this&255
+fun SoftwareI2cTransfer.stopStatus(): int = (this>>>8)&255
+fun SoftwareI2cTransfer.written(): int = (this>>>16)&65535
+fun SoftwareI2cTransfer.received(): int = (this>>>32)&65535
+fun SoftwareI2cTransfer.complete(): bool = this.status() == 1 && this.stopStatus() == 1
+trusted fun SoftwareI2cLines.finishTransfer(status: int,written: int,received: int): SoftwareI2cTransfer {
+    // ACK/NACK leaves SCL low and us owning the bus. Arbitration/timeout has
+    // already released both lines: do not generate a STOP on somebody's bus.
+    val stopped=if (status == 1 || status == 5) this.stop() else 0
+    return SoftwareI2cTransfer(status|(stopped<<8)|(written<<16)|(received<<32))
+}
+// Synchronous7bit transfer. tx=0/rx=0 probes the write address. Pure reads send
+// only the read address; combined operations use repeated START, never STOP
+// between register selection and response. No hidden retry or bus-clear pulses.
+// Full spans are validated before any edges. TX/RX may overlap since all TX is
+// consumed before any RX store. Caller owns buffers and serializes the bus.
+// Optional registerPrefix is sent before TX without a temporary payload copy.
+trusted fun SoftwareI2cLines.transfer(address: int,tx: NativeBuffer,txLength: int,rx: NativeBuffer,rxLength: int,registerPrefix: int = -1): SoftwareI2cTransfer {
+    if (!this.valid() || address < 1 || address > 127 || txLength < 0 || txLength > 65535 ||
+        rxLength < 0 || rxLength > 65535 || registerPrefix < -1 || registerPrefix > 255 ||
+        !tx.hasAddressRange(0,txLength) || !rx.hasAddressRange(0,rxLength)) return SoftwareI2cTransfer(2)
+    val started=this.start()
+    if (started != 1) return SoftwareI2cTransfer(started)
+    val pureRead=txLength == 0 && rxLength > 0 && registerPrefix < 0
+    var status=this.writeByte((address<<1)|(if (pureRead) 1 else 0))
+    if (status == 1 && registerPrefix >= 0) status=this.writeByte(registerPrefix)
+    var written=0
+    var received=0
+    while (status == 1 && written < txLength) {
+        status=this.writeByte(tx.load(written))
+        if (status == 1) written=written+1
+    }
+    if (status == 1 && rxLength > 0 && !pureRead) {
+        status=this.start()
+        if (status == 1) status=this.writeByte((address<<1)|1)
+    }
+    while (status == 1 && received < rxLength) {
+        val value=this.readByte(received+1 < rxLength)
+        status=value&255
+        if (status == 1) { rx.store(received,(value>>>8)&255); received=received+1 }
+    }
+    return this.finishTransfer(status,written,received)
+}

@@ -1,0 +1,67 @@
+import "../audio/pcm_channels_tone.ab"
+import "../audio/pcm_source_queues.ab"
+import "./corep4x_audio_storage.ab"
+// Retain scalar with the same running192B speaker session, bank and staging.
+// Pending staging is immutable; retry cannot render/advance channel cursors.
+// No other pump may use the session. Low8:0initial1queued2invalid3busy4DMA9render;
+// bit8pending; bits9..20 expected descriptor cursor. Failures remain sticky.
+type M5P4ChannelsPump=int
+fun M5P4ChannelsPump.status(): int = this&255
+fun M5P4ChannelsPump.pending(): bool = (this&256) != 0
+fun M5P4ChannelsPump.index(): int = (this >>> 9)&4095
+trusted fun m5P4PumpChannelsOwned(state: M5P4ChannelsPump,r: NativeBuffer,bank: PcmChannels,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,gain: int,exclusive: bool,tab5: bool,tone: PcmTone=PcmTone(0),
+    queues: PcmSourceQueues=PcmSourceQueues(0)): M5P4ChannelsPump {
+    val status=state.status()
+    if (status != 0 && status != 1 && status != 3) return state
+    val invalid=M5P4ChannelsPump((state&~255)|2)
+    if (!exclusive || !m5P4SpeakerSessionValid(r,tab5) || r.loadU32(68) != 2 || r.loadU32(12) != 1 ||
+        (if (queues == 0) !bank.valid() else bank != 0 || tone != 0 || !queues.valid()) ||
+        gain < 0 || gain > 32768 || (state&~2097151) != 0 ||
+        (status == 0 && state != M5P4ChannelsPump(0)) || (status == 3 && !state.pending()) ||
+        (status == 1 && state.pending())) return invalid
+    val count=r.loadU32(24);val bytes=r.loadU32(36);val cursor=r.loadU32(40)
+    val desc=r.loadU32(20);val payload=r.loadU32(28);val stride=r.loadU32(32)
+    if (count < 2 || cursor >= count || bytes < 4 || (bytes&3) != 0 ||
+        !esp32p4AhbGdmaRingLayoutValid(desc,count,payload,stride,bytes) ||
+        (status != 0 && state.index() != cursor) ||
+        (if (queues == 0) bank.channel(0).storage().loadU32(0) else queues.queue(0).storage().loadU32(4)) != 24000) return invalid
+    // TX mono hardware duplicates each16-bit sample into both I2S slots.
+    // Each DMA word therefore contains TWO successive mono frames.
+    val frames=bytes/2
+    if (!coreP4xMicrophoneStorageDisjoint(r,accumulator,frames*8) ||
+        !coreP4xMicrophoneStorageDisjoint(r,scratch,frames*4) || !coreP4xMicrophoneStorageDisjoint(r,staging,bytes) ||
+        pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,staging,bytes) || pcmMixSpansOverlap(scratch,frames*4,staging,bytes)) return invalid
+    var index=0
+    if (tone != 0 && (!tone.valid() || tone.storage().loadU32(4) != 24000 ||
+        !coreP4xMicrophoneStorageDisjoint(r,tone.storage(),tone.stateBytes()) ||
+        !coreP4xMicrophoneStorageDisjoint(r,tone.waveform(),tone.waveform().capacity()) ||
+        !tone.disjointFrom(accumulator,frames*8) ||
+        !tone.disjointFrom(scratch,frames*4) ||
+        !tone.disjointFrom(staging,bytes))) return invalid
+    while (queues == 0 && index < bank.count()) {
+        val voice=bank.channel(index)
+        if (tone != 0 && !voice.disjointFrom(tone.storage(),tone.stateBytes())) return invalid
+        if (!voice.disjointFrom(r,192) || !voice.disjointFrom(nativeBufferAt(desc,count*64),count*64) ||
+            !voice.disjointFrom(nativeBufferAt(payload,count*stride),count*stride) ||
+            !voice.disjointFrom(accumulator,frames*8) || !voice.disjointFrom(scratch,frames*4) ||
+            !voice.disjointFrom(staging,bytes)) return invalid
+        index=index+1
+    }
+    if (queues != 0 && (!queues.disjointFrom(r,192) ||
+        !queues.disjointFrom(nativeBufferAt(desc,count*64),count*64) ||
+        !queues.disjointFrom(nativeBufferAt(payload,count*stride),count*stride) ||
+        !queues.disjointFrom(accumulator,frames*8) || !queues.disjointFrom(scratch,frames*4) ||
+        !queues.disjointFrom(staging,bytes))) return invalid
+    if (!state.pending()) {
+        val rendered=if (queues != 0) queues.renderOutput(frames,accumulator,scratch,staging,false,gain)
+            else if (tone == 0) bank.renderOutput(frames,accumulator,scratch,staging,false,gain)
+            else bank.renderWithTone(tone,frames,accumulator,scratch,staging,false,gain)
+        if (!rendered) return M5P4ChannelsPump(9|(cursor << 9))
+    }
+    val pumped=m5P4SpeakerPumpOwned(r,nativeBufferAt(staging.addressValue(),bytes),tab5)
+    val result=r.loadU32(48)&255
+    if (pumped == 2 && result == 1) return M5P4ChannelsPump(1|(r.loadU32(40) << 9))
+    return M5P4ChannelsPump((if (pumped == 2 && result == 3) 3 else 4)|256|(cursor << 9))
+}

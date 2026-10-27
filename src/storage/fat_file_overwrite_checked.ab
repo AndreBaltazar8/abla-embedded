@@ -1,0 +1,51 @@
+import "./fat_file_overwrite.ab"
+import "./fat_directory_read.ab"
+import "../rtc/calendar.ab"
+// FAT stores local civil time with2-second resolution,1980..2107. Caller
+// chooses timezone before this boundary; no timezone conversion or libc.
+fun fatModifiedTimestamp(value: RtcDateTime): int =
+    if (!value.calendarValid() || value.year() < 1980 || value.year() > 2107) -1
+    else ((value.year()-1980)<<25)|(value.month()<<21)|(value.day()<<16)|
+        (value.hour()<<11)|(value.minute()<<5)|(value.second()>>1)
+// One existing-file overwrite plus archive/modified-time update. Exclusive
+// filesystem ownership is required across this ENTIRE call; SPI locks alone
+// cannot provide it. No allocation/resize, journal, or power-loss atomicity.
+// expectedEntry is the exact32B short-entry snapshot from an owned lookup.
+// Re-read via parent directory chain, compare before any data write, retain
+// current sector to preserve all neighboring entries. Caller refreshes its
+// snapshot after success. workspace2048=directory512+overwrite1536.
+type FatFileOverwriteChecked=int
+// Underlying overwrite statuses1..9;10stale,11metadata-write-uncertain.
+// Confirmed data bytes are retained on11; zero on uncertain data write8.
+fun FatFileOverwriteChecked.status(): int = this&255
+fun FatFileOverwriteChecked.dataBytesWritten(): int = (this>>8)&1023
+trusted fun fatFileOverwriteCheckedOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    parentCluster: int,directoryOrdinal: int,entryIndex: int,expectedEntry: NativeBuffer,
+    offset: int,length: int,budget: int,source: NativeBuffer,modified: RtcDateTime,
+    workspace: NativeBuffer): FatFileOverwriteChecked {
+    val timestamp=fatModifiedTimestamp(modified)
+    if (timestamp < 0 || entryIndex < 0 || entryIndex > 15 || length < 1 || length > 512 ||
+        !source.hasAddressRange(0,length) || !expectedEntry.hasAddressRange(0,32) ||
+        !workspace.hasAddressRange(0,2048) || fatBuffersOverlap(workspace,2048,source,length) ||
+        fatBuffersOverlap(workspace,2048,expectedEntry,32) || fatBuffersOverlap(workspace,2048,boot,512) ||
+        fatBuffersOverlap(workspace,2048,reader,28)) return FatFileOverwriteChecked(3)
+    val directory=nativeBufferAt(workspace.addressValue(),512)
+    val work=nativeBufferAt(workspace.addressValue()+512,1536)
+    val located=fatDirectoryReadOwned(reader,boot,first,sectors,parentCluster,directoryOrdinal,budget,
+        directory,nativeBufferAt(work.addressValue(),1024))
+    if (located.status() != 1) return FatFileOverwriteChecked(if (located.status() == 2) 10 else located.status())
+    var index=0
+    while (index < 32) {
+        if (directory.load(entryIndex*32+index) != expectedEntry.load(index)) return FatFileOverwriteChecked(10)
+        index=index+1
+    }
+    val data=fatFileOverwriteAtOwned(reader,boot,first,sectors,directory,entryIndex,offset,length,budget,source,work)
+    if (data.status() != 1) return FatFileOverwriteChecked(data.status())
+    val entry=entryIndex*32
+    directory.store(entry+11,directory.load(entry+11)|32)
+    // Match FatFs sync behavior, preserving size/cluster/name/creation fields.
+    directory.storeU16(entry+18,0)
+    directory.storeU32(entry+22,timestamp)
+    if (!fatStorageWriteOwned(reader,located.sector(),directory)) return FatFileOverwriteChecked(11|(data.bytesWritten()<<8))
+    return FatFileOverwriteChecked(1|(data.bytesWritten()<<8))
+}

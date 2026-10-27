@@ -1,0 +1,53 @@
+import "./fat_chain_ownership.ab"
+// Read-only range audit after a complete, successful directory-tree walk.
+// Caller holds the SAME immutable volume lifetime and ownership bitmap.
+// Range success is NOT whole-volume certification: every data cluster must
+// be covered and tree traversal must already have succeeded. Bad clusters
+// may be unclaimed; reserved/out-of-range FAT values are corruption.
+type FatAllocationAudit=int
+//1range consistent2input3IO4invalid FAT value5previous duplicate6budget
+//7orphan allocation8claimed free/bad cluster. Detail=count for1,cluster for4/7/8;
+// Original FatLink status at36..43 on failure; physical reads36..55 on
+// success. No repairs, frees or ownership mutation.
+fun FatAllocationAudit.status(): int = this&255
+fun FatAllocationAudit.detail(): int = (this>>>8)&0xfffffff
+fun FatAllocationAudit.linkStatus(): int = if (this.status() == 1) 0 else (this>>>36)&255
+fun FatAllocationAudit.reads(): int = if (this.status() == 1) (this>>>36)&0xfffff else 0
+trusted fun fatAuditAllocationRangeOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,start: int,count: int,budget: int,scratch: NativeBuffer,ownership: FatClusterOwnership): FatAllocationAudit {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || !ownership.valid() || ownership.storage().loadU32(4) != geometry.usableClusters() ||
+        start < 2 || count < 1 || count > geometry.usableClusters() || start-2 > geometry.usableClusters()-count ||
+        budget < 1 || budget > 1000000 || !reader.hasAddressRange(0,28) || !scratch.hasAddressRange(0,1024)) return FatAllocationAudit(2)
+    val map=ownership.storage();val bytes=fatClusterOwnershipBytes(geometry.usableClusters())
+    if (fatBuffersOverlap(map,bytes,reader,28) || fatBuffersOverlap(map,bytes,boot,512) || fatBuffersOverlap(map,bytes,scratch,1024) ||
+        fatBuffersOverlap(scratch,1024,reader,28) || fatBuffersOverlap(scratch,1024,boot,512)) return FatAllocationAudit(2)
+    if (map.loadU32(12) != 0) return FatAllocationAudit(5|(map.loadU32(12)<<8))
+    val a=nativeBufferAt(scratch.addressValue(),512);val b=nativeBufferAt(scratch.addressValue()+512,512)
+    var cached=-1;var second=-1;var remaining=budget;var cluster=start
+    while (cluster < start+count) {
+        val location=fatLinkLocate(boot,first,sectors,cluster)
+        if (!location.valid()) return FatAllocationAudit(2)
+        if (cached != location.sector()) {
+            if (remaining == 0) return FatAllocationAudit(6)
+            remaining=remaining-1
+            if (!fatStorageReadOwned(reader,location.sector(),a)) return FatAllocationAudit(3)
+            cached=location.sector()
+        }
+        if (location.needsSecondSector() && second != location.sector()+1) {
+            if (remaining == 0) return FatAllocationAudit(6)
+            remaining=remaining-1
+            if (!fatStorageReadOwned(reader,location.sector()+1,b)) return FatAllocationAudit(3)
+            second=location.sector()+1
+        }
+        val link=fatLinkDecode(location,geometry.usableClusters(),a,b)
+        val evidence=(cluster<<8)|(link.status()<<36)
+        if (link.status() != 1 && link.status() != 2 && link.status() != 3 && link.status() != 4) return FatAllocationAudit(evidence|4)
+        val claimed=ownership.lookup(cluster)
+        if (claimed == 2) return FatAllocationAudit(2)
+        if (link.status() == 1 || link.status() == 2) {
+            if (claimed == 0) return FatAllocationAudit(evidence|7)
+        } else if (claimed == 1) return FatAllocationAudit(evidence|8)
+        cluster=cluster+1
+    }
+    return FatAllocationAudit(1|(count<<8)|((budget-remaining)<<36))
+}

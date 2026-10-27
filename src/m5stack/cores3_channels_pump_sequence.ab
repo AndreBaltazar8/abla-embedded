@@ -1,0 +1,84 @@
+import "../audio/pcm_channels_tone.ab"
+import "../audio/pcm_source_queues.ab"
+
+// Nonblocking pump for an already-started6x960-byte CoreS3 speaker ring.
+// Caller owns hardware and all memory; stop/park/amp cleanup remain caller's
+// responsibility. Start at state0 only after ring preparation. Return state
+// must be retained. Busy staging remains immutable; no rerender on retries.
+// Status0 initial,1 queued,2 invalid,3 busy,4..7 DMA failure,8 short transfer.
+// Failures are sticky: do not reset state until hardware has been stopped.
+type CoreS3ChannelsPump = int
+fun CoreS3ChannelsPump.status(): int = this & 255
+fun CoreS3ChannelsPump.index(): int = (this >>> 8) & 7
+fun CoreS3ChannelsPump.pending(): bool = (this & 2048) != 0
+trusted fun cores3PumpChannels(state: CoreS3ChannelsPump,bank: PcmChannels,
+    channel: int,descriptors: int,buffers: int,accumulator: NativeBuffer,
+    scratch: NativeBuffer,staging: NativeBuffer,masterGainQ15: int=32768,tone: PcmTone=PcmTone(0),
+    queues: PcmSourceQueues=PcmSourceQueues(0)): CoreS3ChannelsPump {
+    val status=state.status()
+    if (status != 0 && status != 1 && status != 3) return state
+    if ((state & ~4095) != 0 || state.index() >= 6 ||
+        (status == 0 && state != CoreS3ChannelsPump(0)) ||
+        (status == 3 && !state.pending()) || (status == 1 && state.pending()) ||
+        channel < 0 || channel > 4 ||
+        (if (queues == 0) !bank.valid() else bank != 0 || tone != 0 || !queues.valid()) ||
+        masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !esp32s3GdmaRingLayoutValid(descriptors,6,buffers,960,960) ||
+        !accumulator.hasAddressRange(0,1920) || !scratch.hasAddressRange(0,960) || !staging.hasAddressRange(0,960) ||
+        pcmMixSpansOverlap(accumulator,1920,scratch,960) || pcmMixSpansOverlap(accumulator,1920,staging,960) ||
+        pcmMixSpansOverlap(scratch,960,staging,960)) return CoreS3ChannelsPump((state & ~255) | 2)
+    var index=0
+    while (queues == 0 && index < bank.count()) {
+        val voice=bank.channel(index)
+        if (!voice.disjointFrom(nativeBufferAt(descriptors,72),72) ||
+            !voice.disjointFrom(nativeBufferAt(buffers,5760),5760) ||
+            !voice.disjointFrom(accumulator,1920) || !voice.disjointFrom(scratch,960) ||
+            !voice.disjointFrom(staging,960)) return CoreS3ChannelsPump((state & ~255) | 2)
+        index=index+1
+    }
+    if (queues != 0 && (!queues.disjointFrom(nativeBufferAt(descriptors,72),72) ||
+        !queues.disjointFrom(nativeBufferAt(buffers,5760),5760) ||
+        !queues.disjointFrom(accumulator,1920) || !queues.disjointFrom(scratch,960) ||
+        !queues.disjointFrom(staging,960))) return CoreS3ChannelsPump((state & ~255) | 2)
+    var work=0
+    while (work < 3) {
+        val span=if (work == 0) accumulator else if (work == 1) scratch else staging
+        val bytes=if (work == 0) 1920 else 960
+        if (pcmMixSpansOverlap(span,bytes,nativeBufferAt(descriptors,72),72) ||
+            pcmMixSpansOverlap(span,bytes,nativeBufferAt(buffers,5760),5760)) return CoreS3ChannelsPump((state & ~255) | 2)
+        work=work+1
+    }
+    if (tone != 0) {
+        if (!tone.valid() || tone.storage().loadU32(4) != bank.channel(0).storage().loadU32(0) ||
+            !tone.disjointFrom(nativeBufferAt(descriptors,72),72) ||
+            !tone.disjointFrom(nativeBufferAt(buffers,5760),5760) ||
+            !tone.disjointFrom(accumulator,1920) ||
+            !tone.disjointFrom(scratch,960) ||
+            !tone.disjointFrom(staging,960))
+            return CoreS3ChannelsPump((state & ~255) | 2)
+        index=0
+        while (index < bank.count()) {
+            if (!bank.channel(index).disjointFrom(tone.storage(),tone.stateBytes())) return CoreS3ChannelsPump((state & ~255) | 2)
+            index=index+1
+        }
+    }
+    // Tone and PCM advance together exactly once for a new staging block.
+    // Busy retries send those same bytes; no oscillator or clip advancement.
+    if (!state.pending()) {
+        val rendered=if (queues != 0) queues.renderOutput(240,accumulator,scratch,staging,true,masterGainQ15)
+            else if (tone == 0) bank.render(240,accumulator,scratch,staging,masterGainQ15)
+            else bank.renderWithTone(tone,240,accumulator,scratch,staging,true,masterGainQ15)
+        if (!rendered) return CoreS3ChannelsPump((state & ~255) | 2)
+    }
+    val result=esp32s3GdmaPumpBlock(channel,true,descriptors,6,state.index(),staging,960,1)
+    if (result.status() == 1 && result.transferredBytes() == 960)
+        return CoreS3ChannelsPump(1 | (result.nextIndex() << 8))
+    val failed=if (result.status() == 1) 8 else result.status()
+    CoreS3ChannelsPump(failed | (state.index() << 8) | 2048)
+}
+// Same DMA state machine, with PCM/tone transitions owned by each queue.
+trusted fun cores3PumpSourceQueues(state: CoreS3ChannelsPump,queues: PcmSourceQueues,
+    channel: int,descriptors: int,buffers: int,accumulator: NativeBuffer,
+    scratch: NativeBuffer,staging: NativeBuffer,masterGainQ15: int=32768): CoreS3ChannelsPump =
+    cores3PumpChannels(state,PcmChannels(0),channel,descriptors,buffers,accumulator,scratch,
+        staging,masterGainQ15,PcmTone(0),queues)

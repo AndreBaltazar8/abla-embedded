@@ -1,0 +1,44 @@
+// Bounded raw signed16 recording on an already running132B codec capture
+// session (ES8311 boards or PaperColor). No DSP/resampling/hidden allocation.
+// Capture complete blocks into caller storage then close RX/codec/pins. All
+// output span checks happen BEFORE consuming the first descriptor. Busy never
+// advances output; no invented samples. Keep output prefix after close failure,
+// but retain the hardware resources/session for explicit cleanup retry.
+// Resultlow8:1recorded+closed,2invalid,3timeout,4..8DMAerror,10closefailure.
+// High32 is bytes in fully successful blocks only. A DMA rearm failure may
+// have written a further uncommitted block; it is NOT included in this prefix.
+// Output layout/rate: PaperColor mono; ES8311 stereo only for AtomVoiceS3R.
+// Rate is session48. Use these when constructing pcmRaw for later playback.
+// maxIdle consecutive1ms waits/block; do not call under interrupt masks/ISR.
+type M5CodecRecordWindowResult=int
+fun M5CodecRecordWindowResult.status(): int = this&255
+fun M5CodecRecordWindowResult.bytes(): int = this>>>32
+trusted fun m5CodecRecordWindowOwned(r: NativeBuffer,output: NativeBuffer,blocks: int,
+    maxIdle: int,exclusive: bool): M5CodecRecordWindowResult {
+    if (!exclusive || !r.hasAddressRange(0,132) || blocks < 1 || blocks > 4095 || maxIdle < 1 || maxIdle > 1000)
+        return M5CodecRecordWindowResult(2)
+    val paper=paperColorCaptureValid(r)
+    if ((!paper && !m5Es8311CaptureValid(r)) || r.loadU32(4) != 2) return M5CodecRecordWindowResult(2)
+    val bytes=r.loadU32(40);val count=r.loadU32(32);val desc=r.loadU32(28);val payload=r.loadU32(36)
+    if (bytes < 4 || (bytes&3) != 0 || count < 2 || r.loadU32(44) >= count ||
+        !esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes)) return M5CodecRecordWindowResult(2)
+    val total=blocks*bytes
+    if (!output.hasAddressRange(0,total)) return M5CodecRecordWindowResult(2)
+    val address=output.addressValue()
+    if ((address < r.addressValue()+132 && r.addressValue() < address+total) ||
+        (address < desc+count*12 && desc < address+total) ||
+        (address < payload+count*bytes && payload < address+total)) return M5CodecRecordWindowResult(2)
+    var completed=0;var idle=0;var status=1
+    while (completed < blocks && status == 1) {
+        val destination=nativeBufferAt(address+completed*bytes,bytes)
+        val pumped=if (paper) paperColorCaptureReadOwned(r,destination,1,true) else m5Es8311CaptureReadOwned(r,destination,1,true)
+        if (pumped.status() == 1) { completed=completed+1;idle=0 }
+        else if (pumped.status() == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=pumped.status()
+    }
+    val closed=if (paper) paperColorCaptureCloseOwned(r,1000,true) else m5Es8311CaptureCloseOwned(r,1000,true)
+    if (status == 1 && closed != 4) status=10
+    return M5CodecRecordWindowResult(status|((completed*bytes)<<32))
+}

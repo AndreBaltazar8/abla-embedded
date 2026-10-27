@@ -1,0 +1,104 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "./speaker_profile.ab"
+// Exclusive136B record, zero-initialized. Caller owns both stopped board I2S
+// directions, parked TX GDMA, whole codec/PM1/IOE1/rail, old/new pad and input
+// consumers, stable PLL160M, configured control bus and internal DMA ring.
+// Prevent RTC/USB/holds/sleep changes. No duplex, hidden allocation or ISR.
+// Status0 refused,1 prepared,2 running,3 cleanup required,4 closed.
+// Retain ALL resources on3. Clocks remain on. Board callback determines final amplifier/rail state.
+// Sharedrail consumers must stay quiescent; control pads remain caller-owned
+// in their disabled configuration (not restored to a possibly enabled state).
+// Cardputer ADV callback does not power down codec; TXstop is still verified.
+// PCM payload MUST be initialized before begin/start, no silence is invented.
+// Header: magic0,status4,board8,codec12,io16,port20,channel24,desc28,
+// count32,payload36,bytes40,cursor44,rate48,prepare52,codecResult56,
+// start60,stop64,pump68/72,mayRun76,codecDirty80; retained pins84..131,PM1handle132.
+trusted fun m5Es8311PlaybackValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,136) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x45545031
+trusted fun m5Es8311PlaybackPins(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+84,48)
+trusted fun M5BoardId.beginEs8311PlaybackOwned(r: NativeBuffer,hz: int,channel: int,desc: int,count: int,
+    payload: int,bytes: int,owner: u32,codec: Es8311,power: M5Pm1,io: M5Ioe1,exclusive: bool): int {
+    if (!exclusive || (this != m5BoardStickS3 && this != m5BoardStopWatch && this != m5BoardChainCaptain &&
+        this != m5BoardCardputerADV && this != m5BoardAtomVoiceS3R && this != m5BoardPaperColor) ||
+        !codec.valid() || (this == m5BoardStickS3 && !power.valid()) || ((this == m5BoardStopWatch || this == m5BoardChainCaptain) && !io.valid()) || owner == u32(0) ||
+        !r.hasAddressRange(0,136) || (r.addressValue()&3) != 0 || hz < 8000 || hz > 96000 ||
+        channel < 0 || channel > 4 || count < 2 || (bytes&3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes)) return 0
+    val a=r.addressValue()
+    if ((a < desc+count*12 && desc < a+136) || (a < payload+count*bytes && payload < a+136)) return 0
+    if (r.loadU32(0) != 0 && (!m5Es8311PlaybackValid(r) || r.loadU32(4) != 4)) return 0
+    val profile=this.speakerProfile()
+    val m=pin(profile.masterClockPin());val b=pin(profile.bitClockPin())
+    val w=pin(profile.wordSelectPin());val d=pin(profile.dataPin())
+    if (!esp32s3I2sPinsValid(profile.port(),true,m,b,w,d,0)) return 0
+    var offset=4
+    while (offset < 136) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x45545031);r.storeU32(4,3);r.storeU32(8,this|0)
+    r.storeU32(132,power|0);r.storeU32(12,codec|0);r.storeU32(16,io|0);r.storeU32(20,profile.port())
+    r.storeU32(24,channel);r.storeU32(28,desc);r.storeU32(32,count)
+    r.storeU32(36,payload);r.storeU32(40,bytes)
+    val pins=m5Es8311PlaybackPins(r)
+    if (esp32S3I2sPinsCaptureOwned(pins,profile.port(),true,m,b,w,d,0,true) != 1) return 3
+    val prepared=this.prepareEs8311PlaybackOwned(hz,channel,desc,count,payload,bytes,owner,true)
+    r.storeU32(52,prepared|0)
+    if (!prepared.valid()) return 3
+    pins.storeU32(4,1);r.storeU32(48,prepared.sampleRate());r.storeU32(4,1)
+    return 1
+}
+trusted fun m5Es8311PlaybackStartOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !m5Es8311PlaybackValid(r) || r.loadU32(4) != 1 || polls < 1 || polls > 1000000) return 0
+    r.storeU32(4,3);r.storeU32(80,1)
+    val codec=M5BoardId(r.loadU32(8)).es8311SpeakerOwned(Es8311(r.loadU32(12)),M5Pm1(r.loadU32(132)),M5Ioe1(r.loadU32(16)),true,true)
+    r.storeU32(56,codec)
+    if (codec != 1) return 3
+    r.storeU32(76,1)
+    val started=esp32s3I2sStartStream(r.loadU32(20),true,r.loadU32(24),r.loadU32(28),polls)
+    r.storeU32(60,started)
+    if ((started&255) != 1) return 3
+    r.storeU32(4,2);return 2
+}
+trusted fun m5Es8311PlaybackCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !m5Es8311PlaybackValid(r) || polls < 1 || polls > 1000000) return 0
+    val state=r.loadU32(4)
+    if (state == 4) return 4
+    if (state < 1 || state > 3) return 0
+    r.storeU32(4,3)
+    if (r.loadU32(76) != 0) {
+        val stopped=esp32s3I2sStopStream(r.loadU32(20),true,r.loadU32(24),polls)
+        r.storeU32(64,stopped)
+        if (stopped != 1) return 3
+        r.storeU32(76,0)
+    }
+    if (r.loadU32(80) != 0) {
+        val codec=M5BoardId(r.loadU32(8)).es8311SpeakerOwned(Es8311(r.loadU32(12)),M5Pm1(r.loadU32(132)),M5Ioe1(r.loadU32(16)),false,true)
+        r.storeU32(56,codec)
+        if (codec != 1) return 3
+        r.storeU32(80,0)
+    }
+    val pins=m5Es8311PlaybackPins(r)
+    if (pins.loadU32(0) != 0 && esp32S3I2sPinsCloseOwned(pins,true) != 2) return 3
+    r.storeU32(4,4);return 4
+}
+// Refill one completed TX block. Signed16 PCM uses speakerProfile stereo flag;
+// mono DMA samples are duplicated to both wire slots. Apply gain before this call.
+// Busy preserves cursor/state; fault requires close. Reject aliases against
+// the whole ring, descriptors and136B record before consuming any sample.
+trusted fun m5Es8311PlaybackWriteOwned(r: NativeBuffer,input: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    if (!exclusive || !m5Es8311PlaybackValid(r) || r.loadU32(4) != 2 || polls < 1 || polls > 1000000) return Esp32S3GdmaPumpResult(2)
+    val count=r.loadU32(32);val bytes=r.loadU32(40);val cursor=r.loadU32(44)
+    val desc=r.loadU32(28);val payload=r.loadU32(36)
+    if (!esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes) || cursor >= count ||
+        !input.hasAddressRange(0,bytes)) return Esp32S3GdmaPumpResult(2)
+    val a=input.addressValue()
+    if ((a < r.addressValue()+136 && r.addressValue() < a+bytes) ||
+        (a < desc+count*12 && desc < a+bytes) || (a < payload+count*bytes && payload < a+bytes)) return Esp32S3GdmaPumpResult(2)
+    var result=esp32s3GdmaPumpBlock(r.loadU32(24),true,desc,count,cursor,nativeBufferAt(a,bytes),bytes,polls)
+    if (result.status() == 1) {
+        val next=if (cursor+1 == count) 0 else cursor+1
+        if (result.transferredBytes() != bytes || result.nextIndex() != next) result=Esp32S3GdmaPumpResult((result&~255)|8)
+        else r.storeU32(44,next)
+    }
+    r.storeU32(68,result&4294967295);r.storeU32(72,result>>>32)
+    if (result.status() != 1 && result.status() != 3) r.storeU32(4,3)
+    return result
+}

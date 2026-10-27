@@ -1,0 +1,78 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Pinned M5GFX Panel_IT8951 Bayer matrix (epd_waveform.LICENSE). The matrix
+// differs from the other EPD controllers; coordinates are absolute image pixels.
+fun it8951Gray4(red: int,green: int,blue: int,x: int,y: int,fast: bool,invert: bool): int {
+    if (red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255 ||
+        x < 0 || x > 65535 || y < 0 || y > 65535) return -1
+    val index=(y&3)*4+(x&3)
+    val packed=if (index < 8) 0x6e4ca280 else 0x5d7f91b3
+    val dither=((packed>>>((index&7)*4))&15)*4-30
+    val sum=red+green*2+blue
+    var level=0
+    if (fast) level=if (sum+dither*16 < 512) 0 else 15
+    else {
+        val adjusted=sum+dither
+        level=if (adjusted < 0) 0 else if (adjusted >= 1024) 15 else adjusted>>>6
+    }
+    if (invert) 15-level else level
+}
+// Pure CPU conversion of an unrotated image; no transport or implicit refresh.
+// RGB888 source bytes are R,G,B; RGB565 source bytes are big-endian, matching
+// the common LCD canvas. RGB565 expands channels by bit replication as M5GFX.
+// Source/destination must be disjoint. Padding and an unused final low nibble
+// are preserved. Callers initialize destination padding before a wider flush.
+// All admission checks happen before any destination byte changes.
+trusted fun it8951ConvertRgbOwned(source: NativeBuffer,sourceStride: int,destination: NativeBuffer,
+    destinationStride: int,width: int,height: int,originX: int,originY: int,rgb565: bool,
+    fast: bool,invert: bool,exclusive: bool): bool =
+    it8951ConvertRgbMappedOwned(source,sourceStride,destination,destinationStride,width,height,originX,originY,
+        rgb565,fast,invert,exclusive,0)
+// Convert the complete LOGICAL image before it8951Rotate4Owned. Rotation is
+// already resolved against panel offset. Upstream mirrors Y before choosing
+// Bayer rows while reversing source traversal; source pixels themselves stay
+// in logical order here until the separate rotation pass.
+trusted fun it8951ConvertRgbForRotationOwned(source: NativeBuffer,sourceStride: int,destination: NativeBuffer,
+    destinationStride: int,physicalWidth: int,physicalHeight: int,rotation: int,rgb565: bool,
+    fast: bool,invert: bool,exclusive: bool): bool {
+    if (rotation < 0 || rotation > 7) return false
+    val width=if ((rotation&1) == 0) physicalWidth else physicalHeight
+    val height=if ((rotation&1) == 0) physicalHeight else physicalWidth
+    it8951ConvertRgbMappedOwned(source,sourceStride,destination,destinationStride,width,height,0,0,
+        rgb565,fast,invert,exclusive,if ((rotation&4) != 0) height else 0)
+}
+// Internal conversion kernel; mirrorHeight0 disables mirrored Bayer phase.
+trusted fun it8951ConvertRgbMappedOwned(source: NativeBuffer,sourceStride: int,destination: NativeBuffer,
+    destinationStride: int,width: int,height: int,originX: int,originY: int,rgb565: bool,
+    fast: bool,invert: bool,exclusive: bool,mirrorHeight: int): bool {
+    if (!exclusive || width < 1 || width > 65535 || height < 1 || height > 65535 ||
+        originX < 0 || originX > 65536-width || originY < 0 || originY > 65536-height ||
+        sourceStride < width*(if (rgb565) 2 else 3) || sourceStride > 2147483647 ||
+        destinationStride < (width+1)/2 || destinationStride > 2147483647 || mirrorHeight < 0 ||
+        mirrorHeight > 65536 || (mirrorHeight != 0 && originY+height > mirrorHeight)) return false
+    val sourceBytes=(height-1)*sourceStride+width*(if (rgb565) 2 else 3)
+    val destinationBytes=(height-1)*destinationStride+(width+1)/2
+    if (!source.hasAddressRange(0,sourceBytes) || !destination.hasAddressRange(0,destinationBytes) ||
+        (source.addressValue() < destination.addressValue()+destinationBytes &&
+            destination.addressValue() < source.addressValue()+sourceBytes)) return false
+    var row=0
+    while (row < height) {
+        var column=0
+        while (column < width) {
+            val at=row*sourceStride+column*(if (rgb565) 2 else 3)
+            var red=0;var green=0;var blue=0
+            if (rgb565) {
+                val color=(source.load(at)<<8)|source.load(at+1)
+                val r=(color>>>11)&31;val g=(color>>>5)&63;val b=color&31
+                red=(r<<3)|(r>>>2);green=(g<<2)|(g>>>4);blue=(b<<3)|(b>>>2)
+            } else { red=source.load(at);green=source.load(at+1);blue=source.load(at+2) }
+            val ditherY=if (mirrorHeight == 0) originY+row else mirrorHeight-1-originY-row
+            val level=it8951Gray4(red,green,blue,originX+column,ditherY,fast,invert)
+            val target=row*destinationStride+column/2
+            val before=destination.load(target)
+            destination.store(target,if ((column&1) == 0) (before&15)|(level<<4) else (before&240)|level)
+            column=column+1
+        }
+        row=row+1
+    }
+    true
+}

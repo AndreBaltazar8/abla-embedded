@@ -1,0 +1,86 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Caller-owned monochrome page layout: byte=(y/8)*width+x, bit=y%8.
+// Shared by small OLED/matrix displays. No transport, allocation or globals.
+fun monoPageSize(width: int,height: int): int =
+    if (width < 1 || width > 65535 || height < 1 || height > 65535) 0 else width*((height+7)>>>3)
+// Clockwise rotations0..3; mirrored rotations4..7 follow M5GFX's axis masks.
+// Logical dimensions swap for odd rotations. Position packs physical x/y16.
+fun monoPagePosition(width: int,height: int,x: int,y: int,rotation: int): int {
+    if (monoPageSize(width,height) == 0 || rotation < 0 || rotation > 7 || x < 0 || y < 0 ||
+        x >= (if ((rotation&1) != 0) height else width) || y >= (if ((rotation&1) != 0) width else height)) return -1
+    var px=if ((rotation&1) != 0) y else x
+    var py=if ((rotation&1) != 0) x else y
+    val turnBit=int(u32(1)<<u32(rotation))
+    if ((turnBit&198) != 0) px=width-1-px
+    if ((turnBit&156) != 0) py=height-1-py
+    return px|(py<<16)
+}
+trusted fun monoPageRead(frame: NativeBuffer,width: int,height: int,x: int,y: int,rotation: int = 0): int {
+    val position=monoPagePosition(width,height,x,y,rotation)
+    if (position < 0 || !frame.hasAddressRange(0,monoPageSize(width,height))) return -1
+    val px=position&65535;val py=position>>>16
+    return (frame.load((py>>>3)*width+px)>>>(py&7))&1
+}
+// Preclipped logical rectangle; reject malformed/aliased buffers before writes.
+// fill0/1 is solid; fill=-1 copies MSB-first, row-major packed1bpp source.
+// Source stride is bytes, including padding; only w bits per row are used.
+// transparent=-1 opaque,0 skips zero bits,1 skips one bits. Unused destination
+// bits in the final physical page are preserved, as are all untouched pixels.
+trusted fun monoPageDrawOwned(frame: NativeBuffer,width: int,height: int,x: int,y: int,w: int,h: int,rotation: int,
+    source: NativeBuffer,stride: int,fill: int,transparent: int,exclusive: bool,sourceX: int = 0,sourceY: int = 0): bool {
+    val size=monoPageSize(width,height)
+    if (!exclusive || size == 0 || w < 1 || w > 65535 || h < 1 || h > 65535 || fill < -1 || fill > 1 ||
+        transparent < -1 || transparent > 1 || sourceX < 0 || sourceX > 65535-w || sourceY < 0 || sourceY > 65535-h ||
+        monoPagePosition(width,height,x,y,rotation) < 0 ||
+        monoPagePosition(width,height,x+w-1,y+h-1,rotation) < 0 || !frame.hasAddressRange(0,size)) return false
+    if (fill == -1) {
+        val rowBytes=(sourceX+w+7)>>>3
+        if (stride < rowBytes || stride > 2147483647) return false
+        val sourceBytes=(sourceY+h-1)*stride+rowBytes
+        if (!source.hasAddressRange(0,sourceBytes) ||
+            (frame.addressValue() < source.addressValue()+sourceBytes && source.addressValue() < frame.addressValue()+size)) return false
+    }
+    var row=0
+    while (row < h) {
+        var column=0
+        while (column < w) {
+            val sx=sourceX+column
+            val bit=if (fill >= 0) fill else (source.load((sourceY+row)*stride+(sx>>>3))>>>(7-(sx&7)))&1
+            if (bit != transparent) {
+                val position=monoPagePosition(width,height,x+column,y+row,rotation)
+                val px=position&65535;val py=position>>>16
+                val offset=(py>>>3)*width+px;val mask=int(u32(1)<<u32(py&7))
+                frame.store(offset,if (bit == 1) frame.load(offset)|mask else frame.load(offset)&(255^mask))
+            }
+            column=column+1
+        }
+        row=row+1
+    }
+    return true
+}
+// Signed32 origin and bounded positive dimensions. Validate the entire input
+// bitmap before clipping, including for a fully off-screen no-op. Source bit
+// offsets survive left/top clipping without repacking or temporary storage.
+trusted fun monoPageDrawClippedOwned(frame: NativeBuffer,width: int,height: int,x: int,y: int,w: int,h: int,rotation: int,
+    source: NativeBuffer,stride: int,fill: int,transparent: int,exclusive: bool): bool {
+    val size=monoPageSize(width,height)
+    if (!exclusive || size == 0 || !frame.hasAddressRange(0,size) || rotation < 0 || rotation > 7 ||
+        x < -2147483648 || x > 2147483647 || y < -2147483648 || y > 2147483647 ||
+        w < 1 || w > 65535 || h < 1 || h > 65535 || fill < -1 || fill > 1 || transparent < -1 || transparent > 1) return false
+    if (fill == -1) {
+        val rowBytes=(w+7)>>>3
+        if (stride < rowBytes || stride > 2147483647) return false
+        val bytes=(h-1)*stride+rowBytes
+        if (!source.hasAddressRange(0,bytes) ||
+            (frame.addressValue() < source.addressValue()+bytes && source.addressValue() < frame.addressValue()+size)) return false
+    }
+    val logicalWidth=if ((rotation&1) == 0) width else height
+    val logicalHeight=if ((rotation&1) == 0) height else width
+    val left=if (x < 0) 0 else x
+    val top=if (y < 0) 0 else y
+    val right=if (x+w > logicalWidth) logicalWidth else x+w
+    val bottom=if (y+h > logicalHeight) logicalHeight else y+h
+    if (right <= left || bottom <= top) return true
+    return monoPageDrawOwned(frame,width,height,left,top,right-left,bottom-top,rotation,
+        source,stride,fill,transparent,true,left-x,top-y)
+}

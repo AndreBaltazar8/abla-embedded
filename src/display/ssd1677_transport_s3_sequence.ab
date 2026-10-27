@@ -1,0 +1,83 @@
+import "./ssd1677_frame.ab"
+import "./ssd1677_lut.ab"
+import "../esp32/spi/command_sequence_esp32s3.ab"
+import "../esp32/spi/command_word_sequence_esp32s3.ab"
+// Internal transport: canonical gate held, idle powered/reset panel, valid
+// SPI/pads and exclusive panel/immutable buffers. Every SPI failure preserves
+// detail and checked CS cleanup. Upload does NOT activate glass or commit history.
+trusted fun esp32s3Ssd1677WindowOwned(peripheral: int,select: Pin,dc: Pin,
+    width: int,height: int): int {
+    var result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x11,u32(1),1,false)
+    if ((result&255) != 1) return result
+    // Little-endian16-bit source/gate endpoints, Y decrements fromheight-1.
+    val endX=width-1;val endY=height-1
+    result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x44,u32(((endX&255)<<8)|(endX>>8)),4,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x45,u32(((endY&255)<<24)|((endY>>8)<<16)),4,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x4e,u32(0),2,false)
+    if ((result&255) != 1) return result
+    return esp32s3SpiCommandWordOwned(peripheral,select,dc,0x4f,u32(((endY&255)<<8)|(endY>>8)),2,false)
+}
+trusted fun esp32s3Ssd1677LutOwned(peripheral: int,select: Pin,dc: Pin,mode: int): int {
+    val table=ssd1677Lut(mode)
+    var result=esp32s3SpiCommandOwned(peripheral,select,dc,0x32,nativeBufferAt(table.addressValue(),105),105,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandOwned(peripheral,select,dc,0x03,nativeBufferAt(table.addressValue()+105,1),1,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandOwned(peripheral,select,dc,0x04,nativeBufferAt(table.addressValue()+106,3),3,false)
+    if ((result&255) != 1) return result
+    return esp32s3SpiCommandOwned(peripheral,select,dc,0x2c,nativeBufferAt(table.addressValue()+109,1),1,false)
+}
+// Encode at most128B per row on stack, stream64B FIFO chunks under a single
+// CS assertion per plane. No full-plane temporary, DMA allocation or replay.
+trusted fun esp32s3Ssd1677UploadOwned(peripheral: int,select: Pin,dc: Pin,canvas: NativeBuffer,history: NativeBuffer,
+    width: int,height: int,mode: int,odd: bool,invert: bool,x: int,y: int,w: int,h: int): int {
+    val rowBytes=width/8
+    val rowBuffer=nativeBufferAt(nativeStackAllocate(128),128)
+    var bank=0
+    while (bank < 2) {
+        var result=esp32s3Ssd1677WindowOwned(peripheral,select,dc,width,height)
+        if ((result&255) != 1) return result
+        result=esp32s3SpiExchangeReady(peripheral)
+        if (result != 1) return result
+        result=esp32s3SpiCommandPinsBegin(select,dc)
+        if (result == 1) result=esp32s3SpiTransmitByteOwned(peripheral,if (bank == 0) 0x24 else 0x26,100000)
+        if ((result&255) == 1 && !dc.writeLevelOwned(true)) result=(result&~255)|13
+        var row=0
+        while (row < height && (result&255) == 1) {
+            if (!ssd1677EncodeRowOwned(rowBuffer,canvas,history,width,height,row,bank,mode,odd,invert,x,y,w,h,true)) result=2
+            var offset=0
+            while (offset < rowBytes && (result&255) == 1) {
+                val count=if (rowBytes-offset < 64) rowBytes-offset else 64
+                result=esp32s3SpiTransmitOwned(peripheral,nativeBufferAt(rowBuffer.addressValue()+offset,count),count,100000)
+                offset=offset+count
+            }
+            row=row+1
+        }
+        result=esp32s3SpiCommandPinsEndQuiescent(peripheral,select,dc,false,result)
+        if ((result&255) != 1) return result
+        bank=bank+1
+    }
+    return esp32s3Ssd1677LutOwned(peripheral,select,dc,mode)
+}
+// PreparedSPI, BUSY confirmed inactive, valid history for mode4. This is NOT
+// a complete refresh. Caller owns subsequent activation and error recovery;
+// never commit drawing history on upload success alone.
+trusted fun esp32s3Ssd1677Upload(gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,select: Pin,dc: Pin,
+    canvas: NativeBuffer,history: NativeBuffer,width: int,height: int,mode: int,odd: bool,invert: bool,
+    x: int,y: int,w: int,h: int,exclusiveIdle: bool): SpiTransactionResult {
+    val plane=ssd1677PlaneBytes(width,height)
+    if (!exclusiveIdle || width > 1024 || !ssd1677DirtyValid(width,height,x,y,w,h) || mode < 1 || mode > 4 ||
+        !esp32s3SpiCommandPinsValid(peripheral,pins,select,dc,false) ||
+        !esp32s3SpiMemoryRangeValid(peripheral,canvas,plane*2) || !gate.bufferDisjoint(canvas,plane*2) ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292) return SpiTransactionResult(3<<32)
+    if (mode == 4 && (!esp32s3SpiMemoryRangeValid(peripheral,history,plane*2) ||
+        !gate.bufferDisjoint(history,plane*2) || !ssd1677FrameDisjoint(canvas,plane*2,history,plane*2))) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val result=esp32s3Ssd1677UploadOwned(peripheral,select,dc,canvas,history,width,height,mode,odd,invert,x,y,w,h)
+    val healthy=(result&255) == 1
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5<<32)|result)
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|result)
+}

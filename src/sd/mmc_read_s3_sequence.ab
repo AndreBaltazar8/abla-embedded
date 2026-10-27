@@ -1,0 +1,125 @@
+import "./mmc_card_s3_sequence.ab"
+import "./mmc_dma_control_s3_sequence.ab"
+// One CMD17/512-byte native SD read, caller-exclusive configured host/card.
+// context48 CPU bytes, descriptor16 DMA bytes, payload512 DMA bytes, card80
+// must be mutually disjoint and pinned. Begin requires released DMA storage;
+// do not call it over a live context. No allocation or hidden clock changes.
+// Context: tagged status0,phase4,slot5,event flags6,outcome7,descriptor8,
+// payload12,start16,budget20,raw events24,DMA events28,R1 response32,arg36.
+// 1valid payload,2pending,3invalid,4hardware,5card response,6timeout,
+// 7descriptor,8host busy before arm,9setup. Failures never validate payload.
+// Phase3/4 stop cleanup remains pending even beyond deadline: timeout does
+// NOT release live DMA. After a failed transfer, even once DMA is stopped,
+// caller retains host ownership for explicit command/FIFO/card recovery;
+// this is NOT a card-abort routine. Keep host clocks running during cleanup.
+fun sdMmcReadDisjoint(a: int,asize: int,b: int,bsize: int): bool = a+asize <= b || b+bsize <= a
+trusted fun sdMmcReadStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,48) || (context.loadU32(0)&0xffffff00) != 0x53445200) return 3
+    return context.load(0)
+}
+trusted fun sdMmcReadEnd(context: NativeBuffer,status: int): int {
+    context.store(0,status)
+    return status
+}
+trusted fun sdMmcReadBeginOwned(context: NativeBuffer,card: NativeBuffer,descriptor: NativeBuffer,payload: NativeBuffer,sector: int,now: u32,budgetMs: int,releasedExclusive: bool): int {
+    if (!releasedExclusive || !context.hasAddressRange(0,48) || sdMmcCardStatus(card) != 1 ||
+        card.load(5) > 1 || budgetMs < 1 || budgetMs > 60000 || sector < 0 || sector >= sdMmcCardBlockCount(card) ||
+        !sdMmcDmaRegionsValid(descriptor,payload,512)) return 3
+    val highCapacity=(card.loadU32(24)&0x40000000) != 0
+    if (!highCapacity && sector > 0x7fffff) return 3
+    val ctx=context.addressValue()
+    val info=card.addressValue()
+    val desc=descriptor.addressValue()
+    val data=payload.addressValue()
+    if (!sdMmcReadDisjoint(ctx,48,info,80) || !sdMmcReadDisjoint(ctx,48,desc,16) ||
+        !sdMmcReadDisjoint(ctx,48,data,512) || !sdMmcReadDisjoint(info,80,desc,16) || !sdMmcReadDisjoint(info,80,data,512)) return 3
+    var byte=0
+    while (byte < 48) { context.store(byte,0); byte=byte+1 }
+    context.storeU32(0,0x53445202); context.store(4,1); context.store(5,card.load(5))
+    context.storeU32(8,desc); context.storeU32(12,data)
+    context.storeU32(16,int(now)); context.storeU32(20,budgetMs)
+    context.storeU32(36,if (highCapacity) sector else sector<<9)
+    if (sdMmcDmaPrepareOwned(descriptor,payload,512,true) != 1) return sdMmcReadEnd(context,3)
+    return 2
+}
+trusted fun sdMmcReadCleanup(context: NativeBuffer,outcome: int): int {
+    context.store(7,outcome); context.store(4,3)
+    return 2
+}
+trusted fun sdMmcReadPollOwned(context: NativeBuffer,now: u32): int {
+    if (!context.hasAddressRange(0,48) || context.loadU32(40) != 0) return 3
+    return sdMmcTransferPollOwned(context,now)
+}
+// Shared CMD17/CMD24/ACMD51/CMD18/CMD25 engine. Word40 kind0read/1write/2SCR/3multi-read/4multi-write;
+// multi uses word44 byte count. Write/multi wrappers additionally verify CMD13.
+trusted fun sdMmcTransferPollOwned(context: NativeBuffer,now: u32): int {
+    val state=sdMmcReadStatus(context)
+    if (state != 2) return state
+    val phase=context.load(4)
+    if (phase < 1 || phase > 4 || context.load(5) > 1 || context.loadU32(40) > 4) return sdMmcReadEnd(context,3)
+    val writing=context.loadU32(40) == 1 || context.loadU32(40) == 4
+    val scr=context.loadU32(40) == 2
+    val multiple=context.loadU32(40) == 3 || context.loadU32(40) == 4
+    val bytes=if (multiple) context.loadU32(44) else if (scr) 8 else 512
+    if (multiple && (bytes < 1024 || bytes > 0x78000 || (bytes&511) != 0)) return sdMmcReadEnd(context,3)
+    val eventMask=if (multiple) 0xffce else 0xbfce
+    val desc=nativeBufferAt(context.loadU32(8),sdMmcDmaDescriptorCount(bytes)*16)
+    val data=nativeBufferAt(context.loadU32(12),bytes)
+    if (!sdMmcDmaRegionsValid(desc,data,bytes)) return sdMmcReadEnd(context,3)
+    if (phase == 1) {
+        if (int(now-u32(context.loadU32(16))) >= context.loadU32(20)) return sdMmcReadEnd(context,6)
+        val armed=sdMmcDmaArmOwned(desc,data,bytes,if (multiple) 512 else bytes,true)
+        if (armed == 4) return sdMmcReadEnd(context,8)
+        if (armed == 3) return sdMmcReadEnd(context,3)
+        if (armed != 1) return sdMmcReadCleanup(context,9)
+        sdMmcS3Write(68,eventMask)
+        if ((sdMmcS3Read(68)&eventMask) != 0) return sdMmcReadCleanup(context,9)
+        sdMmcS3Write(40,context.loadU32(36))
+        if (sdMmcS3Read(40) != context.loadU32(36)) return sdMmcReadCleanup(context,9)
+        // HOLD + wait + data + short CRC response; CMD24 sets RW bit10.
+        sdMmcS3Write(44,(if (multiple) (if (writing) 0xa0003759 else 0xa0003352) else if (writing) 0xa0002758 else if (scr) 0xa0002373 else 0xa0002351)|(context.load(5)<<16))
+        context.store(4,2)
+        return 2
+    }
+    // Continue collecting late errors during cleanup; never turn them into
+    // success because CMD_DONE/DATA_OVER/descriptor return arrived first.
+    val raw=sdMmcS3Read(68)&eventMask
+    val dma=sdMmcS3Read(140)&0x337
+    context.storeU32(24,context.loadU32(24)|raw)
+    context.storeU32(28,context.loadU32(28)|dma)
+    if (raw != 0) sdMmcS3Write(68,raw)
+    if (dma != 0) sdMmcS3Write(140,dma)
+    if ((raw&0xbfc2) != 0 || (dma&0x234) != 0) {
+        if (phase == 2) return sdMmcReadCleanup(context,4)
+        if (context.load(7) == 1) context.store(7,4)
+    }
+    if (phase == 3) {
+        val stopped=sdMmcDmaStopOwned(true,true)
+        if (stopped == 2) context.store(4,4)
+        // Retry failed disable writes on the next bounded poll, retaining lease.
+        return 2
+    }
+    if (phase == 4) {
+        val stopped=sdMmcDmaStopPollOwned(2)
+        if (stopped == 5) { context.store(4,3); if (context.load(7) == 1) context.store(7,4); return 2 }
+        if (stopped != 1) return 2
+        if (context.load(7) == 1 && ((sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0x6f0) != 0)) return sdMmcReadEnd(context,4)
+        return sdMmcReadEnd(context,context.load(7))
+    }
+    if (int(now-u32(context.loadU32(16))) >= context.loadU32(20)) return sdMmcReadCleanup(context,6)
+    var flags=context.load(6)
+    if ((raw&4) != 0) {
+        val response=sdMmcS3Read(48)
+        context.storeU32(32,response)
+        if (!sdMmcCardR1Valid(response)) return sdMmcReadCleanup(context,5)
+        flags=flags|1
+    }
+    if ((raw&8) != 0) flags=flags|2
+    if (multiple && (raw&0x4000) != 0) flags=flags|8
+    if ((dma&(if (writing) 1 else 2)) != 0) flags=flags|4
+    context.store(6,flags)
+    val inspected=sdMmcDmaInspectOwned(desc,data,bytes)
+    if (inspected != 1 && inspected != 2) return sdMmcReadCleanup(context,7)
+    if (flags != (if (multiple) 15 else 7) || inspected != 1 || (sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0x6f0) != 0) return 2
+    return sdMmcReadCleanup(context,1)
+}

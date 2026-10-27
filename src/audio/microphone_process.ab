@@ -1,0 +1,106 @@
+// Adapted from M5Unified Mic_Class.cpp, Copyright (c) 2021 M5Stack, MIT.
+// See THIRD_PARTY_NOTICES.md for the upstream license notice.
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/float"
+import "../esp32/runtime/libgcc_divsf3_esp32.ab"
+
+// Streaming Mic_Class sample processing, separated from hardware/task policy.
+// Caller-owned40B: magic, config, pending pairs, sums[2], previous[2], DC offset,
+// reserved[2]. Input consists of signed16 LE pairs (two sequential mono samples
+// or one stereo frame). Classic ESP32 FIFO swap is an explicit adapter option.
+// All state persists across input blocks. No samples fabricated on empty input.
+trusted fun microphoneProcessInitialize(state: NativeBuffer,oversampling: int,gain: int,
+    filter: int,inputStereo: bool,adc: bool,swapPair: bool): bool {
+    if (!state.hasAddressRange(0,40) || oversampling < 1 || oversampling > 8 ||
+        gain < 0 || gain > 255 || filter < 0 || filter > 255) return false
+    var i=0
+    while (i < 40) { state.storeU32(i,0);i=i+4 }
+    state.storeU32(0,0x4d494331)
+    state.storeU32(4,oversampling|(gain<<4)|(filter<<12)|
+        (if (inputStereo) 1<<20 else 0)|(if (adc) 1<<21 else 0)|(if (swapPair) 1<<22 else 0))
+    return true
+}
+fun microphoneSigned32(value: int): int = if (value >= 2147483648) value-4294967296 else value
+fun microphoneSigned16(value: int): int = if (value >= 32768) value-65536 else value
+// Values here fit signed32. Decode binary32 with C++ truncation toward zero.
+fun microphoneFloatTruncate(value: f32): int {
+    val bits=int(f32ToBits(value));val exponent=((bits>>>23)&255)-127
+    if (exponent < 0) return 0
+    // This processor's finite intermediates fit signed32. Keep the variable
+    // shift at that width so RV32 does not need 64-bit compiler ABI helpers.
+    val mantissa=u32((bits&8388607)|8388608)
+    val magnitude=int(if (exponent < 23) mantissa>>u32(23-exponent) else mantissa<<u32(exponent-23))
+    return if ((bits&2147483648) != 0) -magnitude else magnitude
+}
+trusted fun microphoneProcessStore(output: NativeBuffer,index: int,value: int,bits16: bool): void {
+    if (bits16) output.storeU16(index*2,if (value < -32752) -32752 else if (value > 32751) 32751 else value)
+    else {
+        val sample=((value+128)>>8)+128
+        output.store(index,if (sample < 0) 0 else if (sample > 255) 255 else sample)
+    }
+    return
+}
+// Returns output SAMPLE count, -1 invalid/insufficient space. Validates all
+// spans before mutation; state/input/output must be disjoint. Output need only
+// fit complete oversampling groups; partial groups are retained in state.
+// Reconfiguration requires initialize and explicitly discards pending input.
+trusted fun microphoneProcessRequiredSamples(state: NativeBuffer,input: NativeBuffer,pairs: int,
+    output: NativeBuffer,outputStereo: bool,bits16: bool): int {
+    if (!state.hasAddressRange(0,40) || state.loadU32(0) != 0x4d494331 || pairs < 0 || pairs > 1048576 ||
+        !input.hasAddressRange(0,pairs*4)) return -1
+    val config=state.loadU32(4);val os=config&15;val pending=state.loadU32(8)
+    if (os < 1 || os > 8 || pending >= os || (config&~8388607) != 0) return -1
+    val stereo=(config&(1<<20)) != 0
+    val perGroup=if (stereo == outputStereo) 2 else if (stereo) 1 else 4
+    val samples=((pending+pairs)/os)*perGroup
+    val bytes=samples*(if (bits16) 2 else 1)
+    if (!output.hasAddressRange(0,bytes)) return -1
+    if ((pairs > 0 && state.addressValue() < input.addressValue()+pairs*4 && input.addressValue() < state.addressValue()+40) ||
+        (bytes > 0 && state.addressValue() < output.addressValue()+bytes && output.addressValue() < state.addressValue()+40) ||
+        (pairs > 0 && bytes > 0 && input.addressValue() < output.addressValue()+bytes && output.addressValue() < input.addressValue()+pairs*4)) return -1
+    return samples
+}
+
+trusted fun microphoneProcess(state: NativeBuffer,input: NativeBuffer,pairs: int,
+    output: NativeBuffer,outputStereo: bool,bits16: bool): int {
+    if (microphoneProcessRequiredSamples(state,input,pairs,output,outputStereo,bits16) < 0) return -1
+    val config=state.loadU32(4);val os=config&15;val pending=state.loadU32(8)
+    val stereo=(config&(1<<20)) != 0
+    val perGroup=if (stereo == outputStereo) 2 else if (stereo) 1 else 4
+    val gain=f32FromBits(esp32Binary32Divide(f32ToBits(f32FromI32(i32((config>>>4)&255))),f32ToBits(f32FromI32(i32(os*2)))))
+    val filter=(config>>>12)&255
+    var sum0=microphoneSigned32(state.loadU32(12));var sum1=microphoneSigned32(state.loadU32(16))
+    var prev0=microphoneSigned32(state.loadU32(20));var prev1=microphoneSigned32(state.loadU32(24))
+    var dc=microphoneSigned32(state.loadU32(28));var count=pending
+    var consumed=0;var written=0
+    while (consumed < pairs) {
+        sum0=sum0+microphoneSigned16(input.loadU16(consumed*4))
+        sum1=sum1+microphoneSigned16(input.loadU16(consumed*4+2))
+        consumed=consumed+1;count=count+1
+        if (count == os) {
+            var a=if ((config&(1<<22)) != 0) sum1 else sum0
+            var b=if ((config&(1<<22)) != 0) sum0 else sum1
+            if ((config&(1<<21)) != 0) { a=a-2048*os;b=b-2048*os }
+            dc=dc-(((a+b)*8+dc+16)>>5)
+            a=a+((dc+8)>>4);b=b+((dc+8)>>4)
+            if (filter != 0) {
+                a=(a*(256-filter)+prev0*filter+128)>>8
+                b=(b*(256-filter)+prev1*filter+128)>>8
+                prev0=a;prev1=b
+            }
+            a=microphoneFloatTruncate(f32FromI32(i32(a))*gain)
+            b=microphoneFloatTruncate(f32FromI32(i32(b))*gain)
+            if (stereo && !outputStereo) microphoneProcessStore(output,written,(a+b+1)>>1,bits16)
+            else if (!stereo && outputStereo) {
+                microphoneProcessStore(output,written,a,bits16);microphoneProcessStore(output,written+1,a,bits16)
+                microphoneProcessStore(output,written+2,b,bits16);microphoneProcessStore(output,written+3,b,bits16)
+            } else {
+                microphoneProcessStore(output,written,a,bits16);microphoneProcessStore(output,written+1,b,bits16)
+            }
+            written=written+perGroup;sum0=0;sum1=0;count=0
+        }
+    }
+    state.storeU32(8,count);state.storeU32(12,sum0);state.storeU32(16,sum1)
+    state.storeU32(20,prev0);state.storeU32(24,prev1);state.storeU32(28,dc)
+    return written
+}

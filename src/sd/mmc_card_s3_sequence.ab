@@ -1,0 +1,127 @@
+import "./mmc_command_s3_sequence.ab"
+import "./csd_capacity.ab"
+
+// Native SD (not MMC/SDIO) initialization. Caller owns an exclusively configured
+// S3 host, powered/settled card, released/routed pads, response/data timeouts,
+// 1-bit bus and continuous <=400kHz card clock throughout this transaction.
+// No allocation, clock switching, filesystem/data commands or implicit recovery.
+// Caller-owned 80 bytes: tagged status0, phase4, slot5, CMD8-supported6,
+// command8, start-ms12, budget-ms16, retry-ms20, OCR24, RCA28,
+// raw CID32, raw CSD48, command response64 (LE RESP0..3 controller order).
+// Status1 selected/ready,2pending,3invalid,4transport,5protocol,6timeout,
+// 7unsupported CSD. Failure preserves metadata; retain host ownership until
+// explicit quiescence/recovery. Never restart this buffer over a live operation.
+trusted fun sdMmcCardStatus(card: NativeBuffer): int {
+    if (!card.hasAddressRange(0,80) || (card.loadU32(0)&0xffffff00) != 0x53444900) return 3
+    return card.load(0)
+}
+trusted fun sdMmcCardFinish(card: NativeBuffer,status: int): int {
+    card.store(0,status)
+    return status
+}
+trusted fun sdMmcCardBeginOwned(card: NativeBuffer,slot: int,now: u32,budgetMs: int,prepared: bool): int {
+    if (!prepared || slot < 0 || slot > 1 || budgetMs < 1 || budgetMs > 60000 || !card.hasAddressRange(0,80)) return 3
+    var index=0
+    while (index < 80) { card.store(index,0); index=index+1 }
+    card.storeU32(0,0x53444902); card.store(4,1); card.store(5,slot)
+    card.storeU32(12,int(now)); card.storeU32(16,budgetMs)
+    return 2
+}
+// Native R2 words have the same bit numbering as SD CSD (IDF MMC_RSP_BITS),
+// unlike wire-order byte buffers used by SPI. Hardware checked the R2 CRC.
+trusted fun sdMmcCardBlockCount(card: NativeBuffer): int {
+    if (sdMmcCardStatus(card) != 1) return 0
+    return sdCsdCapacityFields(card.loadU32(60),card.loadU32(56),card.loadU32(52))
+}
+trusted fun sdMmcCardNext(card: NativeBuffer,phase: int): int {
+    card.store(4,phase); card.storeU32(8,0)
+    return 2
+}
+fun sdMmcCardR1Valid(response: int): bool = (response&0xfff9a088) == 0
+
+// One bounded step: at most one command submission or poll, no busy loop.
+// now is a monotonically advancing wrapping u32 millisecond clock.
+trusted fun sdMmcCardPollOwned(card: NativeBuffer,now: u32): int {
+    val state=sdMmcCardStatus(card)
+    if (state != 2) return state
+    val phase=card.load(4)
+    if (phase < 1 || phase > 13 || card.load(5) > 1 || card.load(6) > 1 || card.loadU32(16) < 1 || card.loadU32(16) > 60000) return sdMmcCardFinish(card,3)
+    if (int(now-u32(card.loadU32(12))) >= card.loadU32(16)) return sdMmcCardFinish(card,6)
+    if (phase == 11 || phase == 13) {
+        if (int(now-u32(card.loadU32(20))) < 10) return 2
+        return sdMmcCardNext(card,if (phase == 11) 3 else 10)
+    }
+    if (phase == 12) {
+        // CMD8 response timeout identifies legacy cards only after the host
+        // command has really retired. CRC/response/HLE errors never downgrade.
+        if ((sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0x6f0) != 0) return 2
+        return sdMmcCardNext(card,3)
+    }
+    val response=nativeBufferAt(card.addressValue()+64,16)
+    var command=SdMmcCommand(card.loadU32(8))
+    if (command == 0) {
+        var index=0
+        var argument=0
+        var kind=1
+        if (phase == 1) { index=0; kind=0 }
+        if (phase == 2) { index=8; argument=0x1aa }
+        if (phase == 3) index=55
+        if (phase == 4) { index=41; argument=0x00ff8000|(if (card.load(6) == 1) 0x40000000 else 0); kind=3 }
+        if (phase == 5) { index=2; kind=2 }
+        if (phase == 6) index=3
+        if (phase == 7) { index=9; argument=card.loadU32(28)<<16; kind=2 }
+        if (phase == 8) { index=7; argument=card.loadU32(28)<<16; kind=4 }
+        if (phase == 9) { index=16; argument=512 }
+        if (phase == 10) { index=13; argument=card.loadU32(28)<<16 }
+        command=sdMmcCommandStartOwned(card.load(5),index,u32(argument),kind,phase == 1)
+        if (command.status() == 4) return 2
+        card.storeU32(8,command|0)
+        if (command.status() != 2) return sdMmcCardFinish(card,4)
+        return 2
+    }
+    command=command.pollOwned(response)
+    card.storeU32(8,command|0)
+    if (command.status() == 2) return 2
+    if (command.status() != 1) {
+        if (phase == 2 && command.status() == 5 && (command.events()&0x1542) == 256) {
+            card.store(4,12)
+            return 2
+        }
+        return sdMmcCardFinish(card,4)
+    }
+    val answer=response.loadU32(0)
+    if (phase == 2) {
+        if ((answer&0xfff) != 0x1aa) return sdMmcCardFinish(card,5)
+        card.store(6,1)
+    }
+    if (phase == 3 && (!sdMmcCardR1Valid(answer) || (answer&32) == 0)) return sdMmcCardFinish(card,5)
+    if (phase == 4) {
+        card.storeU32(24,answer)
+        if ((answer&0x00ff8000) == 0 || (answer&0x01000000) != 0) return sdMmcCardFinish(card,5)
+        if ((answer&0x80000000) == 0) { card.storeU32(20,int(now)); return sdMmcCardNext(card,11) }
+        if ((answer&0x40000000) != 0 && card.load(6) == 0) return sdMmcCardFinish(card,5)
+    }
+    if (phase == 5 || phase == 7) {
+        var byte=0
+        val offset=if (phase == 5) 32 else 48
+        while (byte < 16) { card.store(offset+byte,response.load(byte)); byte=byte+1 }
+        if (phase == 7) {
+            val version=response.loadU32(12)>>>30
+            val length=(response.loadU32(8)>>16)&15
+            if (version > 1 || (version == 1 && length != 9) || (version == 0 && (length < 9 || length > 11))) return sdMmcCardFinish(card,7)
+            if ((version == 1) != ((card.loadU32(24)&0x40000000) != 0)) return sdMmcCardFinish(card,5)
+        }
+    }
+    if (phase == 6) {
+        if ((answer&0xe000) != 0 || (answer>>>16) == 0) return sdMmcCardFinish(card,5)
+        card.storeU32(28,answer>>>16)
+    }
+    if (phase >= 8 && !sdMmcCardR1Valid(answer)) return sdMmcCardFinish(card,5)
+    if (phase == 8 && (card.loadU32(24)&0x40000000) != 0) return sdMmcCardNext(card,10)
+    if (phase == 10) {
+        if ((answer&0x1f00) == 0x900) return sdMmcCardFinish(card,1)
+        card.storeU32(20,int(now))
+        return sdMmcCardNext(card,13)
+    }
+    return sdMmcCardNext(card,phase+1)
+}

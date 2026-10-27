@@ -1,0 +1,60 @@
+import "./fat_read_sequence.ab"
+// Directory ancestry primitives. Caller holds volume ownership. No writes,
+// heap or hidden exports. Dot entries are checked rather than trusted blindly.
+type FatDirectoryParent=int
+//1valid2input3IO4corrupt; parentcluster28@8. Root normalizes to0.
+fun FatDirectoryParent.status(): int = this&255
+fun FatDirectoryParent.cluster(): int = (this>>8)&0xfffffff
+trusted fun fatReadDirectoryParentOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    cluster: int,output: NativeBuffer): FatDirectoryParent {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || !reader.hasAddressRange(0,28) || !output.hasAddressRange(0,512) ||
+        fatBuffersOverlap(output,512,reader,28) || fatBuffersOverlap(output,512,boot,512)) return FatDirectoryParent(2)
+    if (cluster == 0 || (geometry.fatBits() == 32 && cluster == fatBootU32(boot,44))) return FatDirectoryParent(1)
+    val sector=fatClusterFirstSector(boot,first,sectors,cluster)
+    if (sector < 0) return FatDirectoryParent(2)
+    if (!fatStorageReadOwned(reader,sector,output)) return FatDirectoryParent(3)
+    var entry=0;var parent=0
+    while (entry < 2) {
+        val offset=entry*32
+        if (output.load(offset) != 46 || output.load(offset+1) != (if (entry == 0) 32 else 46) ||
+            output.load(offset+11) != 16 || output.loadU32(offset+28) != 0) return FatDirectoryParent(4)
+        var n=2;while (n < 11) { if (output.load(offset+n) != 32) return FatDirectoryParent(4);n=n+1 }
+        val target=output.loadU16(offset+26)|(if (geometry.fatBits() == 32) (output.loadU16(offset+20)&4095)<<16 else 0)
+        if (entry == 0 && target != cluster) return FatDirectoryParent(4)
+        if (entry == 1) {
+            parent=if (geometry.fatBits() == 32 && target == fatBootU32(boot,44)) 0 else target
+            if (parent != 0 && fatClusterFirstSector(boot,first,sectors,parent) < 0) return FatDirectoryParent(4)
+        }
+        entry=entry+1
+    }
+    return FatDirectoryParent(1|(parent<<8))
+}
+//1allowed2input/root3IO4corrupt/source-parent mismatch5cycle6budget7descendant.
+// Read budget covers source validation AND entire destination ancestry walk.
+// sourceSector retains exact512B dot sector for later checked parent update;
+// scratch512 is separate. Hold same gate through eventual move publication.
+trusted fun fatCheckDirectoryMoveOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    source: int,oldParent: int,destination: int,budget: int,sourceSector: NativeBuffer,scratch: NativeBuffer): int {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || source == 0 || (geometry.fatBits() == 32 && source == fatBootU32(boot,44)) ||
+        budget < 1 || budget > 1000000 || !sourceSector.hasAddressRange(0,512) || !scratch.hasAddressRange(0,512) ||
+        fatBuffersOverlap(sourceSector,512,scratch,512) || fatBuffersOverlap(scratch,512,reader,28) ||
+        fatBuffersOverlap(scratch,512,boot,512)) return 2
+    val sourceParent=fatReadDirectoryParentOwned(reader,boot,first,sectors,source,sourceSector)
+    if (sourceParent.status() != 1) return sourceParent.status()
+    val normalizedOld=if (geometry.fatBits() == 32 && oldParent == fatBootU32(boot,44)) 0 else oldParent
+    if (sourceParent.cluster() != normalizedOld) return 4
+    var current=if (geometry.fatBits() == 32 && destination == fatBootU32(boot,44)) 0 else destination
+    var remaining=budget-1;var anchor=current;var power=1;var distance=0;var visited=0
+    while (current != 0) {
+        if (current == source) return 7
+        if (remaining == 0) return 6
+        val next=fatReadDirectoryParentOwned(reader,boot,first,sectors,current,scratch)
+        if (next.status() != 1) return next.status()
+        remaining=remaining-1;visited=visited+1;current=next.cluster();distance=distance+1
+        if (current != 0 && (current == anchor || visited >= geometry.clusters())) return 5
+        if (distance == power) { anchor=current;power=power*2;distance=0 }
+    }
+    return 1
+}

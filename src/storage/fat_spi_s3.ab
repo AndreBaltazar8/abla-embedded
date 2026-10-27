@@ -1,0 +1,49 @@
+import "./fat_read_sequence.ab"
+import "../sd/session_s3_sequence.ab"
+// Immutable28B reader: session64@0,owner32@8,SPI scratch address32@12,
+// poll cap32@16,tag32@20,reserved32@24. No heap.
+// Caller serializes FAT traversals, preserves medium/BPB for mounted lifetime,
+// and keeps descriptor/SPI scratch/session/bus gate/FAT buffers disjoint.
+// Closing/reopening the SD session invalidates old reader handles.
+trusted fun fatSpiS3ReaderInitialize(reader: NativeBuffer,session: Esp32S3SdSession,
+    owner: u32,scratch: NativeBuffer,polls: int = 250): bool {
+    if (!s3SdStorageValid(reader,28) || !s3SdStorageValid(scratch,2) || !peripheralOwnerValid(owner) ||
+        polls < 1 || polls > 1000000 || fatBuffersOverlap(reader,28,scratch,2) ||
+        !s3SdSessionStorageValid(session.storage()) || !s3SdSessionDisjoint(session.storage(),reader,28) ||
+        !s3SdSessionDisjoint(session.storage(),scratch,2) || session.blockCount(owner) == 0) return false
+    val gate=PeripheralGate(s3SdSessionLoad64(session.storage(),24))
+    if (!gate.bufferDisjoint(reader,28) || !gate.bufferDisjoint(scratch,2)) return false
+    s3SdSessionStore64(reader,0,session|0);reader.storeU32(8,int(owner));reader.storeU32(12,scratch.addressValue())
+    reader.storeU32(16,polls);reader.storeU32(20,0x53465333);reader.storeU32(24,0)
+    return true
+}
+// False may leave an untrusted partial sector in destination. FAT routines
+// only consume it on success; fatFileReadAtOwned preserves final output on IO.
+trusted fun fatStorageReadOwned(reader: NativeBuffer,sector: int,destination: NativeBuffer): bool {
+    return fatSpiS3TransferOwned(reader,sector,destination,false)
+}
+// Shared admission for reads and opt-in writes; write callers must exclude all
+// filesystem readers throughout their entire read/modify/write transaction.
+trusted fun fatSpiS3TransferOwned(reader: NativeBuffer,sector: int,destination: NativeBuffer,write: bool): bool {
+    if (!s3SdStorageValid(reader,28) ||
+        !destination.hasAddressRange(0,512) || fatBuffersOverlap(reader,28,destination,512)) return false
+    val session=Esp32S3SdSession(s3SdSessionLoad64(reader,0))
+    val scratch=nativeBufferAt(reader.loadU32(12),2)
+    if (reader.loadU32(20) == 0x53465334) {
+        // Master-owner binding: protect the header/pad snapshot as well as the
+        // nested session. Retain generation checking in session.readBlock.
+        val master=nativeBufferAt(reader.loadU32(24),136)
+        if (!s3SdStorageValid(master,136) || (master.addressValue()&3) != 0 ||
+            master.loadU32(0) != 0x53334f31 || master.loadU32(4) != 1 ||
+            s3SdSessionLoad64(master,16) != (session|0) || session.storage().addressValue() != master.addressValue()+72 ||
+            fatBuffersOverlap(master,136,reader,28) || fatBuffersOverlap(master,136,scratch,2) ||
+            fatBuffersOverlap(master,136,destination,512)) return false
+    } else if (reader.loadU32(20) != 0x53465333 || reader.loadU32(24) != 0) return false
+    val owner=u32(reader.loadU32(8));val polls=reader.loadU32(16)
+    if (!s3SdSessionStorageValid(session.storage()) || !s3SdSessionDisjoint(session.storage(),reader,28) ||
+        fatBuffersOverlap(reader,28,scratch,2) || !peripheralOwnerValid(owner) || polls < 1 || polls > 1000000) return false
+    val gate=PeripheralGate(s3SdSessionLoad64(session.storage(),24))
+    if (!gate.bufferDisjoint(reader,28)) return false
+    return if (write) session.writeBlock(owner,sector,scratch,destination,polls).valid()
+        else session.readBlock(owner,sector,scratch,destination,polls).valid()
+}

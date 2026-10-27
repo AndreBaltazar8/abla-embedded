@@ -1,0 +1,90 @@
+import "./mmc_card_s3_sequence.ab"
+import "./scr.ab"
+// Negotiated SDR 1/4-bit transition. Caller owns initialized card, exclusive
+// host/IRQs and routed pads for the REQUESTED width; SCR must be from this
+// card. No pad rerouting or blind host-only width change. No data transfers
+// overlap this transaction. context48/card80 must be owned and disjoint.
+// tag0,phase4,slot5,width6,changeFlags7,RCA8,start12,budget16,oldCTYPE20,
+// command24,response32..47. Flags:1ACMD6 issued(card MAY have changed),
+// 2card accepted,4host applied. Errors/timeouts retain flags and phase; never
+// auto-rollback one side. Caller retains lease and recovers before further IO.
+// 1configured2pending3invalid4hostbusy5transport6card-status7timeout8readback.
+trusted fun sdMmcWidthStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,48) || (context.loadU32(0)&0xffffff00) != 0x53445700) return 3
+    return context.load(0)
+}
+trusted fun sdMmcWidthEnd(context: NativeBuffer,status: int): int { context.store(0,status); return status }
+trusted fun sdMmcWidthIdleOwned(slot: int): bool = (sdMmcS3Read(0)&0x02000037) == 0 &&
+    (sdMmcS3Read(128)&0x83) == 0 && (sdMmcS3Read(140)&0x1e000) == 0 &&
+    (sdMmcS3Read(44)&0x80000000) == 0 && (sdMmcS3Read(72)&0x3ffe06f0) == 0 && (sdMmcS3Read(16)&(1<<slot)) != 0
+trusted fun sdMmcWidthBeginOwned(context: NativeBuffer,card: NativeBuffer,scr: SdScr,width: int,now: u32,budgetMs: int,padsReadyExclusive: bool): int {
+    if (!padsReadyExclusive || !context.hasAddressRange(0,48) || sdMmcCardStatus(card) != 1 || card.load(5) > 1 ||
+        card.loadU32(28) < 1 || card.loadU32(28) > 65535 || !scr.valid() || (width != 1 && width != 4) ||
+        (width == 4 && !scr.supportsFourBit()) || budgetMs < 1 || budgetMs > 60000 ||
+        (context.addressValue() < card.addressValue()+80 && card.addressValue() < context.addressValue()+48)) return 3
+    val slot=card.load(5)
+    if (!sdMmcWidthIdleOwned(slot) || (sdMmcS3Read(116)&(1<<(16+slot))) != 0 || (sdMmcS3Read(268)&(1<<slot)) != 0 || (sdMmcS3Read(24)&(1<<(16+slot))) != 0) return 4
+    var index=0
+    while (index < 48) { context.store(index,0); index=index+1 }
+    context.storeU32(0,0x53445702); context.store(4,1); context.store(5,slot); context.store(6,width)
+    context.storeU32(8,card.loadU32(28)); context.storeU32(12,int(now)); context.storeU32(16,budgetMs); context.storeU32(20,sdMmcS3Read(24))
+    val command=sdMmcCommandStartOwned(slot,55,u32(card.loadU32(28)<<16),1)
+    context.storeU32(24,command|0)
+    if (command.status() != 2) return sdMmcWidthEnd(context,5)
+    return 2
+}
+trusted fun sdMmcWidthPollOwned(context: NativeBuffer,now: u32): int {
+    val state=sdMmcWidthStatus(context)
+    if (state != 2) return state
+    val phase=context.load(4)
+    val slot=context.load(5)
+    if (phase < 1 || phase > 6 || slot > 1 || (context.load(6) != 1 && context.load(6) != 4)) return sdMmcWidthEnd(context,3)
+    if (int(now-u32(context.loadU32(12))) >= context.loadU32(16)) return sdMmcWidthEnd(context,7)
+    if (phase == 2 || phase == 4 || phase == 5) {
+        val errors=sdMmcS3Read(68)&0x1542
+        if (errors != 0) {
+            sdMmcS3Write(68,errors); context.storeU32(24,(errors<<16)|5)
+            return sdMmcWidthEnd(context,5)
+        }
+    }
+    if (phase == 2) {
+        if (!sdMmcWidthIdleOwned(slot)) return 2
+        sdMmcS3Write(68,0x1546)
+        if ((sdMmcS3Read(68)&0x1546) != 0) return sdMmcWidthEnd(context,5)
+        val argument=if (context.load(6) == 4) 2 else 0
+        sdMmcS3Write(40,argument)
+        if (sdMmcS3Read(40) != argument) return sdMmcWidthEnd(context,8)
+        context.store(7,1)
+        sdMmcS3Write(44,0xa0002146|(slot<<16))
+        context.storeU32(24,514); context.store(4,3)
+        return 2
+    }
+    if (phase == 4) {
+        if (!sdMmcWidthIdleOwned(slot)) return 2
+        val mask=(1<<slot)|(1<<(16+slot))
+        val desired=(sdMmcS3Read(24)&~mask)|(if (context.load(6) == 4) 1<<slot else 0)
+        sdMmcS3Write(24,desired)
+        if (sdMmcS3Read(24) != desired) return sdMmcWidthEnd(context,8)
+        context.store(7,7); context.store(4,5)
+        return 2
+    }
+    if (phase == 5) {
+        val command=sdMmcCommandStartOwned(slot,13,u32(context.loadU32(8)<<16),1)
+        if (command.status() == 4) return 2
+        context.storeU32(24,command|0)
+        if (command.status() != 2) return sdMmcWidthEnd(context,5)
+        context.store(4,6)
+        return 2
+    }
+    val response=nativeBufferAt(context.addressValue()+32,16)
+    val command=SdMmcCommand(context.loadU32(24)).pollOwned(response)
+    context.storeU32(24,command|0)
+    if (command.status() == 2) return 2
+    if (command.status() != 1) return sdMmcWidthEnd(context,5)
+    val r1=response.loadU32(0)
+    if (!sdMmcCardR1Valid(r1) || (phase == 1 && (r1&32) == 0)) return sdMmcWidthEnd(context,6)
+    if (phase == 6) return sdMmcWidthEnd(context,if ((r1&0x1f00) == 0x900) 1 else 6)
+    if (phase == 3) context.store(7,3)
+    context.store(4,phase+1)
+    return 2
+}

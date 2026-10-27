@@ -1,0 +1,37 @@
+import "./pmic_types.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// ToughC5 touch/RTC -> PM1 IRQ -> GPIO4 active-low. Run cache-on, before
+// quiescing I2C/clocks/interrupts. Borrow live PM1 and CHSC6540 handles plus
+//22B scratch; serialize all consumers. Pad input/pullup/holds are board-owned.
+// One bounded upstream release round:8 clears,5ms each. No shutdown request,
+// RTC alarm disable, bus reset, GPIO drive, or automatic sleep on I/O failure.
+// Result:valid0,released1,any communication2,any touch capture3,attempts4..7,
+// last raw clear bitmap8..17. PM1 four-write success defines communication,
+// as upstream; touch capture is reported independently. ACK != pin released.
+type ToughC5WakeRelease=int
+fun ToughC5WakeRelease.valid(): bool = (this&1) != 0 && (this>>>18) == 0 && this.attempts() <= 8
+fun ToughC5WakeRelease.released(): bool = (this&2) != 0
+fun ToughC5WakeRelease.communicated(): bool = (this&4) != 0
+fun ToughC5WakeRelease.touchCaptured(): bool = (this&8) != 0
+fun ToughC5WakeRelease.attempts(): int = (this>>>4)&15
+fun ToughC5WakeRelease.lastClear(): int = (this>>>8)&1023
+trusted fun toughC5ReleaseWakePinOwned(pmic: M5PmicOpen,touch: int,scratch: NativeBuffer,exclusive: bool): ToughC5WakeRelease {
+    if (!exclusive || !pmic.ready() || pmic.kind() != 5 || touch <= 0 || touch > 4294967295 ||
+        !scratch.hasAddressRange(0,22)) return ToughC5WakeRelease(0)
+    var attempts=0;var flags=1;var last=0
+    while (attempts < 8) {
+        // Upstream counts an already released pin as communication OK even
+        // when no clear was necessary, but never invent a touch observation.
+        if (toughC5WakePinReleased()) return ToughC5WakeRelease(flags|6|(attempts<<4)|(last<<8))
+        last=toughC5WakeClear(pmic.deviceHandle(),touch,scratch)
+        if ((last&271) == 271) flags=flags|4
+        if ((last&512) != 0) flags=flags|8
+        toughC5WakeDelayMilliseconds(5)
+        attempts=attempts+1
+    }
+    ToughC5WakeRelease(flags|(if (toughC5WakePinReleased()) 2 else 0)|(attempts<<4)|(last<<8))
+}
+// Recheck after timer/calibration delays and immediately before the sleep
+// handoff. The sleep lifecycle checks again cache-off; I2C stays cache-on.
+trusted fun toughC5WakePinFinalReleasedOwned(exclusive: bool): bool = exclusive && toughC5WakePinReleased()

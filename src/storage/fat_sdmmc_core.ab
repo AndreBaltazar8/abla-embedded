@@ -1,0 +1,94 @@
+import "./fat_read_sequence.ab"
+import "../sd/mmc_read_s3_sequence.ab"
+// Exact wrapping milliseconds from a 52-bit,16MHz counter. Pure helper kept
+// separate from the snapshot hardware so the wrap arithmetic is testable.
+fun fatSdMmcMillisecondsFromTicks(ticks: int): int {
+    if (ticks < 0 || ticks > 4503599627370495) return -1
+    val us=ticks>>>4
+    val high=u32(us>>>32)
+    val low=u32(us&4294967295)
+    return int(high*u32(4294967)+low/u32(1000)+(low%u32(1000)+high*u32(296))/u32(1000))
+}
+// Immutable28-byte reader: card80 pointer0, session52 pointer4, descriptor16
+// pointer8, DMA bounce512 pointer12, timeoutMs16, maxPolls20, tag24.
+// Session uses read context48 then lifecycle32: 0idle,1pending,2failed/drained.
+// Caller exclusively owns all regions/host/pads/source/card for mounted life.
+// No filesystem writers or concurrent calls; lifecycle is NOT a cross-core lock.
+// fatSdMmcNowMilliseconds() returns wrapping u32 milliseconds as int, or <0
+// on clock failure. A poll cap also bounds a frozen clock. False never copies
+// partial data, frees DMA storage, rearms a failed session, or hides cleanup.
+fun fatSdMmcRegionAddress(reader: NativeBuffer,card: NativeBuffer,session: NativeBuffer,descriptor: NativeBuffer,bounce: NativeBuffer,index: int): int =
+    if (index == 0) reader.addressValue() else if (index == 1) card.addressValue() else if (index == 2) session.addressValue() else if (index == 3) descriptor.addressValue() else bounce.addressValue()
+fun fatSdMmcRegionSize(index: int): int = if (index == 0) 28 else if (index == 1) 80 else if (index == 2) 52 else if (index == 3) 16 else 512
+trusted fun fatSdMmcReaderInitialize(reader: NativeBuffer,card: NativeBuffer,session: NativeBuffer,descriptor: NativeBuffer,bounce: NativeBuffer,timeoutMs: int,maxPolls: int,releasedExclusive: bool): bool {
+    if (!releasedExclusive || !reader.hasAddressRange(0,28) || !session.hasAddressRange(0,52) ||
+        sdMmcCardStatus(card) != 1 || sdMmcCardBlockCount(card) == 0 || !sdMmcDmaRegionsValid(descriptor,bounce,512) ||
+        timeoutMs < 1 || timeoutMs > 60000 || maxPolls < 1 || maxPolls > 1000000) return false
+    var i=0
+    while (i < 5) {
+        var j=0
+        while (j < i) {
+            if (!sdMmcReadDisjoint(fatSdMmcRegionAddress(reader,card,session,descriptor,bounce,i),fatSdMmcRegionSize(i),
+                fatSdMmcRegionAddress(reader,card,session,descriptor,bounce,j),fatSdMmcRegionSize(j))) return false
+            j=j+1
+        }
+        i=i+1
+    }
+    reader.storeU32(0,card.addressValue()); reader.storeU32(4,session.addressValue())
+    reader.storeU32(8,descriptor.addressValue()); reader.storeU32(12,bounce.addressValue())
+    reader.storeU32(16,timeoutMs); reader.storeU32(20,maxPolls); reader.storeU32(24,0x53444631)
+    session.storeU32(48,0)
+    return true
+}
+trusted fun fatSdMmcReaderValid(reader: NativeBuffer,expectedTag: int = 0x53444631): bool = reader.hasAddressRange(0,28) && reader.loadU32(24) == expectedTag &&
+    reader.loadU32(16) >= 1 && reader.loadU32(16) <= 60000 && reader.loadU32(20) >= 1 && reader.loadU32(20) <= 1000000
+// One cleanup poll after false with lifecycle1. Terminal cleanup always poisons
+// the session, even if late read completion succeeded: the original FAT call
+// already failed. Only explicit card/host recovery + checked reinitialization
+// may reuse it. Return2pending, other read statuses terminal, -1clock/input.
+trusted fun fatSdMmcDrainOwned(reader: NativeBuffer,expectedTag: int = 0x53444631): int {
+    if (!fatSdMmcReaderValid(reader,expectedTag)) return -1
+    val session=nativeBufferAt(reader.loadU32(4),52)
+    if (!session.hasAddressRange(0,52) || session.loadU32(48) != 1) return -1
+    val now=fatSdMmcNowMilliseconds()
+    if (now < 0) return -1
+    val result=sdMmcReadPollOwned(nativeBufferAt(session.addressValue(),48),u32(now))
+    if (result != 2) session.storeU32(48,2)
+    return result
+}
+trusted fun fatSdMmcReadCardOwned(reader: NativeBuffer,card: NativeBuffer,sector: int,destination: NativeBuffer,expectedTag: int = 0x53444631): bool {
+    if (!fatSdMmcReaderValid(reader,expectedTag) || !destination.hasAddressRange(0,512)) return false
+    val session=nativeBufferAt(reader.loadU32(4),52)
+    val descriptor=nativeBufferAt(reader.loadU32(8),16)
+    val bounce=nativeBufferAt(reader.loadU32(12),512)
+    if (!session.hasAddressRange(0,52) || session.loadU32(48) != 0) return false
+    var index=0
+    while (index < 5) {
+        if (!sdMmcReadDisjoint(destination.addressValue(),512,fatSdMmcRegionAddress(reader,card,session,descriptor,bounce,index),fatSdMmcRegionSize(index))) return false
+        index=index+1
+    }
+    val now=fatSdMmcNowMilliseconds()
+    if (now < 0) return false
+    val context=nativeBufferAt(session.addressValue(),48)
+    val begun=sdMmcReadBeginOwned(context,card,descriptor,bounce,sector,u32(now),reader.loadU32(16),true)
+    if (begun != 2) return false
+    session.storeU32(48,1)
+    var remaining=reader.loadU32(20)
+    while (remaining > 0) {
+        val tick=fatSdMmcNowMilliseconds()
+        if (tick < 0) return false
+        val result=sdMmcReadPollOwned(context,u32(tick))
+        if (result == 1) {
+            var word=0
+            while (word < 128) {
+                destination.storeU32(word*4,sdMmcDmaS3Read(bounce.addressValue()+word*4))
+                word=word+1
+            }
+            session.storeU32(48,0)
+            return true
+        }
+        if (result != 2) { session.storeU32(48,2); return false }
+        remaining=remaining-1
+    }
+    return false
+}

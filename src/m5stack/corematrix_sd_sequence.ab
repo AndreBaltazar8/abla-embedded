@@ -1,0 +1,76 @@
+import "../sd/session_c61_sequence.ab"
+import "../esp32/gpio_pin_c61_sequence.ab"
+import "./pin_map_shared.ab"
+// Exclusive board owner40B: magic0,status4,master8,session16,detail24,control32.
+// Keep control/GPIO clocks live until close completes. No implicit power-off,
+// bus recovery, pin reset, filesystem access or card-data writes.
+type M5CoreMatrixSd=int
+fun m5CoreMatrixSdAt(storage: NativeBuffer): M5CoreMatrixSd =
+    if (c61SpiBufferValid(storage,40) && (storage.addressValue()&3) == 0) M5CoreMatrixSd(storage|0) else M5CoreMatrixSd(0)
+fun M5CoreMatrixSd.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5CoreMatrixSd.valid(): bool = m5CoreMatrixSdAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x434d5331
+trusted fun M5CoreMatrixSd.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5CoreMatrixSd.master(): Esp32C61SpiMaster = Esp32C61SpiMaster(c61SdSessionLoad64(this.buffer(),8))
+trusted fun M5CoreMatrixSd.session(): Esp32C61SdSession = Esp32C61SdSession(c61SdSessionLoad64(this.buffer(),16))
+trusted fun M5CoreMatrixSd.initializeFresh(): bool {
+    if (m5CoreMatrixSdAt(this.buffer()) == 0) return false
+    var at=0
+    while (at < 40) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x434d5331);return true
+}
+// Status0closed1ready2admission3power4master5card6close. Detail preserves
+// power setup result or SD initialization failure. Master always retained.
+// Owner/session storage already initialized fresh. Caller serializes control,
+// SPI users and this owner, owns fresh SD pads and all other inactive CS.
+trusted fun M5CoreMatrixSd.openOwned(control: int,sessionStorage: NativeBuffer,gate: PeripheralGate,
+    owner: u32,sourceHz: int,scratch: NativeBuffer,response: NativeBuffer,settleMicroseconds: int,exclusive: bool): int {
+    val storage=this.buffer()
+    if (!exclusive || this.status() != 0 || !c61SdSessionStorageValid(sessionStorage) ||
+        sessionStorage.loadU32(12) == 1 || sessionStorage.loadU32(8) >= 16777215 ||
+        !c61SpiGateValid(gate) || !peripheralOwnerValid(owner) ||
+        !gate.bufferDisjoint(storage,40) || !gate.bufferDisjoint(sessionStorage,64) ||
+        !c61SdSessionDisjoint(sessionStorage,storage,40) ||
+        !c61SdSessionDisjoint(sessionStorage,scratch,2) || !c61SdSessionDisjoint(sessionStorage,response,16) ||
+        !c61SpiBufferValid(scratch,2) || !c61SpiBufferValid(response,16) ||
+        !gate.bufferDisjoint(scratch,2) || !gate.bufferDisjoint(response,16) ||
+        !(scratch.addressValue()+2 <= response.addressValue() || response.addressValue()+16 <= scratch.addressValue()) ||
+        !(scratch.addressValue()+2 <= storage.addressValue() || storage.addressValue()+40 <= scratch.addressValue()) ||
+        !(response.addressValue()+16 <= storage.addressValue() || storage.addressValue()+40 <= response.addressValue()) ||
+        sourceHz < 1000000 || sourceHz > 160000000 || settleMicroseconds < 1000 || settleMicroseconds > 1000000 ||
+        !coreMatrixSdControlAdmission(control,storage,sessionStorage,gate,scratch,response)) return 2
+    if (!coreMatrixSdRetain(control)) return 2
+    c61SdSessionStore64(storage,32,control)
+    val power=coreMatrixSdPower(control)
+    c61SdSessionStore64(storage,24,power)
+    if ((power&255) != 1) { storage.storeU32(4,3);return 3 }
+    coreMatrixSdDelay(settleMicroseconds)
+    val pins=m5BoardCoreMatrix.sdPins()
+    // At most400kHz even with160MHz source. No platform-specific compiler ops.
+    val master=esp32C61SpiMasterOpenOwned(spiPins(pins.spiMosi().number(),pins.spiMiso().number(),pins.spiClock().number()),
+        pins.spiChipSelect().number(),sourceHz,2,10,20,0,1000,true)
+    c61SdSessionStore64(storage,8,master|0)
+    if (!master.ready()) { storage.storeU32(4,4);return 4 }
+    val session=esp32C61SdSessionOpen(sessionStorage,master,gate,owner,sourceHz,scratch,response)
+    c61SdSessionStore64(storage,16,session|0)
+    c61SdSessionStore64(storage,24,c61SdSessionLoad64(sessionStorage,48))
+    storage.storeU32(4,if (session != 0) 1 else 5)
+    return this.status()
+}
+// All session users must already be joined. Invalidates before releasing pins;
+// active timed-out controller keeps the master owner for retry. Leaves SD rail
+// on deliberately; control must not close GPIO clocks until this returns true.
+trusted fun M5CoreMatrixSd.closeOwned(owner: u32,exclusiveUsersQuiesced: bool): bool {
+    if (!exclusiveUsersQuiesced || !this.valid()) return false
+    val session=this.session()
+    if (session != 0 && !session.invalidate(owner) && session.storage().loadU32(12) == 1) return false
+    c61SdSessionStore64(this.buffer(),16,0)
+    val closed=this.master().closeOwned(true)
+    c61SdSessionStore64(this.buffer(),8,closed|0)
+    this.buffer().storeU32(4,if (closed == 0) 0 else 6)
+    if (closed == 0) {
+        val control=c61SdSessionLoad64(this.buffer(),32)
+        if (control != 0) coreMatrixSdRelease(control)
+        c61SdSessionStore64(this.buffer(),32,0)
+    }
+    return closed == 0
+}

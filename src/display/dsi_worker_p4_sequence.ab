@@ -1,0 +1,44 @@
+import "./dsi_mailbox_p4_sequence.ab"
+import "../service_gate.ab"
+import "./dsi_worker_result.ab"
+// Cooperative task-context poll. Caller pins owning core, clock/DMA/frame/
+// descriptor/mailbox lifetimes and cache-engine serialization. Same service
+// gate as shutdown; never call from ISR or with MIEoff. Poll even without a
+// mailbox event: hw_ver1 has no bridge VSYNC, DMA completion is authoritative.
+// Result low48 = complete rearm report; bits48..49 coalesced bridge events;
+// bits56..59 worker status:0service report,1invalid,2admission,3mailbox fault,
+// 4resume failure,5gate misuse. Sticky mailbox fault is never silently cleared.
+trusted fun esp32P4DsiWorkerPollOwned(box: P4DsiMailbox,gate: ServiceGate,token: u32,channel: int,
+    descriptor: NativeBuffer,frame: NativeBuffer,bytes: int,line: int,polls: int): P4DsiWorkerResult {
+    if (!box.valid() || p4DsiMailboxCore() != box.buffer().loadU32(4) || p4DsiMailboxMasked() ||
+        gate <= 0 || gate > 4294967292 || !gate.word().valid() ||
+        !descriptor.hasAddressRange(0,64) || !frame.hasAddressRange(0,bytes) || bytes < 8 ||
+        channel < 0 || channel > 3 || polls < 1 || polls > 1000000) return p4DsiWorkerResult(1,0,0)
+    val b=box.buffer().addressValue(); val d=descriptor.addressValue(); val f=frame.addressValue()
+    if ((b < gate+4 && gate < b+28) || (b < d+64 && d < b+28) || (b < f+bytes && f < b+28) ||
+        (gate < d+64 && d < gate+4) || (gate < f+bytes && f < gate+4)) return p4DsiWorkerResult(1,0,0)
+    if (!gate.tryBegin(token)) return p4DsiWorkerResult(2,0,0)
+    // Short core-local critical section only: no cache wait or DMA work.
+    val saved=p4DsiWorkerMask()
+    val capture=box.takeOwned()
+    var fault=box.buffer().loadU32(24) != 0 || capture == 2 || (capture&255) == 4
+    p4DsiWorkerRestore(saved)
+    var service=0
+    var status=if (fault) 3 else 0
+    if (!fault) {
+        service=p4DsiWorkerRearm(channel,descriptor,frame,bytes,line,polls)
+        val outcome=service&255
+        fault=outcome != 0 && outcome != 1 && outcome != 3
+    }
+    val finishSaved=p4DsiWorkerMask()
+    // An ISR during rearm may have captured underrun. Keep its report pending
+    // for inspection and close admission, even if DMA itself reported success.
+    if (box.buffer().loadU32(24) != 0) { fault=true; status=3 }
+    if (!fault && capture != 0 && box.buffer().loadU32(20) == 0 &&
+        gate.word().compareExchange(token,token) == token) {
+        if (box.resumeOwned() != 1) { fault=true; status=4 }
+    }
+    if (!gate.finish(token,!fault)) status=5
+    p4DsiWorkerRestore(finishSaved)
+    return p4DsiWorkerResult(status,service,(capture>>>8)&3)
+}

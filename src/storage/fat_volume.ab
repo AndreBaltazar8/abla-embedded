@@ -1,0 +1,84 @@
+import "./fat_mount.ab"
+import "./fat_file_read.ab"
+import "./fat_file_overwrite_checked.ab"
+import "../peripheral_gate.ab"
+// Caller-owned32B: lock0,magic4,generation8,state12,reader16,boot20,first24,size28.
+// state0closed1mounted2opening3fault. One shared gate serializes complete
+// transactions (including readers), not only physical sector transfers.
+// ALL filesystem users must use this volume or externally hold the same gate.
+// Raw Owned APIs do not acquire it. Caller retains media/reader/BPB and native
+// transport resources, disjoint from this storage, until invalidate succeeds.
+// Fresh storage cannot be recycled while stale handles exist. Generation24
+// never wraps. A failed write faults the mount; no automatic retry/recovery.
+type FatVolume=int
+fun FatVolume.storage(): NativeBuffer = nativeBufferAt(this&4294967295,32)
+fun fatVolumeSpan(s: NativeBuffer): bool = s.hasAddressRange(0,32) && (s.addressValue()&3) == 0
+trusted fun fatVolumeInitializeFresh(s: NativeBuffer): bool {
+    if (!fatVolumeSpan(s)) return false
+    var offset=0
+    while (offset < 32) { s.storeU32(offset,0);offset=offset+4 }
+    s.storeU32(4,0x46564f31);return true
+}
+trusted fun FatVolume.currentLocked(): bool = (this>>>56) == 0 && (this>>>32) != 0 &&
+    this.storage().loadU32(8) == (this>>>32)
+trusted fun fatVolumeOpen(s: NativeBuffer,owner: u32,reader: NativeBuffer,cardSectors: int,
+    partition: int,boot: NativeBuffer,scratch: NativeBuffer): FatVolume {
+    if (!fatVolumeSpan(s) || s.loadU32(4) != 0x46564f31 ||
+        fatBuffersOverlap(s,32,reader,28) || fatBuffersOverlap(s,32,boot,512) ||
+        fatBuffersOverlap(s,32,scratch,512)) return FatVolume(0)
+    val gate=peripheralGateAt(s.addressValue())
+    if (gate.tryBegin(owner) != 0) return FatVolume(0)
+    val generation=s.loadU32(8)
+    if (s.loadU32(12) != 0 || generation >= 16777215) { gate.finish(owner,true);return FatVolume(0) }
+    s.storeU32(8,generation+1);s.storeU32(12,2)
+    val mounted=fatMountReadOwned(reader,cardSectors,partition,boot,scratch)
+    s.storeU32(16,reader.addressValue());s.storeU32(20,boot.addressValue())
+    s.storeU32(24,mounted.firstSector());s.storeU32(28,mounted.sectors())
+    s.storeU32(12,if (mounted.valid()) 1 else 0)
+    if (!gate.finish(owner,true)) return FatVolume(0)
+    return if (mounted.valid()) FatVolume(s.addressValue()|((generation+1)<<32)) else FatVolume(0)
+}
+// Status0 acquired,12busy,13stale/invalid,14fault. Internal paired admission.
+trusted fun FatVolume.begin(owner: u32): int {
+    val s=this.storage()
+    if (!fatVolumeSpan(s) || s.loadU32(4) != 0x46564f31) return 13
+    val gate=peripheralGateAt(s.addressValue());val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return if (admitted == 1) 12 else 13
+    val status=if (!this.currentLocked() || s.loadU32(12) == 0) 13 else if (s.loadU32(12) != 1) 14 else 0
+    if (status != 0) gate.finish(owner,true)
+    return status
+}
+trusted fun FatVolume.invalidate(owner: u32): bool {
+    val s=this.storage()
+    if (!fatVolumeSpan(s) || s.loadU32(4) != 0x46564f31) return false
+    val gate=peripheralGateAt(s.addressValue())
+    if (gate.tryBegin(owner) != 0) return false
+    val current=this.currentLocked() && (s.loadU32(12) == 1 || s.loadU32(12) == 3)
+    if (current) s.storeU32(12,0)
+    val released=gate.finish(owner,true);return current && released
+}
+trusted fun FatVolume.overwrite(owner: u32,parent: int,ordinal: int,entry: int,expected: NativeBuffer,
+    offset: int,length: int,budget: int,source: NativeBuffer,modified: RtcDateTime,workspace: NativeBuffer): FatFileOverwriteChecked {
+    val s=this.storage()
+    if (fatBuffersOverlap(s,32,workspace,2048) || fatBuffersOverlap(s,32,source,length) ||
+        fatBuffersOverlap(s,32,expected,32)) return FatFileOverwriteChecked(3)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatFileOverwriteChecked(admitted)
+    val result=fatFileOverwriteCheckedOwned(nativeBufferAt(s.loadU32(16),28),nativeBufferAt(s.loadU32(20),512),
+        s.loadU32(24),s.loadU32(28),parent,ordinal,entry,expected,offset,length,budget,source,modified,workspace)
+    if (result.status() == 4 || result.status() == 8 || result.status() == 11) s.storeU32(12,3)
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatFileOverwriteChecked(14|(result.dataBytesWritten()<<8))
+    return result
+}
+trusted fun FatVolume.read(owner: u32,file: FatDirectoryEntry,offset: int,length: int,budget: int,
+    destination: NativeBuffer,workspace: NativeBuffer): FatFileRead {
+    val s=this.storage()
+    if (fatBuffersOverlap(s,32,workspace,1536) || fatBuffersOverlap(s,32,destination,length)) return FatFileRead(3)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatFileRead(admitted)
+    val result=fatFileReadAtOwned(nativeBufferAt(s.loadU32(16),28),nativeBufferAt(s.loadU32(20),512),
+        s.loadU32(24),s.loadU32(28),file,offset,length,budget,destination,workspace)
+    if (result.status() == 4) s.storeU32(12,3)
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatFileRead(14)
+    return result
+}

@@ -1,0 +1,78 @@
+import "./ssd1677_canvas.ab"
+// Wire encoding/history algorithms from LovyanGFX Panel_SSD1677.cpp;
+// FreeBSD license: epd_waveform.LICENSE. Caller serializes drawing/refresh.
+fun ssd1677FrameDimensions(width: int,height: int): bool = ssd1677CanvasDimensions(width,height) && (width&7) == 0
+fun ssd1677DirtyValid(width: int,height: int,x: int,y: int,w: int,h: int): bool =
+    ssd1677FrameDimensions(width,height) && x >= 0 && y >= 0 && w > 0 && h > 0 && x < width && y < height && w <= width-x && h <= height-y
+fun ssd1677FrameDisjoint(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.addressValue()+an <= b.addressValue() || b.addressValue()+bn <= a.addressValue()
+fun ssd1677DirtyMask(byteIndex: int,x: int,w: int): int {
+    if (byteIndex < (x>>3) || byteIndex > ((x+w-1)>>3)) return 0
+    var mask=255
+    if (byteIndex == (x>>3)) mask=mask&(255>>(x&7))
+    if (byteIndex == ((x+w-1)>>3)) mask=mask&((255<<(7-((x+w-1)&7)))&255)
+    return mask
+}
+// One physical full-width row for BW(bank0) or RED(bank1).
+// mode1/2 absolute Mode1, mode3 absolute Mode2, mode4 differential Mode2.
+// mode4 REQUIRES valid displayed history; caller selects mode3 otherwise.
+// History stays logical. Inverted differential refresh transforms BOTH old
+// and new gray levels before computing transition groups, including unchanged
+// pixels. Inversion changes require an absolute baseline before mode4 reuse.
+// No history writes until activation succeeds.
+trusted fun ssd1677EncodeRowOwned(output: NativeBuffer,canvas: NativeBuffer,history: NativeBuffer,
+    width: int,height: int,row: int,bank: int,mode: int,oddFace: bool,invert: bool,
+    x: int,y: int,w: int,h: int,exclusive: bool): bool {
+    val plane=ssd1677PlaneBytes(width,height);val rowBytes=width/8
+    if (!exclusive || !ssd1677DirtyValid(width,height,x,y,w,h) || row < 0 || row >= height ||
+        bank < 0 || bank > 1 || mode < 1 || mode > 4 || !canvas.hasAddressRange(0,plane*2) ||
+        !output.hasAddressRange(0,rowBytes) || !ssd1677FrameDisjoint(output,rowBytes,canvas,plane*2)) return false
+    if (mode == 4 && (!history.hasAddressRange(0,plane*2) ||
+        !ssd1677FrameDisjoint(output,rowBytes,history,plane*2) || !ssd1677FrameDisjoint(canvas,plane*2,history,plane*2))) return false
+    val selected=if (mode <= 2 && oddFace) 1-bank else bank
+    var column=0
+    while (column < rowBytes) {
+        val index=row*rowBytes+column
+        var value=0
+        if (mode != 4) value=canvas.load(index+selected*plane)^(if (invert) 0 else 255)
+        else {
+            val polarity=if (invert) 255 else 0
+            val oldL=history.load(index)^polarity;val oldM=history.load(index+plane)^polarity
+            val newM=canvas.load(index+plane)^polarity
+            val mask=if (row >= y && row < y+h) ssd1677DirtyMask(column,x,w) else 0
+            val desired=if (bank == 0) newM else (newM&(oldL&oldM))|((255^newM)&(oldL|oldM))
+            value=(oldM&(255^mask))|(desired&mask)
+        }
+        output.store(column,value)
+        column=column+1
+    }
+    return true
+}
+// Commit only after a successful BUSY completion. Full absolute refresh
+// remembers both gray planes; differential updates only dirty bits to mono.
+// Failed/uncertain activation must invalidate history instead of calling this.
+trusted fun ssd1677RememberOwned(history: NativeBuffer,canvas: NativeBuffer,width: int,height: int,
+    x: int,y: int,w: int,h: int,differential: bool,exclusive: bool): bool {
+    val plane=ssd1677PlaneBytes(width,height);val rowBytes=width/8
+    if (!exclusive || !ssd1677DirtyValid(width,height,x,y,w,h) ||
+        !history.hasAddressRange(0,plane*2) || !canvas.hasAddressRange(0,plane*2) ||
+        !ssd1677FrameDisjoint(history,plane*2,canvas,plane*2)) return false
+    if (!differential) {
+        var index=0
+        while (index < plane*2) { history.store(index,canvas.load(index));index=index+1 }
+        return true
+    }
+    var row=y
+    while (row < y+h) {
+        var column=x>>3
+        while (column <= ((x+w-1)>>3)) {
+            val index=row*rowBytes+column;val mask=ssd1677DirtyMask(column,x,w)
+            val mono=canvas.load(index+plane)&mask
+            history.store(index,(history.load(index)&(255^mask))|mono)
+            history.store(index+plane,(history.load(index+plane)&(255^mask))|mono)
+            column=column+1
+        }
+        row=row+1
+    }
+    return true
+}

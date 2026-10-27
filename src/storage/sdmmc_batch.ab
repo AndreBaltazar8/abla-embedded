@@ -1,0 +1,82 @@
+import "./fat_sdmmc.ab"
+import "../sd/mmc_read_multiple_s3_sequence.ab"
+// Bounded contiguous-sector reader. Immutable reader32: same first24 bytes
+// as FAT reader, tag24, bounce capacity in sectors28. Session76: context72,
+// guard72 (0idle/1pending/2failed). Separate from the legacy28/52-byte ABI.
+// All five regions remain exclusively owned. No concurrent calls, filesystem
+// mutation, automatic retry, or implicit splitting beyond bounce capacity.
+// False leaves the destination unchanged. Pending DMA must drain; terminal
+// failure requires explicit host/card recovery before reinitialization.
+fun sdMmcBatchRegionSize(index: int,sectors: int): int = if (index == 0) 32 else if (index == 1) 80 else if (index == 2) 76 else if (index == 3) sdMmcDmaDescriptorCount(sectors<<9)*16 else sectors<<9
+trusted fun sdMmcBatchReaderValid(reader: NativeBuffer): bool = reader.hasAddressRange(0,32) && reader.loadU32(24) == 0x53444231 &&
+    reader.loadU32(16) >= 1 && reader.loadU32(16) <= 60000 && reader.loadU32(20) >= 1 && reader.loadU32(20) <= 1000000 &&
+    reader.loadU32(28) >= 1 && reader.loadU32(28) <= 960
+trusted fun sdMmcBatchReaderInitialize(reader: NativeBuffer,card: NativeBuffer,session: NativeBuffer,descriptors: NativeBuffer,bounce: NativeBuffer,sectors: int,timeoutMs: int,maxPolls: int,releasedExclusive: bool): bool {
+    if (!releasedExclusive || !reader.hasAddressRange(0,32) || !session.hasAddressRange(0,76) || sectors < 1 || sectors > 960 ||
+        sdMmcCardStatus(card) != 1 || sdMmcCardBlockCount(card) == 0 || card.loadU32(28) < 1 || card.loadU32(28) > 65535 ||
+        !sdMmcDmaRegionsValid(descriptors,bounce,sectors<<9) || timeoutMs < 1 || timeoutMs > 60000 || maxPolls < 1 || maxPolls > 1000000) return false
+    var i=0
+    while (i < 5) {
+        var j=0
+        while (j < i) {
+            if (!sdMmcReadDisjoint(fatSdMmcRegionAddress(reader,card,session,descriptors,bounce,i),sdMmcBatchRegionSize(i,sectors),
+                fatSdMmcRegionAddress(reader,card,session,descriptors,bounce,j),sdMmcBatchRegionSize(j,sectors))) return false
+            j=j+1
+        }
+        i=i+1
+    }
+    reader.storeU32(0,card.addressValue()); reader.storeU32(4,session.addressValue())
+    reader.storeU32(8,descriptors.addressValue()); reader.storeU32(12,bounce.addressValue())
+    reader.storeU32(16,timeoutMs); reader.storeU32(20,maxPolls); reader.storeU32(24,0x53444231); reader.storeU32(28,sectors)
+    session.storeU32(72,0)
+    return true
+}
+trusted fun sdMmcBatchPoll(context: NativeBuffer,now: u32): int = if (context.loadU32(40) == 0) sdMmcReadPollOwned(context,now) else sdMmcReadMultiplePollOwned(context,now)
+trusted fun sdMmcBatchDrainOwned(reader: NativeBuffer): int {
+    if (!sdMmcBatchReaderValid(reader)) return -1
+    val session=nativeBufferAt(reader.loadU32(4),76)
+    if (!session.hasAddressRange(0,76) || session.loadU32(72) != 1) return -1
+    val now=fatSdMmcNowMilliseconds()
+    if (now < 0) return -1
+    val result=sdMmcBatchPoll(nativeBufferAt(session.addressValue(),72),u32(now))
+    if (result != 2) session.storeU32(72,2)
+    return result
+}
+trusted fun sdMmcBatchReadOwned(reader: NativeBuffer,sector: int,sectors: int,destination: NativeBuffer): bool {
+    if (!sdMmcBatchReaderValid(reader) || sectors < 1 || sectors > reader.loadU32(28) || !destination.hasAddressRange(0,sectors<<9)) return false
+    val capacity=reader.loadU32(28)
+    val card=nativeBufferAt(reader.loadU32(0),80)
+    val session=nativeBufferAt(reader.loadU32(4),76)
+    val descriptors=nativeBufferAt(reader.loadU32(8),sdMmcDmaDescriptorCount(capacity<<9)*16)
+    val bounce=nativeBufferAt(reader.loadU32(12),capacity<<9)
+    if (!session.hasAddressRange(0,76) || session.loadU32(72) != 0) return false
+    var i=0
+    while (i < 5) {
+        if (!sdMmcReadDisjoint(destination.addressValue(),sectors<<9,fatSdMmcRegionAddress(reader,card,session,descriptors,bounce,i),sdMmcBatchRegionSize(i,capacity))) return false
+        i=i+1
+    }
+    val now=fatSdMmcNowMilliseconds()
+    if (now < 0) return false
+    val context=nativeBufferAt(session.addressValue(),72)
+    val begun=if (sectors == 1) sdMmcReadBeginOwned(context,card,descriptors,bounce,sector,u32(now),reader.loadU32(16),true)
+        else sdMmcReadMultipleBeginOwned(context,card,descriptors,bounce,sector,sectors,u32(now),reader.loadU32(16),true)
+    if (begun != 2) return false
+    session.storeU32(72,1)
+    var remaining=reader.loadU32(20)
+    while (remaining > 0) {
+        val tick=fatSdMmcNowMilliseconds()
+        if (tick < 0) return false
+        val result=sdMmcBatchPoll(context,u32(tick))
+        if (result == 1) {
+            var offset=0
+            while (offset < (sectors<<9)) {
+                destination.storeU32(offset,sdMmcDmaS3Read(bounce.addressValue()+offset)); offset=offset+4
+            }
+            session.storeU32(72,0)
+            return true
+        }
+        if (result != 2) { session.storeU32(72,2); return false }
+        remaining=remaining-1
+    }
+    return false
+}

@@ -1,0 +1,117 @@
+import "./mmc_bus_s3_sequence.ab"
+import "./mmc_host_clock_s3_sequence.ab"
+import "./mmc_frequency.ab"
+import "./mmc_reset_s3_sequence.ab"
+import "./mmc_clock_s3_sequence.ab"
+import "./mmc_card_s3_sequence.ab"
+// Composite native SD identification startup. Caller already owns powered,
+// settled card, routed/released pads with external pulls, pinned stable XTAL40
+// or PLL160 source, and exclusive BOTH-slot/IRQ/SYSTEM ownership. Both CIU
+// clocks must already be disabled; this never steals/resets an active host.
+// GPIO/PMIC policies remain board-specific and are not inferred from pin IDs.
+// context128 bytes: tagged status0,phase4,slot5,PLL6,hostdiv7,carddiv8,
+// sourceHz12,startMs16,budgetMs20,sourceChangeUs24,busLease28,primitive32,
+// failureDetail36,ceilCardHz40,reserved44,card metadata48..127.
+// 1card ready2pending3invalid4stage failure5deadline. ALL pending/failure
+// states retain leases, primitive tokens and phase for explicit recovery.
+// mmc_shutdown_s3_sequence extends this with6closing/7closed/8closefailure.
+// No automatic rollback/gating/reset/close on error or timeout. Keep context,
+// source and pads alive. Caller must not begin again over a live context.
+trusted fun sdMmcStartupStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,128) || (context.loadU32(0)&0xffffff00) != 0x53445300) return 3
+    return context.load(0)
+}
+trusted fun sdMmcStartupEnd(context: NativeBuffer,status: int,detail: int): int {
+    context.store(0,status); context.storeU32(36,detail)
+    return status
+}
+trusted fun sdMmcStartupCard(context: NativeBuffer): NativeBuffer = if (sdMmcStartupStatus(context) == 1) nativeBufferAt(context.addressValue()+48,80) else nativeBufferAt(0,0)
+trusted fun sdMmcStartupBeginOwned(context: NativeBuffer,slot: int,pll160: bool,nowMs: u32,budgetMs: int,preparedExclusive: bool): int {
+    if (!preparedExclusive || !context.hasAddressRange(0,128) || slot < 0 || slot > 1 || budgetMs < 1 || budgetMs > 60000) return 3
+    val source=if (pll160) 160000000 else 40000000
+    val plan=sdMmcFrequency(source,400000)
+    if (!plan.valid()) return 3
+    var index=0
+    while (index < 128) { context.store(index,0); index=index+1 }
+    context.storeU32(0,0x53445302); context.store(4,1); context.store(5,slot)
+    context.store(6,if (pll160) 1 else 0); context.store(7,plan.hostDivider())
+    context.storeU32(8,plan.cardDivider()); context.storeU32(12,source)
+    context.storeU32(16,int(nowMs)); context.storeU32(20,budgetMs)
+    context.storeU32(40,plan.actualHzCeiling())
+    return 2
+}
+// Separate wrapping clocks: milliseconds bound the whole operation;
+// microseconds enforce source propagation. Each call performs one stage/poll.
+trusted fun sdMmcStartupPollOwned(context: NativeBuffer,nowMs: u32,nowUs: u32): int {
+    val state=sdMmcStartupStatus(context)
+    if (state != 2) return state
+    val phase=context.load(4)
+    if (phase < 1 || phase > 11 || context.load(5) > 1) return sdMmcStartupEnd(context,3,0)
+    val elapsed=int(nowMs-u32(context.loadU32(16)))
+    if (elapsed >= context.loadU32(20)) return sdMmcStartupEnd(context,5,0)
+    if (phase == 1) {
+        val lease=sdMmcBusOpenOwned(true)
+        context.storeU32(28,lease|0)
+        if (lease.status() != 1) return sdMmcStartupEnd(context,4,lease.status())
+    }
+    if (phase == 2) {
+        // Hostclock helper does not own IRQ/IDMAC consumers; composite checks
+        // these too before changing their shared source or asserting reset.
+        if ((sdMmcS3Read(0)&0x02000037) != 0 || (sdMmcS3Read(128)&0x83) != 0 ||
+            (sdMmcS3Read(140)&0x1e000) != 0 || (sdMmcS3Read(72)&0x3ffe0000) != 0) return sdMmcStartupEnd(context,4,3)
+        val configured=sdMmcHostClockConfigureOwned(context.load(7),context.load(6) != 0,true)
+        if (configured != 1) return sdMmcStartupEnd(context,4,configured)
+        context.storeU32(24,int(nowUs))
+    }
+    if (phase == 3 && int(nowUs-u32(context.loadU32(24))) < 10) return 2
+    if (phase == 4) {
+        val reset=sdMmcResetStartOwned(true,true)
+        context.storeU32(32,reset|0)
+        if (reset.status() != 2) return sdMmcStartupEnd(context,4,reset.status())
+    }
+    if (phase == 5) {
+        val reset=SdMmcReset(context.loadU32(32)).pollOwned()
+        context.storeU32(32,reset|0)
+        if (reset.status() == 2) return 2
+        if (reset.status() != 1) return sdMmcStartupEnd(context,4,reset.status())
+        // IDMAC has its own software reset in addition to CTRL.dma_reset
+        // (IDF sdmmc_ll_init_dma). Leave DMA/IRQs disabled until a transfer.
+        sdMmcS3Write(128,1)
+        context.store(4,11)
+        return 2
+    }
+    if (phase == 11) {
+        if ((sdMmcS3Read(128)&130) != 0) return sdMmcStartupEnd(context,4,3)
+        if ((sdMmcS3Read(128)&1) != 0 || (sdMmcS3Read(140)&0x1e000) != 0) return 2
+        context.store(4,6)
+        return 2
+    }
+    if (phase == 6) {
+        val configured=sdMmcHostIdentificationConfigureOwned(context.load(5),context.loadU32(40),100,true)
+        if (configured != 1) return sdMmcStartupEnd(context,4,configured)
+    }
+    if (phase == 7) {
+        val clock=sdMmcClockStartOwned(context.load(5),context.loadU32(8),true,false)
+        context.storeU32(32,clock|0)
+        if (clock.status() != 2) return sdMmcStartupEnd(context,4,clock.status())
+    }
+    if (phase == 8) {
+        val clock=SdMmcClock(context.loadU32(32)).pollOwned()
+        context.storeU32(32,clock|0)
+        if (clock.status() == 2) return 2
+        if (clock.status() != 1) return sdMmcStartupEnd(context,4,clock.status())
+    }
+    val card=nativeBufferAt(context.addressValue()+48,80)
+    if (phase == 9) {
+        val initialized=sdMmcCardBeginOwned(card,context.load(5),nowMs,context.loadU32(20)-elapsed,true)
+        if (initialized != 2) return sdMmcStartupEnd(context,4,initialized)
+    }
+    if (phase == 10) {
+        val initialized=sdMmcCardPollOwned(card,nowMs)
+        if (initialized == 2) return 2
+        if (initialized != 1) return sdMmcStartupEnd(context,4,initialized)
+        return sdMmcStartupEnd(context,1,0)
+    }
+    context.store(4,phase+1)
+    return 2
+}

@@ -1,0 +1,64 @@
+import "./wav_pcm16.ab"
+import "../runtime/unsigned_division64.ab"
+
+// Deterministic linear interpolation,8..96kHz. Absolute output-frame phase
+// makes independently rendered blocks identical to one contiguous rendering.
+// This is not a band-limited downsampler; callers requiring anti-alias filtering
+// must filter before reducing the rate. The last source sample is held until
+// the finite clip duration ends, then the output is silent.
+trusted fun PcmWav.resampledFrames(outputRate: int): int {
+    val count=this.frames()
+    if (count < 1 || outputRate < 8000 || outputRate > 96000 ||
+        this.sampleRate() < 8000 || this.sampleRate() > 96000) return -1
+    if (outputRate == this.sampleRate()) return count
+    int(unsignedDivide64(u64(count*outputRate+this.sampleRate()-1),u64(this.sampleRate())))
+}
+
+trusted fun PcmWav.resampleSample(frame: int,channel: int): int {
+    val bits=this.bitsPerSample()
+    val index=(frame*this.channels()+(if (this.channels() == 1) 0 else channel))*(bits >>> 3)
+    val byte=if (bits == 8) this.samples().load(index) else 0
+    val value=if (bits == 8) (if (this.signed8()) (if (byte >= 128) byte-256 else byte)
+        else byte-128)*256 else this.samples().loadU16(index)
+    if (bits == 16 && value >= 32768) value-65536 else value
+}
+
+// Caller-owned output must not overlap immutable source or20-byte metadata.
+// Returns bytes written, or-1 without mutation for invalid input. No heap.
+trusted fun PcmWav.copyResampledStereo16(firstFrame: int,frames: int,outputRate: int,
+    output: NativeBuffer): int {
+    val length=this.resampledFrames(outputRate)
+    if (length < 0 || firstFrame < 0 || firstFrame > 2147483647 || frames < 0 || frames > 268435455 ||
+        !output.hasAddressRange(0,frames*4)) return -1
+    val source=this.samples()
+    val address=output.addressValue()
+    if (frames > 0 && ((address < source.addressValue()+source.capacity() && source.addressValue() < address+frames*4) ||
+        (address < this+20 && this < address+frames*4))) return -1
+    val inputRate=this.sampleRate()
+    val count=this.frames()
+    var index=0
+    while (index < frames) {
+        val current=firstFrame+index
+        var channel=0
+        while (channel < 2) {
+            var sample=0
+            if (current < length) {
+                val phase=current*inputRate
+                val frame=int(unsignedDivide64(u64(phase),u64(outputRate)))
+                val fraction=phase-frame*outputRate
+                val next=if (frame+1 < count) frame+1 else frame
+                val a=this.resampleSample(frame,channel)
+                val b=this.resampleSample(next,channel)
+                val weighted=a*(outputRate-fraction)+b*fraction
+                // Nearest integer, ties away from zero, symmetric for signed PCM.
+                val magnitude=if (weighted < 0) -weighted else weighted
+                val rounded=int(unsignedDivide64(u64(magnitude+(outputRate >>> 1)),u64(outputRate)))
+                sample=if (weighted < 0) -rounded else rounded
+            }
+            output.storeU16(index*4+channel*2,sample)
+            channel=channel+1
+        }
+        index=index+1
+    }
+    frames*4
+}

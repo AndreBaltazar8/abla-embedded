@@ -1,0 +1,91 @@
+// Platform hooks: softwareI2cDrive(pin,released), softwareI2cSample(pin),
+// softwareI2cDelay(us). Pads are caller-owned, configured open-drain with input
+// enabled and external pullups. Caller serializes the complete transaction.
+// No allocation, architecture-specific timer or automatic recovery pulses.
+type SoftwareI2cLines = int
+fun softwareI2cLines(sda: int,scl: int,halfPeriodUs: int,stretchPolls: int): SoftwareI2cLines {
+    if (sda < 0 || sda > 255 || scl < 0 || scl > 255 || sda == scl ||
+        halfPeriodUs < 5 || halfPeriodUs > 1000 || stretchPolls < 1 || stretchPolls > 1000000) return SoftwareI2cLines(0)
+    return SoftwareI2cLines(sda|(scl<<8)|(halfPeriodUs<<16)|(stretchPolls<<26))
+}
+fun SoftwareI2cLines.valid(): bool = this > 0 && (this>>>46) == 0 &&
+    ((this>>>16)&1023) >= 5 && ((this>>>16)&1023) <= 1000 &&
+    ((this>>>26)&1048575) > 0 && ((this>>>26)&1048575) <= 1000000 && (this&255) != ((this>>>8)&255)
+fun SoftwareI2cLines.sda(): int = this&255
+fun SoftwareI2cLines.scl(): int = (this>>>8)&255
+trusted fun SoftwareI2cLines.pause(): void = softwareI2cDelay((this>>>16)&1023)
+trusted fun SoftwareI2cLines.release(): void {
+    softwareI2cDrive(this.sda(),true); softwareI2cDrive(this.scl(),true); return
+}
+trusted fun SoftwareI2cLines.raiseClock(): bool {
+    softwareI2cDrive(this.scl(),true)
+    var remaining=(this>>>26)&1048575
+    while (remaining > 0) {
+        if (softwareI2cSample(this.scl())) return true
+        softwareI2cDelay(1); remaining=remaining-1
+    }
+    this.release(); return false
+}
+// Status1success,2invalid,3stretch timeout,4busy/arbitration lost. On3/4
+// both lines are released; never issue STOP after arbitration loss.
+// Same edges serve an idle-bus START or owned repeated START with SCL low.
+trusted fun SoftwareI2cLines.start(): int {
+    if (!this.valid()) return 2
+    softwareI2cDrive(this.sda(),true); this.pause()
+    if (!this.raiseClock()) return 3
+    this.pause()
+    if (!softwareI2cSample(this.sda())) { this.release(); return 4 }
+    softwareI2cDrive(this.sda(),false); this.pause()
+    softwareI2cDrive(this.scl(),false); return 1
+}
+trusted fun SoftwareI2cLines.stop(): int {
+    if (!this.valid()) return 2
+    // Only call while owning the bus with SCL low, never after arbitration loss.
+    softwareI2cDrive(this.sda(),false); this.pause()
+    if (!this.raiseClock()) return 3
+    this.pause(); softwareI2cDrive(this.sda(),true); this.pause()
+    if (!softwareI2cSample(this.sda())) { this.release(); return 4 }
+    return 1
+}
+trusted fun SoftwareI2cLines.writeBit(high: bool): int {
+    if (!this.valid()) return 2
+    softwareI2cDrive(this.sda(),high); this.pause()
+    if (!this.raiseClock()) return 3
+    this.pause()
+    if (high && !softwareI2cSample(this.sda())) { this.release(); return 4 }
+    softwareI2cDrive(this.scl(),false); return 1
+}
+// Low8status,bit8sample. Last edge leaves SCL low for the next bit/STOP.
+trusted fun SoftwareI2cLines.readBit(): int {
+    if (!this.valid()) return 2
+    softwareI2cDrive(this.sda(),true); this.pause()
+    if (!this.raiseClock()) return 3
+    this.pause()
+    val value=softwareI2cSample(this.sda())
+    softwareI2cDrive(this.scl(),false)
+    return 1|(if (value) 256 else 0)
+}
+// Explicit exclusive SINGLE-MASTER recovery only. Caller has quiesced every
+// transaction and authorizes slave clocks when clearStuck is true. Never use
+// this to seize a bus from another master after arbitration loss.
+// Ordinary recovery releases lines and waits for idle without clock pulses.
+// Optional clearing sends at most nine clocks with SDA released, then STOP
+// only after the slave releases SDA. Stretch budget is per raised clock.
+// Status1idle,2invalid,3SCL timeout,4SDA held. Failure leaves pads released.
+trusted fun SoftwareI2cLines.recoverOwned(clearStuck: bool = false): int {
+    if (!this.valid()) return 2
+    softwareI2cDrive(this.sda(),true)
+    if (!this.raiseClock()) return 3
+    this.pause()
+    if (softwareI2cSample(this.sda())) return 1
+    if (!clearStuck) { this.release(); return 4 }
+    var pulses=0
+    while (pulses < 9 && !softwareI2cSample(this.sda())) {
+        softwareI2cDrive(this.scl(),false); this.pause()
+        if (!this.raiseClock()) return 3
+        this.pause(); pulses=pulses+1
+    }
+    if (!softwareI2cSample(this.sda())) { this.release(); return 4 }
+    softwareI2cDrive(this.scl(),false); this.pause()
+    return this.stop()
+}

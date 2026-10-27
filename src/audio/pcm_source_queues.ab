@@ -1,0 +1,113 @@
+import "./pcm_source_queue.ab"
+// Contiguous1..8 mixed-source queues. Borrowed sources require exclusive
+// ownership across the entire bank. Immutable waveforms may be shared.
+// No heap or hidden task; retain rendered output across DMA retries.
+type PcmSourceQueues=int
+fun PcmSourceQueues.storage(): NativeBuffer = NativeBuffer(this|0)
+fun PcmSourceQueues.count(): int = this.storage().capacity()>>>5
+fun PcmSourceQueues.queue(index: int): PcmSourceQueue =
+    if (index < 0 || index >= this.count()) PcmSourceQueue(0)
+    else PcmSourceQueue(nativeBufferAt(this.storage().addressValue()+index*32,32)|0)
+// Fresh unpublished storage only.
+trusted fun pcmSourceQueuesAt(storage: NativeBuffer,count: int,rate: int): PcmSourceQueues {
+    if (count < 1 || count > 8 || rate < 8000 || rate > 96000 ||
+        !storage.hasAddressRange(0,count*32) || (storage.addressValue()&3) != 0) return PcmSourceQueues(0)
+    var index=0
+    while (index < count) {
+        pcmSourceQueueAt(nativeBufferAt(storage.addressValue()+index*32,32),rate)
+        index=index+1
+    }
+    return PcmSourceQueues(nativeBufferAt(storage.addressValue(),count*32)|0)
+}
+trusted fun PcmSourceQueues.valid(): bool {
+    val s=this.storage();val count=this.count()
+    if (count < 1 || count > 8 || s.capacity() != count*32 || !s.hasAddressRange(0,count*32)) return false
+    var index=0
+    while (index < count) {
+        val q=this.queue(index)
+        if (!q.valid() || q.storage().loadU32(4) != this.queue(0).storage().loadU32(4)) return false
+        index=index+1
+    }
+    index=0
+    while (index < count) {
+        var slot=0
+        while (slot < 2) {
+            val item=this.queue(index).source(slot)
+            if (item != 0) {
+                if (!item.disjointFrom(s,count*32)) return false
+                var other=0
+                while (other < count) {
+                    // Checks every other queue and both of its source regions.
+                    // The reverse traversal protects immutable data from writes
+                    // through the other source's mutable state as well.
+                    if (other != index && !this.queue(other).disjointFrom(item.state(),item.state().capacity())) return false
+                    other=other+1
+                }
+            }
+            slot=slot+1
+        }
+        index=index+1
+    }
+    return true
+}
+trusted fun PcmSourceQueues.disjointFrom(buffer: NativeBuffer,bytes: int): bool {
+    if (!this.valid()) return false
+    var index=0
+    while (index < this.count()) {
+        if (!this.queue(index).disjointFrom(buffer,bytes)) return false
+        index=index+1
+    }
+    return true
+}
+// Returns chosen index or-1. Highest empty queue wins automatic selection.
+trusted fun PcmSourceQueues.enqueue(source: PcmPlaybackSource,index: int=-1,replace: bool=false): int {
+    if (!this.valid() || !source.valid() || index < -1 || index >= this.count() ||
+        !source.disjointFrom(this.storage(),this.storage().capacity())) return -1
+    var selected=index
+    if (selected == -1) {
+        selected=this.count()-1
+        while (selected >= 0 && this.queue(selected).source(0) != 0) selected=selected-1
+    }
+    if (selected < 0) return -1
+    var other=0
+    while (other < this.count()) {
+        if (other != selected) {
+            val q=this.queue(other)
+            if (!q.disjointFrom(source.state(),source.state().capacity())) return -1
+            var slot=0
+            while (slot < 2) {
+                val item=q.source(slot)
+                if (item != 0 && !source.disjointFrom(item.state(),item.state().capacity())) return -1
+                slot=slot+1
+            }
+        }
+        other=other+1
+    }
+    return if (this.queue(selected).enqueue(source,replace)) selected else -1
+}
+trusted fun PcmSourceQueues.stop(): bool {
+    if (!this.valid()) return false
+    var index=0
+    while (index < this.count()) { this.queue(index).stop();index=index+1 }
+    return true
+}
+// Validate all queued sources and all workspaces before clearing/advancing.
+// Source gain precedes summation, master gain precedes final16-bit clipping.
+trusted fun PcmSourceQueues.renderOutput(frames: int,accumulator: NativeBuffer,scratch: NativeBuffer,
+    output: NativeBuffer,stereo: bool=true,masterGainQ15: int=32768): bool {
+    val outputBytes=frames*(if (stereo) 4 else 2)
+    if (frames < 0 || frames > 268435455 || masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !this.disjointFrom(accumulator,frames*8) || !this.disjointFrom(scratch,frames*4) ||
+        !this.disjointFrom(output,outputBytes) ||
+        pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,output,outputBytes) ||
+        pcmMixSpansOverlap(scratch,frames*4,output,outputBytes)) return false
+    if (!clearPcm16Mix(accumulator,frames*2)) return false
+    var index=0
+    while (index < this.count()) {
+        if (!this.queue(index).render(frames,scratch) || !addPcm16ToMix(accumulator,scratch,frames*2)) return false
+        index=index+1
+    }
+    return if (stereo) finishPcm16Mix(accumulator,output,frames*2,masterGainQ15)
+        else finishPcm16MixMono(accumulator,output,frames,masterGainQ15)
+}

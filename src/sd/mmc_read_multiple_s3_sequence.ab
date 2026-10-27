@@ -1,0 +1,66 @@
+import "./mmc_read_s3_sequence.ab"
+// CMD18 with controller-generated CMD12. Require command/data/RX/auto-stop
+// completion, every descriptor returned, DMA quiescence, then CMD13 READY/TRAN.
+// Failure never validates any payload, even if some sectors arrived. Retain
+// buffers while pending; after failure caller must explicitly recover the card.
+// context72: common48 (kind3,bytes44), RCA48,command52,response56..71.
+// Caller owns card80, context72, all descriptors and contiguous internal DMA
+// payload. No allocation, cache-backed DMA, implicit splitting or retry.
+trusted fun sdMmcReadMultipleBeginOwned(context: NativeBuffer,card: NativeBuffer,descriptors: NativeBuffer,payload: NativeBuffer,sector: int,sectors: int,now: u32,budgetMs: int,releasedExclusive: bool): int {
+    if (!releasedExclusive || !context.hasAddressRange(0,72) || sdMmcCardStatus(card) != 1 || card.load(5) > 1 ||
+        sectors < 2 || sectors > 960 || sector < 0 || budgetMs < 1 || budgetMs > 60000 ||
+        card.loadU32(28) < 1 || card.loadU32(28) > 65535) return 3
+    val capacity=sdMmcCardBlockCount(card)
+    if (sector >= capacity || sectors > capacity-sector) return 3
+    val high=(card.loadU32(24)&0x40000000) != 0
+    if (!high && sector+sectors > 0x800000) return 3
+    val bytes=sectors<<9
+    val count=sdMmcDmaDescriptorCount(bytes)
+    if (!sdMmcDmaRegionsValid(descriptors,payload,bytes) ||
+        !sdMmcReadDisjoint(context.addressValue(),72,card.addressValue(),80) ||
+        !sdMmcReadDisjoint(context.addressValue(),72,descriptors.addressValue(),count*16) ||
+        !sdMmcReadDisjoint(context.addressValue(),72,payload.addressValue(),bytes) ||
+        !sdMmcReadDisjoint(card.addressValue(),80,descriptors.addressValue(),count*16) ||
+        !sdMmcReadDisjoint(card.addressValue(),80,payload.addressValue(),bytes)) return 3
+    var index=0
+    while (index < 72) { context.store(index,0); index=index+1 }
+    context.storeU32(0,0x53445202); context.store(4,1); context.store(5,card.load(5))
+    context.storeU32(8,descriptors.addressValue()); context.storeU32(12,payload.addressValue())
+    context.storeU32(16,int(now)); context.storeU32(20,budgetMs)
+    context.storeU32(36,if (high) sector else sector<<9); context.storeU32(40,3)
+    context.storeU32(44,bytes); context.storeU32(48,card.loadU32(28))
+    if (sdMmcDmaPrepareOwned(descriptors,payload,bytes,true) != count) return sdMmcReadEnd(context,3)
+    return 2
+}
+trusted fun sdMmcReadMultiplePollOwned(context: NativeBuffer,now: u32): int {
+    if (!context.hasAddressRange(0,72) || context.loadU32(40) != 3) return 3
+    return sdMmcMultipleTransferPollOwned(context,now)
+}
+trusted fun sdMmcMultipleTransferPollOwned(context: NativeBuffer,now: u32): int {
+    if (!context.hasAddressRange(0,72) || (context.loadU32(40) != 3 && context.loadU32(40) != 4)) return 3
+    val status=sdMmcReadStatus(context)
+    if (status != 2) return status
+    val phase=context.load(4)
+    if (phase <= 4) {
+        val result=sdMmcTransferPollOwned(context,now)
+        if (result != 1) return result
+        context.store(0,2); context.store(4,5); return 2
+    }
+    if (phase != 5 && phase != 6) return sdMmcReadEnd(context,3)
+    if (int(now-u32(context.loadU32(16))) >= context.loadU32(20)) return sdMmcReadEnd(context,6)
+    if ((sdMmcS3Read(68)&0xbfc2) != 0) return sdMmcReadEnd(context,4)
+    if (phase == 5) {
+        val command=sdMmcCommandStartOwned(context.load(5),13,u32(context.loadU32(48)<<16),1)
+        if (command.status() == 4) return 2
+        context.storeU32(52,command|0)
+        if (command.status() != 2) return sdMmcReadEnd(context,4)
+        context.store(4,6); return 2
+    }
+    val response=nativeBufferAt(context.addressValue()+56,16)
+    val command=SdMmcCommand(context.loadU32(52)).pollOwned(response)
+    context.storeU32(52,command|0)
+    if (command.status() == 2) return 2
+    if (command.status() != 1) return sdMmcReadEnd(context,4)
+    val r1=response.loadU32(0)
+    return sdMmcReadEnd(context,if (sdMmcCardR1Valid(r1) && (r1&0x1f00) == 0x900) 1 else 5)
+}

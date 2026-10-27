@@ -1,0 +1,60 @@
+import "./codec_channels_pump_p4_sequence.ab"
+// Finite synchronous window on an ALREADY running/owned192B CoreP4X speaker session.
+// Consume exactly1..4095 mixer blocks, then queue silence without advancing
+// channel cursors. Complete one ring rotation plus >=120ms silence and one
+// extra block before ampOFF -> stop/park/cacheidle -> pinrestore. This bounds a
+// digital tail; it is not proof of analog codec latency or audible completion.
+// maxIdle1..1000 is consecutive 1ms waits per block, not an overall deadline.
+// Never call under interrupt masks/from ISR. Retain all resources ifclose3.
+// Initial ringpayload must already be initialized; no otherpump/binding edits.
+// Result low8:1window+cleanup complete,2invalid,3timeout,4DMA,9render,
+// 10cleanup failure after otherwise successful tail. High32 counts QUEUED
+// source blocks (not physical playback). Detailed cleanup remains in session.
+type M5P4PlaybackWindowResult=int
+fun M5P4PlaybackWindowResult.status(): int = this&255
+fun M5P4PlaybackWindowResult.queuedBlocks(): int = this>>>32
+trusted fun m5P4PlaybackChannelsWindowOwned(r: NativeBuffer,bank: PcmChannels,blocks: int,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,maxIdle: int,
+    masterGainQ15: int,exclusive: bool,tab5: bool,tone: PcmTone=PcmTone(0),
+    queues: PcmSourceQueues=PcmSourceQueues(0)): M5P4PlaybackWindowResult {
+    if (!exclusive || !m5P4SpeakerSessionValid(r,tab5) || r.loadU32(68) != 2 || r.loadU32(12) != 1 || blocks < 1 || blocks > 4095 ||
+        maxIdle < 1 || maxIdle > 1000 ||
+        (if (queues == 0) !bank.valid() else bank != 0 || tone != 0 || !queues.valid()) ||
+        masterGainQ15 < 0 || masterGainQ15 > 32768) return M5P4PlaybackWindowResult(2)
+    val bytes=r.loadU32(36);val count=r.loadU32(24);val rate=24000
+    if (bytes < 4 || (bytes&3) != 0 || rate < 8000 || rate > 96000 || count < 2 ||
+        !esp32p4AhbGdmaRingLayoutValid(r.loadU32(20),count,r.loadU32(28),r.loadU32(32),bytes)) return M5P4PlaybackWindowResult(2)
+    val frames=bytes/2
+    val silenceFrames=(rate*120+999)/1000
+    val tail=count+int((u32(silenceFrames)+u32(frames)-u32(1))/u32(frames))+1
+    var queued=0;var silent=0;var idle=0;var status=1
+    var state=M5P4ChannelsPump(0)
+    while (queued < blocks && status == 1) {
+        state=m5P4PumpChannelsOwned(state,r,bank,accumulator,scratch,staging,masterGainQ15,true,tab5,tone,queues)
+        if (state.status() == 1) { queued=queued+1;idle=0 }
+        else if (state.status() == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=state.status()
+    }
+    // An initial preflight rejection neither rendered nor submitted a block.
+    // Do not surprise the caller by changing the existing session in this case.
+    if (status == 2 && queued == 0 && !state.pending()) return M5P4PlaybackWindowResult(2)
+    if (status == 1) {
+        var offset=0
+        while (offset < bytes) { staging.storeU32(offset,0);offset=offset+4 }
+    }
+    idle=0
+    while (silent < tail && status == 1) {
+        val pumped=m5P4SpeakerPumpOwned(r,nativeBufferAt(staging.addressValue(),bytes),tab5)
+        val report=r.loadU32(48)&255
+        if (pumped == 2 && report == 1) { silent=silent+1;idle=0 }
+        else if (pumped == 2 && report == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=4
+    }
+    val closed=m5P4SpeakerStopOwned(r,tab5)
+    if (status == 1 && closed != 4) status=10
+    return M5P4PlaybackWindowResult(status|(queued<<32))
+}

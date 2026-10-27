@@ -1,0 +1,49 @@
+import "./command_buffer.ab"
+import "./software_command.ab"
+
+// Validates the COMPLETE program before any GPIO, then holds the canonical
+// gate through commands and delays. Delays are milliseconds (255=>500ms), not
+// RTOS ticks. Arguments are views into immutable program bytes, never copied.
+// Shared D/C must start as input; each command releases it before any delay.
+trusted fun softwareLcdRunProgram(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, chipSelect: Pin, dataCommand: Pin,
+    program: NativeBuffer, length: int, halfPeriodMicroseconds: int = 1,
+    sharedDataCommand: bool = false): SpiTransactionResult {
+    if (!softwareSpiCommandPinsValid(clock, mosi, chipSelect, dataCommand, 0, halfPeriodMicroseconds) ||
+        !gate.bufferDisjoint(program, length) || !lcdCommandBufferValid(program, length)) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    val completed = softwareLcdRunProgramOwned(clock, mosi, chipSelect, dataCommand,
+        program, length, halfPeriodMicroseconds, sharedDataCommand)
+    if (!gate.finish(owner, completed)) return SpiTransactionResult(5 << 32)
+    SpiTransactionResult((if (completed) 1 else 6) << 32)
+}
+
+// Internal: caller has validated the complete immutable program and owns the
+// canonical bus gate. This allows several programs/configuration commands to
+// form a single noninterleaved panel initialization.
+trusted fun softwareLcdRunProgramOwned(clock: Pin, mosi: Pin, chipSelect: Pin, dataCommand: Pin,
+    program: NativeBuffer, length: int, halfPeriodMicroseconds: int,
+    sharedDataCommand: bool = false): bool {
+    var index = 0
+    var completed = true
+    var done = false
+    while (!done && completed) {
+        val command = program.load(index)
+        val encoded = program.load(index + 1)
+        index = index + 2
+        if (command == 255 && encoded == 255) done = true
+        else {
+            val count = encoded & 127
+            completed = softwareLcdCommandOwned(clock, mosi, chipSelect, dataCommand, command,
+                nativeBufferAt(program.addressValue() + index, count), count, halfPeriodMicroseconds, sharedDataCommand)
+            index = index + count
+            if ((encoded & 128) != 0) {
+                val delay = program.load(index)
+                index = index + 1
+                if (completed && delay != 0) peripheralDelayMilliseconds(if (delay == 255) 500 else delay)
+            }
+        }
+    }
+    completed && done
+}

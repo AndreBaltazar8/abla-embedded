@@ -1,0 +1,198 @@
+// Import alongside the selected I2cBus/I2cDevice backend.
+import "../esp32/sdk/raw_buffer.ab"
+import "./types.ab"
+import "./calendar.ab"
+import "./pcf8563_logic.ab"
+import "./timer_result.ab"
+import "./alarm_result.ab"
+import "abla/unsafe/memory/raw"
+
+type Pcf8563 = int
+
+// Partial reads do not depend on the validity of unrelated date/time fields.
+trusted fun Pcf8563.time(): RtcTime = this.timeWithBuffer(nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun Pcf8563.timeWithBuffer(bytes: NativeBuffer): RtcTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,3) || !this.device().readRegister(2,bytes,3)) return RtcTime(0)
+    pcf8563DecodeDateTime(bytes.load(0),bytes.load(1),bytes.load(2),1,0,1,0).time()
+}
+trusted fun Pcf8563.date(): RtcDate = this.dateWithBuffer(nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun Pcf8563.dateWithBuffer(bytes: NativeBuffer): RtcDate {
+    if (!this.valid() || !bytes.hasAddressRange(0,4) || !this.device().readRegister(5,bytes,4)) return RtcDate(0)
+    pcf8563DecodeDateTime(0,0,0,bytes.load(0),bytes.load(1),bytes.load(2),bytes.load(3)).date()
+}
+
+trusted fun pcf8563(bus: I2cBus): Pcf8563 =
+    Pcf8563(
+        if (bus.valid()) bus.device(81, 400000) & 4294967295 else 0
+    )
+
+// No upper metadata bits: reject malformed casts rather than aliasing a live
+// low32 device during reads, writes, or close.
+fun Pcf8563.valid(): bool = this > 0 && this <= 4294967295
+fun Pcf8563.device(): I2cDevice = I2cDevice(this & 4294967295)
+
+trusted fun Pcf8563.begin(): bool {
+    if (!this.valid()) return false
+    this.device().writeRegister8(0, 0)
+    this.device().writeRegister8(0, 0) &&
+        this.device().writeRegister8(14, 3)
+}
+
+trusted fun Pcf8563.close(): bool =
+    this.valid() && this.device().close()
+
+trusted fun Pcf8563.lowVoltageChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val result=this.device().readRegister8Checked(2)
+    if (result.valid()) I2cByteResult(256 | (if ((result.value() & 128) != 0) 1 else 0)) else I2cByteResult(0)
+}
+trusted fun Pcf8563.lowVoltage(): bool {
+    val result=this.lowVoltageChecked()
+    result.valid() && result.value() != 0
+}
+
+trusted fun Pcf8563.dateTime(): RtcDateTime = this.dateTimeWithBuffer(nativeBufferAt(nativeStackAllocate(7),7))
+trusted fun Pcf8563.dateTimeWithBuffer(bytes: NativeBuffer): RtcDateTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,7)) return RtcDateTime(0)
+    if (!this.device().readRegister(2, bytes, 7)) return RtcDateTime(0)
+    pcf8563DecodeDateTime(
+        bytes.load(0), bytes.load(1), bytes.load(2), bytes.load(3),
+        bytes.load(4), bytes.load(5), bytes.load(6)
+    )
+}
+
+trusted fun Pcf8563.setDateTime(value: RtcDateTime): bool {
+    if (!this.valid() || !value.calendarValid() || value.year() < 1900 || value.year() > 2099) return false
+    this.setDateTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(7),7))
+}
+trusted fun Pcf8563.setDateTimeWithBuffer(value: RtcDateTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,7) || value.year() < 1900 ||
+        value.year() > 2099) return false
+    bytes.store(0, bcdEncode(value.second()))
+    bytes.store(1, bcdEncode(value.minute()))
+    bytes.store(2, bcdEncode(value.hour()))
+    bytes.store(3, bcdEncode(value.day()))
+    bytes.store(4, value.weekday())
+    bytes.store(
+        5, bcdEncode(value.month()) + if (value.year() < 2000) 128 else 0
+    )
+    bytes.store(6, bcdEncode(value.year() - (value.year() / 100) * 100))
+    this.device().writeRegister(2, bytes, 7)
+}
+
+// Direct partial writes: never read/overwrite the independently ticking time
+// when setting date, or replace the date when setting time.
+trusted fun Pcf8563.setTime(value: RtcTime): bool = this.setTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun Pcf8563.setTimeWithBuffer(value: RtcTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.valid() || !bytes.hasAddressRange(0,3)) return false
+    bytes.store(0,bcdEncode(value.second())); bytes.store(1,bcdEncode(value.minute())); bytes.store(2,bcdEncode(value.hour()))
+    this.device().writeRegister(2,bytes,3)
+}
+trusted fun Pcf8563.setDate(value: RtcDate): bool = this.setDateWithBuffer(value,nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun Pcf8563.setDateWithBuffer(value: RtcDate,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,4) || value.year() < 1900 || value.year() > 2099) return false
+    bytes.store(0,bcdEncode(value.day())); bytes.store(1,value.weekday())
+    bytes.store(2,bcdEncode(value.month()) | (if (value.year() < 2000) 128 else 0))
+    bytes.store(3,bcdEncode(value.year()%100))
+    this.device().writeRegister(5,bytes,4)
+}
+
+trusted fun Pcf8563.setTimerInterrupt(milliseconds: int): int {
+    val result=this.setTimerInterruptChecked(milliseconds)
+    if (result.valid()) result.milliseconds() else 0
+}
+
+// Stop both interrupt delivery and the counter, attempting counter shutdown
+// even if reading/writing control2 fails. Preserve unrelated alarm state.
+trusted fun Pcf8563.stopTimer(): bool {
+    if (!this.valid()) return false
+    val control=this.device().readRegister8Checked(1)
+    val irqStopped=control.valid() && this.device().writeRegister8(1,pcf8563Control2Write(control.value(),4,1,0))
+    val counterStopped=this.device().writeRegister8(14,3)
+    irqStopped && counterStopped
+}
+
+trusted fun Pcf8563.setTimerInterruptChecked(milliseconds: int): RtcTimerResult {
+    if (!this.valid()) return RtcTimerResult(2)
+    if (milliseconds <= 0) return RtcTimerResult(if (this.stopTimer()) 1 else 5)
+    val control = this.device().readRegister8Checked(1)
+    if (!control.valid()) return RtcTimerResult(3)
+    val current = control.value()
+    val plan = pcf8563TimerPlan(if (milliseconds > 15300000) 15300000 else milliseconds)
+    if (pcf8563TimerCount(plan) == 0) return RtcTimerResult(2)
+    val configured = this.device().writeRegister8(
+        14, pcf8563TimerControl(plan) & 127
+    ) && this.device().writeRegister8(15, pcf8563TimerCount(plan)) &&
+        this.device().writeRegister8(1, pcf8563Control2Write(current,4,1,1)) &&
+        this.device().writeRegister8(14,pcf8563TimerControl(plan))
+    if (configured) return RtcTimerResult(1 | (pcf8563TimerMilliseconds(plan) << 8))
+    RtcTimerResult(if (this.stopTimer()) 4 else 5)
+}
+
+trusted fun Pcf8563.setAlarmInterrupt(
+    minute: int = -1,
+    hour: int = -1,
+    day: int = -1,
+    weekday: int = -1
+): bool {
+    this.setAlarmInterruptChecked(minute,hour,day,weekday).valid()
+}
+
+trusted fun Pcf8563.setAlarmInterruptChecked(minute: int=-1,hour: int=-1,
+    day: int=-1,weekday: int=-1): RtcAlarmResult =
+    this.setAlarmInterruptWithBuffer(nativeBufferAt(nativeStackAllocate(4),4),minute,hour,day,weekday)
+
+// Uses caller-owned4-byte scratch; no hidden allocation in this variant.
+// Failed setup attempts to leave AIE disabled, not restore a potentially
+// partially rewritten alarm. Caller serializes access to control2.
+trusted fun Pcf8563.setAlarmInterruptWithBuffer(bytes: NativeBuffer,minute: int=-1,
+    hour: int=-1,day: int=-1,weekday: int=-1): RtcAlarmResult {
+    if (!this.valid() || minute > 59 || hour > 23 || day > 31 ||
+        weekday > 6 || minute < -1 || hour < -1 || day < -1 ||
+        weekday < -1 || day == 0 || !bytes.hasAddressRange(0,4)) return RtcAlarmResult(2)
+    val control=this.device().readRegister8Checked(1)
+    if (!control.valid()) return RtcAlarmResult(3)
+    val disabled=pcf8563Control2Write(control.value(),8,2,0)
+    if (!this.device().writeRegister8(1,disabled)) {
+        return RtcAlarmResult(if (this.device().writeRegister8(1,disabled)) 4 else 5)
+    }
+    bytes.store(0, if (minute < 0) 128 else bcdEncode(minute) & 127)
+    bytes.store(1, if (hour < 0) 128 else bcdEncode(hour) & 63)
+    bytes.store(2, if (day < 0) 128 else bcdEncode(day) & 63)
+    bytes.store(3, if (weekday < 0) 128 else weekday & 7)
+    if (!this.device().writeRegister(9, bytes, 4)) {
+        return RtcAlarmResult(if (this.device().writeRegister8(1,disabled)) 4 else 5)
+    }
+    val enabled = minute >= 0 || hour >= 0 || day >= 0 || weekday >= 0
+    if (this.device().writeRegister8(1,pcf8563Control2Write(control.value(),8,2,if (enabled) 2 else 0))) return RtcAlarmResult(1)
+    RtcAlarmResult(if (this.device().writeRegister8(1,disabled)) 4 else 5)
+}
+
+trusted fun Pcf8563.interruptPendingChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val status=this.device().readRegister8Checked(1)
+    if (status.valid()) I2cByteResult(256 | (if ((status.value() & 12) != 0) 1 else 0)) else I2cByteResult(0)
+}
+trusted fun Pcf8563.interruptPending(): bool {
+    val status=this.interruptPendingChecked()
+    status.valid() && status.value() != 0
+}
+
+trusted fun Pcf8563.clearInterrupt(): bool {
+    if (!this.valid()) return false
+    val control=this.device().readRegister8Checked(1)
+    control.valid() && this.device().writeRegister8(1,pcf8563Control2Write(control.value(),12,0,0))
+}
+
+trusted fun Pcf8563.disableInterrupts(): bool {
+    if (!this.valid()) return false
+    val address = nativeStackAllocate(4)
+    val bytes = nativeBufferAt(address, 4)
+    bytes.store(0, 128)
+    bytes.store(1, 128)
+    bytes.store(2, 128)
+    bytes.store(3, 128)
+    this.device().writeRegister(9, bytes, 4) &&
+        this.device().writeRegister8(14, 0) &&
+        this.device().writeRegister8(1, 0)
+}

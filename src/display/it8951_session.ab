@@ -1,0 +1,107 @@
+import "./it8951_power.ab"
+// Caller-owned40B session: magic,state,context64,info64,lastResult64,flags32,
+// reserved32. State0closed1ready2fault3refreshing4standby5sleep. Flag1full image.
+// The caller retains the powered/configured transport for the session lifetime
+// and serializes EVERY operation, including external/raw transport users.
+// This does not acquire/release board power, SD bus ownership or GPIO pads.
+type It8951Session = int
+fun it8951SessionAt(storage: NativeBuffer): It8951Session =
+    if (storage.hasAddressRange(0,40) && (storage.addressValue()&3) == 0) It8951Session(storage|0) else It8951Session(0)
+fun It8951Session.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun It8951Session.valid(): bool = it8951SessionAt(this.buffer()) != 0 &&
+    this.buffer().loadU32(0) == 0x49545331 && this.buffer().loadU32(4) <= 5
+trusted fun It8951Session.state(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun It8951Session.context(): int = this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32)
+trusted fun It8951Session.info(): It8951DeviceInfo = It8951DeviceInfo(this.buffer().loadU32(16)|(this.buffer().loadU32(20)<<32))
+trusted fun It8951Session.lastResult(): int = if (!this.valid()) 2 else this.buffer().loadU32(24)|(this.buffer().loadU32(28)<<32)
+trusted fun It8951Session.remember(result: int): void {
+    this.buffer().storeU32(24,result&0xffffffff);this.buffer().storeU32(28,result>>>32);return
+}
+fun It8951Session.disjoint(buffer: NativeBuffer,count: int): bool = buffer.hasAddressRange(0,count) &&
+    (buffer.addressValue() >= this.buffer().addressValue()+40 || this.buffer().addressValue() >= buffer.addressValue()+count)
+// Fresh storage only; never initialize a live session to discard ownership.
+trusted fun It8951Session.initialize(): bool {
+    if (it8951SessionAt(this.buffer()) == 0) return false
+    var offset=4
+    while (offset < 40) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x49545331);return true
+}
+// Internal start: context already retained. Fault before the first wire access.
+trusted fun It8951Session.startAfterReset(scratch: NativeBuffer,polls: int): int {
+    this.buffer().storeU32(4,2);this.buffer().storeU32(32,0)
+    val result=it8951Initialize(this.context(),scratch,polls)
+    this.remember(result|0)
+    if (!result.success()) return 2
+    val info=it8951DeviceInfo(scratch)
+    this.buffer().storeU32(16,(info|0)&0xffffffff);this.buffer().storeU32(20,(info|0)>>>32)
+    this.buffer().storeU32(4,1);return 1
+}
+trusted fun It8951Session.openOwned(context: int,scratch: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || this.state() != 0 || !this.disjoint(scratch,40) || !it8951Admission(context,polls)) return -1
+    this.buffer().storeU32(8,context&0xffffffff);this.buffer().storeU32(12,context>>>32)
+    this.startAfterReset(scratch,polls)
+}
+// Caller has ACTUALLY reset this same controller while retaining bus/power.
+// This is not a software reset or permission to bypass a failure. A new reset
+// invalidates image contents; initialization failure retains fault ownership.
+trusted fun It8951Session.recoverAfterHardwareResetOwned(scratch: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || (this.state() != 2 && this.state() != 5) || !this.disjoint(scratch,40) ||
+        !it8951Admission(this.context(),polls)) return -1
+    this.startAfterReset(scratch,polls)
+}
+trusted fun It8951Session.loadFullOwned(pixels: NativeBuffer,stride: int,scratch: NativeBuffer,
+    polls: int,attempts: int,exclusive: bool): It8951ImageResult {
+    if (!exclusive || this.state() != 1 || !this.info().valid() || !this.disjoint(scratch,14) ||
+        stride < (this.info().width()+1)/2 || stride > 2147483647) return It8951ImageResult(2)
+    val count=(this.info().height()-1)*stride+(this.info().width()+1)/2
+    if (!this.disjoint(pixels,count)) return It8951ImageResult(2)
+    val result=it8951Load4(this.context(),this.info(),pixels,stride,0,0,this.info().width(),this.info().height(),scratch,polls,attempts)
+    if (result.status() != 2) {
+        this.remember(result|0);this.buffer().storeU32(32,if (result.success()) 1 else 0)
+        if (!result.success()) this.buffer().storeU32(4,2)
+    }
+    result
+}
+trusted fun It8951Session.refreshFullOwned(mode: int,scratch: NativeBuffer,polls: int,attempts: int,exclusive: bool): It8951ImageResult {
+    if (!exclusive || this.state() != 1 || this.buffer().loadU32(32) != 1 || !this.disjoint(scratch,14)) return It8951ImageResult(2)
+    val result=it8951Refresh(this.context(),this.info(),0,0,this.info().width(),this.info().height(),mode,scratch,polls,attempts)
+    if (result.status() != 2) {
+        this.remember(result|0);this.buffer().storeU32(4,if (result.success()) 3 else 2)
+    }
+    result
+}
+trusted fun It8951Session.waitOwned(scratch: NativeBuffer,polls: int,attempts: int,exclusive: bool): int {
+    if (!exclusive || (this.state() != 1 && this.state() != 3) || !this.disjoint(scratch,2)) return 2
+    val result=it8951WaitDisplayIdle(this.context(),scratch,polls,attempts)
+    if (result != 2) {
+        this.remember(result)
+        this.buffer().storeU32(4,if (result == 1) 1 else if (result == 7) 3 else 2)
+    }
+    result
+}
+trusted fun It8951Session.lowPowerOwned(sleep: bool,scratch: NativeBuffer,polls: int,attempts: int,exclusive: bool): It8951ImageResult {
+    if (!exclusive || (this.state() != 1 && this.state() != 3) || !this.disjoint(scratch,2)) return It8951ImageResult(2)
+    val result=it8951EnterLowPower(this.context(),sleep,scratch,polls,attempts,true)
+    if (result.status() != 2) {
+        this.remember(result|0)
+        this.buffer().storeU32(4,if (result.success()) (if (sleep) 5 else 4) else if (result.status() == 7) 3 else 2)
+    }
+    result
+}
+trusted fun It8951Session.resumeStandbyOwned(polls: int,exclusive: bool): It8951ImageResult {
+    if (!exclusive || this.state() != 4) return It8951ImageResult(2)
+    val result=it8951ResumeStandby(this.context(),polls,true)
+    if (result.status() != 2) { this.remember(result|0);this.buffer().storeU32(4,if (result.success()) 1 else 2) }
+    result
+}
+// Only acknowledged standby can be detached. No implicit rail/pin release;
+// after false, retain resources and recover. Sleep/fault require hardware reset.
+trusted fun It8951Session.detachStandbyOwned(exclusive: bool): bool {
+    if (!exclusive || this.state() != 4) return false
+    if (!it8951TransportSelect(this.context(),false)) {
+        this.remember(5);this.buffer().storeU32(4,2);return false
+    }
+    var offset=4
+    while (offset < 40) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    true
+}

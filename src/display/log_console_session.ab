@@ -1,0 +1,67 @@
+import "./log_console.ab"
+// Caller-exclusive48B state, separate borrowed RGB565 framebuffer. No globals,
+// heap or panel initialization. Publisher hook is selected by static imports:
+// displayLogPublishOwned(token,frame,width,height,stride,littleEndian) -> int;
+// Signed32-bit status; only1 confirms full publication. Hook must return normally and serialize
+// the actual display/bus. All storage must be RAM and exclude provider/gate
+// bookkeeping; adapters/callers validate that before opening this RAM session.
+// Retain state/frame/style/publisher context through successful flush+close.
+type Rgb565LogConsole=int
+fun rgb565LogConsoleAt(storage: NativeBuffer): Rgb565LogConsole =
+    if (storage.hasAddressRange(0,48) && (storage.addressValue()&3) == 0) Rgb565LogConsole(storage|0) else Rgb565LogConsole(0)
+fun Rgb565LogConsole.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun Rgb565LogConsole.valid(): bool = rgb565LogConsoleAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x4c4f4731
+// 0closed1clean2pending3publishing(reentrant mutation forbidden).
+trusted fun Rgb565LogConsole.state(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+// Fresh or explicitly released storage ONLY; not a live-session reset.
+trusted fun Rgb565LogConsole.initialize(): bool {
+    if (rgb565LogConsoleAt(this.buffer()) == 0) return false
+    var at=4;while (at < 48) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x4c4f4731);return true
+}
+trusted fun Rgb565LogConsole.frame(): NativeBuffer = NativeBuffer(this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32))
+trusted fun Rgb565LogConsole.cursor(): TextCursor = TextCursor(this.buffer().loadU32(24)|(this.buffer().loadU32(28)<<32))
+trusted fun Rgb565LogConsole.lastPublishStatus(): int = if (this.valid()) int(i32(this.buffer().loadU32(40))) else -1
+trusted fun Rgb565LogConsole.openOwned(frame: NativeBuffer,width: int,height: int,stride: int,
+    foreground: int,background: int,scale: int,littleEndian: bool,exclusive: bool): bool {
+    if (!exclusive || this.state() != 0 || scale < 1 || scale > 8 || width < 6*scale || height < 8*scale ||
+        width > 65535 || height > 65535 || foreground < 0 || foreground > 65535 || background < 0 || background > 65535 ||
+        !lcdRgb565SourceValid(frame,width,height,stride)) return false
+    val span=(height-1)*stride+width*2;val address=this.buffer().addressValue()
+    if (frame.addressValue() < address+48 && address < frame.addressValue()+span) return false
+    textScrollRgb565Owned(frame,width,height,stride,height,background,littleEndian)
+    val b=this.buffer()
+    b.storeU32(8,frame&0xffffffff);b.storeU32(12,frame>>>32)
+    b.storeU16(16,width);b.storeU16(18,height);b.storeU32(20,stride)
+    b.storeU32(24,0);b.storeU32(28,1)
+    b.storeU16(32,foreground);b.storeU16(34,background);b.storeU32(36,scale|(if (littleEndian) 256 else 0))
+    b.storeU32(40,0);b.storeU32(4,2);return true
+}
+// 1appended2invalid3pending/busy. Explicit flush before another append keeps
+// cursor/frame atomic at the message level, even after uncertain panel writes.
+trusted fun Rgb565LogConsole.appendOwned(text: NativeBuffer,length: int,level: int,color: bool,suffix: int,exclusive: bool): int {
+    if (!exclusive || this.state() < 1) return 2
+    if (this.state() != 1) return 3
+    val b=this.buffer();val address=b.addressValue()
+    if (length < 0 || !text.hasAddressRange(0,length) ||
+        (length > 0 && text.addressValue() < address+48 && address < text.addressValue()+length)) return 2
+    val next=this.cursor().logRgb565Owned(this.frame(),b.loadU16(16),b.loadU16(18),b.loadU32(20),text,length,
+        level,color,b.loadU16(32),b.loadU16(34),suffix,b.loadU32(36)&255,(b.loadU32(36)&256) != 0)
+    if (!next.valid()) return 2
+    b.storeU32(24,next&0xffffffff);b.storeU32(28,next>>>32);b.storeU32(4,2);return 1
+}
+// 1clean/published2invalid3busy4publishfailed; raw publisher result retained.
+trusted fun Rgb565LogConsole.flushOwned(token: int,exclusive: bool): int {
+    if (!exclusive || this.state() < 1) return 2
+    if (this.state() == 3) return 3
+    if (this.state() == 1) return 1
+    val b=this.buffer();b.storeU32(4,3)
+    val result=displayLogPublishOwned(token,this.frame(),b.loadU16(16),b.loadU16(18),b.loadU32(20),(b.loadU32(36)&256) != 0)
+    b.storeU32(40,result);b.storeU32(4,if (result == 1) 1 else 2)
+    return if (result == 1) 1 else 4
+}
+// Does not close the display/provider or discard an unacknowledged frame.
+trusted fun Rgb565LogConsole.closeOwned(exclusive: bool): bool {
+    if (!exclusive || (this.state() != 0 && this.state() != 1)) return false
+    this.buffer().storeU32(8,0);this.buffer().storeU32(12,0);this.buffer().storeU32(4,0);return true
+}

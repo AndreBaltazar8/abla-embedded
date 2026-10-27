@@ -1,0 +1,70 @@
+import "./mmc_pins_s3_sequence.ab"
+import "../esp32/gpio/snapshot_s3_sequence.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Caller64-byte snapshot: tag0,slot4,count5,pin states8..31,input routes32..51,
+// last restore error56. Capture BEFORE routeOwned, restore AFTER host shutdown
+// and with BOTH old/new peripheral consumers quiescent. Pin/RTC/USB/hold/power
+// ownership remains caller responsibility; this restores digital routing only.
+fun sdMmcInputSignal(slot: int,index: int): int = if (index == 0) 178+slot else (if (slot == 0) 180 else 213)+index-1
+trusted fun sdMmcPinsCaptureOwned(pins: SdMmcPins,slot: int,snapshot: NativeBuffer,quiescentOwners: bool): int {
+    if (!snapshot.hasAddressRange(0,64) || !pins.valid() || slot < 0 || slot > 1) return 2
+    if (!quiescentOwners) return 3
+    var index=0
+    while (index < 64) { snapshot.store(index,0); index=index+1 }
+    val count=pins.width()+2
+    snapshot.store(4,slot); snapshot.store(5,count)
+    index=0
+    while (index < count) {
+        val state=esp32S3GpioSnapshotOwned(pins.pin(index),true)
+        if (!state.valid()) return 2
+        snapshot.storeU32(8+index*4,state|0)
+        index=index+1
+    }
+    index=0
+    while (index < count-1) {
+        snapshot.storeU32(32+index*4,esp32S3PinStateRead(0x60004154+sdMmcInputSignal(slot,index)*4)&255)
+        index=index+1
+    }
+    snapshot.storeU32(0,0x53445001)
+    return 1
+}
+// Full snapshot validation precedes ANY register write, including duplicate
+// pins and input byte bounds. Failed restores retain every original value for
+// explicit retry. Return1restored2invalid3notquiescent,16+input/32+pin failure.
+trusted fun sdMmcPinsRestoreOwned(snapshot: NativeBuffer,quiescentOwners: bool): int {
+    if (!snapshot.hasAddressRange(0,64)) return 2
+    val tag=snapshot.loadU32(0)
+    if (tag == 0x53445002) return 1
+    if (tag != 0x53445001 || snapshot.load(4) > 1 || (snapshot.load(5) != 3 && snapshot.load(5) != 6)) return 2
+    if (!quiescentOwners) return 3
+    val count=snapshot.load(5)
+    var index=0
+    while (index < count) {
+        val state=S3GpioSnapshot(snapshot.loadU32(8+index*4))
+        if (!state.valid()) return 2
+        var previous=0
+        while (previous < index) {
+            if (S3GpioSnapshot(snapshot.loadU32(8+previous*4)).pin() == state.pin()) return 2
+            previous=previous+1
+        }
+        if (index < count-1 && snapshot.loadU32(32+index*4) > 255) return 2
+        index=index+1
+    }
+    index=0
+    while (index < count-1) {
+        if (!esp32S3PinStateField(0x60004154+sdMmcInputSignal(snapshot.load(4),index)*4,255,snapshot.loadU32(32+index*4))) {
+            snapshot.storeU32(56,16+index); return 16+index
+        }
+        index=index+1
+    }
+    // Restore data/CMD before CLK; all old/new peripheral owners remain idle.
+    index=count-1
+    while (index >= 0) {
+        if (S3GpioSnapshot(snapshot.loadU32(8+index*4)).restoreOwned(true) != 1) {
+            snapshot.storeU32(56,32+index); return 32+index
+        }
+        index=index-1
+    }
+    snapshot.storeU32(56,0); snapshot.storeU32(0,0x53445002)
+    return 1
+}

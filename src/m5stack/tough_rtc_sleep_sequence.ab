@@ -1,0 +1,55 @@
+import "./tough_power_sleep_sequence.ab"
+import "./tough_rtc_timer_session_sequence.ab"
+// Optional RTC countdown alongside the existing HP timer/GPIO wake policy.
+//72B timer record extends its64B child with wrapper address64/binding tag68.
+// RTC period is independently quantized; it does not replace the caller's
+// HP deadline. All operations here are CACHE-ON. After Begin, use measured
+// framework retries; call Finish only once recovery permits cache/bus use.
+// Preflight9ready/7held/8communication failure/10RTC setup-or-cleanup failure,
+//2invalid. On7/8/10 the timer record can still own hardware: finish/cancel it.
+trusted fun toughRtcSleepStorageAdmitted(owner: M5ToughPowerOwner,wrapper: NativeBuffer,request: NativeBuffer,context: NativeBuffer,scratch: NativeBuffer,timer: NativeBuffer,slowCycles: int,fastCycles: int,exclusive: bool): bool {
+    if (!timer.hasAddressRange(0,72) || (timer.addressValue()&3) != 0 ||
+        !toughPowerSleepAdmitted(owner,wrapper,request,context,scratch,slowCycles,fastCycles,exclusive)) return false
+    val address=timer.addressValue();val parent=owner.buffer().addressValue();val record=wrapper.addressValue()
+    val input=request.addressValue();val memory=context.addressValue();val temporary=scratch.addressValue()
+    return !(address < parent+96 && parent < address+72) && !(address < record+1024 && record < address+72) &&
+        !(address < input+68 && input < address+72) && !(address < memory+772 && memory < address+72) &&
+        !(address < temporary+56 && temporary < address+72)
+}
+trusted fun toughRtcSleepBound(timer: NativeBuffer,wrapper: NativeBuffer): bool = timer.hasAddressRange(0,72) &&
+    (timer.addressValue()&3) == 0 && timer.loadU32(68) == 0x54525331 && timer.loadU32(64) == wrapper.addressValue()
+trusted fun M5ToughPowerOwner.preflightRtcSleepOwned(wrapper: NativeBuffer,request: NativeBuffer,context: NativeBuffer,scratch: NativeBuffer,timer: NativeBuffer,rtc: M5RtcOpenResult,bus: int,touch: int,milliseconds: int,slowCycles: int,fastCycles: int,exclusive: bool): int {
+    if (touch <= 0 || touch > 0xffffffff || milliseconds <= 0 || milliseconds > 0xffffffff ||
+        !toughRtcSleepStorageAdmitted(this,wrapper,request,context,scratch,timer,slowCycles,fastCycles,exclusive) ||
+        !toughRtcSleepBusOwnsTouch(bus,touch)) return 2
+    if (timer.loadU32(0) == 0) {
+        val started=this.beginRtcTimerSessionOwned(timer,rtc,bus,milliseconds,true)
+        if (started == 2) return 2
+        timer.storeU32(64,wrapper.addressValue());timer.storeU32(68,0x54525331)
+        // Preserve the first failure for the caller; retry on a later call.
+        if (started != 1) return 10
+    } else {
+        if (!toughRtcSleepBound(timer,wrapper) || timer.loadU32(60) != milliseconds ||
+            toughRtcSessionRead64(timer,20) != (rtc|0) || toughRtcSessionRead64(timer,12) != bus ||
+            !toughRtcTimerSessionMatches(this,timer,true)) return 2
+        if (timer.loadU32(4) == 3) {
+            if (this.retryRtcTimerCleanupOwned(timer,true) != 1) return 10
+        } else if (timer.loadU32(4) != 1) return 2
+    }
+    return this.sleepPreflightOwned(wrapper,request,context,scratch,touch,slowCycles,fastCycles,true)
+}
+trusted fun M5ToughPowerOwner.beginRtcSleepOwned(wrapper: NativeBuffer,request: NativeBuffer,context: NativeBuffer,scratch: NativeBuffer,timer: NativeBuffer,slowCycles: int,fastCycles: int,exclusive: bool): int {
+    if (!toughRtcSleepStorageAdmitted(this,wrapper,request,context,scratch,timer,slowCycles,fastCycles,exclusive) ||
+        !toughRtcSleepBound(timer,wrapper) || timer.loadU32(4) != 1 || !toughRtcTimerSessionMatches(this,timer,true) ||
+        !toughRtcSleepBusOwnsTouch(toughRtcSessionRead64(timer,12),scratch.loadU32(52))) return 2
+    return this.sleepBeginOwned(wrapper,request,context,scratch,slowCycles,fastCycles,true)
+}
+// Explicitly stops the owned timer and acknowledges its TF/PM1 evidence;
+// consume wanted wake evidence before calling. Never disables alarm/AIE.
+// No I2C while wrapper is pending. This is not a cache-off callable root.
+trusted fun M5ToughPowerOwner.finishRtcSleepOwned(wrapper: NativeBuffer,timer: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !wrapper.hasAddressRange(0,1024) || (wrapper.addressValue()&3) != 0 || !toughRtcSleepBound(timer,wrapper)) return 2
+    val tag=c5SleepRecordRead(wrapper,0)
+    if (tag != 0 && (tag != 0x434d4331 || (c5SleepRecordRead(wrapper,4) != 1 && c5SleepRecordRead(wrapper,4) != 4))) return 2
+    return this.closeRtcTimerSessionOwned(timer,true)
+}

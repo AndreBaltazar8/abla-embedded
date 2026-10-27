@@ -1,0 +1,62 @@
+import "./i80_config_s3_sequence.ab"
+// Exclusive polling transport, configured LCD clock/pads/phases, finite owned
+// internal-SRAM descriptor chain/payload. No concurrent ISR acknowledgements or
+// descriptor rearm. Start clears old completion events; never start again until
+// Poll completes or Abort parks both engines. Terminal in Poll is this chain's
+// EOF/next0 descriptor. A caller owns the entire chain, not just these addresses.
+// Start:1requested,2invalid,3busy,4configuration/ack failure,5FIFOreset timeout,
+// 6DMA start refusal. Failures retain resources for explicit abort/retry.
+trusted fun esp32S3LcdI80StartOwned(channel: int,descriptor: int,polls: int,exclusive: bool): int {
+    if (!exclusive || channel < 0 || channel > 4 || polls < 1 || polls > 1000000 || !esp32s3GdmaDescriptorValid(descriptor)) return 2
+    if (!s3I80Idle() || !esp32s3GdmaParked(channel,true)) return 3
+    val user=esp32S3I80Read(0x60041014)
+    if ((esp32S3I80Read(0x6004101C)&0x80000000) != 0 || (user&(1<<24)) == 0) return 2
+    if (!esp32s3GdmaConfigureLcd(channel,descriptor) || !esp32s3GdmaAcknowledge(channel,true,255)) return 4
+    esp32S3I80Write(0x60041070,2)
+    if ((esp32S3I80Read(0x60041068)&2) != 0) return 4
+    val misc=esp32S3I80Read(0x60041018)
+    esp32S3I80Write(0x60041018,misc|(1<<27))
+    var attempt=0
+    while ((esp32S3I80Read(0x60041018)&(1<<27)) != 0 && attempt < polls) { attempt=attempt+1 }
+    if ((esp32S3I80Read(0x60041018)&(1<<27)) != 0) return 5
+    if (!esp32s3GdmaStart(channel,true)) return 6
+    // Same ordering as IDF: GDMA supplies FIFO before LCD starts clocking.
+    esp32S3I80DelayUs(4)
+    esp32S3I80Write(0x60041014,user|(1<<20))
+    esp32S3I80Write(0x60041014,user|(1<<20)|(1<<27))
+    return 1
+}
+// Poll:0pending,1LCD+DMA complete,2invalid,3DMA error. Does not acknowledge
+// either event; errors remain visible. Memory EOF alone NEVER latches EPD line.
+trusted fun esp32S3LcdI80PollOwned(channel: int,terminal: int,exclusive: bool): int {
+    if (!exclusive || channel < 0 || channel > 4 || !esp32s3GdmaDescriptorValid(terminal)) return 2
+    val dma=0x6003F060+channel*192
+    val events=esp32s3GdmaRead(dma+8)&255
+    if ((events&244) != 0) return 3
+    if ((esp32S3I80Read(0x60041068)&2) == 0 || (esp32S3I80Read(0x60041014)&0x08100000) != 0 ||
+        (events&10) != 10 || esp32s3GdmaRead(dma+40) != terminal ||
+        (esp32s3GdmaRead(dma+32)&0xF00000) != 0x800000 || (esp32s3GdmaRead(dma+24)&0x7FFFFF) != 42) return 0
+    esp32s3GdmaPublish()
+    val flags=esp32s3GdmaRead(terminal)
+    if ((flags&0xC0000000) != 0x40000000 || esp32s3GdmaRead(terminal+8) != 0) return 0
+    return 1
+}
+// Abort explicitly permits a truncated scanline, NOT successful panel output.
+// 1stopped/buffers reclaimable,2invalid,3domain inaccessible,5still stopping.
+// Do not power off/reclaim memory on5. No descriptor/FIFO reset on this path.
+trusted fun esp32S3LcdI80AbortOwned(channel: int,polls: int,exclusive: bool): int {
+    if (!exclusive || channel < 0 || channel > 4 || polls < 1 || polls > 1000000) return 2
+    if ((esp32S3I80Read(0x600C001C)&256) == 0 || (esp32S3I80Read(0x600C0024)&256) != 0) return 3
+    val user=esp32S3I80Read(0x60041014)
+    esp32S3I80Write(0x60041014,(user&(~0x18100000))|(1<<20))
+    if (!esp32s3GdmaRequestStop(channel,true)) return 5
+    var attempt=0
+    while (attempt < polls) {
+        if ((esp32S3I80Read(0x60041014)&0x18100000) == 0 && esp32s3GdmaParked(channel,true) &&
+            (esp32s3GdmaRead(0x6003F080+channel*192)&0x700000) == 0) {
+            esp32s3GdmaPublish();return 1
+        }
+        attempt=attempt+1
+    }
+    return 5
+}

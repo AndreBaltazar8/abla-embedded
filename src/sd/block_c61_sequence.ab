@@ -1,0 +1,62 @@
+import "./startup_c61_sequence.ab"
+import "./selected_write.ab"
+// Both block results extend status with11busy12faultedGate13ownership
+// 14liveAdmission15CS16releaseClock. Cleanup kind@28:1CS,2releaseClock;
+// bit31 means cleanup incomplete. Original protocol/transport failure survives.
+fun SdSpiReadResult.cleanupPending(): bool = (this&(1<<31)) != 0
+fun SdSpiWriteResult.cleanupPending(): bool = (this&(1<<31)) != 0
+fun SdSpiReadResult.cleanupKind(): int = (this>>>28)&3
+fun SdSpiWriteResult.cleanupKind(): int = (this>>>28)&3
+trusted fun c61SdBlockStorageReady(master: Esp32C61SpiMaster,gate: PeripheralGate,
+    state: SdSpiInitResult,block: int,scratch: NativeBuffer,payload: NativeBuffer,polls: int,sourceHz: int): bool =
+    master.ready() && state.valid() && sdSpiBlockAddressValid(state.highCapacity(),block) &&
+    c61SpiGateValid(gate) && c61SpiBufferValid(scratch,2) && sdSpiReadStorageValid(scratch,payload,512) &&
+    (payload.addressValue() >= 0x60100000 || payload.addressValue()+512 <= 0x60000000) &&
+    gate.bufferDisjoint(scratch,2) && gate.bufferDisjoint(payload,512) &&
+    polls >= 1 && polls <= 1000000 && sourceHz >= 1000000 && sourceHz <= 160000000
+trusted fun c61SdFinishBlockSelected(master: Esp32C61SpiMaster,scratch: NativeBuffer,result: int): int {
+    var cleanup=1
+    var raw=0
+    if (!esp32C61SpiCpuIdleOwned() || !c61SpiSelectLevel(master.pins().pinAt(3),true)) cleanup=15
+    else {
+        val release=sdSpiSelectedExchange(master|0,255,scratch)
+        if ((release>>>32) != 1) { cleanup=16;raw=release&4294967295 }
+    }
+    if (cleanup == 1) return result
+    val updated=if ((result&255) == 1) (result&~255)|cleanup|(raw<<32) else result
+    return updated|(1<<31)|((if (cleanup == 15) 1 else 2)<<28)
+}
+// state must come from this SAME master/card/power lifetime. Caller invalidates
+// it on removal, power/reset or reconfiguration; it is not a card-detect handle.
+// Default-speed cards only (<=25MHz); no implicit CMD6 high-speed assumption.
+trusted fun Esp32C61SpiMaster.readSdBlock(gate: PeripheralGate,owner: u32,sourceHz: int,
+    state: SdSpiInitResult,block: int,scratch: NativeBuffer,destination: NativeBuffer,polls: int = 250): SdSpiReadResult {
+    if (!c61SdBlockStorageReady(this,gate,state,block,scratch,destination,polls,sourceHz)) return SdSpiReadResult(2)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SdSpiReadResult(if (admission == 1) 11 else if (admission == 2) 12 else 2)
+    var result=14
+    if (c61SpiMasterDataReady(this,true) && c61SdClockReady(sourceHz,25000000)) {
+        result=if (!c61SpiSelectLevel(this.pins().pinAt(3),false)) 15 else
+            sdSpiReadBlockSelected(this|0,state.highCapacity(),block,scratch,destination,polls)|0
+        result=c61SdFinishBlockSelected(this,scratch,result)
+    }
+    if (!gate.finish(owner,(result&255) == 1)) result=(result&~255)|13
+    return SdSpiReadResult(result)
+}
+// Explicit sector mutation. Failure may have written data; no automatic replay.
+// Gate remains faulted on any failure, including card-programming busy timeout.
+// Bus recovery alone does not establish card readiness or undo a partial write.
+trusted fun Esp32C61SpiMaster.writeSdBlock(gate: PeripheralGate,owner: u32,sourceHz: int,
+    state: SdSpiInitResult,block: int,scratch: NativeBuffer,source: NativeBuffer,polls: int = 250): SdSpiWriteResult {
+    if (!c61SdBlockStorageReady(this,gate,state,block,scratch,source,polls,sourceHz)) return SdSpiWriteResult(2)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SdSpiWriteResult(if (admission == 1) 11 else if (admission == 2) 12 else 2)
+    var result=14
+    if (c61SpiMasterDataReady(this,true) && c61SdClockReady(sourceHz,25000000)) {
+        result=if (!c61SpiSelectLevel(this.pins().pinAt(3),false)) 15 else
+            sdSpiWriteBlockSelected(this|0,state.highCapacity(),block,scratch,source,polls)|0
+        result=c61SdFinishBlockSelected(this,scratch,result)
+    }
+    if (!gate.finish(owner,(result&255) == 1)) result=(result&~255)|13
+    return SdSpiWriteResult(result)
+}

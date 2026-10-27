@@ -1,0 +1,72 @@
+import "./software_command.ab"
+
+// Status:1 ready,2 busy,3 invalid,4 faulted gate,5 ownership failure,
+// 6 CMD0,7 CMD8,8 ACMD41,9 OCR/voltage,10 block length. No heap/driver handle.
+// Success records CCS at bit16 and v2 at bit17; no success inferred on timeout.
+type SoftwareSdInitResult = int
+fun SoftwareSdInitResult.status(): int = this & 255
+fun SoftwareSdInitResult.valid(): bool = this.status() == 1
+fun SoftwareSdInitResult.highCapacity(): bool = this.valid() && (this & 65536) != 0
+fun SoftwareSdInitResult.version2(): bool = this.valid() && (this & 131072) != 0
+
+trusted fun softwareSdInitializeOwned(clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    response: NativeBuffer, halfPeriodMicroseconds: int): SoftwareSdInitResult {
+    clock.write(false)
+    chipSelect.write(true)
+    var clocks = 0
+    while (clocks < 10) {
+        softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(255), 8, 0, halfPeriodMicroseconds)
+        clocks = clocks + 1
+    }
+    var idle = false
+    var attempts = 0
+    while (!idle && attempts < 16) {
+        idle = softwareSdCommandOwned(clock, mosi, miso, chipSelect, 0, 0, response, 0, halfPeriodMicroseconds) == 1
+        attempts = attempts + 1
+    }
+    if (!idle) return SoftwareSdInitResult(6)
+    val condition = softwareSdCommandOwned(clock, mosi, miso, chipSelect, 8, 426, response, 4, halfPeriodMicroseconds)
+    val version2 = condition == 1
+    if (version2) {
+        if (response.load(0) != 0 || response.load(1) != 0 || response.load(2) != 1 || response.load(3) != 170) return SoftwareSdInitResult(7)
+    } else if (condition != 5) return SoftwareSdInitResult(7)
+    // Only an explicit idle+illegal-command response selects legacy SDSC.
+    var ready = false
+    attempts = 0
+    while (!ready && attempts < 1000) {
+        val prefix = softwareSdCommandOwned(clock, mosi, miso, chipSelect, 55, 0, response, 0, halfPeriodMicroseconds)
+        if (prefix != 0 && prefix != 1) return SoftwareSdInitResult(8)
+        val state = softwareSdCommandOwned(clock, mosi, miso, chipSelect, 41,
+            if (version2) 1073741824 else 0, response, 0, halfPeriodMicroseconds)
+        if (state == 0) ready = true
+        else if (state != 1) return SoftwareSdInitResult(8)
+        if (!ready) peripheralDelayMicroseconds(1000)
+        attempts = attempts + 1
+    }
+    if (!ready) return SoftwareSdInitResult(8)
+    if (softwareSdCommandOwned(clock, mosi, miso, chipSelect, 58, 0, response, 4, halfPeriodMicroseconds) != 0) return SoftwareSdInitResult(9)
+    // Require power-up complete and at least one supported 2.7..3.6V bit.
+    val ocr = (response.load(0) << 24) | (response.load(1) << 16) | (response.load(2) << 8) | response.load(3)
+    if ((ocr & 2147483648) == 0 || (ocr & 16744448) == 0) return SoftwareSdInitResult(9)
+    val highCapacity = version2 && (ocr & 1073741824) != 0
+    if (!highCapacity && softwareSdCommandOwned(clock, mosi, miso, chipSelect, 16, 512, response, 0, halfPeriodMicroseconds) != 0) return SoftwareSdInitResult(10)
+    SoftwareSdInitResult(1 | (if (highCapacity) 65536 else 0) | (if (version2) 131072 else 0))
+}
+
+// Startup owns the bus for the entire bounded sequence. Caller supplies powered,
+// settled card, configured pins and inactive other chip selects. No implicit
+// rail changes, filesystem access, card writes or SPI-clock reconfiguration.
+trusted fun softwareSdInitialize(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin, response: NativeBuffer,
+    halfPeriodMicroseconds: int = 2): SoftwareSdInitResult {
+    if (halfPeriodMicroseconds < 2 || halfPeriodMicroseconds > 10 ||
+        !gate.bufferDisjoint(response, 4) || mosi.number() < 0 || miso.number() < 0 ||
+        !softwareSpiConfigurationValid(clock, mosi, miso, 0, halfPeriodMicroseconds) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, 0, 0)) return SoftwareSdInitResult(3)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SoftwareSdInitResult(if (admission == 1) 2 else if (admission == 2) 4 else 3)
+    val result = softwareSdInitializeOwned(clock, mosi, miso, chipSelect, response, halfPeriodMicroseconds)
+    // Every command releases CS and provides trailing clocks, including errors.
+    if (!gate.finish(owner, true)) return SoftwareSdInitResult(5)
+    result
+}

@@ -1,0 +1,81 @@
+import "./session_s3_sequence.ab"
+// Exclusive136B owner: magic0/status4/link8/gate12/session64@16/detail24,
+// master snapshot40@32, generation-retaining card session64@72.
+// Owns SPI pad snapshots and card lifecycle, NOT rails or PLL. Supply must be
+// settled, PLL80 stable, other shared devices stopped/CS inactive throughout.
+type S3SdMasterOwner=int
+fun s3SdMasterOwnerAt(storage: NativeBuffer): S3SdMasterOwner =
+    if (s3SdStorageValid(storage,136) && (storage.addressValue()&3) == 0) S3SdMasterOwner(storage|0) else S3SdMasterOwner(0)
+fun S3SdMasterOwner.buffer(): NativeBuffer = NativeBuffer(this|0)
+fun S3SdMasterOwner.masterStorage(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+32,40)
+fun S3SdMasterOwner.cardStorage(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+72,64)
+trusted fun S3SdMasterOwner.valid(): bool = s3SdMasterOwnerAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x53334f31
+trusted fun S3SdMasterOwner.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun S3SdMasterOwner.session(): Esp32S3SdSession =
+    Esp32S3SdSession(if (this.status() == 1) s3SdSessionLoad64(this.buffer(),16) else 0)
+// Fresh unpublished storage only; never recycle while old session handles exist.
+trusted fun S3SdMasterOwner.initializeFresh(): bool {
+    if (s3SdMasterOwnerAt(this.buffer()) == 0) return false
+    var offset=0
+    while (offset < 136) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x53334f31)
+    return esp32S3SdSessionInitializeFresh(this.cardStorage())
+}
+// Status0closed1ready2admission3masterfailure4cardfailure5closefailure6clockfailure.
+// Result2 does not mutate ownership. All other failed opens require close.
+trusted fun S3SdMasterOwner.openOwned(link: SdSpiS3Link,gate: PeripheralGate,owner: u32,
+    scratch: NativeBuffer,response: NativeBuffer,polls: int,poweredExclusive: bool): int {
+    if (!poweredExclusive || this.status() != 0 || !peripheralOwnerValid(owner) ||
+        !s3SdOwnedStorageReady(link,gate,scratch,response,16,polls,80000000) ||
+        !gate.bufferDisjoint(this.buffer(),136) ||
+        (scratch.addressValue() < this.buffer().addressValue()+136 && this.buffer().addressValue() < scratch.addressValue()+2) ||
+        (response.addressValue() < this.buffer().addressValue()+136 && this.buffer().addressValue() < response.addressValue()+16) ||
+        this.cardStorage().loadU32(8) >= 16777215) return 2
+    if (gate.tryBegin(owner) != 0) return 2
+    this.buffer().storeU32(4,3);this.buffer().storeU32(8,link|0);this.buffer().storeU32(12,gate|0)
+    val master=s3SdOwnerMasterBegin(this.masterStorage(),link,owner,polls)
+    this.buffer().storeU32(24,master)
+    val published=gate.finish(owner,master == 1)
+    if (!published || master != 1) return 3
+    val session=esp32S3SdSessionOpen(this.cardStorage(),link,gate,owner,80000000,scratch,response,polls)
+    s3SdSessionStore64(this.buffer(),16,session|0)
+    s3SdSessionStore64(this.buffer(),24,s3SdSessionLoad64(this.cardStorage(),48))
+    this.buffer().storeU32(4,4)
+    if (session == 0) return 4
+    // No handle escapes until transfer-clock promotion succeeds. Lock ordering
+    // matches card I/O: session then physical bus. Never reset a busy master.
+    this.buffer().storeU32(4,6)
+    val cardLock=peripheralGateAt(this.cardStorage().addressValue())
+    if (cardLock.tryBegin(owner) != 0) { this.buffer().storeU32(24,1);return 6 }
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) {
+        this.buffer().storeU32(24,2);cardLock.finish(owner,true);return 6
+    }
+    val clock=s3SdOwnerMasterTransferClock(link)
+    val clockReleased=gate.finish(owner,clock)
+    val cardReleased=cardLock.finish(owner,true)
+    this.buffer().storeU32(24,if (!clock) 3 else if (!clockReleased || !cardReleased) 4 else 0)
+    if (clock && clockReleased && cardReleased) this.buffer().storeU32(4,1)
+    return this.status()
+}
+// Join every card/filesystem/SPI user before closing. Revoke card BEFORE pads
+// restore. Physical idle/noDMA and every pad restore must pass before gate can
+// be published healthy; busy/partial restore keeps owner for explicit retry.
+trusted fun S3SdMasterOwner.closeOwned(owner: u32,usersQuiescedExclusive: bool,polls: int = 1000): bool {
+    if (!usersQuiescedExclusive || !this.valid() || !peripheralOwnerValid(owner) || polls < 1 || polls > 1000000) return false
+    if (this.status() == 0) return true
+    val session=Esp32S3SdSession(s3SdSessionLoad64(this.buffer(),16))
+    if (session != 0 && !session.invalidate(owner) && this.cardStorage().loadU32(12) == 1) return false
+    s3SdSessionStore64(this.buffer(),16,0);this.buffer().storeU32(4,5)
+    val gate=PeripheralGate(this.buffer().loadU32(12))
+    val admission=gate.tryBegin(owner)
+    if (admission == 1 || admission == 3) return false
+    val recovery=admission == 2
+    if (recovery && !gate.tryBeginRecovery(owner)) return false
+    val closed=s3SdOwnerMasterClose(this.masterStorage(),polls)
+    this.buffer().storeU32(24,closed)
+    val released=if (recovery) gate.finishRecovery(owner,closed == 2) else gate.finish(owner,closed == 2)
+    if (!released || closed != 2) return false
+    this.buffer().storeU32(4,0)
+    return true
+}

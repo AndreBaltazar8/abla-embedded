@@ -1,0 +1,49 @@
+import "../esp32/dsi_short_p4_sequence.ab"
+import "../esp32/sdk/raw_buffer.ab"
+
+// Caller owns an initialized command-mode DSI host, powered/reset/settled
+// panel, and 16 scratch bytes. One attempt; no reset or retry is hidden here.
+// Scratch[8..15] retains the complete last DsiCommandResult for recovery.
+// Transport failure may leave queued packets or a late RX response: do NOT
+// issue another command blindly, including a page-restore command.
+type Ili9881cProbe = int
+// 0 invalid, 1 matched AND page-zero write completed, 2 mismatch AND restored,
+// 3 transport failure (caller must recover host/panel before reuse).
+fun Ili9881cProbe.status(): int = this & 255
+fun Ili9881cProbe.matched(): bool = this.status() == 1
+fun Ili9881cProbe.failedStep(): int = (this >>> 8) & 255
+fun Ili9881cProbe.identity(): int = (this >>> 16) & 16777215
+fun Ili9881cProbe.recoveryRequired(): bool = this.status() == 3
+
+trusted fun ili9881cSaveTransport(scratch: NativeBuffer,result: DsiCommandResult): void {
+    scratch.storeU32(8,u32(result & 4294967295))
+    scratch.storeU32(12,u32((result >>> 32) & 4294967295))
+    return
+}
+
+trusted fun ili9881cProbeOwned(channel: int,scratch: NativeBuffer,polls: int): Ili9881cProbe {
+    if (channel < 0 || channel > 3 || polls < 1 || polls > 1000000 ||
+        !scratch.hasAddressRange(0,16)) return Ili9881cProbe(0)
+    val payload=nativeBufferAt(scratch.addressValue(),4)
+    val reply=nativeBufferAt(scratch.addressValue()+4,1)
+    payload.store(0,255); payload.store(1,152); payload.store(2,129); payload.store(3,1)
+    var transport=ili9881cDsiWrite(channel,payload,polls)
+    ili9881cSaveTransport(scratch,transport)
+    if (!transport.hostComplete()) return Ili9881cProbe(3 | (1 << 8))
+    var identity=0
+    var command=0
+    while (command < 3) {
+        transport=ili9881cDsiRead(channel,command,reply,polls)
+        ili9881cSaveTransport(scratch,transport)
+        if (!transport.hostComplete()) return Ili9881cProbe(3 | ((command+2) << 8) | (identity << 16))
+        identity=identity | int(u32(reply.load(0)) << u32(command*8))
+        command=command+1
+    }
+    // Restore even on a successfully read nonmatching identity. A completed
+    // host write is not independent proof that a nonmatching panel accepted it.
+    payload.store(3,0)
+    transport=ili9881cDsiWrite(channel,payload,polls)
+    ili9881cSaveTransport(scratch,transport)
+    if (!transport.hostComplete()) return Ili9881cProbe(3 | (5 << 8) | (identity << 16))
+    Ili9881cProbe((if ((identity & 65535) == 33176) 1 else 2) | (identity << 16))
+}

@@ -1,0 +1,56 @@
+import "./i2c_pin_map.ab"
+import "../esp32/i2c/timing_p4_logic.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// CoreP4X/Tab5/Tab5X internal control bus, selected HP controller0/1.
+// Caller owns dedicated controller, safed pads and former HP/LP consumers;
+// global holds released, GPIO/LP power stable, RCC/lifecycle serialized.
+// Owns IOMUX gates but does not initialize LP power, release holds or reset
+// board peripherals. External pullups required. No codec/PMIC power writes.
+// 96B aligned record: magic,state,primary,cleanup,IOMUX token,bus epoch;
+// inner72B session. Keep it alive and exclusive until closed. Child devices
+// must be quiesced before close, which revokes handles before restoring pads.
+// Status1ready2invalid3provideroccupied4clock5session6bind7cleanup8closed.
+trusted fun m5P4HardwareControlValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,96) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x4d354834
+trusted fun m5P4HardwareControlOpenOwned(r: NativeBuffer,board: M5BoardId,port: int,layout: int,
+    sourceHz: u32,cpuHz: u32,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,96) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        (board != m5BoardCoreP4X && board != m5BoardTab5 && board != m5BoardTab5X) ||
+        port < 0 || port > 1 || (layout != 1 && layout != 3) ||
+        cpuHz < u32(1000) || cpuHz > u32(1000000000) || !esp32p4I2cTiming(sourceHz,u32(100000)).valid()) return 2
+    if (!m5P4HardwareProviderFree()) return 3
+    var i=4
+    while (i < 96) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x4d354834);r.storeU32(4,3)
+    val clock=m5P4HardwareClockOpen(layout)
+    r.storeU32(16,clock)
+    if ((clock&255) != 1) { r.storeU32(8,4);return 4 }
+    val pins=board.i2cPins()
+    val session=nativeBufferAt(r.addressValue()+24,72)
+    if (m5P4HardwareSessionOpen(session,port,pins.internalData(),pins.internalClock(),layout,sourceHz) != 1) {
+        r.storeU32(8,5);return 5
+    }
+    val bus=m5P4HardwareBind(nativeBufferAt(r.addressValue(),96),sourceHz,cpuHz)
+    if (bus == 0) { r.storeU32(8,6);return 6 }
+    r.storeU32(20,bus);r.storeU32(4,1);return 1
+}
+trusted fun m5P4HardwareControlBus(r: NativeBuffer): int =
+    if (m5P4HardwareControlValid(r) && r.loadU32(4) == 1) r.loadU32(20) else 0
+trusted fun m5P4HardwareControlCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !m5P4HardwareControlValid(r)) return 2
+    if (r.loadU32(4) == 4) return 8
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 2
+    r.storeU32(4,3)
+    val bus=r.loadU32(20)
+    val session=nativeBufferAt(r.addressValue()+24,72)
+    if (bus != 0) {
+        if (!m5P4HardwareBusClose(bus)) { r.storeU32(12,6);return 7 }
+        r.storeU32(20,0)
+    } else if (session.loadU32(0) != 0 && session.loadU32(4) != 4) {
+        if (m5P4HardwareSessionClose(session) != 8) { r.storeU32(12,5);return 7 }
+    }
+    val clock=m5P4HardwareClockClose(r.loadU32(16))
+    r.storeU32(16,clock)
+    if (clock != 0) { r.storeU32(12,4);return 7 }
+    r.storeU32(12,0);r.storeU32(4,4);return 8
+}

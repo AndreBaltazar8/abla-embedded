@@ -1,0 +1,139 @@
+import "./fat_volume.ab"
+import "./fat_lookup.ab"
+import "./fat_short_name.ab"
+import "./fat_path_utf16.ab"
+// Caller-owned80B, bound immutably to one mount generation. All access uses
+// that volume gate. Never recycle this storage while handles can survive.
+// magic0,generation4,open8,reserved12,volume16,parent24,ordinal28,index32,
+// reserved36,exact short-entry snapshot40..71,reserved72..79. No heap.
+// Handle: status8,address32,generation24. Generation never wraps.
+type FatFile=int
+fun FatFile.status(): int = this&255
+fun FatFile.storage(): NativeBuffer = nativeBufferAt((this>>>8)&4294967295,80)
+trusted fun fatFileInitializeFresh(s: NativeBuffer,volume: FatVolume,owner: u32): bool {
+    if (!s.hasAddressRange(0,80) || (s.addressValue()&7) != 0 || volume == 0 ||
+        fatBuffersOverlap(s,80,volume.storage(),32)) return false
+    if (volume.begin(owner) != 0) return false
+    val v=volume.storage()
+    val valid=!fatBuffersOverlap(s,80,nativeBufferAt(v.loadU32(16),28),28) &&
+        !fatBuffersOverlap(s,80,nativeBufferAt(v.loadU32(20),512),512)
+    if (valid) {
+        var i=0;while (i < 80) { s.storeU32(i,0);i=i+4 }
+        s.storeU32(0,0x46464831);s.storeU32(16,(volume|0)&4294967295);s.storeU32(20,volume>>>32)
+    }
+    return peripheralGateAt(v.addressValue()).finish(owner,true) && valid
+}
+trusted fun FatFile.currentLocked(): bool = this.status() == 1 && (this>>>40) != 0 &&
+    this.storage().loadU32(0) == 0x46464831 && this.storage().loadU32(8) == 1 &&
+    this.storage().loadU32(4) == (this>>>40)
+// Open one UTF16 component with insensitive LFN and ASCII8.3 fallback.
+// Workspace2080:sector512,scratch1024,LFN520,alias11,padding5,location8.
+// Status1open,2input,3notfound,4IO,5corrupt,6budget,9notfile,
+// 12busy/alreadyopen,13stale/exhausted,14mountfault. Failure leaves s intact.
+trusted fun fatFileOpen(s: NativeBuffer,owner: u32,parent: int,name: NativeBuffer,units: int,budget: int,work: NativeBuffer,pathMode: bool = false): FatFile {
+    val workspaceBytes=if (pathMode) 2092 else 2080
+    if (!s.hasAddressRange(0,80) || (s.addressValue()&7) != 0 || s.loadU32(0) != 0x46464831 ||
+        units < 1 || units > (if (pathMode) 4096 else 255) || !name.hasAddressRange(0,units*2) || !work.hasAddressRange(0,workspaceBytes) ||
+        fatBuffersOverlap(s,80,name,units*2) || fatBuffersOverlap(s,80,work,workspaceBytes) ||
+        fatBuffersOverlap(work,workspaceBytes,name,units*2)) return FatFile(2)
+    val volume=FatVolume(s.loadU32(16)|(s.loadU32(20)<<32));val v=volume.storage()
+    if (fatBuffersOverlap(work,workspaceBytes,v,32) || fatBuffersOverlap(name,units*2,v,32)) return FatFile(2)
+    val admitted=volume.begin(owner)
+    if (admitted != 0) return FatFile(admitted)
+    val reader=nativeBufferAt(v.loadU32(16),28);val boot=nativeBufferAt(v.loadU32(20),512)
+    var result=FatFile(2)
+    if (s.loadU32(8) != 0) result=FatFile(12)
+    else if (s.loadU32(4) >= 16777215) result=FatFile(13)
+    else if (!fatBuffersOverlap(s,80,reader,28) && !fatBuffersOverlap(s,80,boot,512) &&
+        !fatBuffersOverlap(work,workspaceBytes,reader,28) && !fatBuffersOverlap(work,workspaceBytes,boot,512)) {
+        val sector=nativeBufferAt(work.addressValue()+(if (pathMode) 1024 else 0),512);val alias=nativeBufferAt(work.addressValue()+2056,11)
+        val pathLocation=nativeBufferAt(work.addressValue()+2080,12)
+        val location=nativeBufferAt(work.addressValue()+(if (pathMode) 2084 else 2072),8)
+        val encoded=if (pathMode) false else fatShortNameEncodeUtf16(name,units,alias)
+        val found=if (pathMode) fatLookupPathUtf16Owned(reader,boot,v.loadU32(24),v.loadU32(28),name,units,budget,
+            nativeBufferAt(work.addressValue(),2080),pathLocation) else fatLookupNameOwned(reader,boot,v.loadU32(24),v.loadU32(28),parent,name,units,true,
+            nativeBufferAt(work.addressValue()+1536,520),budget,sector,nativeBufferAt(work.addressValue()+512,1024),
+            if (encoded) alias else NativeBuffer(0),true,location)
+        if (found.isFile()) {
+            val generation=s.loadU32(4)+1;s.storeU32(4,generation);s.storeU32(8,1)
+            s.storeU32(24,if (pathMode) pathLocation.loadU32(0) else parent);s.storeU32(28,location.loadU32(0));s.storeU32(32,location.loadU32(4))
+            var i=0;while (i < 32) { s.store(40+i,sector.load(location.loadU32(4)*32+i));i=i+1 }
+            result=FatFile(1|(s.addressValue()<<8)|(generation<<40))
+        } else result=FatFile(if (found.isDirectory() || found.status() == 15) 9 else if (found.status() == 9) 3 else if (found.status() == 10) 2
+            else if (found.status() == 11) 4 else if (found.status() == 14) 6 else 5)
+    }
+    if (result.status() == 4) v.storeU32(12,3)
+    if (!peripheralGateAt(v.addressValue()).finish(owner,true)) return FatFile(14)
+    return result
+}
+// Revalidate exact directory snapshot before reading. Metadata changed by
+// another handle requires reopen (10); identical ABA reuse cannot be detected
+// by FAT metadata. No concurrent raw Owned mutations may bypass the gate.
+trusted fun FatFile.readAt(owner: u32,offset: int,length: int,budget: int,destination: NativeBuffer,work: NativeBuffer): FatFileRead {
+    val s=this.storage()
+    if (this.status() != 1 || !s.hasAddressRange(0,80) || s.loadU32(0) != 0x46464831 ||
+        length < 1 || length > 512 || !destination.hasAddressRange(0,length) || !work.hasAddressRange(0,2048) ||
+        fatBuffersOverlap(s,80,destination,length) || fatBuffersOverlap(s,80,work,2048) ||
+        fatBuffersOverlap(destination,length,work,2048)) return FatFileRead(3)
+    val volume=FatVolume(s.loadU32(16)|(s.loadU32(20)<<32));val v=volume.storage()
+    if (fatBuffersOverlap(v,32,destination,length) || fatBuffersOverlap(v,32,work,2048)) return FatFileRead(3)
+    val admitted=volume.begin(owner)
+    if (admitted != 0) return FatFileRead(admitted)
+    val reader=nativeBufferAt(v.loadU32(16),28);val boot=nativeBufferAt(v.loadU32(20),512)
+    var result=FatFileRead(13)
+    if (this.currentLocked()) {
+        result=FatFileRead(3)
+        if (!fatBuffersOverlap(destination,length,reader,28) && !fatBuffersOverlap(destination,length,boot,512) &&
+            !fatBuffersOverlap(work,2048,reader,28) && !fatBuffersOverlap(work,2048,boot,512)) {
+            val directory=nativeBufferAt(work.addressValue(),512);val scratch=nativeBufferAt(work.addressValue()+512,1536)
+            val read=fatDirectoryReadOwned(reader,boot,v.loadU32(24),v.loadU32(28),s.loadU32(24),s.loadU32(28),budget,
+                directory,nativeBufferAt(scratch.addressValue(),1024))
+            result=FatFileRead(if (read.status() == 2) 10 else read.status())
+            if (read.status() == 1) {
+                var same=true;var i=0
+                while (i < 32) { if (s.load(40+i) != directory.load(s.loadU32(32)*32+i)) same=false;i=i+1 }
+                val geometry=fatBootValidate(boot,v.loadU32(24),v.loadU32(28))
+                result=if (!same) FatFileRead(10) else fatFileReadAtOwned(reader,boot,v.loadU32(24),v.loadU32(28),
+                    fatDirectoryDecode(directory,s.loadU32(32),geometry.fatBits(),geometry.clusters()),offset,length,budget,destination,scratch)
+            }
+        }
+    }
+    if (result.status() == 4) v.storeU32(12,3)
+    if (!peripheralGateAt(v.addressValue()).finish(owner,true)) return FatFileRead(14)
+    return result
+}
+// Existing-file overwrite; refresh this handle's snapshot only after both
+// data and metadata writes succeed. Other handles then become stale.
+trusted fun FatFile.overwriteAt(owner: u32,offset: int,length: int,budget: int,source: NativeBuffer,
+    modified: RtcDateTime,work: NativeBuffer): FatFileOverwriteChecked {
+    val s=this.storage()
+    if (this.status() != 1 || !s.hasAddressRange(0,80) || s.loadU32(0) != 0x46464831 ||
+        length < 1 || length > 512 || !source.hasAddressRange(0,length) || !work.hasAddressRange(0,2048) ||
+        fatBuffersOverlap(s,80,source,length) || fatBuffersOverlap(s,80,work,2048) ||
+        fatBuffersOverlap(source,length,work,2048)) return FatFileOverwriteChecked(3)
+    val volume=FatVolume(s.loadU32(16)|(s.loadU32(20)<<32));val v=volume.storage()
+    if (fatBuffersOverlap(v,32,source,length) || fatBuffersOverlap(v,32,work,2048)) return FatFileOverwriteChecked(3)
+    val admitted=volume.begin(owner)
+    if (admitted != 0) return FatFileOverwriteChecked(admitted)
+    var result=FatFileOverwriteChecked(13)
+    if (this.currentLocked()) {
+        result=fatFileOverwriteCheckedOwned(nativeBufferAt(v.loadU32(16),28),nativeBufferAt(v.loadU32(20),512),
+            v.loadU32(24),v.loadU32(28),s.loadU32(24),s.loadU32(28),s.loadU32(32),nativeBufferAt(s.addressValue()+40,32),
+            offset,length,budget,source,modified,work)
+        if (result.status() == 1) {
+            var i=0;while (i < 32) { s.store(40+i,work.load(s.loadU32(32)*32+i));i=i+1 }
+        }
+    }
+    if (result.status() == 4 || result.status() == 8 || result.status() == 11) v.storeU32(12,3)
+    if (!peripheralGateAt(v.addressValue()).finish(owner,true)) return FatFileOverwriteChecked(14|(result.dataBytesWritten()<<8))
+    return result
+}
+trusted fun FatFile.close(owner: u32): bool {
+    val s=this.storage()
+    if (this.status() != 1 || !s.hasAddressRange(0,80) || s.loadU32(0) != 0x46464831) return false
+    val volume=FatVolume(s.loadU32(16)|(s.loadU32(20)<<32));val v=volume.storage()
+    if (volume.begin(owner) != 0) return false
+    val current=this.currentLocked()
+    if (current) s.storeU32(8,0)
+    return peripheralGateAt(v.addressValue()).finish(owner,true) && current
+}

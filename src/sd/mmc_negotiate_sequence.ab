@@ -1,0 +1,59 @@
+import "./scr.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Exclusive144B record: tag/status0,phase4,width5,card8,descriptor12,payload16,
+// start20/budget24/detail28, retained SCR context64@32,width context48@96.
+// No allocation, silent width fallback, or automatic retry/rollback. Keep all
+// four regions and the host/card/source lease alive until explicitly recovered.
+fun sdMmcNegotiationRange(buffer: NativeBuffer,bytes: int): bool = buffer.hasAddressRange(0,bytes) &&
+    (buffer.addressValue()+bytes <= 0x60000000 || buffer.addressValue() >= 0x60100000)
+fun sdMmcNegotiationSeparate(a: NativeBuffer,asize: int,b: NativeBuffer,bsize: int): bool =
+    a.addressValue()+asize <= b.addressValue() || b.addressValue()+bsize <= a.addressValue()
+trusted fun sdMmcNegotiationStatus(context: NativeBuffer): int =
+    if (sdMmcNegotiationRange(context,144) && (context.loadU32(0)&0xffffff00) == 0x53444e00) context.load(0) else 3
+trusted fun sdMmcNegotiationEnd(context: NativeBuffer,status: int,detail: int): int {
+    context.store(0,status);context.storeU32(28,detail);return status
+}
+//1ready2pending3invalid4SCRfailure5unsupported/corruptSCR6widthfailure7budget.
+// Read SCR even for requested1-bit, preserving honest capability discovery.
+trusted fun sdMmcNegotiationBeginOwned(context: NativeBuffer,card: NativeBuffer,descriptor: NativeBuffer,
+    payload: NativeBuffer,width: int,now: u32,budget: int,releasedExclusive: bool): int {
+    if (!releasedExclusive || (width != 1 && width != 4) || budget < 1 || budget > 60000 ||
+        !sdMmcNegotiationRange(context,144) || (context.addressValue()&3) != 0 || context.loadU32(0) != 0 ||
+        !sdMmcNegotiationRange(card,80) || !sdMmcNegotiationRange(descriptor,16) || !sdMmcNegotiationRange(payload,8) ||
+        !sdMmcNegotiationSeparate(context,144,card,80) || !sdMmcNegotiationSeparate(context,144,descriptor,16) ||
+        !sdMmcNegotiationSeparate(context,144,payload,8) || !sdMmcNegotiationSeparate(card,80,descriptor,16) ||
+        !sdMmcNegotiationSeparate(card,80,payload,8) || !sdMmcNegotiationSeparate(descriptor,16,payload,8) ||
+        !sdMmcNegotiationAdmission(card,descriptor,payload)) return 3
+    var index=0
+    while (index < 144) { context.store(index,0);index=index+1 }
+    context.storeU32(0,0x53444e02);context.store(4,1);context.store(5,width)
+    context.storeU32(8,card.addressValue());context.storeU32(12,descriptor.addressValue());context.storeU32(16,payload.addressValue())
+    context.storeU32(20,int(now));context.storeU32(24,budget)
+    val started=sdMmcNegotiationScrBegin(nativeBufferAt(context.addressValue()+32,64),card,descriptor,payload,now,budget)
+    return if (started == 2) 2 else sdMmcNegotiationEnd(context,4,started)
+}
+trusted fun sdMmcNegotiationPollOwned(context: NativeBuffer,now: u32): int {
+    val status=sdMmcNegotiationStatus(context)
+    if (status != 2) return status
+    val phase=context.load(4)
+    if (phase == 1) {
+        val scratch=nativeBufferAt(context.addressValue()+32,64)
+        // Underlying SCR engine owns its deadline and DMA cleanup. Do not
+        // abandon it merely because an outer wall-clock budget expired.
+        val result=sdMmcNegotiationScrPoll(scratch,now)
+        if (result == 2) return 2
+        if (result != 1) return sdMmcNegotiationEnd(context,4,result)
+        val scr=sdMmcNegotiationScrResult(scratch)
+        if (!scr.valid() || (context.load(5) == 4 && !scr.supportsFourBit())) return sdMmcNegotiationEnd(context,5,0)
+        val elapsed=int(now-u32(context.loadU32(20)))
+        val budget=context.loadU32(24)
+        if (elapsed >= budget) return sdMmcNegotiationEnd(context,7,0)
+        context.store(4,2)
+        val started=sdMmcNegotiationWidthBegin(nativeBufferAt(context.addressValue()+96,48),nativeBufferAt(context.loadU32(8),80),
+            scr,context.load(5),now,budget-elapsed)
+        return if (started == 2) 2 else sdMmcNegotiationEnd(context,6,started)
+    }
+    if (phase != 2) return sdMmcNegotiationEnd(context,3,0)
+    val result=sdMmcNegotiationWidthPoll(nativeBufferAt(context.addressValue()+96,48),now)
+    return if (result == 2) 2 else sdMmcNegotiationEnd(context,if (result == 1) 1 else 6,result)
+}

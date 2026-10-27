@@ -1,0 +1,57 @@
+import "./dsi_mailbox_p4_sequence.ab"
+import "../esp32/irq_dispatch_p4_sequence.ab"
+// Scalar remaining-ownership report: status low8; bound256, route attempted512,
+// CPU enable attempted1024, source enable attempted2048. Preserve on failure.
+// Caller exclusively owns bridge source86 on BOTH cores and an unshared CPU
+// line; source clock pinned, MIEoff on mailbox core, IRQ entry/vectors and
+// dispatcher already installed. No other task changes mailbox/table/route.
+// Keep the SAME box/table and lease through cleanup. No implicit rollback.
+trusted fun p4DsiIrqOwnerValid(box: P4DsiMailbox,table: P4IrqDispatch): bool {
+    if (!box.owned() || !table.valid() || box.buffer().loadU32(4) != table.buffer().loadU32(4)) return false
+    val b=box.buffer().addressValue()
+    val t=table.buffer().addressValue()
+    return !(b < t+272 && t < b+28) && table.buffer().loadU32(8) == 0
+}
+// 1ready,2invalid,3not fresh/quiescent,4bind,5CLIC config,6route,7CPU,
+// 8source. Source enables LAST; no global MIE changes or pending clears.
+trusted fun esp32P4DsiIrqOpenOwned(box: P4DsiMailbox,table: P4IrqDispatch,priority: int): int {
+    if (!p4DsiIrqOwnerValid(box,table) || priority < 1 || priority > 7) return 2
+    val b=box.buffer()
+    val core=b.loadU32(4); val layout=b.loadU32(8); val line=b.loadU32(12)
+    if (b.loadU32(20) != 0 || b.loadU32(24) != 0 || p4DsiIrqLineEnabled(line) ||
+        p4DsiIrqSourceEnabled(layout) != 0 || p4DsiIrqRouteRead(layout,core) != 0 ||
+        p4DsiIrqRouteRead(layout,1-core) != 0) return 3
+    if (p4DsiIrqBind(box,table,false) != 1) return 4
+    if (p4DsiIrqConfigure(line,priority) != 1) return 256|5
+    if (p4DsiIrqRoute(layout,core,0,line) != 1) return 768|6
+    if (p4DsiIrqEnableLine(line,true) != 1) return 1792|7
+    if (box.resumeOwned() != 1) return 3840|8
+    return 3840|1
+}
+// Close only after deferred worker joined; MIEoff joins same-core nonnested
+// callback. Mask source -> disableCPU -> disconnect observed owned route ->
+// unregister matching context. Never free/reset mailbox, table, vectors or DMA.
+// 1closed,2invalid,9source mask,10CPU disable,11route conflict/failure,12unbind.
+// A successful phase clears its flag, so retry cannot replay completed cleanup.
+trusted fun esp32P4DsiIrqCloseOwned(box: P4DsiMailbox,table: P4IrqDispatch,lease: int): int {
+    var flags=lease&3840
+    if (lease < 0 || lease > 4095 || !p4DsiIrqOwnerValid(box,table)) return flags|2
+    if (flags == 0) return 1
+    val b=box.buffer()
+    val layout=b.loadU32(8); val core=b.loadU32(4); val line=b.loadU32(12)
+    if ((flags&2048) != 0) {
+        if (esp32P4DsiEventsEnableOwned(layout,p4DsiIrqSourceEnabled(layout),0) != 1) return flags|9
+        flags=flags&1792
+    }
+    if ((flags&1024) != 0) {
+        if (p4DsiIrqEnableLine(line,false) != 1) return flags|10
+        flags=flags&768
+    }
+    if ((flags&512) != 0) {
+        val current=p4DsiIrqRouteRead(layout,core)
+        if (current != 0 && (current != line || p4DsiIrqRoute(layout,core,line,0) != 1)) return flags|11
+        flags=flags&256
+    }
+    if ((flags&256) != 0 && p4DsiIrqBind(box,table,true) != 1) return flags|12
+    return 1
+}

@@ -1,0 +1,94 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Caller-owned FIFO: magic0, capacity4, head8, count12, u32 task IDs from16.
+// Zero is not a task ID. One queue per scheduling priority/affinity domain;
+// policy selects the queue, this module preserves FIFO order within it.
+// Caller holds the scheduler lock through peek, switch and commit. IDs must
+// refer to live tasks; no allocation, pointer dereference, lock or IRQ changes.
+@section(".iram1.abla.readyQueueStorage")
+fun readyQueueStorageValid(buffer: NativeBuffer): bool = buffer.capacity() >= 20 &&
+    buffer.addressValue() != 0 && buffer.addressValue()+buffer.capacity() <= 0x100000000 &&
+    (buffer.addressValue() & 3) == 0 && (buffer.capacity() & 3) == 0
+@section(".iram1.abla.readyQueueInitialize")
+trusted fun readyQueueInitializeOwned(buffer: NativeBuffer): bool {
+    if (!readyQueueStorageValid(buffer)) return false
+    readyQueueWrite(buffer.addressValue(),0)
+    var offset=8
+    while (offset < buffer.capacity()) { readyQueueWrite(buffer.addressValue()+offset,0); offset=offset+4 }
+    readyQueueWrite(buffer.addressValue()+4,(buffer.capacity()-16)/4)
+    readyQueueWrite(buffer.addressValue(),0x52515931)
+    true
+}
+@section(".iram1.abla.readyQueueValid")
+trusted fun readyQueueValid(buffer: NativeBuffer): bool {
+    if (!readyQueueStorageValid(buffer)) return false
+    val base=buffer.addressValue()
+    val capacity=(buffer.capacity()-16)/4
+    readyQueueRead(base) == 0x52515931 && readyQueueRead(base+4) == capacity &&
+        readyQueueRead(base+8) < capacity && readyQueueRead(base+12) <= capacity
+}
+@section(".iram1.abla.readyQueueContains")
+trusted fun readyQueueContainsValid(buffer: NativeBuffer,id: int): bool {
+    val base=buffer.addressValue()
+    val capacity=readyQueueRead(base+4)
+    var index=readyQueueRead(base+8)
+    var left=readyQueueRead(base+12)
+    while (left > 0) {
+        if (readyQueueRead(base+16+index*4) == id) return true
+        index=index+1; if (index == capacity) index=0
+        left=left-1
+    }
+    false
+}
+@section(".iram1.abla.readyQueuePush")
+trusted fun readyQueuePushOwned(buffer: NativeBuffer,id: int): bool {
+    if (id <= 0 || id > 0xFFFFFFFF || !readyQueueValid(buffer)) return false
+    val base=buffer.addressValue()
+    val capacity=readyQueueRead(base+4)
+    val count=readyQueueRead(base+12)
+    if (count == capacity || readyQueueContainsValid(buffer,id)) return false
+    var index=readyQueueRead(base+8)+count
+    if (index >= capacity) index=index-capacity
+    readyQueueWrite(base+16+index*4,id)
+    readyQueueWrite(base+12,count+1)
+    true
+}
+// -1 invalid queue,0 empty,otherwise next task ID. Does not dequeue: failed
+// context switches leave the queue untouched.
+@section(".iram1.abla.readyQueuePeek")
+trusted fun readyQueuePeekOwned(buffer: NativeBuffer): int {
+    if (!readyQueueValid(buffer)) return -1
+    val base=buffer.addressValue()
+    if (readyQueueRead(base+12) == 0) return 0
+    val id=readyQueueRead(base+16+readyQueueRead(base+8)*4)
+    if (id == 0) return -1
+    id
+}
+// After successful switch: remove expected head, optionally append previous
+// runnable task (requeue=0 means it blocked/exited). A full queue can rotate
+// without temporary overflow. Validate before any writes. A failure AFTER a
+// committed CPU switch violates caller's lock/ownership contract: fatal, not
+// permission to resume previous task. Call CanCommit before switching and keep
+// the lock held through switch+commit so this predicate cannot become stale.
+@section(".iram1.abla.readyQueueCanCommit")
+trusted fun readyQueueCanCommitOwned(buffer: NativeBuffer,expected: int,requeue: int): bool =
+    expected > 0 && expected <= 0xFFFFFFFF && requeue >= 0 && requeue <= 0xFFFFFFFF &&
+        readyQueuePeekOwned(buffer) == expected && (requeue == 0 || !readyQueueContainsValid(buffer,requeue))
+@section(".iram1.abla.readyQueueCommit")
+trusted fun readyQueueCommitOwned(buffer: NativeBuffer,expected: int,requeue: int): bool {
+    if (!readyQueueCanCommitOwned(buffer,expected,requeue)) return false
+    val base=buffer.addressValue()
+    val capacity=readyQueueRead(base+4)
+    val count=readyQueueRead(base+12)
+    val oldHead=readyQueueRead(base+8)
+    var head=oldHead+1
+    if (head == capacity) head=0
+    readyQueueWrite(base+16+oldHead*4,0)
+    if (requeue != 0) {
+        var tail=head+count-1
+        if (tail >= capacity) tail=tail-capacity
+        readyQueueWrite(base+16+tail*4,requeue)
+    }
+    readyQueueWrite(base+8,head)
+    readyQueueWrite(base+12,if (requeue == 0) count-1 else count)
+    true
+}

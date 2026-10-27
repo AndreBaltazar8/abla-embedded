@@ -1,0 +1,64 @@
+import "../esp32/power/sleep_gpio_cancel_s3_sequence.ab"
+// Config48: I/D tag plans64@0/8,bias64@16,ports24,options28
+// (flashOctal1,smallData2,monitor4),ramKind signed32@32,protocol36,baseline40,polls44.
+// Report64: magic,state,primary,result,sleep,wake,config,reserved;
+// actual ESP preparation report16@32, actual cancellation report16@48.
+// Caller completed GT911 release before quiescence. Wake session must already
+// own GPIO48 low-level. All six buffers and stack must remain retained and
+// exclusive; CPU/tag buffers already initialized. No bus access or sleep entry.
+// Results1armed,2invalid,3failed+cancelled,4recovery pending. Retry4 only; never
+// replay preparation after failure. Config/CPU/tag storage stable until done.
+fun paperS3PrepareBuffer(index: int,sleep: NativeBuffer,wake: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,report: NativeBuffer,tagBytes: int): NativeBuffer {
+    if (index == 0) return nativeBufferAt(sleep.addressValue(),128)
+    if (index == 1) return nativeBufferAt(wake.addressValue(),32)
+    if (index == 2) return nativeBufferAt(cpu.addressValue(),8800)
+    if (index == 3) return nativeBufferAt(tags.addressValue(),tagBytes)
+    if (index == 4) return nativeBufferAt(config.addressValue(),48)
+    return nativeBufferAt(report.addressValue(),64)
+}
+@section(".iram1.abla.paperS3SleepPrepare")
+@noinline
+trusted fun paperS3SleepPrepareOwned(sleep: NativeBuffer,wake: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,report: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !config.hasAddressRange(0,48) || !report.hasAddressRange(0,64) ||
+        ((config.addressValue()|report.addressValue())&3) != 0 || !esp32S3SleepGpioRecordsDisjoint(sleep,wake)) return 2
+    val i=Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()))
+    val d=Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()+8))
+    if (!esp32S3RetentionBuffersValid(cpu,tags,i,d)) return 2
+    val tagBytes=esp32S3TagBufferBytes(i,d)
+    var a=0
+    while (a < 6) {
+        val left=paperS3PrepareBuffer(a,sleep,wake,cpu,tags,config,report,tagBytes)
+        var b=a+1
+        while (b < 6) {
+            val right=paperS3PrepareBuffer(b,sleep,wake,cpu,tags,config,report,tagBytes)
+            if (left.addressValue() < right.addressValue()+right.capacity() && right.addressValue() < left.addressValue()+left.capacity()) return 2
+            b=b+1
+        }
+        a=a+1
+    }
+    val options=config.loadU32(28);val polls=config.loadU32(44)
+    if (options > 7 || polls <= 0 || polls > 0x7fffffff) return 2
+    if (report.loadU32(0) == 0) {
+        if (sleep.loadU32(0) != 0 || sleep.loadU32(4) != 0 || !esp32S3SleepGpioReadyOwned(sleep,wake) ||
+            S3GpioWake(wake.loadU32(16)).pin() != 48 || (s3GpioWakeRead(0x60004134)&0x780) != 0x600) return 2
+        var offset=4
+        while (offset < 64) { report.storeU32(offset,0);offset=offset+4 }
+        report.storeU32(0,0x50335350);report.storeU32(4,1)
+        report.storeU32(16,sleep.addressValue());report.storeU32(20,wake.addressValue());report.storeU32(24,config.addressValue())
+    }
+    if (report.loadU32(0) != 0x50335350 || report.loadU32(16) != sleep.addressValue() || report.loadU32(20) != wake.addressValue() || report.loadU32(24) != config.addressValue()) return 2
+    val state=report.loadU32(4)
+    if (state == 4) return 3
+    if (state == 3) return if (sleep.loadU32(0) == 0x53504c50 && sleep.loadU32(4) == 9 && esp32S3SleepGpioReadyOwned(sleep,wake)) 1 else 2
+    if (state != 1 && state != 2) return 2
+    if (state == 1) {
+        val prepared=esp32S3SleepPrepareRetainedOwned(sleep,cpu,tags,i,d,Esp32S3ClockBias(esp32S3MspiStateLoad64(config.addressValue()+16)),
+            config.loadU32(24),(options&1) != 0,int(i32(config.loadU32(32))),config.loadU32(36),config.loadU32(40),polls,(options&2) != 0,(options&4) != 0,nativeBufferAt(report.addressValue()+32,16))
+        report.storeU32(8,prepared)
+        if (prepared == 1) { report.storeU32(4,3);report.storeU32(12,1);return 1 }
+        report.storeU32(4,2)
+    }
+    val cancelled=esp32S3SleepGpioCancelOwned(sleep,wake,nativeBufferAt(report.addressValue()+48,16),polls,true,true)
+    if (cancelled != 1) { report.storeU32(12,4);return 4 }
+    report.storeU32(4,4);report.storeU32(12,3);return 3
+}

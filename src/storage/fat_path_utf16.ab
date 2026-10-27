@@ -1,0 +1,60 @@
+import "./fat_path.ab"
+// Root-relative UTF16LE path, up to4096 units/32 components, each <=255.
+// FatFs Unicode uppercase comparison plus ASCII8.3 aliases in one bounded
+// scan per component. No normalization, locale casing or OEM conversion.
+// Repeated/leading '/', '.' and root '..' are handled without media reads;
+// trailing '/' requires a directory. Budget is reads PER component.
+// Caller owns2067-byte workspace: scratch1024, sector512, LFN520, alias11.
+trusted fun fatLookupPathUtf16Owned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,path: NativeBuffer,units: int,budget: int,workspace: NativeBuffer,fileLocation: NativeBuffer = NativeBuffer(0)): FatDirectoryEntry {
+    // Optional12B parent/ordinal/index output, written only for a final file.
+    // Requires2080B workspace (extra8B intermediate lookup location at2072).
+    val located=(fileLocation|0) != 0
+    val workspaceBytes=if (located) 2080 else 2067
+    if (units < 1 || units > 4096 || budget < 1 || budget > 1000000 || !path.hasAddressRange(0,units*2) ||
+        !workspace.hasAddressRange(0,workspaceBytes) || !reader.hasAddressRange(0,28) || !fatBootValidate(boot,first,sectors).valid() ||
+        fatBuffersOverlap(workspace,workspaceBytes,path,units*2) || fatBuffersOverlap(workspace,workspaceBytes,boot,512) || fatBuffersOverlap(workspace,workspaceBytes,reader,28)) return FatDirectoryEntry(10<<60)
+    if (located && (!fileLocation.hasAddressRange(0,12) || fatBuffersOverlap(fileLocation,12,workspace,workspaceBytes) ||
+        fatBuffersOverlap(fileLocation,12,path,units*2) || fatBuffersOverlap(fileLocation,12,reader,28) ||
+        fatBuffersOverlap(fileLocation,12,boot,512))) return FatDirectoryEntry(10<<60)
+    // Validate all components before the first read, including surrogate pairs.
+    var position=0; var components=0
+    while (position < units) {
+        if (path.loadU16(position*2) == 47) position=position+1
+        else {
+            val start=position
+            while (position < units && path.loadU16(position*2) != 47) position=position+1
+            components=components+1
+            if (components > 32 || !fatLongNameUtf16Valid(nativeBufferAt(path.addressValue()+start*2,(position-start)*2),position-start)) return FatDirectoryEntry(10<<60)
+        }
+    }
+    val scratch=nativeBufferAt(workspace.addressValue(),1024)
+    val sector=nativeBufferAt(workspace.addressValue()+1024,512)
+    val assembly=nativeBufferAt(workspace.addressValue()+1536,520)
+    val short=nativeBufferAt(workspace.addressValue()+2056,11)
+    var entry=FatDirectoryEntry(8<<60)
+    var parent=0
+    val positionOutput=if (located) nativeBufferAt(workspace.addressValue()+2072,8) else NativeBuffer(0)
+    position=0
+    while (position < units) {
+        if (!entry.isDirectory()) return FatDirectoryEntry(15<<60)
+        if (path.loadU16(position*2) == 47) position=position+1
+        else {
+            val start=position
+            while (position < units && path.loadU16(position*2) != 47) position=position+1
+            val count=position-start
+            val component=nativeBufferAt(path.addressValue()+start*2,count*2)
+            val hasShort=fatShortNameEncodeUtf16(component,count,short)
+            val identity=count == 1 && component.loadU16(0) == 46
+            val rootParent=entry.firstCluster() == 0 && count == 2 && component.loadU16(0) == 46 && component.loadU16(2) == 46
+            if (!identity && !rootParent) {
+                parent=entry.firstCluster()
+                entry=fatLookupNameOwned(reader,boot,first,sectors,parent,component,count,true,assembly,budget,sector,scratch,if (hasShort) short else NativeBuffer(0),true,positionOutput)
+                if (!entry.isDirectory() && !entry.isFile()) return entry
+            }
+        }
+    }
+    if (located && entry.isFile()) {
+        fileLocation.storeU32(0,parent);fileLocation.storeU32(4,positionOutput.loadU32(0));fileLocation.storeU32(8,positionOutput.loadU32(4))
+    }
+    entry
+}

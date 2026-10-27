@@ -1,0 +1,71 @@
+import "./microphone_profile.ab"
+//152B: native PDM session0..63, magic64/status68/board72/PM1handle76/
+// IOE1handle80/power-cleanup-pending84/last-power-result88/reserved92,
+// retained56B PDM pin snapshot96..151. This supersedes the96B record.
+// Status1prepared2running3cleanup4closed. All handles and buffers stay owned
+// until close. Restore pins only after stop and power cleanup. Shared clocks/
+// BOOST remain enabled; old/new global-input users must stay quiescent.
+trusted fun m5PdmMicrophoneSessionStatus(r: NativeBuffer): int =
+    if (r.hasAddressRange(0,152) && r.loadU32(64) == 0x4d504432) r.loadU32(68) else 0
+fun M5BoardId.hasNativeS3PdmMicrophone(): bool = this == m5BoardPaperMono ||
+    this == m5BoardAtomS3U || this == m5BoardCardputer || this == m5BoardCapsule
+// Caller owns stopped I2S0/RXGDMA/pads, stablePLL160MHz and internal ring.
+// PaperMono also requires initialized exclusive PM1/IOE1 handles and calibrated
+// native I2C timing; other boards never access those handles. This prepares only.
+trusted fun M5BoardId.beginPdmMicrophoneOwned(r: NativeBuffer,rate: int,channel: int,
+    descriptors: int,count: int,payload: int,blockBytes: int,owner: u32,
+    power: M5Pm1,expander: M5Ioe1,exclusive: bool): int {
+    if (!exclusive || !this.hasNativeS3PdmMicrophone() || !r.hasAddressRange(0,152) || (r.addressValue()&3) != 0 ||
+        rate < 8000 || rate > 96000 || !esp32s3GdmaRingLayoutValid(descriptors,count,payload,blockBytes,blockBytes) ||
+        (r.addressValue() < descriptors+count*12 && descriptors < r.addressValue()+152) ||
+        (r.addressValue() < payload+count*blockBytes && payload < r.addressValue()+152) ||
+        (this == m5BoardPaperMono && (!power.valid() || !expander.valid()))) return 0
+    if (r.loadU32(64) != 0 && m5PdmMicrophoneSessionStatus(r) != 4) return 0
+    val profile=this.microphoneProfile()
+    val saved=nativeBufferAt(r.addressValue()+96,56)
+    if (esp32s3PdmPinsCaptureOwned(saved,profile.pdmPins(),profile.pdmSlotMask(),false,true) != 1) return 0
+    val prepared=esp32s3PdmSessionBeginOwned(nativeBufferAt(r.addressValue(),64),profile.pdmPins(),profile.pdmSlotMask(),
+        true,false,false,rate,2,160000000,8,channel,descriptors,count,payload,blockBytes,owner,true)
+    // Native begin0 is a pre-mutation refusal. Capture was read-only, so
+    // discard its metadata without doing unnecessary GPIO restoration.
+    if (prepared == 0) { saved.storeU32(0,0);return 0 }
+    r.storeU32(64,0x4d504432);r.storeU32(68,prepared);r.storeU32(72,this|0)
+    r.storeU32(76,power|0);r.storeU32(80,expander|0);r.storeU32(84,0);r.storeU32(88,0);r.storeU32(92,0)
+    return prepared
+}
+trusted fun m5PdmMicrophoneStartOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || m5PdmMicrophoneSessionStatus(r) != 1 || polls < 1 || polls > 1000000) return 0
+    r.storeU32(68,3)
+    if (r.loadU32(72) == (m5BoardPaperMono|0)) {
+        r.storeU32(84,1)
+        val powered=paperMonoMicrophonePowerOwned(M5Pm1(r.loadU32(76)),M5Ioe1(r.loadU32(80)),true,true)
+        r.storeU32(88,powered)
+        if (powered != 1) return 3
+    }
+    val started=esp32s3PdmSessionStartOwned(nativeBufferAt(r.addressValue(),64),polls,true)
+    if (started != 2) return 3
+    r.storeU32(68,2);return 2
+}
+trusted fun m5PdmMicrophoneReadOwned(r: NativeBuffer,output: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    if (!exclusive || m5PdmMicrophoneSessionStatus(r) != 2) return Esp32S3GdmaPumpResult(2)
+    val bytes=r.loadU32(24)
+    if (!output.hasAddressRange(0,bytes) || (output.addressValue() < r.addressValue()+152 && r.addressValue() < output.addressValue()+bytes)) return Esp32S3GdmaPumpResult(2)
+    val result=esp32s3PdmSessionReadOwned(nativeBufferAt(r.addressValue(),64),output,polls,true)
+    if (esp32s3PdmSessionStatus(nativeBufferAt(r.addressValue(),64)) == 3) r.storeU32(68,3)
+    return result
+}
+trusted fun m5PdmMicrophoneCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    val status=m5PdmMicrophoneSessionStatus(r)
+    if (!exclusive || status < 1 || status > 4 || polls < 1 || polls > 1000000) return 0
+    if (status == 4) return 4
+    r.storeU32(68,3)
+    if (esp32s3PdmSessionCloseOwned(nativeBufferAt(r.addressValue(),64),polls,true) != 4) return 3
+    if (r.loadU32(84) != 0) {
+        val powered=paperMonoMicrophonePowerOwned(M5Pm1(r.loadU32(76)),M5Ioe1(r.loadU32(80)),false,true)
+        r.storeU32(88,powered)
+        if (powered != 1) return 3
+        r.storeU32(84,0)
+    }
+    if (esp32s3PdmPinsCloseOwned(nativeBufferAt(r.addressValue()+96,56),true) != 2) return 3
+    r.storeU32(68,4);return 4
+}

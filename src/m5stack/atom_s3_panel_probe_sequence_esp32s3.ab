@@ -1,0 +1,89 @@
+import "./board_id.ab"
+import "../esp32/spi/register_read_sequence_esp32s3.ab"
+import "../esp32/spi/clock_snapshot_sequence_esp32s3.ab"
+import "../esp32/spi/config_sequence_esp32s3.ab"
+// Caller owns powered/reset panel, routed SPID bidirectional pads, CS/DC GPIO,
+// mode0/MSB controller, stable PLL80MHz AND original clock source throughout.
+// One canonical gate spans capture,8MHz RDDID, optional100kHz RDDID and restore.
+// Only AtomS3R retries a successfully read unknown ID; transport failures NEVER
+// retry. Success may still be unknown: classify with atomS3PanelFromId.
+// Retain the16B snapshot unchanged on failure; do not release pad/clock leases.
+// Failure stage5=capture,6=clock setup,7=clock restore; lower24=detail.
+// A failed read keeps its original detail even if restore also cannot finish.
+// Explicit recovery must quiesce the controller, restore CS/DC and snapshot,
+// then clear the gate fault; this function never resets or replays a failure.
+trusted fun M5BoardId.readAtomPanelIdNativeChecked(gate: PeripheralGate,owner: u32,
+    peripheral: int,snapshot: NativeBuffer,polls: int): SpiTransactionResult {
+    if ((this != m5BoardAtomS3 && this != m5BoardAtomS3R) || polls < 1 || polls > 1000000 ||
+        !esp32s3SpiMemoryRangeValid(peripheral,snapshot,16) || (snapshot.addressValue()&3) != 0 ||
+        !gate.bufferDisjoint(snapshot,16) || gate.word().address() > 4294967292 ||
+        (gate.word().address() >= 0x60024000 && gate.word().address() < 0x60026000)) return SpiTransactionResult(3<<32)
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return SpiTransactionResult((if (admitted == 1) 2 else if (admitted == 2) 4 else 3)<<32)
+    val result=this.readAtomPanelIdNativeHeld(peripheral,snapshot,polls)
+    if (!gate.finish(owner,result.valid())) return SpiTransactionResult((5<<32)|(result&0xffffffff))
+    return result
+}
+// Composition entry; caller already holds canonical gate and all resources.
+trusted fun M5BoardId.readAtomPanelIdNativeHeld(peripheral: int,snapshot: NativeBuffer,polls: int): SpiTransactionResult {
+    if ((this != m5BoardAtomS3 && this != m5BoardAtomS3R) || polls < 1 || polls > 1000000 ||
+        !esp32s3SpiMemoryRangeValid(peripheral,snapshot,16) || (snapshot.addressValue()&3) != 0) return SpiTransactionResult(3<<32)
+    var result=SpiTransactionResult((6<<32)|(5<<24))
+    if (esp32s3SpiClockSnapshotOwned(snapshot,peripheral,true)) {
+        val clock=Pin(if (this == m5BoardAtomS3) 17 else 15)
+        val data=Pin(21);val cs=Pin(if (this == m5BoardAtomS3) 15 else 14)
+        val dc=Pin(if (this == m5BoardAtomS3) 33 else 42)
+        result=SpiTransactionResult((6<<32)|(6<<24))
+        if (esp32s3SpiConfigureClockOwned(peripheral,1,1,10,5)) {
+            result=esp32s3SpiReadRegister32SharedOwned(peripheral,clock,data,cs,dc,4,1,polls)
+            if (result.valid() && this == m5BoardAtomS3R) {
+                val id=result&0xffffffff
+                if ((id&65535) != 0x7683 && (id&65535) != 0x897c && (id&0xffffff) != 0x079100) {
+                    result=SpiTransactionResult((6<<32)|(6<<24)|1)
+                    if (esp32s3SpiConfigureClockOwned(peripheral,1,16,50,25))
+                        result=esp32s3SpiReadRegister32SharedOwned(peripheral,clock,data,cs,dc,4,1,polls)
+                }
+            }
+        }
+        val restored=esp32s3SpiClockRestoreOwned(snapshot,polls,true)
+        if (result.valid() && restored != 1) result=SpiTransactionResult((6<<32)|(7<<24)|restored)
+    }
+    return result
+}
+
+// Explicit recovery of THIS probe's fault only. Caller retains original
+// board/peripheral/snapshot, all pad leases and both clock sources, excludes
+// other clients/ISR/DMA, and has ruled out unrelated causes of the gate fault.
+// Never resets hardware or replays RDDID. A still-active controller leaves
+// CS/DC and clocks untouched. Snapshot is immutable and retained on failure.
+// 1 recovered,2 invalid,3 gate unavailable,4 idle timeout,5 CS,6 DC,
+// 7 clock restoration (clock status in bits8+),8 ownership lost.
+trusted fun M5BoardId.recoverAtomPanelProbeNativeOwned(gate: PeripheralGate,owner: u32,
+    peripheral: int,snapshot: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || (this != m5BoardAtomS3 && this != m5BoardAtomS3R) ||
+        polls < 1 || polls > 1000000 || !esp32s3SpiMemoryRangeValid(peripheral,snapshot,16) ||
+        (snapshot.addressValue()&3) != 0 || !gate.bufferDisjoint(snapshot,16) ||
+        gate.word().address() > 4294967292 ||
+        (gate.word().address() >= 0x60024000 && gate.word().address() < 0x60026000) ||
+        snapshot.loadU32(0) != 0x53434c4b || snapshot.loadU32(4) != peripheral ||
+        (snapshot.loadU32(12)&3) != 3) return 2
+    if (!gate.tryBeginRecovery(owner)) return 3
+    val base=esp32s3SpiBase(peripheral)
+    var attempt=0
+    while (attempt < polls && !esp32s3SpiCpuBufferIdle(base)) attempt=attempt+1
+    var result=4
+    if (attempt < polls) {
+        val cs=Pin(if (this == m5BoardAtomS3) 15 else 14)
+        val dc=Pin(if (this == m5BoardAtomS3) 33 else 42)
+        result=5
+        if (cs.writeLevelOwned(true)) {
+            result=6
+            if (dc.writeLevelOwned(true)) {
+                val restored=esp32s3SpiClockRestoreOwned(snapshot,polls,true)
+                result=if (restored == 1) 1 else 7|(restored<<8)
+            }
+        }
+    }
+    if (!gate.finishRecovery(owner,result == 1)) return 8
+    return result
+}

@@ -1,0 +1,65 @@
+import "./spi_window_c5_sequence.ab"
+import "./color.ab"
+import "../esp32/spi/command_data_c5_sequence.ab"
+// Status matches SPI transaction; completedPixels uses24bits, not16: a
+// 320x240 frame exceeds65535. Progress is completed FIFO pixels, not panel ACK.
+type C5LcdDrawResult=int
+fun C5LcdDrawResult.status(): int = (this>>>56)&7
+fun C5LcdDrawResult.valid(): bool = this.status() == 1 && (this>>>59) == 0
+fun C5LcdDrawResult.completedPixels(): int = (this>>>32)&0xffffff
+fun C5LcdDrawResult.detail(): int = this&0xffffffff
+// Internal: admitted live master/DC, canonical gate held, 1..1023*1023 pixels.
+// CS remains asserted from RAMWR to final pixel. No restart on timeout.
+trusted fun c5LcdFillStreamOwned(master: Esp32C5SpiMaster,dc: int,color: Rgb565,pixels: int,polls: int): C5LcdDrawResult {
+    val packet=nativeBufferAt(nativeStackAllocate(64),64)
+    packet.store(0,44)
+    val cs=master.pins().pinAt(3)
+    var report=14;var completed=0;var commandDone=false;var healthy=false
+    if (c5SpiSelectLevel(dc,false)) {
+        report=11
+        if (c5SpiSelectLevel(cs,false)) {
+            report=esp32C5SpiTransferOwned(nativeBufferAt(packet.addressValue(),1),NativeBuffer(0),1,polls,false)
+            commandDone=report == 257
+            if (commandDone) {
+                if (!c5SpiSelectLevel(dc,true)) report=14
+                else {
+                    var i=0
+                    while (i < 64) { packet.store(i,(color&65535)>>>8);packet.store(i+1,color&255);i=i+2 }
+                    while (completed < pixels && report == 257) {
+                        val count=if (pixels-completed < 32) pixels-completed else 32
+                        report=esp32C5SpiTransferOwned(nativeBufferAt(packet.addressValue(),count*2),NativeBuffer(0),count*2,polls,false)
+                        if (report == 257) completed=completed+count
+                    }
+                }
+            }
+        }
+    }
+    if (esp32C5SpiCpuIdleOwned()) {
+        if (!c5SpiSelectLevel(cs,true)) report=report|(12<<16)|(1<<24)
+        else healthy=report == 257 && completed == pixels
+    } else report=report|(1<<24)
+    return C5LcdDrawResult(((if (healthy) 1 else 6)<<56)|(completed<<32)|report|(if (commandDone) 1<<25 else 0))
+}
+// One gate over window + RAMWR + all pixels; at most64B color staging.
+// Empty clipped rectangles are successful no-ops under the gate, not writes.
+trusted fun esp32C5LcdFillRect(master: Esp32C5SpiMaster,gate: PeripheralGate,owner: u32,dc: int,
+    view: LcdView,x: int,y: int,width: int,height: int,color: Rgb565,polls: int): C5LcdDrawResult {
+    if (!view.valid() ||
+        width < 0 || height < 0 || polls < 1 || polls > 1000000 || !c5SpiGateValid(gate)) return C5LcdDrawResult(3<<56)
+    val rectangle=clipDisplayRect(x,y,width,height,view.width(),view.height())
+    val program=nativeBufferAt(nativeStackAllocate(14),14)
+    if (!rectangle.empty() && !c5LcdWindowProgram(view,rectangle.x(),rectangle.y(),rectangle.width(),rectangle.height(),program)) return C5LcdDrawResult(3<<56)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return C5LcdDrawResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<56)
+    var result=C5LcdDrawResult(1<<56)
+    if (!rectangle.empty()) {
+        if (!c5LcdProgramAdmission(master|0,dc)) result=C5LcdDrawResult((6<<56)|13)
+        else {
+            val window=c5LcdWindowOwned(master|0,dc,program,polls)
+            if (!window.valid()) result=C5LcdDrawResult((6<<56)|window.detail())
+            else result=c5LcdFillStreamOwned(master,dc,color,rectangle.width()*rectangle.height(),polls)
+        }
+    }
+    if (!gate.finish(owner,result.valid())) return C5LcdDrawResult((result&((1<<56)-1))|(5<<56))
+    return result
+}

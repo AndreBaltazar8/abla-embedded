@@ -1,0 +1,88 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Exclusive432B: header32, startup128@32,pad snapshot64@160,
+// retained SCR/width negotiation144@224, transfer clock64@368.
+// Separate DMA descriptor16/payload8.
+// Owns no new allocations. Borrowed control, rails, source and all host/pad
+// users stay owned throughout; join all borrowed card/FAT views before close.
+type PaperMonoSdOwner=int
+fun paperMonoSdOwnerAt(storage: NativeBuffer): PaperMonoSdOwner =
+    if (storage.hasAddressRange(0,432) && (storage.addressValue()&3) == 0 &&
+        (storage.addressValue()+432 <= 0x60000000 || storage.addressValue() >= 0x60100000)) PaperMonoSdOwner(storage|0) else PaperMonoSdOwner(0)
+fun PaperMonoSdOwner.buffer(): NativeBuffer = NativeBuffer(this|0)
+fun PaperMonoSdOwner.startup(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+32,128)
+fun PaperMonoSdOwner.pads(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+160,64)
+fun PaperMonoSdOwner.negotiation(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+224,144)
+fun PaperMonoSdOwner.transferClock(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+368,64)
+trusted fun PaperMonoSdOwner.status(): int =
+    if (paperMonoSdOwnerAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x504d5334) this.buffer().loadU32(4) else -1
+// Fresh unpublished memory only. Never clear/recycle a live or failed owner.
+trusted fun PaperMonoSdOwner.initializeFresh(): bool {
+    if (paperMonoSdOwnerAt(this.buffer()) == 0) return false
+    var offset=0
+    while (offset < 432) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x504d5334);return true
+}
+// State0fresh1ready2starting3negotiating4failed5closing6closed7clocking.
+// Last low-level result24, per-stage time budget28; errors keep every context.
+trusted fun PaperMonoSdOwner.beginOwned(control: int,descriptor: NativeBuffer,payload: NativeBuffer,
+    slot: int,pll160: bool,width: int,now: u32,budget: int,exclusivePrepared: bool): int {
+    if (!exclusivePrepared || this.status() != 0 || slot < 0 || slot > 1 || (width != 1 && width != 4) ||
+        budget < 1 || budget > 60000 || !paperMonoSdOwnerAdmission(control,this.buffer(),descriptor,payload)) return 3
+    this.buffer().store(8,width);this.buffer().storeU32(12,descriptor.addressValue());this.buffer().storeU32(16,payload.addressValue())
+    this.buffer().storeU32(20,control);this.buffer().storeU32(28,budget);this.buffer().storeU32(4,2)
+    val result=paperMonoSdOwnerBegin(control,this.startup(),this.pads(),slot,pll160,now,budget)
+    this.buffer().storeU32(24,result)
+    if (result != 2) this.buffer().storeU32(4,4)
+    return if (result == 2) 2 else 4
+}
+trusted fun PaperMonoSdOwner.pollOwned(nowMs: u32,nowUs: u32,exclusive: bool): int {
+    if (!exclusive || this.status() < 0) return 3
+    val state=this.status()
+    if (state != 2 && state != 3 && state != 7) return state
+    if (state == 7) {
+        val clockResult=paperMonoSdOwnerClockPoll(this.transferClock(),nowMs,nowUs)
+        this.buffer().storeU32(24,clockResult)
+        if (clockResult == 2) return 2
+        this.buffer().storeU32(4,if (clockResult == 1) 1 else 4)
+        return if (clockResult == 1) 1 else 4
+    }
+    var result=2
+    if (state == 2) {
+        result=paperMonoSdOwnerStartupPoll(this.startup(),nowMs,nowUs)
+        this.buffer().storeU32(24,result)
+        if (result == 2) return 2
+        if (result != 1) { this.buffer().storeU32(4,4);return 4 }
+        this.buffer().storeU32(4,3)
+        result=paperMonoSdOwnerNegotiateBegin(this.negotiation(),this.startup(),
+            nativeBufferAt(this.buffer().loadU32(12),16),nativeBufferAt(this.buffer().loadU32(16),8),
+            this.buffer().load(8),nowMs,this.buffer().loadU32(28))
+    } else result=paperMonoSdOwnerNegotiatePoll(this.negotiation(),nowMs)
+    this.buffer().storeU32(24,result)
+    if (result == 2) return 2
+    if (result != 1) { this.buffer().storeU32(4,4);return 4 }
+    this.buffer().storeU32(4,7)
+    result=paperMonoSdOwnerClockBegin(this.transferClock(),this.startup(),nowMs,this.buffer().loadU32(28))
+    this.buffer().storeU32(24,result)
+    if (result == 2) return 2
+    this.buffer().storeU32(4,if (result == 1) 1 else 4)
+    return if (result == 1) 1 else 4
+}
+// No usable view while width may differ between card and host. Returned view
+// is borrowed, not a generation handle; it must not outlive this owner.
+trusted fun PaperMonoSdOwner.card(): NativeBuffer =
+    if (this.status() == 1 && paperMonoSdOwnerReady(this.startup(),this.negotiation(),this.transferClock())) nativeBufferAt(this.buffer().addressValue()+80,80)
+    else NativeBuffer(0)
+// Pending startup/negotiation/clock must finish via pollOwned. Failed DMA or width
+// transitions may require explicit low-level recovery using retained contexts.
+// This function does not abort or force a busy host idle.
+trusted fun PaperMonoSdOwner.closeOwned(quiescentExclusive: bool): int {
+    val state=this.status()
+    if (!quiescentExclusive || state < 0 || state == 0) return 3
+    if (state == 6) return 1
+    if (state == 2 || state == 3 || state == 7) return 2
+    this.buffer().storeU32(4,5)
+    val result=paperMonoSdOwnerClose(this.startup(),this.pads())
+    this.buffer().storeU32(24,result)
+    if (result == 1) this.buffer().storeU32(4,6)
+    return result
+}

@@ -1,0 +1,188 @@
+import "abla/runtime/scalar"
+import "../esp32/sdk/raw_buffer.ab"
+// Waveform data and transition semantics adapted from M5GFX/LovyanGFX
+// src/lgfx/v1/platforms/esp32/Panel_EPD.cpp, author lovyan03.
+// See epd_waveform.LICENSE for the upstream notice.
+// Packed two-bit actions for 16 gray levels. Modes: eraser0,quality1,text2,fast3,fastest4.
+val epdWaveformRows=nativeStaticU32s([
+    1609214634,
+    1431656442,
+    4294967295,
+    0,
+    1432982869,
+    2863311530,
+    2863311530,
+    1431655765,
+    1431655765,
+    1431721301,
+    3579418021,
+    2845464917,
+    2779424437,
+    2863311531,
+    2863311531,
+    2863311701,
+    2868204885,
+    3579139415,
+    3942645759,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    0,
+    1789569706,
+    1789569706,
+    1789569706,
+    1785375402,
+    1785375146,
+    2673825129,
+    2639779197,
+    2506447485,
+    3848886967,
+    2863311509,
+    2863310165,
+    3218429269,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    4294967295,
+    0,
+    2147483646,
+    2147483646,
+    3221225469,
+    3221225469,
+    3221225469,
+    3221225469,
+    3221225469,
+    3221225469,
+    4294967295,
+    0,
+    2147483646,
+    3221225469,
+    3221225469,
+    3221225469,
+    3221225469,
+    4294967295,
+    0
+])
+fun epdWaveformOffset(mode: int): int = if (mode == 0) 0 else if (mode == 1) 4 else if (mode == 2) 36 else if (mode == 3) 68 else if (mode == 4) 78 else -1
+// Index is a 16-bit current/queued halfword. Inactive indices never access the LUT.
+fun epdWaveformIndexValid(index: int): bool = index >= 0 && index <= 65535 && ((index&32768) != 0 || index < 21760)
+trusted fun epdWaveformAction(index: int): int {
+    if (!epdWaveformIndexValid(index)) return -1
+    if ((index&32768) != 0) return 0
+    val row=nativeAddressLoadU32(epdWaveformRows,(index>>>8)*4)
+    return (((row>>>(((index>>>4)&15)*2))&3)<<2)|((row>>>((index&15)*2))&3)
+}
+// Pair word: low16 current, high16 queued. Pure value transform; -1 invalid.
+// Caller serializes updates with rendering. Same-gray text black refreshes;
+// same-gray text white does not. Quality preserves an eraser already in flight.
+fun epdWaveformRequest(pair: int,gray: int,mode: int): int {
+    if (pair < 0 || pair > 4294967295 || gray < 0 || gray > 255 || mode < 1 || mode > 4) return -1
+    var current=pair&65535
+    val queued=pair>>>16
+    if (!epdWaveformIndexValid(current) || !epdWaveformIndexValid(queued)) return -1
+    val offset=epdWaveformOffset(mode)*256
+    val request=offset+gray
+    if (mode >= 3) return if (queued == request+32768) pair else ((request+32768)<<16)|request
+    if (mode == 2) {
+        val previous=queued&32767
+        if (previous == (offset|255) && previous == request) return pair
+    } else if (queued == request) return pair
+    if (current >= 1024) current=current&255
+    return (request<<16)|current
+}
+fun epdWaveformDisjoint(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.addressValue()+an <= b.addressValue() || b.addressValue()+bn <= a.addressValue()
+// Caller supplies writable exclusive memory. No allocation, no hardware writes.
+trusted fun epdWaveformInitialize(state: NativeBuffer,pixels: int,exclusive: bool): bool {
+    if (!exclusive || pixels < 2 || pixels > 1073741823 || (pixels&1) != 0 || !state.hasAddressRange(0,pixels*2)) return false
+    var offset=0
+    while (offset < pixels*2) { state.storeU32(offset,0x88888888);offset=offset+4 }
+    return true
+}
+// One already positioned row/region of paired gray bytes; caller handles rotation.
+// Validate the entire request BEFORE mutation, including aliasing.
+trusted fun epdWaveformUpdateOwned(state: NativeBuffer,gray: NativeBuffer,pairs: int,mode: int,exclusive: bool): bool {
+    if (!exclusive || pairs < 1 || pairs > 536870911 || mode < 1 || mode > 4 ||
+        !state.hasAddressRange(0,pairs*4) || !gray.hasAddressRange(0,pairs) ||
+        !epdWaveformDisjoint(state,pairs*4,gray,pairs)) return false
+    var index=0
+    while (index < pairs) {
+        if (epdWaveformRequest(state.loadU32(index*4),gray.load(index),mode) < 0) return false
+        index=index+1
+    }
+    index=0
+    while (index < pairs) {
+        state.storeU32(index*4,epdWaveformRequest(state.loadU32(index*4),gray.load(index),mode));index=index+1
+    }
+    return true
+}
+// Render a whole 16-pixel-aligned line. Output is little-endian 4pixels/byte,
+// with the exact upstream nibble order. Zero padding is part of the output.
+// -1 invalid (no writes),0 all inactive,1 any active pair processed (even a
+// terminal transition emitting zero). Caller must transmit this staged row ONCE
+// before rendering it again; DMA retries reuse the immutable staged payload.
+// State advances here, not at DMA completion; failed physical frames require
+// caller-controlled panel recovery, not blind re-rendering/replaying.
+trusted fun epdWaveformRenderOwned(state: NativeBuffer,output: NativeBuffer,pixels: int,padding: int,exclusive: bool): int {
+    if (!exclusive || pixels < 16 || pixels > 1073741808 || (pixels&15) != 0 || padding < 0 || padding > 65535 ||
+        !state.hasAddressRange(0,pixels*2) || !output.hasAddressRange(0,pixels/4+padding) ||
+        !epdWaveformDisjoint(state,pixels*2,output,pixels/4+padding)) return -1
+    var index=0
+    while (index < pixels/2) {
+        val pair=state.loadU32(index*4)
+        if (!epdWaveformIndexValid(pair&65535) || !epdWaveformIndexValid(pair>>>16)) return -1
+        index=index+1
+    }
+    var active=0
+    index=0
+    while (index < pixels/2) {
+        var packed=0
+        var part=0
+        while (part < 8) {
+            val pair=state.loadU32((index+part)*4)
+            val current=pair&65535
+            if ((current&32768) == 0) {
+                active=1
+                val action=epdWaveformAction(current)
+                packed=packed|(action<<((part^1)*4))
+                val queued=pair>>>16
+                val next=if (action == 0) ((queued|32768)<<16)|queued else (queued<<16)|(current+256)
+                state.storeU32((index+part)*4,next)
+            }
+            part=part+1
+        }
+        output.storeU32(index/2,packed);index=index+8
+    }
+    index=pixels/4
+    while (index < pixels/4+padding) { output.store(index,0);index=index+1 }
+    return active
+}
+

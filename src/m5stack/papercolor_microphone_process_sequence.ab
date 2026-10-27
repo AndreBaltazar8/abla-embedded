@@ -1,0 +1,36 @@
+import "../audio/microphone_process.ab"
+type PaperColorMicrophoneBlockResult=int
+fun PaperColorMicrophoneBlockResult.status(): int = this&255
+fun PaperColorMicrophoneBlockResult.samples(): int = this>>>32
+// Full DMA events/bytes/cursor remain in the capture record at68/72.
+// Low8 result:1processed2preflight3busy4..8DMAfault9processingfault;
+// output sample count high32. No data replay or fake samples on empty/busy DMA.
+trusted fun paperColorMicrophoneBufferDisjoint(r: NativeBuffer,buffer: NativeBuffer,bytes: int): bool {
+    if (!buffer.hasAddressRange(0,bytes)) return false
+    val address=buffer.addressValue();val count=r.loadU32(32)
+    val desc=r.loadU32(28);val payload=r.loadU32(36);val block=r.loadU32(40)
+    return bytes == 0 || !((address < r.addressValue()+132 && r.addressValue() < address+bytes) ||
+        (address < desc+count*12 && desc < address+bytes) ||
+        (address < payload+count*block && payload < address+bytes))
+}
+// Running board session132 + initialized DSP40 + one raw DMA block + output.
+// PaperColor capture selects ONE hardware channel, so DMA pairs are successive mono
+// samples: initialize DSP inputStereo=false/adc=false/swap=false. Output may
+// be mono or duplicated stereo, unsigned8 or signed16. Supply profile gain
+// unless overridden. Hardware rate/oversampling is the actual output rate;
+// prepare the appropriate hardware rate before start, never change it here.
+trusted fun paperColorMicrophoneProcessBlockOwned(r: NativeBuffer,state: NativeBuffer,
+    raw: NativeBuffer,output: NativeBuffer,stereo: bool,bits16: bool,polls: int,exclusive: bool): PaperColorMicrophoneBlockResult {
+    if (!exclusive || !paperColorCaptureValid(r) || r.loadU32(4) != 2 ||
+        polls < 1 || polls > 1000000 || !state.hasAddressRange(0,40) || (state.loadU32(4)&7340032) != 0) return PaperColorMicrophoneBlockResult(2)
+    val bytes=r.loadU32(40)
+    if (bytes < 4 || (bytes&3) != 0 || !esp32s3GdmaRingLayoutValid(r.loadU32(28),r.loadU32(32),r.loadU32(36),bytes,bytes)) return PaperColorMicrophoneBlockResult(2)
+    val samples=microphoneProcessRequiredSamples(state,raw,bytes/4,output,stereo,bits16)
+    if (samples < 0 || !paperColorMicrophoneBufferDisjoint(r,state,40) || !paperColorMicrophoneBufferDisjoint(r,raw,bytes) ||
+        !paperColorMicrophoneBufferDisjoint(r,output,samples*(if (bits16) 2 else 1))) return PaperColorMicrophoneBlockResult(2)
+    val pumped=paperColorCaptureReadOwned(r,raw,polls,true)
+    if (pumped.status() != 1) return PaperColorMicrophoneBlockResult(pumped.status())
+    val written=microphoneProcess(state,raw,bytes/4,output,stereo,bits16)
+    if (written != samples) { r.storeU32(4,3);return PaperColorMicrophoneBlockResult(9) }
+    return PaperColorMicrophoneBlockResult(1|(written<<32))
+}

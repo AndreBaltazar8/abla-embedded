@@ -1,0 +1,72 @@
+import "./board_id.ab"
+import "../i2c/results.ab"
+// Status1 success,2 unsupported board/chip pair,3 invalid handle,
+// 4 safety read failure,5 safety veto,6 rail write failure,7 EXTEN failure.
+// No rollback: a successful GPIO0/BLDO2 change can precede a later failure.
+type M5AxpExternalResult = int
+fun M5AxpExternalResult.status(): int = this | 0
+fun M5AxpExternalResult.valid(): bool = this == 1
+// Read the rail controlled by setAxpExternal: BLDO2 on AXP2101 Core2/Tough,
+// EXTEN on AXP192. This deliberately avoids upstream Tough readback's
+// unconditional AXP192 fallthrough when an AXP2101 was actually selected.
+trusted fun M5BoardId.axpExternalOutputCheckedOwned(power: int,identity: int): I2cByteResult {
+    val core=this == m5BoardStackCore2 || this == m5BoardTough
+    val legacy=this == m5BoardStickC || this == m5BoardStickCPlus || this == m5BoardStation
+    if ((!core && !legacy) || (identity != 3 && identity != 74) || (legacy && identity != 3) || power <= 0 || power > 4294967295) return I2cByteResult(0)
+    val value=axpExternalReadByte(power,if (identity == 74) 144 else 18)
+    if (!value.valid()) return I2cByteResult(0)
+    I2cByteResult(256|(if ((value.value() & (if (identity == 74) 32 else 64)) != 0) 1 else 0))
+}
+// Exact <=8 predicate of AXP192_Class::getBatteryLevel for its four-byte
+// 0x78 burst. Byte packing uses upstream addition, not masked/OR fields.
+// Truncation thresholds avoid bringing floating-point into power switching.
+fun axp192ExternalBatteryLow(raw: I2cDwordResult): I2cByteResult {
+    if (!raw.valid()) return I2cByteResult(0)
+    val value=raw.value()
+    val voltage=((value>>>24)<<4)+((value>>>16)&255)
+    val current=(((value>>>8)&255)<<5)+(value&255)
+    I2cByteResult(256|(if (voltage <= (if (current > 16) 3231 else 3023)) 1 else 0))
+}
+trusted fun M5BoardId.setAxpExternalOwned(power: int,identity: int,monitor: int,enabled: bool): M5AxpExternalResult {
+    val core=this == m5BoardStackCore2 || this == m5BoardTough
+    val stick=this == m5BoardStickC || this == m5BoardStickCPlus
+    if ((!core && !stick) || (identity != 3 && identity != 74) || (stick && identity != 3)) return M5AxpExternalResult(2)
+    if (power <= 0 || power > 4294967295 || (core && identity == 74 && enabled && (monitor <= 0 || monitor > 4294967295))) return M5AxpExternalResult(3)
+    if (core && enabled) {
+        var checkBattery=false
+        if (identity == 74) {
+            val first=axpExternalReadWord(monitor,1)
+            if (!first.valid()) return M5AxpExternalResult(4)
+            if (first.signedValue() < 0) checkBattery=true
+            else {
+                val second=axpExternalReadWord(monitor,3)
+                if (!second.valid()) return M5AxpExternalResult(4)
+                checkBattery=second.signedValue() < 0
+            }
+        } else {
+            val status=axpExternalReadByte(power,0)
+            if (!status.valid()) return M5AxpExternalResult(4)
+            if ((status.value() & 128) == 0) {
+                val current=axpExternalReadWord(power,92)
+                if (!current.valid()) return M5AxpExternalResult(4)
+                checkBattery=(((current.value()>>>8)<<4)+(current.value()&255)) > 0
+            }
+        }
+        if (checkBattery) {
+            if (identity == 74) {
+                val level=axpExternalReadByte(power,164)
+                if (!level.valid() || level.value() > 100) return M5AxpExternalResult(4)
+                if (level.value() <= 8) return M5AxpExternalResult(5)
+            } else {
+                val low=axp192ExternalBatteryLow(axpExternalBatteryBurst(power))
+                if (!low.valid()) return M5AxpExternalResult(4)
+                if (low.value() != 0) return M5AxpExternalResult(5)
+            }
+        }
+    }
+    if (core) {
+        if (identity == 74) return M5AxpExternalResult(if (axpExternalBldo2(power,enabled)) 1 else 6)
+        if (!axpExternalGpio0(power,enabled)) return M5AxpExternalResult(6)
+    }
+    M5AxpExternalResult(if (axpExternalExten(power,enabled)) 1 else 7)
+}

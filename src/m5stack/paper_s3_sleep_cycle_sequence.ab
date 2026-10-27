@@ -1,0 +1,161 @@
+import "./paper_s3_sleep_prepare_sequence.ab"
+import "./paper_s3_sleep_run_sequence.ab"
+import "./paper_s3_wake_wait_sequence.ab"
+import "./paper_s3_sleep_config.ab"
+import "../esp32/gpio/snapshot_s3_logic.ab"
+import "../esp32/i2c/sleep_s3_sequence.ab"
+// Board lifecycle336: header64,wake32@64,sleep128@96,prepare64@224,run40@288.
+// Header magic,state,result,primary,touch,cpu,tags,tagBytes,config,lastRelease,
+// wait64@40,padSnapshot48,padOwned52,finalOutcome56,busGeneration60;
+// tail8@328 holds the33-bit-key I2C sleep lease (record remains336B).
+// Config72: preparation48 +flags48,period52,duration64@56,
+// reject64,reserved68. Duration0 means GPIO only here, NOT M5 zero-duration API.
+// Borrow powered GPIO48 with holds released and initialized GT911/CPU/tag
+// buffers. Own and restore digital mux/OE/pull/routing; never drive touch INT.
+// Own all buffers/code/stack, peers,DMA,interrupts and power as documented by
+// retained sleep. This does not invent a scheduler or suspend other clients.
+// Normal phase open/poll/cancel may use I2C. Quiesced phase never does.
+// States2wait,4handoff,5prepare,6run,7normalcancel,8quiescedcancel,9done,10padrestore.
+// Results1opened,2wait10ms,3quiesce-now,4pending-recovery,5woke,
+// 6entry-refused/rejected,7preparation-failed-restored,8cancelled,9invalid.
+fun paperS3CycleBuffersValid(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer): bool {
+    if (!r.hasAddressRange(0,336) || !config.hasAddressRange(0,72) || ((r.addressValue()|config.addressValue())&3) != 0) return false
+    val i=Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()))
+    val d=Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()+8))
+    if (!esp32S3RetentionBuffersValid(cpu,tags,i,d)) return false
+    val size=esp32S3TagBufferBytes(i,d)
+    val a=r.addressValue();val b=cpu.addressValue();val c=tags.addressValue();val e=config.addressValue()
+    return !(a < b+8800 && b < a+336) && !(a < c+size && c < a+336) && !(a < e+72 && e < a+336) &&
+        !(b < e+72 && e < b+8800) && !(c < e+72 && e < c+size)
+}
+fun paperS3CycleBound(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer): bool =
+    paperS3CycleBuffersValid(r,cpu,tags,config) && r.loadU32(0) == 0x50334359 &&
+    r.loadU32(20) == cpu.addressValue() && r.loadU32(24) == tags.addressValue() && r.loadU32(32) == config.addressValue() &&
+    r.loadU32(28) == esp32S3TagBufferBytes(Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue())),Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()+8)))
+// Only after clocks and GPIO wake source have been restored. Retain intended
+// outcome separately so a failed pad restoration does not turn wake into cancel.
+trusted fun paperS3CycleFinishPadOwned(r: NativeBuffer,outcome: int): int {
+    r.storeU32(4,10);r.storeU32(56,outcome)
+    if (r.loadU32(52) == 1) {
+        if (paperS3CyclePadRestore(S3GpioSnapshot(r.loadU32(48))) != 1) { r.storeU32(8,4);return 4 }
+        r.storeU32(52,2)
+    }
+    var lease=S3I2cSleepLease(r.loadU32(328)|(r.loadU32(332)<<32))
+    if (lease.owned()) {
+        lease=lease.resumeOwned(true)
+        r.storeU32(328,lease|0);r.storeU32(332,(lease|0)>>>32)
+        if (lease.owned() || lease.status() != 6) { r.storeU32(8,4);return 4 }
+    }
+    r.storeU32(4,9);r.storeU32(8,outcome);return outcome
+}
+trusted fun paperS3CycleNormalCancelOwned(r: NativeBuffer): int {
+    r.storeU32(4,7)
+    if (r.loadU32(64) != 0 && esp32S3GpioWakeSessionCloseOwned(nativeBufferAt(r.addressValue()+64,32),true) != 8) { r.storeU32(8,4);return 4 }
+    return paperS3CycleFinishPadOwned(r,8)
+}
+trusted fun paperS3SleepCycleOpenOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,touch: int,normalExclusive: bool): int {
+    if (!normalExclusive || !paperS3CycleBuffersValid(r,cpu,tags,config) || !paperS3SleepConfigValid(config) || r.loadU32(0) != 0 || !paperS3WakeWait(touch).valid()) return 9
+    val bus=paperS3CycleTouchBus(touch)
+    if (!esp32S3I2cBusKeyValid(bus) || esp32S3I2cBusKeyPort(bus) != 1) return 9
+    var offset=4
+    while (offset < 336) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x50334359);r.storeU32(16,touch);r.storeU32(20,cpu.addressValue());r.storeU32(24,tags.addressValue())
+    r.storeU32(28,esp32S3TagBufferBytes(Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue())),Esp32S3TagPlan(esp32S3MspiStateLoad64(config.addressValue()+8))))
+    r.storeU32(32,config.addressValue())
+    r.storeU32(60,esp32S3I2cBusKeyGeneration(bus))
+    val pad=paperS3CyclePadCapture()
+    if (!pad.valid() || pad.pin() != 48) { r.storeU32(12,10);return paperS3CycleNormalCancelOwned(r) }
+    r.storeU32(48,pad|0);r.storeU32(52,1)
+    val input=paperS3CyclePadPrepare(pad)
+    if (input != 1) { r.storeU32(12,16+input);return paperS3CycleNormalCancelOwned(r) }
+    val wait=paperS3WakeWait(touch)|0;r.storeU32(40,wait);r.storeU32(44,wait>>>32)
+    val result=esp32S3GpioWakeSessionOpenOwned(nativeBufferAt(r.addressValue()+64,32),48,false,true)
+    if (result != 1) { r.storeU32(12,result);return paperS3CycleNormalCancelOwned(r) }
+    r.storeU32(4,2);r.storeU32(8,1);return 1
+}
+// Schedule another poll10ms AFTER result2. Final consumption occurs here,
+// before result3 transfers control to the caller's quiescence boundary.
+trusted fun paperS3SleepCyclePollOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,scratch: NativeBuffer,normalExclusive: bool): int {
+    if (!normalExclusive || !paperS3CycleBound(r,cpu,tags,config) || !scratch.hasAddressRange(0,40)) return 9
+    val a=scratch.addressValue()
+    if ((a < r.addressValue()+336 && r.addressValue() < a+40) || (a < cpu.addressValue()+8800 && cpu.addressValue() < a+40) ||
+        (a < tags.addressValue()+r.loadU32(28) && tags.addressValue() < a+40) || (a < config.addressValue()+72 && config.addressValue() < a+40)) return 9
+    val state=r.loadU32(4)
+    if (state == 9) return r.loadU32(8)
+    if (state == 10) return paperS3CycleFinishPadOwned(r,r.loadU32(56))
+    if (state == 7) return paperS3CycleNormalCancelOwned(r)
+    if (state == 4) return 3
+    if (state != 2) return 9
+    // An uncertain release from a failed pause must be resolved/cancelled;
+    // never issue more I2C reads through a gate still owned by this lifecycle.
+    if (S3I2cSleepLease(r.loadU32(328)|(r.loadU32(332)<<32)).owned()) return 4
+    val wait=PaperS3WakeWait(r.loadU32(40)|(r.loadU32(44)<<32)).updateOwned(scratch,true)
+    if (!wait.valid()) return 9
+    r.storeU32(40,wait|0);r.storeU32(44,(wait|0)>>>32)
+    if (wait.status() == 2) { r.storeU32(8,2);return 2 }
+    val final=paperS3ReleaseWakePinOwned(r.loadU32(16),scratch,true)
+    r.storeU32(36,final|0)
+    if (!final.valid()) return 9
+    val lease=esp32S3I2cPauseForSleepOwned(esp32S3I2cBusKey(1,r.loadU32(60)))
+    r.storeU32(328,lease|0);r.storeU32(332,(lease|0)>>>32)
+    if (lease.status() != 1) {
+        val result=if (lease.owned()) 4 else if (lease.status() == 3 || lease.status() == 5) 2 else 9
+        r.storeU32(8,result);return result
+    }
+    r.storeU32(4,4);r.storeU32(8,3);return 3
+}
+// Cancel only in normal-clock phase. Once preparation starts use the
+// quiesced continuation; its failure recovery keeps ownership until restored.
+trusted fun paperS3SleepCycleCancelNormalOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,normalExclusive: bool): int {
+    if (!normalExclusive || !paperS3CycleBound(r,cpu,tags,config)) return 9
+    val state=r.loadU32(4)
+    if (state == 9) return r.loadU32(8)
+    if (state == 10) return paperS3CycleFinishPadOwned(r,r.loadU32(56))
+    if (state != 2 && state != 4 && state != 7) return 9
+    return paperS3CycleNormalCancelOwned(r)
+}
+@section(".iram1.abla.paperS3SleepCycle")
+@noinline
+trusted fun paperS3SleepCycleContinueQuiescedOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,quiescedExclusive: bool): int {
+    if (!quiescedExclusive || !paperS3CycleBound(r,cpu,tags,config)) return 9
+    var state=r.loadU32(4)
+    if (state == 9) return r.loadU32(8)
+    if (state == 10) return paperS3CycleFinishPadOwned(r,r.loadU32(56))
+    if (state == 8) return paperS3SleepCycleCancelQuiescedOwned(r,cpu,tags,config,true)
+    if (state != 4 && state != 5 && state != 6) return 9
+    if (state == 4 && !paperS3SleepConfigValid(config)) return 9
+    if (state == 4 && !S3I2cSleepLease(r.loadU32(328)|(r.loadU32(332)<<32)).pausedOwned()) return 9
+    val sleep=nativeBufferAt(r.addressValue()+96,128);val wake=nativeBufferAt(r.addressValue()+64,32)
+    if (state != 6) {
+        r.storeU32(4,5)
+        val prepared=paperS3SleepPrepareOwned(sleep,wake,cpu,tags,config,nativeBufferAt(r.addressValue()+224,64),true)
+        r.storeU32(12,prepared)
+        if (prepared == 2) { r.storeU32(8,9);return 9 }
+        if (prepared == 4) { r.storeU32(8,4);return 4 }
+        if (prepared == 3) return paperS3CycleFinishPadOwned(r,7)
+        if (prepared != 1) return 9
+        r.storeU32(4,6)
+    }
+    val duration=config.loadU32(56)|(config.loadU32(60)<<32)
+    val result=paperS3SleepRunPreparedOwned(sleep,wake,nativeBufferAt(r.addressValue()+288,40),config.loadU32(48),config.loadU32(52),duration,config.loadU32(64),config.loadU32(44),true)
+    if (result == 2) { r.storeU32(8,9);return 9 }
+    if (result == 4 || result == 5) { r.storeU32(8,4);return 4 }
+    if (result != 1 && result != 3) return 9
+    val outcome=if (result == 1) 5 else 6
+    return paperS3CycleFinishPadOwned(r,outcome)
+}
+// Explicit escape from failed admission/partial preparation, but never from
+// an already invoked runner. Once run report exists, continue recovery there.
+@section(".iram1.abla.paperS3SleepCycleCancel")
+@noinline
+trusted fun paperS3SleepCycleCancelQuiescedOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,quiescedExclusive: bool): int {
+    if (!quiescedExclusive || !paperS3CycleBound(r,cpu,tags,config)) return 9
+    val state=r.loadU32(4)
+    if (state == 9) return r.loadU32(8)
+    if (state == 10) return paperS3CycleFinishPadOwned(r,r.loadU32(56))
+    if ((state != 4 && state != 5 && state != 6 && state != 8) || r.loadU32(288) != 0) return 9
+    r.storeU32(4,8)
+    val cancelled=esp32S3SleepGpioCancelOwned(nativeBufferAt(r.addressValue()+96,128),nativeBufferAt(r.addressValue()+64,32),nativeBufferAt(r.addressValue()+272,16),config.loadU32(44),true,true)
+    if (cancelled != 1) { r.storeU32(8,if (cancelled == 2) 9 else 4);return r.loadU32(8) }
+    return paperS3CycleFinishPadOwned(r,8)
+}

@@ -1,8 +1,9 @@
 import "./types_logic.ab"
 import "./offsets.ab"
 import "./calibration_logic.ab"
-import "../esp32/sdk/buffer.ab"
-import "abla/unsafe/memory"
+import "./calibration_f32.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/unsafe/memory/raw"
 
 type ImuCalibration = int
 
@@ -21,7 +22,15 @@ fun ImuCalibration.buffer(): NativeBuffer = NativeBuffer(
 )
 
 fun ImuCalibration.valid(): bool =
-    this.buffer().capacity() >= imuCalibrationStorageBytes
+    this.buffer().hasAddressRange(0, imuCalibrationStorageBytes)
+
+// State and persistent offsets must remain separate even for direct calls.
+// Reject before seeding/filter writes, not only when correction is published.
+fun ImuCalibration.acceptsOffsets(offsets: ImuOffsets): bool {
+    if (!this.valid() || !offsets.valid()) return false
+    val state=this.buffer().addressValue();val data=offsets.buffer().addressValue()
+    return !(state < data+36 && data < state+120)
+}
 
 fun imuCalibrationSensorOffset(sensor: int): int =
     if (sensor < 0 || sensor > 2) -1 else sensor * imuCalibrationSensorBytes
@@ -40,12 +49,19 @@ trusted fun ImuCalibration.configure(
     noiseLevel: int,
     averageShift: int,
     strength: int
-): bool {
+): bool = this.configureFloat(sensor,f32FromI32(i32(radius)),f32FromI32(i32(tolerance)),noiseLevel,averageShift,strength)
+
+// Radius/tolerance remain binary32 like M5Unified; persisted offsets remain
+// signed Q16 integers. Reject nonfinite limits before modifying state.
+trusted fun ImuCalibration.configureFloat(sensor: int,radius: f32,tolerance: f32,
+    noiseLevel: int,averageShift: int,strength: int): bool {
     val base = imuCalibrationSensorOffset(sensor)
-    if (!this.valid() || base < 0) return false
+    if (!this.valid() || base < 0 ||
+        (f32ToBits(radius)&u32(0x7fffffff)) >= u32(0x7f800000) ||
+        (f32ToBits(tolerance)&u32(0x7fffffff)) >= u32(0x7f800000)) return false
     val buffer = this.buffer()
-    buffer.storeU32(base + 24, radius)
-    buffer.storeU32(base + 28, tolerance)
+    buffer.storeU32(base + 24, int(f32ToBits(radius)))
+    buffer.storeU32(base + 28, int(f32ToBits(tolerance)))
     buffer.storeU32(base + 32, noiseLevel)
     buffer.storeU32(
         base + 36,
@@ -57,9 +73,14 @@ trusted fun ImuCalibration.configureM5UnifiedDefaults(
     accelStrength: int = 0,
     gyroStrength: int = 0,
     magneticStrength: int = 0
-): bool = this.configure(0, 4096, 2, 256, 1, accelStrength) &&
-    this.configure(1, 0, 0, 32, 6, gyroStrength) &&
-    this.configure(2, 256, 42, 64, 1, magneticStrength)
+): bool {
+    val scale=esp32Binary32Divide(f32ToBits(f32FromI32(i32(49120))),f32ToBits(f32FromI32(i32(32760))))
+    val radius=f32FromBits(esp32Binary32Divide(f32ToBits(f32FromI32(i32(384))),scale))
+    val tolerance=f32FromBits(esp32Binary32Divide(f32ToBits(f32FromI32(i32(64))),scale))
+    this.configure(0,4096,2,256,1,accelStrength) &&
+        this.configure(1,0,0,32,6,gyroStrength) &&
+        this.configureFloat(2,radius,tolerance,64,1,magneticStrength)
+}
 
 trusted fun ImuCalibration.setStrength(sensor: int, strength: int): bool {
     val base = imuCalibrationSensorOffset(sensor)
@@ -82,7 +103,7 @@ trusted fun ImuCalibration.initializeSensor(
     offsets: ImuOffsets
 ): bool {
     val base = imuCalibrationSensorOffset(sensor)
-    if (!this.valid() || base < 0 || !axes.valid() || !offsets.valid()) {
+    if (!this.acceptsOffsets(offsets) || base < 0 || !axes.valid()) {
         return false
     }
     val buffer = this.buffer()
@@ -110,7 +131,7 @@ trusted fun ImuCalibration.calibrateSensor(
     offsets: ImuOffsets
 ): bool {
     val base = imuCalibrationSensorOffset(sensor)
-    if (!this.valid() || base < 0 || !offsets.valid()) return false
+    if (!this.acceptsOffsets(offsets) || base < 0) return false
     val buffer = this.buffer()
     val metadata = buffer.loadU32(base + 36)
     val stillness = imuCalibrationStillnessValue(metadata)
@@ -121,31 +142,18 @@ trusted fun ImuCalibration.calibrateSensor(
         offsets.sensorAxis(sensor, 1)
     val dz = imuSigned32(buffer.loadU32(base + 8)) -
         offsets.sensorAxis(sensor, 2)
-    val distance = imuCalibrationDistance(dx, dy, dz)
-    if (distance < 1) return false
-    val radius = imuSigned32(buffer.loadU32(base + 24))
-    val tolerance = imuSigned32(buffer.loadU32(base + 28))
-    val error = distance - radius
-    val force = imuCalibrationAbsolute(error)
-    if (force <= tolerance) return false
-    val signedForce = if (error < 0) -force else force
+    val radius = f32FromBits(u32(buffer.loadU32(base + 24)))
+    val tolerance = f32FromBits(u32(buffer.loadU32(base + 28)))
+    val gain=imuCalibrationFloatGainWithLimits(dx,dy,dz,radius,tolerance,stillness,strength)
+    if ((f32ToBits(gain) & u32(2147483647)) == u32(0)) return false
     offsets.setSensorAxis(
-        sensor, 0, offsets.sensorAxis(sensor, 0) +
-            imuCalibrationDelta(
-                dx, signedForce, stillness, strength, distance
-            )
+        sensor, 0, imuCalibrationFloatOffset(offsets.sensorAxis(sensor,0),dx,gain)
     )
     offsets.setSensorAxis(
-        sensor, 1, offsets.sensorAxis(sensor, 1) +
-            imuCalibrationDelta(
-                dy, signedForce, stillness, strength, distance
-            )
+        sensor, 1, imuCalibrationFloatOffset(offsets.sensorAxis(sensor,1),dy,gain)
     )
     offsets.setSensorAxis(
-        sensor, 2, offsets.sensorAxis(sensor, 2) +
-            imuCalibrationDelta(
-                dz, signedForce, stillness, strength, distance
-            )
+        sensor, 2, imuCalibrationFloatOffset(offsets.sensorAxis(sensor,2),dz,gain)
     )
     true
 }
@@ -156,7 +164,7 @@ trusted fun ImuCalibration.update(
     offsets: ImuOffsets
 ): int {
     val base = imuCalibrationSensorOffset(sensor)
-    if (!this.valid() || base < 0 || !axes.valid() || !offsets.valid()) {
+    if (!this.acceptsOffsets(offsets) || base < 0 || !axes.valid()) {
         return 0
     }
     val buffer = this.buffer()

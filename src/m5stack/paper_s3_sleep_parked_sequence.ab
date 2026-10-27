@@ -1,0 +1,84 @@
+import "./paper_s3_sleep_cycle_sequence.ab"
+import "../esp32/power/sleep_quiesce_s3_sequence.ab"
+import "../esp32/power/sleep_scheduler_s3_sequence.ab"
+import "../esp32/gdma_sleep_s3_sequence.ab"
+// After normal polling has paused I2C, caller requests an actual peer park.
+// Keep the SAME quiescence record exclusively bound to this cycle until both
+// finish. Scheduler/DMA ownership, internal storage/stack and routed peer
+// handler remain prerequisites; this is not a scheduler implementation.
+fun paperS3ParkedDisjoint(a: int,n: int,b: int,m: int): bool = !(a < b+m && b < a+n)
+fun paperS3ParkedBuffersValid(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,q: NativeBuffer): bool {
+    if (!paperS3CycleBound(r,cpu,tags,config) || !s3SleepQuiesceRecordValid(q)) return false
+    val a=q.addressValue();val mailbox=q.loadU32(8)
+    if (mailbox == 0 || (mailbox&3) != 0 || mailbox > 4294967292 || !paperS3ParkedDisjoint(a,32,mailbox,4)) return false
+    var index=0
+    while (index < 4) {
+        val b=if (index == 0) r.addressValue() else if (index == 1) cpu.addressValue() else if (index == 2) tags.addressValue() else config.addressValue()
+        val size=if (index == 0) 336 else if (index == 1) 8800 else if (index == 2) r.loadU32(28) else 72
+        if (!paperS3ParkedDisjoint(a,32,b,size) || !paperS3ParkedDisjoint(mailbox,4,b,size)) return false
+        index=index+1
+    }
+    return true
+}
+// Same cycle result codes; 4 also means waiting for peer ACK/release or local
+// interrupt restoration. Never expose a terminal result while either remains
+// owned. No touch transfers or new entry during recovery.
+@section(".iram1.abla.paperS3SleepParked")
+@noinline
+trusted fun paperS3SleepCycleContinueParkedOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,q: NativeBuffer,cancelBeforeEntry: bool,schedulerSafeExclusive: bool): int {
+    if (!schedulerSafeExclusive || !paperS3ParkedBuffersValid(r,cpu,tags,config,q)) return 9
+    if (r.loadU32(4) != 9) {
+        if (cancelBeforeEntry && q.loadU32(4) == 1) {
+            // No clock preparation or local masking yet. Unwind normal owners
+            // without waiting for an ACK that might never arrive. Close below
+            // handles a peer accepting the request concurrently with cancel.
+            val result=paperS3SleepCycleCancelNormalOwned(r,cpu,tags,config,true)
+            if (r.loadU32(4) != 9) return result
+        } else {
+            val ready=esp32S3SleepQuiescePollOwned(q)
+            if (ready == 2) return 4
+            if (ready != 1) return 9
+            val result=if (cancelBeforeEntry) paperS3SleepCycleCancelQuiescedOwned(r,cpu,tags,config,true) else paperS3SleepCycleContinueQuiescedOwned(r,cpu,tags,config,true)
+            if (r.loadU32(4) != 9) return result
+        }
+    }
+    // Cycle done proves clocks/cache, GPIO and I2C lease restored. Release peer
+    // first, wait for its restored interrupt state, then restore local IRQs.
+    val closed=esp32S3SleepQuiesceCloseOwned(q,true)
+    if (closed == 5) return r.loadU32(8)
+    return if (closed == 2 || closed == 6) 4 else 9
+}
+// Scheduler-backed alternative. Open the64B scheduler owner only after normal
+// cycle polling paused I2C. Its lock must be the actual shared scheduler lock.
+// DMA/other clients and RCC reconfiguration must already be excluded; this owns scheduler/peer/local IRQ
+// exclusion, not arbitrary peripherals. Same owner/buffers throughout retries.
+@section(".iram1.abla.paperS3SleepScheduled")
+@noinline
+trusted fun paperS3SleepCycleContinueScheduledOwned(r: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,config: NativeBuffer,scheduler: NativeBuffer,cancelBeforeEntry: bool,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !s3SleepSchedulerValid(scheduler) || !paperS3CycleBound(r,cpu,tags,config)) return 9
+    val lock=scheduler.loadU32(8)
+    var index=0
+    while (index < 4) {
+        val address=if (index == 0) r.addressValue() else if (index == 1) cpu.addressValue() else if (index == 2) tags.addressValue() else config.addressValue()
+        val size=if (index == 0) 336 else if (index == 1) 8800 else if (index == 2) r.loadU32(28) else 72
+        if (!paperS3ParkedDisjoint(scheduler.addressValue(),64,address,size) || !paperS3ParkedDisjoint(lock,4,address,size)) return 9
+        index=index+1
+    }
+    val q=nativeBufferAt(scheduler.addressValue()+32,32)
+    // A failed request has no quiescence record. Caller cancels the normal
+    // cycle and closes the scheduler owner explicitly in that admission case.
+    if (!paperS3ParkedBuffersValid(r,cpu,tags,config,q)) return 9
+    if (r.loadU32(4) != 9) {
+        val ready=esp32S3SleepSchedulerPollOwned(scheduler)
+        if (ready != 1 && ready != 2) return 9
+        // Final read-only hardware admission after peer ACK, before clocks or
+        // cache change. On failure cancel, restore normal IRQs, and drain via
+        // the client API; do not wait for IRQ-driven work while masked here.
+        if (!cancelBeforeEntry && ready == 1 && r.loadU32(4) == 4 && esp32S3GdmaSleepStatusOwned(true) != 0) return 9
+        val result=paperS3SleepCycleContinueParkedOwned(r,cpu,tags,config,q,cancelBeforeEntry,true)
+        if (r.loadU32(4) != 9) return result
+    }
+    val closed=esp32S3SleepSchedulerCloseOwned(scheduler,true)
+    if (closed == 5) return r.loadU32(8)
+    return if (closed == 2 || closed == 6) 4 else 9
+}

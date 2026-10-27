@@ -1,0 +1,76 @@
+import "../audio/pcm_channels_tone.ab"
+import "../audio/pcm_source_queues.ab"
+import "./speaker_profile.ab"
+// Retain returned scalar alongside ONE running playbacksession/bank/staging.
+// Never change those bindings or staging contents while pending. No separate
+// DMA pump may advance the same session. Enqueue/gain edits between queued
+// blocks only; gain is applied at render time, not again on busy retries.
+// Low8:0initial1queued2invalid3busy4..8DMAfault9renderfailure;
+// bit8pending; bits9..20 expected session cursor. Faults sticky until session
+// stop/close; only then may caller discard pending staging and reset to0.
+// Queued is NOT physically played/drained. Initial DMA payload is separately
+// initialized by caller before session start. No playback/rail cleanup here.
+type M5Es8311ChannelsPump=int
+fun M5Es8311ChannelsPump.status(): int = this&255
+fun M5Es8311ChannelsPump.pending(): bool = (this&256) != 0
+fun M5Es8311ChannelsPump.index(): int = (this>>>9)&4095
+trusted fun m5Es8311MixerSpan(r: NativeBuffer,buffer: NativeBuffer,bytes: int): bool {
+    return buffer.hasAddressRange(0,bytes) &&
+        !pcmMixSpansOverlap(buffer,bytes,r,136) &&
+        !pcmMixSpansOverlap(buffer,bytes,nativeBufferAt(r.loadU32(28),r.loadU32(32)*12),r.loadU32(32)*12) &&
+        !pcmMixSpansOverlap(buffer,bytes,nativeBufferAt(r.loadU32(36),r.loadU32(32)*r.loadU32(40)),r.loadU32(32)*r.loadU32(40))
+}
+trusted fun m5Es8311PumpChannelsOwned(state: M5Es8311ChannelsPump,r: NativeBuffer,bank: PcmChannels,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,masterGainQ15: int,exclusive: bool,tone: PcmTone=PcmTone(0),
+    queues: PcmSourceQueues=PcmSourceQueues(0)): M5Es8311ChannelsPump {
+    val status=state.status()
+    if (status != 0 && status != 1 && status != 3) return state
+    val invalid=M5Es8311ChannelsPump((state&~255)|2)
+    if (!exclusive || !m5Es8311PlaybackValid(r) || r.loadU32(4) != 2 ||
+        (if (queues == 0) !bank.valid() else bank != 0 || tone != 0 || !queues.valid()) ||
+        masterGainQ15 < 0 || masterGainQ15 > 32768 || (state&~2097151) != 0 ||
+        (status == 0 && state != M5Es8311ChannelsPump(0)) || (status == 3 && !state.pending()) ||
+        (status == 1 && state.pending())) return invalid
+    val count=r.loadU32(32);val bytes=r.loadU32(40);val cursor=r.loadU32(44)
+    if (count < 2 || cursor >= count || bytes < 4 || (bytes&3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(r.loadU32(28),count,r.loadU32(36),bytes,bytes) ||
+        (status != 0 && state.index() != cursor) ||
+        (if (queues == 0) bank.channel(0).storage().loadU32(0) else queues.queue(0).storage().loadU32(4)) != r.loadU32(48)) return invalid
+    val stereo=M5BoardId(r.loadU32(8)).speakerProfile().stereo()
+    val frames=bytes/(if (stereo) 4 else 2)
+    if (!m5Es8311MixerSpan(r,accumulator,frames*8) || !m5Es8311MixerSpan(r,scratch,frames*4) ||
+        !m5Es8311MixerSpan(r,staging,bytes) || pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,staging,bytes) || pcmMixSpansOverlap(scratch,frames*4,staging,bytes)) return invalid
+    var index=0
+    if (tone != 0 && (!tone.valid() || tone.storage().loadU32(4) != r.loadU32(48) ||
+        !m5Es8311MixerSpan(r,tone.storage(),tone.stateBytes()) ||
+        !m5Es8311MixerSpan(r,tone.waveform(),tone.waveform().capacity()) ||
+        !tone.disjointFrom(accumulator,frames*8) ||
+        !tone.disjointFrom(scratch,frames*4) ||
+        !tone.disjointFrom(staging,bytes))) return invalid
+    while (queues == 0 && index < bank.count()) {
+        val voice=bank.channel(index)
+        if (tone != 0 && !voice.disjointFrom(tone.storage(),tone.stateBytes())) return invalid
+        if (!voice.disjointFrom(r,136) || !voice.disjointFrom(nativeBufferAt(r.loadU32(28),count*12),count*12) ||
+            !voice.disjointFrom(nativeBufferAt(r.loadU32(36),count*bytes),count*bytes) ||
+            !voice.disjointFrom(accumulator,frames*8) || !voice.disjointFrom(scratch,frames*4) || !voice.disjointFrom(staging,bytes)) return invalid
+        index=index+1
+    }
+    if (queues != 0 && (!queues.disjointFrom(r,136) ||
+        !queues.disjointFrom(nativeBufferAt(r.loadU32(28),count*12),count*12) ||
+        !queues.disjointFrom(nativeBufferAt(r.loadU32(36),count*bytes),count*bytes) ||
+        !queues.disjointFrom(accumulator,frames*8) || !queues.disjointFrom(scratch,frames*4) ||
+        !queues.disjointFrom(staging,bytes))) return invalid
+    if (!state.pending()) {
+        val rendered=if (queues != 0) queues.renderOutput(frames,accumulator,scratch,staging,stereo,masterGainQ15)
+            else if (tone == 0) bank.renderOutput(frames,accumulator,scratch,staging,stereo,masterGainQ15)
+            else bank.renderWithTone(tone,frames,accumulator,scratch,staging,stereo,masterGainQ15)
+        if (!rendered) return M5Es8311ChannelsPump(9|(cursor<<9))
+    }
+    val result=m5Es8311PlaybackWriteOwned(r,nativeBufferAt(staging.addressValue(),bytes),1,true)
+    if (result.status() == 1) return M5Es8311ChannelsPump(1|(r.loadU32(44)<<9))
+    return M5Es8311ChannelsPump(result.status()|256|(cursor<<9))
+}
+trusted fun m5Es8311PumpSourceQueuesOwned(state: M5Es8311ChannelsPump,r: NativeBuffer,queues: PcmSourceQueues,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,masterGainQ15: int,exclusive: bool): M5Es8311ChannelsPump =
+    m5Es8311PumpChannelsOwned(state,r,PcmChannels(0),accumulator,scratch,staging,masterGainQ15,exclusive,PcmTone(0),queues)

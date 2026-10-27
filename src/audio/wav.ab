@@ -1,0 +1,92 @@
+import "../esp32/sdk/raw_buffer.ab"
+
+// Caller-owned20-byte metadata and immutable source must outlive this scalar
+// view. Samples are borrowed, not copied. PCM8 is unsigned; PCM16 is signed
+// little-endian. No resampling, playback, allocation or hardware access here.
+type PcmWav = int
+fun PcmWav.valid(): bool = this != 0
+trusted fun PcmWav.samples(): NativeBuffer =
+    if (this.valid()) nativeBufferAt(nativeBufferAt(this,20).loadU32(0),
+        nativeBufferAt(this,20).loadU32(4)) else NativeBuffer(0)
+trusted fun PcmWav.sampleRate(): int =
+    if (this.valid()) nativeBufferAt(this,20).loadU32(8) else 0
+trusted fun PcmWav.channels(): int =
+    if (this.valid()) nativeBufferAt(this,20).loadU32(12) else 0
+trusted fun PcmWav.bitsPerSample(): int =
+    if (this.valid()) nativeBufferAt(this,20).loadU32(16) & 255 else 0
+trusted fun PcmWav.signed8(): bool =
+    this.valid() && (nativeBufferAt(this,20).loadU32(16) & 256) != 0
+
+// Borrow headerless PCM using the same20-byte metadata view as parsed WAV.
+// Byte capacity must contain complete frames. PCM16 is always signed LE;
+// PCM8 may be signed or unsigned. No allocation, conversion or source writes.
+// Caller keeps source and metadata alive and immutable during playback.
+trusted fun pcmRaw(source: NativeBuffer,metadata: NativeBuffer,sampleRate: int,
+    channels: int,bits: int,signedSamples: bool=true): PcmWav {
+    if (sampleRate < 1 || sampleRate > 4294967295 || (channels != 1 && channels != 2) ||
+        (bits != 8 && bits != 16) || (bits == 16 && !signedSamples) ||
+        !source.hasAddressRange(0,source.capacity()) || !metadata.hasAddressRange(0,20) ||
+        (source.capacity() & (channels*(bits >>> 3)-1)) != 0) return PcmWav(0)
+    val a=source.addressValue()
+    val b=metadata.addressValue()
+    if (source.capacity() > 0 && a < b+20 && b < a+source.capacity()) return PcmWav(0)
+    metadata.storeU32(0,a); metadata.storeU32(4,source.capacity())
+    metadata.storeU32(8,sampleRate); metadata.storeU32(12,channels)
+    metadata.storeU32(16,bits | (if (bits == 8 && signedSamples) 256 else 0))
+    PcmWav(b)
+}
+
+// RIFF/WAVE PCM format1,8/16-bit mono/stereo. Unknown chunks (with mandatory
+// odd-byte padding) are skipped within RIFF bounds. Exactly one fmt and data
+// chunk; either order is accepted. Trailing bytes outside RIFF are not audio.
+// Invalid input leaves metadata untouched, including on late parse failure.
+trusted fun pcmWav(source: NativeBuffer,metadata: NativeBuffer): PcmWav {
+    if (!source.hasAddressRange(0,12) || !metadata.hasAddressRange(0,20)) return PcmWav(0)
+    val a=source.addressValue()
+    val b=metadata.addressValue()
+    if (a < b+20 && b < a+source.capacity()) return PcmWav(0)
+    if (source.loadU32(0) != 0x46464952 || source.loadU32(8) != 0x45564157) return PcmWav(0)
+    val end=source.loadU32(4)+8
+    if (end < 12 || !source.hasAddressRange(0,end)) return PcmWav(0)
+    var offset=12
+    var formatSeen=false
+    var dataSeen=false
+    var sampleRate=0
+    var channels=0
+    var bits=0
+    var blockAlign=0
+    var dataOffset=0
+    var dataLength=0
+    while (offset < end) {
+        if (end-offset < 8) return PcmWav(0)
+        val kind=source.loadU32(offset)
+        val length=source.loadU32(offset+4)
+        val payload=offset+8
+        val padded=length+(length & 1)
+        if (padded > end-payload) return PcmWav(0)
+        if (kind == 0x20746d66) {
+            if (formatSeen || length < 16 || source.loadU16(payload) != 1) return PcmWav(0)
+            channels=source.loadU16(payload+2)
+            sampleRate=source.loadU32(payload+4)
+            blockAlign=source.loadU16(payload+12)
+            bits=source.loadU16(payload+14)
+            if ((channels != 1 && channels != 2) || (bits != 8 && bits != 16) ||
+                sampleRate == 0 || blockAlign != channels*(bits >>> 3) ||
+                source.loadU32(payload+8) != sampleRate*blockAlign) return PcmWav(0)
+            formatSeen=true
+        } else if (kind == 0x61746164) {
+            if (dataSeen) return PcmWav(0)
+            dataOffset=payload
+            dataLength=length
+            dataSeen=true
+        }
+        offset=payload+padded
+    }
+    if (!formatSeen || !dataSeen || (dataLength & (blockAlign-1)) != 0) return PcmWav(0)
+    metadata.storeU32(0,a+dataOffset)
+    metadata.storeU32(4,dataLength)
+    metadata.storeU32(8,sampleRate)
+    metadata.storeU32(12,channels)
+    metadata.storeU32(16,bits)
+    PcmWav(b)
+}

@@ -1,0 +1,87 @@
+import "../audio/microphone_process.ab"
+import "../audio/pcm_channels.ab"
+import "./microphone_profile.ab"
+import "./speaker_profile.ab"
+// Synchronous six-board record/process/replay demonstration workflow, no
+// allocation/task/ISR. Own BOTH board I2S ports, shared codec/rails/pads,
+// initialized control buses/handles, stable PLL and the parked DMA channel.
+// PaperColor uses DISTINCT mic ES7210 and speaker ES8311 handles.
+// r: zeroed136B. recorded: blocks*bytes raw storage. work:96+blocks*bytes+
+// 12*TXframesPerBlock+bytes; layout DSP0..39, WAV40..59, bank64..95,
+// processed96.., accumulator, scratch, TXstaging. All complete spans disjoint.
+// Applies board microphone gain/DC removal, os1/filter0; playback mixer unity
+// Q15 gain. No extra speaker magnification or automatic loudness calibration.
+// Status1completed,2preflight,3RXprepare,4RXstart,5record,6DSP/metadata,
+// 7TXprepare,8TXstart,9playback; subordinate code bits8..23, bit24 cleanup
+// pending. High32 committed raw capturebytes. Inspect/close retained r on
+// cleanup pending; never reset/reuse it while hardware still owns resources.
+// Caller may inspect recordings; physical correctness still needs listening.
+trusted fun m5CodecReplayDisjoint(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.hasAddressRange(0,an) && b.hasAddressRange(0,bn) && !pcmMixSpansOverlap(a,an,b,bn)
+trusted fun m5CodecRecordReplayOwned(board: M5BoardId,r: NativeBuffer,hz: int,channel: int,desc: int,count: int,
+    payload: int,bytes: int,owner: u32,mic: u32,speaker: Es8311,pm1: M5Pm1,io: M5Ioe1,
+    recorded: NativeBuffer,work: NativeBuffer,blocks: int,maxIdle: int,exclusive: bool): int {
+    val paper=board == m5BoardPaperColor
+    if (!exclusive || (board != m5BoardStickS3 && board != m5BoardStopWatch && board != m5BoardChainCaptain &&
+        board != m5BoardCardputerADV && board != m5BoardAtomVoiceS3R && !paper) ||
+        !r.hasAddressRange(0,136) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || hz < 8000 || hz > 96000 ||
+        channel < 0 || channel > 4 || owner == u32(0) || blocks < 1 || blocks > 2047 || maxIdle < 1 || maxIdle > 1000 ||
+        count < 2 || bytes < 4 || (bytes&3) != 0 || !speaker.valid() ||
+        !(if (paper) Es7210(int(mic)).valid() else Es8311(int(mic)).valid()) ||
+        (board == m5BoardStickS3 && !pm1.valid()) ||
+        ((board == m5BoardStopWatch || board == m5BoardChainCaptain) && !io.valid()) ||
+        !esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes)) return 2
+    val sp=board.speakerProfile();val mp=board.microphoneProfile()
+    val total=blocks*bytes;val txFrames=bytes/(if (sp.stereo()) 4 else 2)
+    val workBytes=96+total+txFrames*12+bytes
+    val descriptors=nativeBufferAt(desc,count*12);val ring=nativeBufferAt(payload,count*bytes)
+    if (!m5CodecReplayDisjoint(r,136,recorded,total) || !m5CodecReplayDisjoint(r,136,work,workBytes) ||
+        !m5CodecReplayDisjoint(recorded,total,work,workBytes) || !m5CodecReplayDisjoint(r,136,descriptors,count*12) ||
+        !m5CodecReplayDisjoint(r,136,ring,count*bytes) || !m5CodecReplayDisjoint(recorded,total,descriptors,count*12) ||
+        !m5CodecReplayDisjoint(recorded,total,ring,count*bytes) || !m5CodecReplayDisjoint(work,workBytes,descriptors,count*12) ||
+        !m5CodecReplayDisjoint(work,workBytes,ring,count*bytes)) return 2
+    val prepared=if (paper) paperColorCaptureBeginOwned(r,hz,channel,desc,count,payload,bytes,owner,Es7210(int(mic)),true)
+        else board.beginEs8311CaptureOwned(r,hz,channel,desc,count,payload,bytes,owner,Es8311(int(mic)),io,true)
+    if (prepared != 1) {
+        val closed=if (prepared == 0) 4 else if (paper) paperColorCaptureCloseOwned(r,1000,true) else m5Es8311CaptureCloseOwned(r,1000,true)
+        return 3|(prepared<<8)|(if (closed == 4) 0 else 1<<24)
+    }
+    val started=if (paper) paperColorCaptureStartOwned(r,1000,true) else m5Es8311CaptureStartOwned(r,1000,true)
+    if (started != 2) {
+        val closed=if (paper) paperColorCaptureCloseOwned(r,1000,true) else m5Es8311CaptureCloseOwned(r,1000,true)
+        return 4|(started<<8)|(if (closed == 4) 0 else 1<<24)
+    }
+    val rate=r.loadU32(48)
+    val captured=m5CodecRecordWindowOwned(r,recorded,blocks,maxIdle,true)
+    val prefix=captured.bytes()<<32
+    if (captured.status() != 1 || r.loadU32(4) != 4) return prefix|5|(captured.status()<<8)|(if (r.loadU32(4) == 4) 0 else 1<<24)
+    val dsp=nativeBufferAt(work.addressValue(),40);val processed=nativeBufferAt(work.addressValue()+96,total)
+    val inputStereo=mp.channel() == 2
+    if (!microphoneProcessInitialize(dsp,1,mp.gain(),0,inputStereo,false,false) ||
+        microphoneProcess(dsp,nativeBufferAt(recorded.addressValue(),total),total/4,processed,inputStereo,true) != total/2) return prefix|6
+    val wav=pcmRaw(processed,nativeBufferAt(work.addressValue()+40,20),rate,if (inputStereo) 2 else 1,16)
+    val bank=pcmChannelsAt(nativeBufferAt(work.addressValue()+64,32),1,rate)
+    if (!bank.valid() || bank.enqueue(wav,1) != 0) return prefix|6
+    val playBlocks=int((u32(wav.frames())+u32(txFrames)-u32(1))/u32(txFrames))
+    if (playBlocks < 1 || playBlocks > 4095) return prefix|6
+    // RX has closed: only now repurpose its record and DMA payload for TX.
+    var offset=0
+    while (offset < count*bytes) { ring.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0)
+    val tx=board.beginEs8311PlaybackOwned(r,hz,channel,desc,count,payload,bytes,owner,speaker,pm1,io,true)
+    if (tx != 1 || r.loadU32(48) != rate) {
+        val closed=if (tx == 0) 4 else m5Es8311PlaybackCloseOwned(r,1000,true)
+        return prefix|7|(tx<<8)|(if (closed == 4) 0 else 1<<24)
+    }
+    val txStart=m5Es8311PlaybackStartOwned(r,1000,true)
+    if (txStart != 2) {
+        val closed=m5Es8311PlaybackCloseOwned(r,1000,true)
+        return prefix|8|(txStart<<8)|(if (closed == 4) 0 else 1<<24)
+    }
+    val acc=nativeBufferAt(work.addressValue()+96+total,txFrames*8)
+    val scratch=nativeBufferAt(acc.addressValue()+txFrames*8,txFrames*4)
+    val staging=nativeBufferAt(scratch.addressValue()+txFrames*4,bytes)
+    val played=m5Es8311PlaybackChannelsWindowOwned(r,bank,playBlocks,acc,scratch,staging,maxIdle,32768,true)
+    if (played.status() != 1 || r.loadU32(4) != 4) return prefix|9|(played.status()<<8)|(if (r.loadU32(4) == 4) 0 else 1<<24)
+    return prefix|1
+}

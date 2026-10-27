@@ -1,0 +1,64 @@
+import "./software_transfer.ab"
+import "../peripheral_gate.ab"
+import "./transaction_result.ab"
+import "./buffer_gate.ab"
+
+// Low32 bits receive value; status above it:1 complete,2 busy,3 invalid,
+// 4 faulted,5 ownership failure,6 transfer failure. Completion is not a device ACK.
+
+@inline
+fun softwareSpiSelectionValid(clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    setupMicroseconds: int, holdMicroseconds: int): bool =
+    chipSelect.outputCapable() && chipSelect != clock && chipSelect != mosi && chipSelect != miso &&
+    setupMicroseconds >= 0 && setupMicroseconds <= 65535 && holdMicroseconds >= 0 && holdMicroseconds <= 65535
+
+// All clients of the physical bus must use the SAME gate. Pins are already
+// configured and exclusively assigned, all CS lines inactive before admission;
+// no allocation or implicit pad setup.
+// Nonblocking admission, but the selected word transfer is synchronous.
+// Normal completion releases CS before ownership. Invalid requests never
+// assert CS. This does not provide cleanup after a CPU fault or reset.
+trusted fun softwareSpiTransactionWord(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin, output: u32,
+    bitCount: int = 8, mode: int = 0, halfPeriodMicroseconds: int = 1,
+    activeHigh: bool = false, setupMicroseconds: int = 0, holdMicroseconds: int = 0): SpiTransactionResult {
+    if (!softwareSpiConfigurationValid(clock, mosi, miso, mode, halfPeriodMicroseconds) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, setupMicroseconds, holdMicroseconds) ||
+        bitCount < 1 || bitCount > 32) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    clock.write((mode & 2) != 0)
+    chipSelect.write(activeHigh)
+    if (setupMicroseconds > 0) peripheralDelayMicroseconds(setupMicroseconds)
+    val received = softwareSpiExchangeWordOwned(clock, mosi, miso, output, bitCount, mode, halfPeriodMicroseconds)
+    if (holdMicroseconds > 0) peripheralDelayMicroseconds(holdMicroseconds)
+    chipSelect.write(!activeHigh)
+    if (!gate.finish(owner, true)) return SpiTransactionResult(5 << 32)
+    SpiTransactionResult((1 << 32) | int(received))
+}
+
+// Buffer form with identical admission/CS ownership. Empty transfer still
+// respects the gate but emits no clock/CS pulse. RX bytes live in caller input.
+trusted fun softwareSpiTransaction(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    output: NativeBuffer, written: int, input: NativeBuffer, read: int,
+    mode: int = 0, halfPeriodMicroseconds: int = 1, fill: int = 255,
+    activeHigh: bool = false, setupMicroseconds: int = 0, holdMicroseconds: int = 0): SpiTransactionResult {
+    if (!gate.bufferDisjoint(output, written) || !gate.bufferDisjoint(input, read) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, setupMicroseconds, holdMicroseconds) ||
+        !softwareSpiTransferValid(clock, mosi, miso, output, written, input, read, mode, halfPeriodMicroseconds, fill))
+        return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    var completed = true
+    if (written != 0 || read != 0) {
+        clock.write((mode & 2) != 0)
+        chipSelect.write(activeHigh)
+        if (setupMicroseconds > 0) peripheralDelayMicroseconds(setupMicroseconds)
+        completed = softwareSpiTransferOwned(clock, mosi, miso, output, written, input, read, mode, halfPeriodMicroseconds, fill)
+        if (holdMicroseconds > 0) peripheralDelayMicroseconds(holdMicroseconds)
+        chipSelect.write(!activeHigh)
+    }
+    if (!gate.finish(owner, completed)) return SpiTransactionResult(5 << 32)
+    SpiTransactionResult((if (completed) 1 else 6) << 32)
+}

@@ -1,0 +1,146 @@
+import "./types_device.ab"
+import "./bmm150_logic.ab"
+import "./bmi270_logic.ab"
+import "./bmi270_config.ab"
+import "./bmi270_aux_wait.ab"
+import "./bmi270_frame.ab"
+
+type Bmi270 = int
+
+trusted fun bmi270(bus: I2cBus): Bmi270 = Bmi270(
+    if (bus.valid()) bus.device(105, 400000) & 4294967295 else 0
+)
+
+fun Bmi270.valid(): bool = this > 0 && this <= 4294967295
+fun Bmi270.device(): I2cDevice = I2cDevice(if (this.valid()) this | 0 else 0)
+fun Bmi270.accelerationScale(): f64 = 8.0 / 32768.0
+fun Bmi270.gyroscopeScale(): f64 = 2000.0 / 32768.0
+fun Bmi270.magneticFieldScale(): f64 = 49120.0 / 32760.0
+fun Bmi270.temperatureScale(): f64 = 1.0 / 512.0
+fun Bmi270.temperatureOffset(): f64 = 23.0
+
+trusted fun Bmi270.whoAmI(): int =
+    if (this.valid()) this.device().readRegister8(0) else 0
+
+trusted fun Bmi270.uploadConfiguration(): bool {
+    if (!this.valid()) return false
+    val addressCellAddress = nativeStackAllocate(2)
+    val addressCell = nativeBufferAt(addressCellAddress, 2)
+    addressCell.store(0, 0)
+    addressCell.store(1, 0)
+    val configuration = nativeBufferAt(
+        bmi270ConfigurationAddress,
+        8192
+    )
+    this.device().writeRegister(91, addressCell, 2) &&
+        this.device().writeRegister(94, configuration, 8192)
+}
+
+trusted fun Bmi270.auxiliarySetup(address: int): bool {
+    if (!this.valid()) return false
+    val device = this.device()
+    device.writeRegister8(107, 32) &&
+        device.writeRegister8(124, 0) &&
+        device.writeRegister8(125, 14) &&
+        device.writeRegister8(76, 128) &&
+        device.writeRegister8(75, address << 1)
+}
+
+trusted fun Bmi270.auxiliaryWriteRegister8(
+    register: int,
+    value: int
+): bool {
+    if (!this.valid()) return false
+    val device = this.device()
+    if (!device.writeRegister8(79, value) ||
+        !device.writeRegister8(78, register)) return false
+    device.waitBmi270AuxiliaryReady()
+}
+
+trusted fun Bmi270.auxiliaryReadRegister8(register: int): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val device = this.device()
+    if (!device.writeRegister8(76, 128) ||
+        !device.writeRegister8(77, register)) return I2cByteResult(0)
+    if (!device.waitBmi270AuxiliaryReady()) I2cByteResult(0)
+    else device.readRegister8Checked(4)
+}
+
+trusted fun Bmi270.begin(): int {
+    if (!this.valid()) return imuSpecNone
+    // M5Unified intentionally performs one warm-up identity transaction.
+    val warmIdentity = this.whoAmI()
+    if (!bmi270IdentityValid(this.whoAmI())) return imuSpecNone
+    val device = this.device()
+    if (!device.writeRegister8(126, 182)) return imuSpecNone
+    var retries = 16
+    var resetReady=false
+    while (retries > 0 && !resetReady) {
+        imuDelay(1)
+        val status=device.readRegister8Checked(124)
+        if (!status.valid()) return imuSpecNone
+        resetReady=status.value() != 0
+        retries = retries - 1
+    }
+    if (!resetReady || !device.writeRegister8(124, 0)) return imuSpecNone
+    imuDelay(1)
+    if (!this.uploadConfiguration() || !device.writeRegister8(89, 1) ||
+        !device.writeRegister8(88, 255)) return imuSpecNone
+    retries = 16
+    var initialized=false
+    while (retries > 0 && !initialized) {
+        imuDelay(1)
+        val status=device.readRegister8Checked(33)
+        if (!status.valid()) return imuSpecNone
+        initialized=status.value() != 0
+        retries = retries - 1
+    }
+    if (!initialized || !this.auxiliarySetup(16)) return imuSpecNone
+
+    if (!this.auxiliaryWriteRegister8(75, 131)) return imuSpecNone
+    if (!this.auxiliaryReadRegister8(64).valid()) return imuSpecNone
+    val magneticIdentity = this.auxiliaryReadRegister8(64)
+    if (!magneticIdentity.valid()) return imuSpecNone
+    if (magneticIdentity.value() != 50) {
+        return imuSpecAcceleration | imuSpecGyroscope
+    }
+    if (!this.auxiliaryWriteRegister8(76, 56) ||
+        !device.writeRegister8(76, 79) ||
+        !device.writeRegister8(77, 66) ||
+        !device.writeRegister8(125, 15)) {
+        return imuSpecNone
+    }
+    imuSpecAcceleration | imuSpecGyroscope | imuSpecMagneticField
+}
+
+trusted fun Bmi270.close(): bool =
+    this.valid() && this.device().close()
+
+trusted fun Bmi270.dataReady(): int =
+    if (this.valid()) this.device().readRegister8(29) & 224 else 0
+
+trusted fun Bmi270.readFrame(destination: NativeBuffer): int =
+    if (this.valid()) this.device().readBmi270Frame(destination) else -1
+trusted fun Bmi270.accelerationFromFrame(frame: NativeBuffer): ImuAxes =
+    if (this.valid()) bmi270FrameAxes(frame,0) else invalidImuAxes()
+trusted fun Bmi270.gyroscopeFromFrame(frame: NativeBuffer): ImuAxes =
+    if (this.valid()) bmi270FrameAxes(frame,1) else invalidImuAxes()
+trusted fun Bmi270.magneticFieldFromFrame(frame: NativeBuffer): ImuAxes =
+    if (this.valid()) bmi270FrameAxes(frame,2) else invalidImuAxes()
+
+trusted fun Bmi270.readAccelerationRaw(): ImuAxes =
+    if (this.valid()) this.device().readImuAxesLittleEndian(12)
+    else invalidImuAxes()
+
+trusted fun Bmi270.readGyroscopeRaw(): ImuAxes =
+    if (this.valid()) this.device().readImuAxesLittleEndian(18)
+    else invalidImuAxes()
+
+trusted fun Bmi270.readMagneticFieldRaw(): ImuAxes =
+    if (this.valid()) bmm150DecodeMagneticField(
+        this.device().readImuAxesLittleEndian(4)
+    ) else invalidImuAxes()
+
+trusted fun Bmi270.readTemperatureRaw(): ImuSample =
+    if (this.valid()) this.device().readImuSampleLittleEndian(34)
+    else invalidImuSample()

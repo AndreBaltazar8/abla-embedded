@@ -1,0 +1,50 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Caller-owned40B teardown record. Transfer existing DSI/DMA ownership into
+// fresh storage; never retain another independently closable owner copy.
+// Whole DMA controller must belong to this display (other channels quiesced).
+// 0magic,4phase,8/12last stage result,16/20DSI,24/28DMA,32channel,36reserved.
+// Caller serializes teardown, holds cache/RCC leases and keeps gate/event-source
+// storage alive until callbacks are detached/joined. Does not free buffers,
+// release source PLL/reference/LDO/panel supplies or detach an IRQ itself.
+type Tab5DisplayClose = int
+fun tab5DisplayCloseAt(storage: NativeBuffer): Tab5DisplayClose =
+    if (storage.hasAddressRange(0,40) && (storage.addressValue()&3) == 0) Tab5DisplayClose(storage|0) else Tab5DisplayClose(0)
+fun Tab5DisplayClose.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun Tab5DisplayClose.valid(): bool = this.buffer().hasAddressRange(0,40) &&
+    (this.buffer().addressValue()&3) == 0 && this.buffer().loadU32(0) == 0x5444434c
+trusted fun Tab5DisplayClose.loadWide(offset: int): int = this.buffer().loadU32(offset)|(this.buffer().loadU32(offset+4)<<32)
+trusted fun Tab5DisplayClose.storeWide(offset: int,value: int): void {
+    this.buffer().storeU32(offset,value&4294967295); this.buffer().storeU32(offset+4,value>>>32); return
+}
+// Fresh memory only; all child owners are transferred, not opened here.
+trusted fun Tab5DisplayClose.initialize(dsi: int,dma: int,channel: int): bool {
+    if (!this.buffer().hasAddressRange(0,40) || (this.buffer().addressValue()&3) != 0 || channel < 0 || channel > 3) return false
+    this.buffer().storeU32(0,0x5444434c); this.buffer().storeU32(4,1)
+    this.storeWide(8,0); this.storeWide(16,dsi); this.storeWide(24,dma)
+    this.buffer().storeU32(32,channel); this.buffer().storeU32(36,0); return true
+}
+// 1closed,2invalid,3service/DMA drain blocked,4DSI close blocked,5DMA close
+// blocked. Retry continues at the retained phase, never reads a gated block.
+trusted fun Tab5DisplayClose.closeOwned(gate: int,polls: int): int {
+    if (!this.valid() || polls < 1 || polls > 1000000 || gate <= 0 || gate > 4294967292 || (gate&3) != 0 ||
+        (gate < this.buffer().addressValue()+40 && gate+4 > this.buffer().addressValue())) return 2
+    val phase=this.buffer().loadU32(4)
+    if (phase > 3 || this.buffer().loadU32(32) > 3) return 2
+    if (phase == 0) return 1
+    if (phase == 1) {
+        val result=tab5CloseService(gate,this.buffer().loadU32(32),polls)
+        this.storeWide(8,result)
+        if ((result&255) != 1 || (result&32768) == 0) return 3
+        this.buffer().storeU32(4,2)
+    }
+    if (this.buffer().loadU32(4) == 2) {
+        val dsi=tab5CloseDsi(this.loadWide(16),polls)
+        this.storeWide(16,dsi); this.storeWide(8,dsi)
+        if (dsi != 0) return 4
+        this.buffer().storeU32(4,3)
+    }
+    val dma=tab5CloseDma(this.loadWide(24),polls)
+    this.storeWide(24,dma); this.storeWide(8,dma)
+    if (dma != 0) return 5
+    this.buffer().storeU32(4,0); return 1
+}

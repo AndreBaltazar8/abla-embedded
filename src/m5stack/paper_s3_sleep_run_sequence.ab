@@ -1,0 +1,48 @@
+import "../esp32/power/sleep_gpio_record_s3_sequence.ab"
+// Prepared PaperS3 light-sleep lifecycle. Caller has configured/released GT911
+// IRQ48 before quiescing I2C, prepared clocks and armed CPU/cache retention.
+// All records, stack and reachable recovery code must remain in retained
+// internal memory. Caller owns peers/interrupts/DMA/powered input through done.
+// Report40: magic,state,entry,result,resume64,finalPinReleased,reserved,sleep,wake.
+// States1new,2resume,3GPIOcleanup,4done. Results1wake,2invalid,3refused/reject,
+// 4resume incomplete,5GPIO cleanup incomplete. Never re-enter on retries.
+fun paperS3SleepReportDisjoint(sleep: NativeBuffer,wake: NativeBuffer,report: NativeBuffer): bool =
+    esp32S3SleepGpioRecordsDisjoint(sleep,wake) && report.hasAddressRange(0,40) && (report.addressValue()&3) == 0 &&
+    (report.addressValue()+40 <= sleep.addressValue() || sleep.addressValue()+128 <= report.addressValue()) &&
+    (report.addressValue()+40 <= wake.addressValue() || wake.addressValue()+32 <= report.addressValue())
+@section(".iram1.abla.paperS3SleepRun")
+@noinline
+trusted fun paperS3SleepRunPreparedOwned(sleep: NativeBuffer,wake: NativeBuffer,report: NativeBuffer,flags: int,period: int,duration: int,reject: int,polls: int,exclusive: bool): int {
+    if (!exclusive || polls <= 0 || polls > 0x7fffffff || !paperS3SleepReportDisjoint(sleep,wake,report)) return 2
+    if (report.loadU32(0) == 0) {
+        if (duration < 0 || !esp32S3SleepGpioReadyOwned(sleep,wake) ||
+            S3GpioWake(wake.loadU32(16)).pin() != 48 || (s3GpioWakeRead(0x60004134)&0x780) != 0x600 ||
+            sleep.loadU32(0) != 0x53504c50 || sleep.loadU32(4) != 9 || sleep.loadU32(104) != 1) return 2
+        var offset=4
+        while (offset < 40) { report.storeU32(offset,0);offset=offset+4 }
+        report.storeU32(32,sleep.addressValue());report.storeU32(36,wake.addressValue())
+        report.storeU32(0,0x50335352);report.storeU32(4,1)
+    }
+    if (report.loadU32(0) != 0x50335352 || report.loadU32(32) != sleep.addressValue() || report.loadU32(36) != wake.addressValue()) return 2
+    var state=report.loadU32(4)
+    if (state == 4) return report.loadU32(12)
+    if (state < 1 || state > 3) return 2
+    if (state == 1) {
+        // MMIO only: do not attempt I2C consumption after clock preparation.
+        report.storeU32(24,if (paperS3SleepFinalPinReleased()) 1 else 0)
+        // An asserted pin is not forced success: preserve actual entry outcome.
+        report.storeU32(4,2)
+        val entry=esp32S3SleepGpioEnterOwned(sleep,wake,flags,period,duration,reject)
+        report.storeU32(8,entry)
+        state=2
+    }
+    if (state == 2) {
+        val progress=esp32S3SleepRetainedRecordResumeOwned(sleep,polls)
+        report.storeU32(16,progress|0);report.storeU32(20,(progress|0)>>>32)
+        if (!progress.valid() || !progress.complete()) { report.storeU32(12,4);return 4 }
+        report.storeU32(4,3)
+    }
+    if (!esp32S3SleepGpioCleanupOwned(sleep,wake)) { report.storeU32(12,5);return 5 }
+    val result=if (report.loadU32(8) == 0) 1 else 3
+    report.storeU32(12,result);report.storeU32(4,4);return result
+}

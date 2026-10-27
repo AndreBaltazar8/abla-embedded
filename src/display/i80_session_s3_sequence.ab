@@ -1,0 +1,85 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Polling, finite data-only i80 session. Record160: header64 + pin owner96.
+// Header magic,state,channel,width,polls,descriptor,descriptorCapacity,payload,
+// payloadCapacity,activeBytes,terminal,primary,reserved,DMAowned,reserved8.
+// States1ready2running3fault4closing5closed6opening.
+// Results1ready/complete2running3invalid4fault5closed6cleanup pending.
+// Caller owns LCD, channel, buffers, pads and source PLL160M for entire lifetime;
+// no ISR event acknowledgements/rearm or payload writes while running/faulted.
+// Close is an explicit ABORT if running: a truncated scanline is not success.
+// Clocks remain enabled on close because camera/other DMA users may share them.
+fun s3I80SessionValid(r: NativeBuffer): bool = r.hasAddressRange(0,160) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x49385353
+fun s3I80SessionCount(bytes: int): int = if (bytes < 4 || bytes > 491520 || (bytes&3) != 0) 0 else (bytes+4091)/4092
+trusted fun esp32S3I80SessionCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !s3I80SessionValid(r)) return 3
+    if (r.loadU32(4) == 5) return 5
+    if (r.loadU32(4) < 1 || r.loadU32(4) > 6) return 3
+    r.storeU32(4,4)
+    if (r.loadU32(52) == 1) {
+        if (s3I80SessionAbort(r.loadU32(8),r.loadU32(16)) != 1) return 6
+        r.storeU32(52,0)
+    }
+    val pins=nativeBufferAt(r.addressValue()+64,96)
+    if (pins.loadU32(0) != 0 && !s3I80SessionReady(r.loadU32(8))) return 6
+    if (pins.loadU32(0) != 0 && s3I80SessionPinsClose(pins) != 2) return 6
+    r.storeU32(4,5);return 5
+}
+trusted fun esp32S3I80SessionOpenOwned(r: NativeBuffer,pinConfig: NativeBuffer,descriptors: NativeBuffer,payload: NativeBuffer,width: int,channel: int,groupDivider: int,pixelDivider: int,owner: int,polls: int,exclusive: bool): int {
+    val count=s3I80SessionCount(payload.capacity())
+    if (!exclusive || !r.hasAddressRange(0,160) || !pinConfig.hasAddressRange(0,76) || ((r.addressValue()|pinConfig.addressValue())&3) != 0 || r.loadU32(0) != 0 ||
+        (width != 8 && width != 16) || channel < 0 || channel > 4 || groupDivider < 2 || groupDivider > 256 || pixelDivider < 1 || pixelDivider > 64 ||
+        owner <= 0 || owner > 0xFFFFFFFF || polls < 1 || polls > 1000000 || count == 0 || !descriptors.hasAddressRange(0,count*12) ||
+        !s3I80SessionDmaStorage(descriptors.addressValue(),payload.addressValue(),payload.capacity())) return 3
+    var index=0
+    while (index < 4) {
+        val a=if (index == 0) nativeBufferAt(r.addressValue(),160) else if (index == 1) nativeBufferAt(pinConfig.addressValue(),76) else if (index == 2) descriptors else payload
+        var earlier=0
+        while (earlier < index) {
+            val b=if (earlier == 0) nativeBufferAt(r.addressValue(),160) else if (earlier == 1) nativeBufferAt(pinConfig.addressValue(),76) else descriptors
+            if (a.addressValue() < b.addressValue()+b.capacity() && b.addressValue() < a.addressValue()+a.capacity()) return 3
+            earlier=earlier+1
+        }
+        index=index+1
+    }
+    index=4
+    while (index < 160) { r.storeU32(index,0);index=index+4 }
+    r.storeU32(0,0x49385353);r.storeU32(4,6);r.storeU32(8,channel);r.storeU32(12,width);r.storeU32(16,polls)
+    r.storeU32(20,descriptors.addressValue());r.storeU32(24,descriptors.capacity());r.storeU32(28,payload.addressValue());r.storeU32(32,payload.capacity())
+    var failure=1
+    if (s3I80SessionClock(owner)) {
+        failure=2
+        if (s3I80SessionReady(channel)) {
+            failure=3
+            if (s3I80SessionConfigure(width,groupDivider,pixelDivider) == 1) {
+                failure=4
+                if (s3I80SessionPinsOpen(nativeBufferAt(r.addressValue()+64,96),pinConfig,width) == 1) { r.storeU32(4,1);return 1 }
+            }
+        }
+    }
+    r.storeU32(44,failure);r.storeU32(4,3);return 4
+}
+trusted fun esp32S3I80SessionSendOwned(r: NativeBuffer,bytes: int,exclusive: bool): int {
+    if (!exclusive || !s3I80SessionValid(r) || r.loadU32(4) != 1) return 3
+    val count=s3I80SessionCount(bytes)
+    if (count == 0 || bytes > r.loadU32(32) || count*12 > r.loadU32(24)) return 3
+    if (!s3I80SessionReady(r.loadU32(8))) { r.storeU32(52,1);r.storeU32(44,5);r.storeU32(4,3);return 4 }
+    if (s3I80SessionPhases() != 1 || s3I80SessionChain(r.loadU32(20),r.loadU32(28),bytes) != count) {
+        r.storeU32(44,6);r.storeU32(4,3);return 4
+    }
+    r.storeU32(36,bytes);r.storeU32(40,r.loadU32(20)+(count-1)*12)
+    // Mark ownership BEFORE start: no failure can accidentally free buffers.
+    r.storeU32(52,1);r.storeU32(4,2)
+    val result=s3I80SessionStart(r.loadU32(8),r.loadU32(20),r.loadU32(16))
+    if (result != 1) { r.storeU32(44,256+result);r.storeU32(4,3);return 4 }
+    return 2
+}
+trusted fun esp32S3I80SessionPollOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !s3I80SessionValid(r)) return 3
+    if (r.loadU32(4) == 1) return 1
+    if (r.loadU32(4) != 2) return 3
+    val result=s3I80SessionPoll(r.loadU32(8),r.loadU32(40))
+    if (result == 0) return 2
+    if (result != 1) { r.storeU32(44,512+result);r.storeU32(4,3);return 4 }
+    r.storeU32(52,0);r.storeU32(4,1);return 1
+}

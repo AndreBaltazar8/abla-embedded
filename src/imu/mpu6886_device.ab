@@ -1,0 +1,151 @@
+import "./types_device.ab"
+import "./mpu6886_logic.ab"
+import "./frame.ab"
+
+type Mpu6886 = int
+
+trusted fun mpu6886(bus: I2cBus): Mpu6886 = Mpu6886(
+    if (bus.valid()) bus.device(104, 400000) & 4294967295 else 0
+)
+
+fun Mpu6886.valid(): bool = this > 0 && this <= 4294967295
+fun Mpu6886.device(): I2cDevice = I2cDevice(if (this.valid()) this | 0 else 0)
+fun Mpu6886.accelerationScale(): f64 = 8.0 / 32768.0
+fun Mpu6886.gyroscopeScale(): f64 = 2000.0 / 32768.0
+fun Mpu6886.temperatureScale(): f64 = 1.0 / 326.8
+fun Mpu6886.temperatureOffset(): f64 = 25.0
+
+trusted fun Mpu6886.whoAmI(): int =
+    if (this.valid()) this.device().readRegister8(117) else 0
+
+trusted fun Mpu6886.writeRegister8Verified(
+    register: int,
+    value: int
+): bool {
+    if (!this.valid()) return false
+    val device = this.device()
+    var retries = 16
+    var matched = false
+    while (!matched && retries > 0) {
+        if (!device.writeRegister8(register, value)) return false
+        val readback = device.readRegister8Checked(register)
+        if (!readback.valid()) return false
+        matched = readback.value() == value
+        retries = retries - 1
+    }
+    matched
+}
+
+trusted fun Mpu6886.begin(): int {
+    if (!this.valid() || !mpu6886IdentityValid(this.whoAmI())) {
+        return imuSpecNone
+    }
+    val device = this.device()
+    if (!device.writeRegister8(107, 128)) return imuSpecNone
+    if (!this.writeRegister8Verified(107, 1)) return imuSpecNone
+    if (!this.writeRegister8Verified(28, 16)) return imuSpecNone
+    if (!this.writeRegister8Verified(27, 24)) return imuSpecNone
+    if (!this.writeRegister8Verified(26, 1)) return imuSpecNone
+    if (!this.writeRegister8Verified(25, 3)) return imuSpecNone
+    if (!this.writeRegister8Verified(55, 192)) return imuSpecNone
+    if (!this.writeRegister8Verified(56, 0)) return imuSpecNone
+    if (!this.writeRegister8Verified(29, 0)) return imuSpecNone
+    if (!this.writeRegister8Verified(106, 0)) return imuSpecNone
+    if (!this.writeRegister8Verified(35, 0)) return imuSpecNone
+    // M5Unified reapplies both full-scale settings after the verified table.
+    if (!device.writeRegister8(27, 24)) return imuSpecNone
+    imuDelay(10)
+    if (!device.writeRegister8(28, 16)) return imuSpecNone
+    imuDelay(10)
+    imuSpecAcceleration | imuSpecGyroscope
+}
+
+trusted fun Mpu6886.close(): bool =
+    this.valid() && this.device().close()
+
+// Sample divider0..255 gives1000/(divider+1)Hz. Matches M5Unified's
+// gyro+DLPF+accel+temperature14-byte FIFO layout and six10-tick waits.
+// Call with exclusive sensor ownership. A failure may leave partial hardware
+// configuration; it never reports enabled or silently skips a failed access.
+trusted fun Mpu6886.enableFifo(divider: int = 0): bool {
+    if (!this.valid() || divider < 0 || divider > 255) return false
+    val device = this.device()
+    val gyro = device.readRegister8Checked(27)
+    if (!gyro.valid() || !device.writeRegister8(27, gyro.value() & 28)) return false
+    imuDelay(10)
+    if (!device.writeRegister8(25, divider)) return false
+    imuDelay(10)
+    val config = device.readRegister8Checked(26)
+    if (!config.valid() || !device.writeRegister8(26, (config.value() | 1) & 191)) return false
+    imuDelay(10)
+    if (!device.writeRegister8(35, 248)) return false
+    imuDelay(10)
+    val interrupt = device.readRegister8Checked(56)
+    if (!interrupt.valid() || !device.writeRegister8(56, interrupt.value() | 16)) return false
+    imuDelay(10)
+    if (!device.writeRegister8(106, 68)) return false
+    imuDelay(10)
+    true
+}
+
+trusted fun Mpu6886.fifoByteCount(): I2cWordResult =
+    if (this.valid()) this.device().readRegister16BigEndianChecked(114) else I2cWordResult(0)
+
+// Explicit FIFO read, independent of a hidden mutable mode flag. Destination
+// receives accelerationXYZ, temperature, gyroXYZ as seven big-endian i16s.
+// Incomplete frames are left queued; false does not promise unchanged output.
+trusted fun Mpu6886.readFifoFrame(destination: NativeBuffer): bool {
+    if (!this.valid() || !destination.hasAddressRange(0, 14)) return false
+    val count = this.fifoByteCount()
+    if (!count.valid() || count.value() < 14) return false
+    if (!this.device().readRegister(116, destination, 14)) return false
+    // Preserve the upstream empty/invalid FIFO sentinel check.
+    !(destination.load(0) == 127 && destination.load(1) == 127)
+}
+
+trusted fun Mpu6886.sleep(): bool =
+    this.valid() && this.device().writeRegister8(107, 64)
+
+trusted fun Mpu6886.dataReady(): bool =
+    this.valid() && (this.device().readRegister8(58) & 1) != 0
+
+// Non-FIFO burst:3=accel+gyro,0=not ready,-1=arguments,-2=transport.
+// Caller retains14-byte storage; only decode a successful frame.
+trusted fun Mpu6886.readFrame(destination: NativeBuffer): int =
+    if (this.valid()) this.device().readImuFrame14(58,1,59,destination) else -1
+trusted fun Mpu6886.frameAcceleration(frame: NativeBuffer): ImuAxes =
+    if (this.valid()) imuFrameAxes(frame,0,false) else invalidImuAxes()
+trusted fun Mpu6886.frameGyroscope(frame: NativeBuffer): ImuAxes =
+    if (this.valid()) imuFrameAxes(frame,8,false) else invalidImuAxes()
+trusted fun Mpu6886.frameTemperature(frame: NativeBuffer): ImuSample =
+    if (this.valid()) imuFrameSample(frame,6,false) else invalidImuSample()
+
+trusted fun Mpu6886.readAccelerationRaw(): ImuAxes =
+    if (this.valid()) this.device().readImuAxesBigEndian(59)
+    else invalidImuAxes()
+
+trusted fun Mpu6886.readGyroscopeRaw(): ImuAxes =
+    if (this.valid()) this.device().readImuAxesBigEndian(67)
+    else invalidImuAxes()
+
+trusted fun Mpu6886.readTemperatureRaw(): ImuSample =
+    if (this.valid()) this.device().readImuSampleBigEndian(65)
+    else invalidImuSample()
+
+trusted fun Mpu6886.setInterruptActiveHigh(activeHigh: bool): bool =
+    this.valid() && this.device().updateRegister8(
+        55, 128, if (activeHigh) 0 else 128
+    )
+
+trusted fun Mpu6886.setGyroscopeOffset(x: int, y: int, z: int): bool {
+    if (!this.valid()) return false
+    val address = nativeStackAllocate(6)
+    val bytes = nativeBufferAt(address, 6)
+    bytes.store(0, x >>> 8)
+    bytes.store(1, x)
+    bytes.store(2, y >>> 8)
+    bytes.store(3, y)
+    bytes.store(4, z >>> 8)
+    bytes.store(5, z)
+    this.device().writeRegister(19, bytes, 6)
+}

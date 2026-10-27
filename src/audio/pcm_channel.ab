@@ -1,0 +1,126 @@
+import "./wav_resample.ab"
+import "./pcm16_mix.ab"
+
+// One current clip plus one queued clip,32 caller-owned bytes. Serialized
+// owner only: not an ISR/thread-safe publication queue. Borrowed clips and
+// metadata remain immutable until consumed or stopped. Repeat0 is endless.
+// Render advances once into caller staging; DMA retries must reuse staging.
+type PcmChannel = int
+fun PcmChannel.storage(): NativeBuffer = nativeBufferAt(this,32)
+trusted fun pcmChannelAt(storage: NativeBuffer,rate: int): PcmChannel {
+    if (!storage.hasAddressRange(0,32) || rate < 8000 || rate > 96000) return PcmChannel(0)
+    var i=0
+    while (i < 32) { storage.storeU32(i,0); i=i+4 }
+    storage.storeU32(0,rate); storage.storeU32(4,32768)
+    storage.storeU32(28,0x50434d43)
+    PcmChannel(storage.addressValue())
+}
+trusted fun PcmChannel.valid(): bool {
+    val s=this.storage()
+    if (!s.hasAddressRange(0,32) || s.loadU32(28) != 0x50434d43 ||
+        s.loadU32(0) < 8000 || s.loadU32(0) > 96000 || s.loadU32(4) > 32768) return false
+    val current=PcmWav(s.loadU32(8))
+    val pending=PcmWav(s.loadU32(20))
+    if (current == PcmWav(0)) return pending == PcmWav(0) && s.loadU32(16) == 0
+    var slot=8
+    while (slot <= 20) {
+        val wav=PcmWav(s.loadU32(slot))
+        if (wav != PcmWav(0)) {
+            val frames=wav.resampledFrames(s.loadU32(0))
+            if (frames < 1 || frames > 2147483647 ||
+                (slot == 8 && s.loadU32(16) >= frames) ||
+                pcmMixSpansOverlap(s,32,nativeBufferAt(wav,20),20) ||
+                pcmMixSpansOverlap(s,32,wav.samples(),wav.samples().capacity())) return false
+        }
+        slot=slot+12
+    }
+    pending == PcmWav(0) || s.loadU32(12) != 0
+}
+trusted fun PcmChannel.isPlaying(): int {
+    if (!this.valid()) return 0
+    val s=this.storage()
+    (if (s.loadU32(8) != 0) 1 else 0)+(if (s.loadU32(20) != 0) 1 else 0)
+}
+trusted fun PcmChannel.setGain(gainQ15: int): bool {
+    if (!this.valid() || gainQ15 < 0 || gainQ15 > 32768) return false
+    this.storage().storeU32(4,gainQ15)
+    true
+}
+trusted fun PcmChannel.stop(): bool {
+    if (!this.valid()) return false
+    val s=this.storage()
+    s.storeU32(8,0); s.storeU32(12,0); s.storeU32(16,0)
+    s.storeU32(20,0); s.storeU32(24,0)
+    true
+}
+trusted fun PcmChannel.enqueue(wav: PcmWav,repeats: int=1,replace: bool=false): bool {
+    if (!this.valid() || repeats < 0 || repeats > 4294967295) return false
+    val s=this.storage()
+    val frames=wav.resampledFrames(s.loadU32(0))
+    if (frames < 1 || frames > 2147483647 ||
+        pcmMixSpansOverlap(s,32,nativeBufferAt(wav,20),20) ||
+        pcmMixSpansOverlap(s,32,wav.samples(),wav.samples().capacity())) return false
+    if (replace || s.loadU32(8) == 0) {
+        s.storeU32(8,wav); s.storeU32(12,repeats); s.storeU32(16,0)
+        s.storeU32(20,0); s.storeU32(24,0)
+    } else {
+        if (s.loadU32(20) != 0 || s.loadU32(12) == 0) return false
+        s.storeU32(20,wav); s.storeU32(24,repeats)
+    }
+    true
+}
+
+trusted fun PcmChannel.disjointFrom(output: NativeBuffer,bytes: int): bool {
+    if (!this.valid() || !output.hasAddressRange(0,bytes) ||
+        pcmMixSpansOverlap(this.storage(),32,output,bytes)) return false
+    val s=this.storage()
+    var slot=8
+    while (slot <= 20) {
+        val wav=PcmWav(s.loadU32(slot))
+        if (wav != PcmWav(0) && (pcmMixSpansOverlap(nativeBufferAt(wav,20),20,output,bytes) ||
+            pcmMixSpansOverlap(wav.samples(),wav.samples().capacity(),output,bytes))) return false
+        slot=slot+12
+    }
+    true
+}
+
+// Invalid spans leave output and cursor untouched. Exhaustion pads silence.
+trusted fun PcmChannel.render(frames: int,output: NativeBuffer): bool {
+    if (frames < 0 || frames > 268435455 || !this.disjointFrom(output,frames*4)) return false
+    val s=this.storage()
+    var wav=PcmWav(s.loadU32(8))
+    var repeats=s.loadU32(12)
+    var cursor=s.loadU32(16)
+    var pending=PcmWav(s.loadU32(20))
+    var pendingRepeats=s.loadU32(24)
+    var position=0
+    while (position < frames) {
+        if (wav == PcmWav(0)) { output.storeU32(position*4,0); position=position+1 }
+        else {
+            val length=wav.resampledFrames(s.loadU32(0))
+            val count=if (length-cursor < frames-position) length-cursor else frames-position
+            val destination=nativeBufferAt(output.addressValue()+position*4,count*4)
+            val copied=if (wav.sampleRate() == s.loadU32(0)) wav.copyStereo16(cursor,count,destination)
+                else wav.copyResampledStereo16(cursor,count,s.loadU32(0),destination)
+            if (copied != count*4) return false
+            position=position+count; cursor=cursor+count
+            if (cursor == length) {
+                cursor=0
+                if (repeats != 0) {
+                    repeats=repeats-1
+                    if (repeats == 0) { wav=pending; repeats=pendingRepeats; pending=PcmWav(0); pendingRepeats=0 }
+                }
+            }
+        }
+    }
+    var sample=0
+    while (sample < frames*2) {
+        val raw=output.loadU16(sample*2)
+        val signed=if (raw >= 32768) raw-65536 else raw
+        output.storeU16(sample*2,pcm16AttenuatedSample(signed,s.loadU32(4)))
+        sample=sample+1
+    }
+    s.storeU32(8,wav); s.storeU32(12,repeats); s.storeU32(16,cursor)
+    s.storeU32(20,pending); s.storeU32(24,pendingRepeats)
+    true
+}

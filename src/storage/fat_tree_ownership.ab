@@ -1,0 +1,105 @@
+import "./fat_chain_ownership.ab"
+import "./fat_directory_entry.ab"
+import "./fat_directory_parent.ab"
+// Breadth-first allocation walk. Queue is caller-owned pairs(head,parent),
+//8B each, including root. One bitmap covers root/child directory/file chains.
+// Immutable volume lifetime required; no disk writes, repair or allocation.
+// This validates allocation/dot ancestry/file capacity, not LFN syntax or names.
+type FatTreeAudit=int
+//1tree complete2input3IO4bad chain5duplicate6readbudget7directory8queuefull
+//9file chain too short. Detail=count of directories for1,head on failure;
+// successful physical reads at36..55. Any failure invalidates this scan.
+fun FatTreeAudit.status(): int = this&255
+fun FatTreeAudit.detail(): int = (this>>>8)&0xfffffff
+fun FatTreeAudit.reads(): int = if (this.status() == 1) (this>>>36)&0xfffff else 0
+fun fatTreeWorkspaceValid(reader: NativeBuffer,boot: NativeBuffer,queue: NativeBuffer,data: NativeBuffer,scratch: NativeBuffer,map: NativeBuffer,clusters: int): bool {
+    val bytes=fatClusterOwnershipBytes(clusters);val qbytes=queue.capacity()
+    if (bytes == 0 || !map.hasAddressRange(0,bytes) || !reader.hasAddressRange(0,28) || !boot.hasAddressRange(0,512) || !queue.hasAddressRange(0,qbytes) || qbytes < 8 || qbytes > 8000000 || !data.hasAddressRange(0,512) || !scratch.hasAddressRange(0,1024)) return false
+    return !(fatBuffersOverlap(map,bytes,reader,28) || fatBuffersOverlap(map,bytes,boot,512) || fatBuffersOverlap(map,bytes,queue,qbytes) || fatBuffersOverlap(map,bytes,data,512) || fatBuffersOverlap(map,bytes,scratch,1024) ||
+        fatBuffersOverlap(queue,qbytes,reader,28) || fatBuffersOverlap(queue,qbytes,boot,512) || fatBuffersOverlap(queue,qbytes,data,512) || fatBuffersOverlap(queue,qbytes,scratch,1024) ||
+        fatBuffersOverlap(data,512,reader,28) || fatBuffersOverlap(data,512,boot,512) || fatBuffersOverlap(data,512,scratch,1024) || fatBuffersOverlap(scratch,1024,reader,28) || fatBuffersOverlap(scratch,1024,boot,512))
+}
+trusted fun fatWalkOwnershipTreeOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,budget: int,queue: NativeBuffer,data: NativeBuffer,scratch: NativeBuffer,ownership: FatClusterOwnership): FatTreeAudit {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || !ownership.valid() || ownership.storage().loadU32(4) != geometry.usableClusters() || ownership.storage().loadU32(8) != 0 || ownership.storage().loadU32(12) != 0 ||
+        budget < 1 || budget > 1000000 || !fatTreeWorkspaceValid(reader,boot,queue,data,scratch,ownership.storage(),geometry.usableClusters())) return FatTreeAudit(2)
+    val qbytes=queue.capacity()
+    var remaining=budget
+    val root=if (geometry.fatBits() == 32) fatBootU32(boot,44) else 0
+    if (root != 0) {
+        val chain=fatClaimChainOwned(reader,boot,first,sectors,root,remaining,scratch,ownership)
+        if (chain.status() != 1) return FatTreeAudit(chain.status()|(root<<8))
+        remaining=remaining-chain.reads()
+    }
+    queue.storeU32(0,root);queue.storeU32(4,0)
+    var queued=1;var cursor=0
+    val spc=boot.load(13);val clusterBytes=spc*512
+    while (cursor < queued) {
+        val head=queue.loadU32(cursor*8);val parent=queue.loadU32(cursor*8+4)
+        var cluster=head;var sectorIndex=0;var ordinal=0;var done=false;var loaded=false
+        if (cursor != 0) {
+            if (remaining == 0) return FatTreeAudit(6|(head<<8))
+            remaining=remaining-1
+            val dot=fatReadDirectoryParentOwned(reader,boot,first,sectors,head,data)
+            if (dot.status() == 3) return FatTreeAudit(3|(head<<8))
+            if (dot.status() != 1 || dot.cluster() != parent) return FatTreeAudit(7|(head<<8))
+            loaded=true
+        }
+        while (!done) {
+            val lba=if (head == 0) first+fatBootU16(boot,14)+boot.load(16)*fatBootFatSectors(boot)+ordinal
+                else fatClusterFirstSector(boot,first,sectors,cluster)+sectorIndex
+            if (!loaded) {
+                if (remaining == 0) return FatTreeAudit(6|(head<<8))
+                remaining=remaining-1
+                if (!fatStorageReadOwned(reader,lba,data)) return FatTreeAudit(3|(head<<8))
+            }
+            loaded=false
+            var entry=if (cursor != 0 && ordinal == 0) 2 else 0
+            while (entry < 16 && !done) {
+                if (head == 0 && ordinal*16+entry >= fatBootU16(boot,17)) { done=true }
+                else {
+                    val decoded=fatDirectoryDecode(data,entry,geometry.fatBits(),geometry.usableClusters())
+                    val status=decoded.status()
+                    if (status == 3) done=true
+                    else if (status == 7 || status == 8) return FatTreeAudit(7|(head<<8))
+                    else if (status == 1 || status == 2) {
+                        val child=decoded.firstCluster()
+                        if (child != 0) {
+                            if (remaining == 0) return FatTreeAudit(6|(child<<8))
+                            val chain=fatClaimChainOwned(reader,boot,first,sectors,child,remaining,scratch,ownership)
+                            if (chain.status() != 1) return FatTreeAudit(chain.status()|(child<<8))
+                            remaining=remaining-chain.reads()
+                            if (status == 1) {
+                                // File size is u32; quotient+remainder avoids
+                                // overflow at4GiB and signed64 division helpers.
+                                val size=u32(decoded.byteSize());val block=u32(clusterBytes)
+                                val needed=int(size/block)+(if (size%block != u32(0)) 1 else 0)
+                                if (chain.detail() < needed) return FatTreeAudit(9|(child<<8))
+                            }
+                            if (status == 2) {
+                                if (queued >= qbytes/8) return FatTreeAudit(8|(child<<8))
+                                queue.storeU32(queued*8,child);queue.storeU32(queued*8+4,if (cursor == 0) 0 else head);queued=queued+1
+                            }
+                        }
+                    }
+                }
+                entry=entry+1
+            }
+            ordinal=ordinal+1;sectorIndex=sectorIndex+1
+            if (!done && head == 0 && ordinal*16 >= fatBootU16(boot,17)) done=true
+            if (!done && head != 0 && sectorIndex == spc) {
+                val location=fatLinkLocate(boot,first,sectors,cluster)
+                val cost=if (location.needsSecondSector()) 2 else 1
+                if (remaining < cost) return FatTreeAudit(6|(head<<8))
+                remaining=remaining-cost
+                val link=fatReadLinkOwned(reader,boot,first,sectors,cluster,scratch)
+                if (link.status() == 8) return FatTreeAudit(3|(head<<8))
+                if (link.status() == 2) done=true
+                else if (link.status() != 1) return FatTreeAudit(4|(head<<8))
+                else { cluster=link.nextCluster();sectorIndex=0 }
+            }
+        }
+        cursor=cursor+1
+    }
+    return FatTreeAudit(1|(queued<<8)|((budget-remaining)<<36))
+}

@@ -1,0 +1,46 @@
+import "./co5300_sequence_esp32s3.ab"
+import "./rgb565_source.ab"
+// Aligned direct RGB565 wire-order image. Source rows may have padding;
+// one pixel CS spans all rows/chunks. Never transmit padding or mutate source.
+// Caller retains dirty bounds on ANY failure; CS release is not SPI recovery.
+trusted fun esp32s3Co5300Blit(gate: PeripheralGate,owner: u32,peripheral: int,
+    pins: QuadSpiPins,select: Pin,x: int,y: int,width: int,height: int,source: NativeBuffer,stride: int): SpiTransactionResult {
+    if (!esp32s3SpiQuadTransmitPinsValid(peripheral,pins,select) || x < 0 || y < 0 || width < 1 || height < 1 ||
+        x > 65535 || y > 65535 || width > 65536-x || height > 65536-y || (x&1) != 0 || (width&1) != 0 ||
+        !lcdRgb565SourceValid(source,width,height,stride) || gate.word().address() <= 0 || gate.word().address() > 4294967292)
+        return SpiTransactionResult(3<<32)
+    val span=(height-1)*stride+width*2
+    if (!esp32s3SpiMemoryRangeValid(peripheral,source,span) || !gate.bufferDisjoint(source,span)) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val window=nativeBufferAt(nativeStackAllocate(4),4)
+    window.store(0,x>>>8);window.store(1,x);window.store(2,(x+width-1)>>>8);window.store(3,x+width-1)
+    var detail=esp32s3Co5300TransferOwned(peripheral,select,42,window,4,false)
+    if ((detail&255) == 1) {
+        window.store(0,y>>>8);window.store(1,y);window.store(2,(y+height-1)>>>8);window.store(3,y+height-1)
+        detail=esp32s3Co5300TransferOwned(peripheral,select,43,window,4,false)
+    }
+    if ((detail&255) == 1) {
+        detail=esp32s3SpiExchangeReady(peripheral)
+        if (detail == 1) {
+            detail=esp32s3SpiSelectBegin(select)
+            var row=0
+            var first=true
+            while (row < height && (detail&255) == 1) {
+                var sent=0
+                while (sent < width*2 && (detail&255) == 1) {
+                    val count=if (width*2-sent < 64) width*2-sent else 64
+                    val chunk=nativeBufferAt(source.addressValue()+row*stride+sent,count)
+                    detail=esp32s3SpiQuadTransmitOwned(peripheral,if (first) 50 else 0,if (first) 8 else 0,
+                        if (first) 0x2c00 else 0,if (first) 24 else 0,0,chunk,count,100000)
+                    first=false;sent=sent+count
+                }
+                row=row+1
+            }
+            detail=esp32s3SpiSelectEnd(select,detail)
+        }
+    }
+    val healthy=(detail&255) == 1
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5<<32)|detail)
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|detail)
+}

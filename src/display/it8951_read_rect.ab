@@ -1,0 +1,79 @@
+import "./it8951_session_readback.ab"
+import "./epd_canvas.ab"
+import "./color.ab"
+// status low8, completed PHYSICAL rows above8. A rotated output can therefore
+// contain completed columns, not a contiguous byte prefix, after failure.
+type It8951RectReadResult = int
+fun It8951RectReadResult.status(): int = this&255
+fun It8951RectReadResult.rows(): int = this>>>8
+fun It8951RectReadResult.success(): bool = this.status() == 1
+// Logical preclipped rectangle; source rotation matches it8951Rotate4Owned.
+// RGB888 output is R,G,B; RGB565 output is big-endian. Upstream expands raw
+// controller bytes by uint8(8+raw), optionally inverted; do not multiply by17.
+// Caller serializes ready session, destination and disjoint line/argument
+// scratch. Reads stage a complete physical row before touching the output.
+// Preserve all caller buffers/ownership on fault; session requires recovery.
+trusted fun It8951Session.readRectOwned(x: int,y: int,w: int,h: int,rotation: int,
+    destination: NativeBuffer,stride: int,line: NativeBuffer,args: NativeBuffer,
+    rgb565Output: bool,invert: bool,polls: int,exclusive: bool): It8951RectReadResult {
+    if (!exclusive || this.state() != 1 || !this.info().valid() || rotation < 0 || rotation > 7 ||
+        w < 1 || w > 65535 || h < 1 || h > 65535 || x < 0 || y < 0 || x > 65535 || y > 65535 ||
+        polls < 1 || polls > 1000000 || stride < w*(if (rgb565Output) 2 else 3) || stride > 2147483647 ||
+        !this.disjoint(args,8)) return It8951RectReadResult(2)
+    val width=this.info().width();val height=this.info().height()
+    val a=epdCanvasPosition(width,height,x,y,rotation)
+    val b=epdCanvasPosition(width,height,x+w-1,y+h-1,rotation)
+    if (a < 0 || b < 0 || (this.info().imageAddress()&3) != 0) return It8951RectReadResult(2)
+    val left=if ((a&65535) < (b&65535)) a&65535 else b&65535
+    val top=if ((a>>>16) < (b>>>16)) a>>>16 else b>>>16
+    val physicalWidth=if ((rotation&1) == 0) w else h
+    val physicalHeight=if ((rotation&1) == 0) h else w
+    val imageBytes=width*height
+    val destinationBytes=(h-1)*stride+w*(if (rgb565Output) 2 else 3)
+    if ((imageBytes&3) != 0 || !this.disjoint(destination,destinationBytes)) return It8951RectReadResult(2)
+    // Upstream rounds bursts to32 bytes. Near the final image edge move the
+    // aligned start backwards instead of reading beyond known image memory.
+    var maximum=0
+    var row=0
+    while (row < physicalHeight) {
+        val offset=(top+row)*width+left
+        val bytes=((offset&3)+physicalWidth+31)&~31
+        if (bytes > imageBytes) return It8951RectReadResult(2)
+        if (bytes > maximum) maximum=bytes
+        row=row+1
+    }
+    if (!this.disjoint(line,maximum) ||
+        !it8951RectDisjoint(destination,destinationBytes,line,maximum) ||
+        !it8951RectDisjoint(destination,destinationBytes,args,8) || !it8951RectDisjoint(line,maximum,args,8)) return It8951RectReadResult(2)
+    val logicalWidth=if ((rotation&1) == 0) width else height
+    val logicalHeight=if ((rotation&1) == 0) height else width
+    val inverse=if (rotation < 4) (4-rotation)&3 else rotation
+    row=0
+    while (row < physicalHeight) {
+        val offset=(top+row)*width+left
+        val bytes=((offset&3)+physicalWidth+31)&~31
+        var start=offset&~3
+        if (start > imageBytes-bytes) start=imageBytes-bytes
+        val acquired=this.readImageWordsOwned(start,line,bytes/2,args,polls,true)
+        if (!acquired.success()) return It8951RectReadResult(acquired.status()|(row<<8))
+        var column=0
+        while (column < physicalWidth) {
+            val logical=epdCanvasPosition(logicalWidth,logicalHeight,left+column,top+row,inverse)
+            val dx=(logical&65535)-x;val dy=(logical>>>16)-y
+            val level=(8+line.load(offset-start+column))&255
+            val gray=if (invert) 255-level else level
+            val target=dy*stride+dx*(if (rgb565Output) 2 else 3)
+            if (rgb565Output) {
+                val color=rgb565(gray,gray,gray)
+                destination.store(target,(color&65535)>>>8);destination.store(target+1,color&255)
+            } else {
+                destination.store(target,gray);destination.store(target+1,gray);destination.store(target+2,gray)
+            }
+            column=column+1
+        }
+        row=row+1
+    }
+    It8951RectReadResult(1|(physicalHeight<<8))
+}
+fun it8951RectDisjoint(a: NativeBuffer,n: int,b: NativeBuffer,m: int): bool =
+    a.addressValue() >= b.addressValue()+m || b.addressValue() >= a.addressValue()+n

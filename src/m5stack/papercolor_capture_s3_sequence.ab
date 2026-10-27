@@ -1,0 +1,105 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "./microphone_profile.ab"
+// Exclusive132B record, zero-initialized. Caller owns both stopped I2S1
+// directions, parked RX GDMA, whole codec/GPIO45 rail, old/new pad and input
+// consumers, stable PLL160M, configured control bus and internal DMA ring.
+// Prevent RTC/USB/holds/sleep changes. No duplex, hidden allocation or ISR.
+// Status0 refused,1 prepared,2 running,3 cleanup required,4 closed.
+// Retain ALL resources on3. Clocks remain on; GPIO45 returns to its original digital state.
+// Caller must quiesce ALL other codec-rail consumers for this whole session.
+// Header: magic0,status4,board8,codec12,railSnapshot16,port20,channel24,desc28,
+// count32,payload36,bytes40,cursor44,rate48,prepare52,codecResult56,
+// start60,stop64,pump68/72,mayRun76,codecDirty80; retained pins84..131.
+trusted fun paperColorCaptureValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,132) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x50434331
+trusted fun paperColorCapturePins(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+84,48)
+trusted fun paperColorCaptureBeginOwned(r: NativeBuffer,hz: int,channel: int,desc: int,count: int,
+    payload: int,bytes: int,owner: u32,codec: Es7210,exclusive: bool): int {
+    if (!exclusive || !codec.valid() || owner == u32(0) ||
+        !r.hasAddressRange(0,132) || (r.addressValue()&3) != 0 || hz < 8000 || hz > 96000 ||
+        channel < 0 || channel > 4 || count < 2 || (bytes&3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes)) return 0
+    val a=r.addressValue()
+    if ((a < desc+count*12 && desc < a+132) || (a < payload+count*bytes && payload < a+132)) return 0
+    if (r.loadU32(0) != 0 && (!paperColorCaptureValid(r) || r.loadU32(4) != 4)) return 0
+    val profile=m5BoardPaperColor.microphoneProfile()
+    val m=pin(profile.masterClockPin());val b=pin(profile.bitClockPin())
+    val w=pin(profile.wordSelectPin());val d=pin(profile.dataPin())
+    if (!esp32s3I2sPinsValid(profile.port(),false,m,b,w,d,0)) return 0
+    val rail=esp32S3GpioSnapshotOwned(45,true)
+    if (!rail.valid()) return 0
+    var offset=4
+    while (offset < 132) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x50434331);r.storeU32(4,3);r.storeU32(8,m5BoardPaperColor|0)
+    r.storeU32(12,codec|0);r.storeU32(16,rail|0);r.storeU32(20,profile.port())
+    r.storeU32(24,channel);r.storeU32(28,desc);r.storeU32(32,count)
+    r.storeU32(36,payload);r.storeU32(40,bytes)
+    val pins=paperColorCapturePins(r)
+    if (esp32S3I2sPinsCaptureOwned(pins,profile.port(),false,m,b,w,d,0,true) != 1) return 3
+    val prepared=esp32s3PrepareStandard16Dma(profile.port(),false,m,b,w,d,1,hz,channel,desc,count,payload,bytes,owner)
+    r.storeU32(52,prepared|0)
+    if (!prepared.valid()) return 3
+    pins.storeU32(4,1);r.storeU32(48,prepared.sampleRate());r.storeU32(4,1)
+    return 1
+}
+trusted fun paperColorCaptureStartOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !paperColorCaptureValid(r) || r.loadU32(4) != 1 || polls < 1 || polls > 1000000) return 0
+    r.storeU32(4,3);r.storeU32(80,1)
+    val codec=paperColorMicrophoneOwned(Es7210(r.loadU32(12)),true,true)
+    r.storeU32(56,codec)
+    if (codec != 1) return 3
+    r.storeU32(76,1)
+    val started=esp32s3I2sStartStream(r.loadU32(20),false,r.loadU32(24),r.loadU32(28),polls)
+    r.storeU32(60,started)
+    if ((started&255) != 1) return 3
+    r.storeU32(4,2);return 2
+}
+trusted fun paperColorCaptureCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !paperColorCaptureValid(r) || polls < 1 || polls > 1000000) return 0
+    val state=r.loadU32(4)
+    if (state == 4) return 4
+    if (state < 1 || state > 3) return 0
+    r.storeU32(4,3)
+    if (r.loadU32(76) != 0) {
+        val stopped=esp32s3I2sStopStream(r.loadU32(20),false,r.loadU32(24),polls)
+        r.storeU32(64,stopped)
+        if (stopped != 1) return 3
+        r.storeU32(76,0)
+    }
+    if (r.loadU32(80) != 0) {
+        val codec=paperColorMicrophoneOwned(Es7210(r.loadU32(12)),false,true)
+        r.storeU32(56,codec)
+        if (codec != 1) return 3
+        r.storeU32(80,0)
+    }
+    val pins=paperColorCapturePins(r)
+    if (pins.loadU32(0) != 0 && esp32S3I2sPinsCloseOwned(pins,true) != 2) return 3
+    if (r.loadU32(16) != 0) {
+        val rail=S3GpioSnapshot(r.loadU32(16))
+        if (!rail.valid() || rail.pin() != 45 || rail.restoreOwned(true) != 1) return 3
+        r.storeU32(16,0)
+    }
+    r.storeU32(4,4);return 4
+}
+// One full left-channel signed16 block; consecutive pairs are mono DSP input.
+// Busy preserves cursor/state; fault requires close. Reject aliases against
+// the whole ring, descriptors and132B record before consuming any sample.
+trusted fun paperColorCaptureReadOwned(r: NativeBuffer,output: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    if (!exclusive || !paperColorCaptureValid(r) || r.loadU32(4) != 2 || polls < 1 || polls > 1000000) return Esp32S3GdmaPumpResult(2)
+    val count=r.loadU32(32);val bytes=r.loadU32(40);val cursor=r.loadU32(44)
+    val desc=r.loadU32(28);val payload=r.loadU32(36)
+    if (!esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes) || cursor >= count ||
+        !output.hasAddressRange(0,bytes)) return Esp32S3GdmaPumpResult(2)
+    val a=output.addressValue()
+    if ((a < r.addressValue()+132 && r.addressValue() < a+bytes) ||
+        (a < desc+count*12 && desc < a+bytes) || (a < payload+count*bytes && payload < a+bytes)) return Esp32S3GdmaPumpResult(2)
+    var result=esp32s3GdmaPumpBlock(r.loadU32(24),false,desc,count,cursor,nativeBufferAt(a,bytes),0,polls)
+    if (result.status() == 1) {
+        val next=if (cursor+1 == count) 0 else cursor+1
+        if (result.transferredBytes() != bytes || result.nextIndex() != next) result=Esp32S3GdmaPumpResult((result&~255)|8)
+        else r.storeU32(44,next)
+    }
+    r.storeU32(68,result&4294967295);r.storeU32(72,result>>>32)
+    if (result.status() != 1 && result.status() != 3) r.storeU32(4,3)
+    return result
+}

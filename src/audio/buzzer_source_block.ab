@@ -1,0 +1,40 @@
+import "./pcm_source_queues.ab"
+import "./pcm_volume.ab"
+import "./buzzer_i2s16.ab"
+// Retained24B block producer:magic0,state4,remainder8,frames12,address16,bytes20.
+// State1empty2prepared3failed. Own queues/sources/workspaces for render and
+// retain output until its DMA consumer has completed or explicitly discarded.
+// A prepared block cannot be rendered again: DMA retry never advances source
+// cursors, tone phase, volume or delta-sigma a second time. No hardware/heap.
+fun buzzerSourceBlockStorage(r: NativeBuffer): bool = r.hasAddressRange(0,24) && (r.addressValue()&3) == 0
+trusted fun buzzerSourceBlockValid(r: NativeBuffer): bool = buzzerSourceBlockStorage(r) && r.loadU32(0) == 0x42534231 && r.loadU32(8) <= 65535
+trusted fun buzzerSourceBlockInitOwned(r: NativeBuffer,remainder: int,exclusive: bool): bool {
+    if (!exclusive || !buzzerSourceBlockStorage(r) || r.loadU32(0) != 0 || !BuzzerDeltaSigma(remainder).valid()) return false
+    r.storeU32(0,0x42534231);r.storeU32(4,1);r.storeU32(8,remainder);r.storeU32(12,0);r.storeU32(16,0);r.storeU32(20,0);return true
+}
+//1prepared2invalid3latched render failure4already prepared. Stereo sources mix
+// in wide accumulators, downmix before clipping, master curve applied once.
+// Silence padding keeps delta-sigma state; idle reset is never guessed here.
+trusted fun buzzerSourceBlockPrepareOwned(r: NativeBuffer,sources: PcmSourceQueues,frames: int,accumulator: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,output: NativeBuffer,master: PcmVolume,exclusive: bool): int {
+    if (!exclusive || !buzzerSourceBlockValid(r) || !master.valid() || frames < 1 || frames > 1048576) return 2
+    if (r.loadU32(4) == 2) return 4
+    if (r.loadU32(4) == 3) return 3
+    if (r.loadU32(4) != 1 || !sources.disjointFrom(r,24) || !sources.disjointFrom(accumulator,frames*8) || !sources.disjointFrom(scratch,frames*4) || !sources.disjointFrom(mono,frames*2) || !sources.disjointFrom(output,frames*4)) return 2
+    if (pcmMixSpansOverlap(r,24,accumulator,frames*8) || pcmMixSpansOverlap(r,24,scratch,frames*4) || pcmMixSpansOverlap(r,24,mono,frames*2) || pcmMixSpansOverlap(r,24,output,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) || pcmMixSpansOverlap(accumulator,frames*8,mono,frames*2) || pcmMixSpansOverlap(accumulator,frames*8,output,frames*4) ||
+        pcmMixSpansOverlap(scratch,frames*4,mono,frames*2) || pcmMixSpansOverlap(scratch,frames*4,output,frames*4) || pcmMixSpansOverlap(mono,frames*2,output,frames*4)) return 2
+    r.storeU32(4,3)
+    if (!sources.renderOutput(frames,accumulator,scratch,mono,false,master.gainQ15())) return 3
+    val next=BuzzerDeltaSigma(r.loadU32(8)).encodePcm16Stereo16(mono,output,frames)
+    if (!next.valid()) return 3
+    r.storeU32(8,next|0);r.storeU32(12,frames);r.storeU32(16,output.addressValue());r.storeU32(20,frames*4);r.storeU32(4,2);return 1
+}
+trusted fun buzzerSourceBlockOutput(r: NativeBuffer): NativeBuffer =
+    if (buzzerSourceBlockValid(r) && r.loadU32(4) == 2 && r.loadU32(12) >= 1 && r.loadU32(12) <= 1048576 && r.loadU32(20) == r.loadU32(12)*4)
+        nativeBufferAt(r.loadU32(16),r.loadU32(20)) else NativeBuffer(0)
+// No DMA completion inferred: caller explicitly joins/discards the consumer.
+// Source cursors are already committed and cannot be rolled back by release.
+trusted fun buzzerSourceBlockReleaseOwned(r: NativeBuffer,consumerJoined: bool,exclusive: bool): bool {
+    if (!exclusive || !consumerJoined || !buzzerSourceBlockValid(r) || r.loadU32(4) != 2) return false
+    r.storeU32(12,0);r.storeU32(16,0);r.storeU32(20,0);r.storeU32(4,1);return true
+}

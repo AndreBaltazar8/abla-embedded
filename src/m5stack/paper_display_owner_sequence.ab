@@ -1,0 +1,86 @@
+import "../display/it8951_session.ab"
+import "../spi/buffer_gate.ab"
+// Original M5Paper:312B parent, separate40B controller, separate40B scratch.
+// Header magic,state,gate64,token32,controller64,last-error; seven40B leases.
+// Parent retains the canonical SPI gate until every pad is restored. Caller
+// has stopped SD and ALL digital/RTC/analog pad users and owns stable board
+// power (GPIO2 hold is not a display-private resource). No live-owner copies.
+type M5PaperDisplayOwner = int
+fun m5PaperDisplayOwnerAt(storage: NativeBuffer): M5PaperDisplayOwner =
+    if (storage.hasAddressRange(0,312) && (storage.addressValue()&3) == 0) M5PaperDisplayOwner(storage|0) else M5PaperDisplayOwner(0)
+fun M5PaperDisplayOwner.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5PaperDisplayOwner.valid(): bool = m5PaperDisplayOwnerAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x50445031
+trusted fun M5PaperDisplayOwner.state(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5PaperDisplayOwner.gate(): PeripheralGate = peripheralGateAt(this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32))
+trusted fun M5PaperDisplayOwner.token(): u32 = u32(this.buffer().loadU32(16))
+trusted fun M5PaperDisplayOwner.controller(): It8951Session = It8951Session(this.buffer().loadU32(20)|(this.buffer().loadU32(24)<<32))
+fun M5PaperDisplayOwner.lease(index: int): NativeBuffer =
+    if (index < 0 || index > 6) NativeBuffer(0) else nativeBufferAt(this.buffer().addressValue()+32+index*40,40)
+trusted fun M5PaperDisplayOwner.held(): bool = this.valid() && peripheralOwnerValid(this.token()) &&
+    this.gate().word().valid() && this.gate().word().compareExchange(this.token(),this.token()) == this.token()
+trusted fun M5PaperDisplayOwner.initialize(): bool {
+    if (m5PaperDisplayOwnerAt(this.buffer()) == 0) return false
+    var offset=4
+    while (offset < 312) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x50445031);return true
+}
+fun paperDisplayDisjoint(a: NativeBuffer,n: int,b: NativeBuffer,m: int): bool =
+    a.hasAddressRange(0,n) && b.hasAddressRange(0,m) && (a.addressValue() >= b.addressValue()+m || b.addressValue() >= a.addressValue()+n)
+// Return1ready2partial-pins3controller/setup-fault;-1admission,-2gatebusy.
+// Fault states retain parent, gate and child. Inspect/repair before close.
+trusted fun M5PaperDisplayOwner.openOwned(gate: PeripheralGate,token: u32,controller: It8951Session,
+    scratch: NativeBuffer,polls: int,exclusive: bool,boardPowerOwned: bool): int {
+    if (!exclusive || !boardPowerOwned || this.state() != 0 || controller.state() != 0 ||
+        !peripheralOwnerValid(token) || polls < 1 || polls > 1000000 ||
+        !paperDisplayDisjoint(this.buffer(),312,controller.buffer(),40) ||
+        !paperDisplayDisjoint(this.buffer(),312,scratch,40) || !controller.disjoint(scratch,40) ||
+        !gate.bufferDisjoint(this.buffer(),312) || !gate.bufferDisjoint(controller.buffer(),40) ||
+        !gate.bufferDisjoint(scratch,40)) return -1
+    if (gate.tryBegin(token) != 0) return -2
+    this.buffer().storeU32(8,(gate|0)&0xffffffff);this.buffer().storeU32(12,(gate|0)>>>32)
+    this.buffer().storeU32(16,int(token));this.buffer().storeU32(20,(controller|0)&0xffffffff)
+    this.buffer().storeU32(24,(controller|0)>>>32);this.buffer().storeU32(4,2)
+    var index=0
+    while (index < 7) {
+        val opened=paperDisplayPinOpen(this.lease(index),index)
+        if (opened != 1) { this.buffer().storeU32(28,opened|(index<<8));return 2 }
+        index=index+1
+    }
+    this.buffer().storeU32(4,3)
+    // SD preparation is the upstream CMD58/CMD0 fallback, not card detection
+    // or full SD initialization. CS15 stays inactive throughout its clocks.
+    paperDisplayPrepareSdHeld()
+    if (!paperDisplayResetCycle()) { this.buffer().storeU32(28,4);return 3 }
+    val opened=controller.openOwned(paperDisplayTransport(),scratch,polls,true)
+    if (opened != 1 || controller.info().width() != 960 || controller.info().height() != 540) {
+        this.buffer().storeU32(28,6);return 3
+    }
+    this.buffer().storeU32(28,0);this.buffer().storeU32(4,1);return 1
+}
+trusted fun M5PaperDisplayOwner.recoverControllerOwned(scratch: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || (this.state() != 1 && this.state() != 3) || !this.held() ||
+        (this.controller().state() != 2 && this.controller().state() != 5) || polls < 1 || polls > 1000000 ||
+        !paperDisplayDisjoint(this.buffer(),312,scratch,40) || !this.controller().disjoint(scratch,40) ||
+        !this.gate().bufferDisjoint(scratch,40)) return -1
+    this.buffer().storeU32(4,3)
+    if (!paperDisplayResetCycle()) return 3
+    if (this.controller().recoverAfterHardwareResetOwned(scratch,polls,true) != 1 ||
+        this.controller().info().width() != 960 || this.controller().info().height() != 540) return 3
+    this.buffer().storeU32(4,1);return 1
+}
+// Child must have acknowledged standby and detached (or never opened).
+// Retry failed restoration; do not release the SPI gate or board power early.
+trusted fun M5PaperDisplayOwner.closeOwned(exclusive: bool): bool {
+    if (!exclusive || this.state() < 1 || this.state() > 4 || !this.held() || this.controller().state() != 0) return false
+    this.buffer().storeU32(4,4)
+    var index=6
+    while (index >= 0) {
+        val lease=this.lease(index)
+        if (lease.loadU32(0) != 0 && paperDisplayPinClose(lease) != 1) return false
+        index=index-1
+    }
+    if (!this.gate().finish(this.token(),true)) return false
+    var offset=4
+    while (offset < 32) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    true
+}

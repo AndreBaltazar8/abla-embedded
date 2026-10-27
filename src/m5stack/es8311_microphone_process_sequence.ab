@@ -1,0 +1,40 @@
+import "../audio/microphone_process.ab"
+import "./microphone_profile.ab"
+type M5Es8311MicrophoneBlockResult=int
+fun M5Es8311MicrophoneBlockResult.status(): int = this&255
+fun M5Es8311MicrophoneBlockResult.samples(): int = this>>>32
+// Full DMA events/bytes/cursor remain in the capture record at68/72.
+// Low8 result:1processed2preflight3busy4..8DMAfault9processingfault;
+// output sample count high32. No data replay or fake samples on empty/busy DMA.
+trusted fun m5Es8311MicrophoneBufferDisjoint(r: NativeBuffer,buffer: NativeBuffer,bytes: int): bool {
+    if (!buffer.hasAddressRange(0,bytes)) return false
+    val address=buffer.addressValue();val count=r.loadU32(32)
+    val desc=r.loadU32(28);val payload=r.loadU32(36);val block=r.loadU32(40)
+    return bytes == 0 || !((address < r.addressValue()+132 && r.addressValue() < address+bytes) ||
+        (address < desc+count*12 && desc < address+bytes) ||
+        (address < payload+count*block && payload < address+bytes))
+}
+// Running board session132 + initialized DSP40 + one raw DMA block + output.
+// Atom Voice S3R captures stereo; other supported ES8311 boards capture mono.
+// Initialize DSP inputStereo from the board profile, adc=false/swap=false. Output may
+// be mono or duplicated stereo, unsigned8 or signed16. Supply profile gain
+// unless overridden. Hardware rate/oversampling is the actual output rate;
+// prepare the appropriate hardware rate before start, never change it here.
+trusted fun m5Es8311MicrophoneProcessBlockOwned(r: NativeBuffer,state: NativeBuffer,
+    raw: NativeBuffer,output: NativeBuffer,stereo: bool,bits16: bool,polls: int,exclusive: bool): M5Es8311MicrophoneBlockResult {
+    if (!exclusive || !m5Es8311CaptureValid(r) || r.loadU32(4) != 2 ||
+        polls < 1 || polls > 1000000 || !state.hasAddressRange(0,40)) return M5Es8311MicrophoneBlockResult(2)
+    val board=M5BoardId(r.loadU32(8))
+    val config=state.loadU32(4)
+    if ((config&6291456) != 0 || ((config&(1<<20)) != 0) != (board == m5BoardAtomVoiceS3R)) return M5Es8311MicrophoneBlockResult(2)
+    val bytes=r.loadU32(40)
+    if (bytes < 4 || (bytes&3) != 0 || !esp32s3GdmaRingLayoutValid(r.loadU32(28),r.loadU32(32),r.loadU32(36),bytes,bytes)) return M5Es8311MicrophoneBlockResult(2)
+    val samples=microphoneProcessRequiredSamples(state,raw,bytes/4,output,stereo,bits16)
+    if (samples < 0 || !m5Es8311MicrophoneBufferDisjoint(r,state,40) || !m5Es8311MicrophoneBufferDisjoint(r,raw,bytes) ||
+        !m5Es8311MicrophoneBufferDisjoint(r,output,samples*(if (bits16) 2 else 1))) return M5Es8311MicrophoneBlockResult(2)
+    val pumped=m5Es8311CaptureReadOwned(r,raw,polls,true)
+    if (pumped.status() != 1) return M5Es8311MicrophoneBlockResult(pumped.status())
+    val written=microphoneProcess(state,raw,bytes/4,output,stereo,bits16)
+    if (written != samples) { r.storeU32(4,3);return M5Es8311MicrophoneBlockResult(9) }
+    return M5Es8311MicrophoneBlockResult(1|(written<<32))
+}

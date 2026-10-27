@@ -1,0 +1,93 @@
+import "../esp32/sdk/raw_buffer.ab"
+// IT8951 SPI framing from pinned M5GFX Panel_IT8951 (epd_waveform.LICENSE).
+// Exclusive borrowed transport, mode0, 16-bit MSB-first words. Hooks provide
+// checked CS, ready level (-1 error/0 busy/1 ready), exchange (-1 error), delay.
+// No retries or rollback. Reads can change a prefix of caller-owned scratch.
+// A failed CS release means the caller retains the bus for explicit recovery.
+// No allocation, implicit reset, VCOM changes or guessed framebuffer address.
+type It8951Transfer = int
+fun It8951Transfer.status(): int = this & 255
+fun It8951Transfer.completed(): int = this >>> 8
+fun It8951Transfer.success(): bool = this.status() == 1
+// Status1complete2admission3BUSY exhausted4transport5CS release failed.
+fun it8951Admission(context: int,polls: int): bool =
+    polls >= 1 && polls <= 1000000 && it8951TransportValid(context)
+trusted fun it8951WaitReady(context: int,polls: int): int {
+    var remaining=polls
+    while (remaining > 0) {
+        val level=it8951TransportReady(context)
+        if (level == 1) return 1
+        if (level != 0) return 4
+        remaining=remaining-1
+        if (remaining > 0) it8951TransportDelay(context,1)
+    }
+    3
+}
+trusted fun it8951Finish(context: int,status: int,completed: int): It8951Transfer =
+    It8951Transfer((if (it8951TransportSelect(context,false)) status else 5)|(completed<<8))
+// CS rises before each new frame, but never within an argument burst.
+trusted fun it8951Begin(context: int,polls: int): int {
+    if (!it8951TransportSelect(context,false)) return 5
+    val ready=it8951WaitReady(context,polls)
+    if (ready != 1) return ready
+    if (it8951TransportSelect(context,true)) 1 else 4
+}
+trusted fun it8951WriteFrame(context: int,preamble: int,word: int,polls: int): It8951Transfer {
+    if (!it8951Admission(context,polls) || (preamble != 0 && preamble != 24576) || word < 0 || word > 65535) return It8951Transfer(2)
+    val begun=it8951Begin(context,polls)
+    if (begun != 1) return it8951Finish(context,begun,0)
+    if (it8951TransportExchange(context,preamble) < 0 || it8951TransportExchange(context,word) < 0)
+        return it8951Finish(context,4,0)
+    it8951Finish(context,1,1)
+}
+trusted fun it8951WriteWord(context: int,word: int,polls: int): It8951Transfer =
+    it8951WriteFrame(context,0,word,polls)
+// args contains count little-endian u16 words, emitted big-endian on the wire.
+// Empty arguments send only the command. Completed counts argument words,
+// not the command or preamble, and is zero if either preceding frame failed.
+trusted fun it8951Command(context: int,command: int,args: NativeBuffer,count: int,polls: int): It8951Transfer {
+    if (!it8951Admission(context,polls) || command < 0 || command > 65535 ||
+        count < 0 || count > 65535 || !args.hasAddressRange(0,count*2)) return It8951Transfer(2)
+    val sent=it8951WriteFrame(context,24576,command,polls)
+    if (!sent.success()) return It8951Transfer(sent.status())
+    if (count == 0) return It8951Transfer(1)
+    val begun=it8951Begin(context,polls)
+    if (begun != 1) return it8951Finish(context,begun,0)
+    if (it8951TransportExchange(context,0) < 0) return it8951Finish(context,4,0)
+    var index=0
+    while (index < count) {
+        val ready=it8951WaitReady(context,polls)
+        if (ready != 1) return it8951Finish(context,ready,index)
+        if (it8951TransportExchange(context,args.loadU16(index*2)) < 0) return it8951Finish(context,4,index)
+        index=index+1
+    }
+    it8951Finish(context,1,count)
+}
+// Read preamble1000, one dummy word, then payload, all under one CS assertion.
+// Destination stores host little-endian u16s, independently of transport ABI.
+trusted fun it8951ReadWords(context: int,destination: NativeBuffer,count: int,polls: int): It8951Transfer {
+    if (!it8951Admission(context,polls) || count < 1 || count > 65535 ||
+        !destination.hasAddressRange(0,count*2)) return It8951Transfer(2)
+    val begun=it8951Begin(context,polls)
+    if (begun != 1) return it8951Finish(context,begun,0)
+    if (it8951TransportExchange(context,4096) < 0 || it8951TransportExchange(context,0) < 0)
+        return it8951Finish(context,4,0)
+    var index=0
+    while (index < count) {
+        val value=it8951TransportExchange(context,0)
+        if (value < 0 || value > 65535) return it8951Finish(context,4,index)
+        destination.storeU16(index*2,value)
+        index=index+1
+    }
+    it8951Finish(context,1,count)
+}
+// Register writes use separate data-word frames, as in upstream. Failed
+// writes may have changed hardware; return the first failure without retrying.
+trusted fun it8951WriteRegister(context: int,address: int,value: int,polls: int): It8951Transfer {
+    if (address < 0 || address > 65535 || value < 0 || value > 65535) return It8951Transfer(2)
+    val command=it8951Command(context,17,NativeBuffer(0),0,polls)
+    if (!command.success()) return command
+    val selected=it8951WriteWord(context,address,polls)
+    if (!selected.success()) return selected
+    it8951WriteWord(context,value,polls)
+}

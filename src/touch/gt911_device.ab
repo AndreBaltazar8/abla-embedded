@@ -1,0 +1,77 @@
+import "./gt911_logic.ab"
+import "./gt911_snapshot.ab"
+import "../i2c/register_address16.ab"
+import "../checksum/sum8.ab"
+
+// Caller configures reset/IRQ address selection and wake pins. Addresses0x5d
+// and0x14 are explicit; never switch addresses or drive pads behind the caller.
+type Gt911 = int
+trusted fun gt911(bus: I2cBus, address: int = 93, frequency: int = 400000): Gt911 =
+    Gt911(if (bus.valid() && (address == 93 || address == 20))
+        bus.device(address, frequency) & 4294967295 else 0)
+fun Gt911.valid(): bool = this > 0 && this <= 4294967295
+fun Gt911.device(): I2cDevice = I2cDevice(if (this.valid()) this | 0 else 0)
+trusted fun Gt911.close(): bool = this.valid() && this.device().close()
+
+// Explicitly acknowledge/discard a queued report. Board code can use this
+// after reset or after a long polling gap, as M5GFX does before retrying.
+trusted fun Gt911.discardPending(): bool =
+    this.valid() && this.device().writeRegisterAddress16Byte(0x814e, 0)
+trusted fun Gt911.refreshPeriodMillisecondsChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val value = this.device().readRegisterAddress16ByteChecked(0x8056)
+    if (!value.valid()) return I2cByteResult(0)
+    I2cByteResult(256 | (5 + (value.value() & 15)))
+}
+trusted fun Gt911.begin(): bool =
+    this.discardPending() && this.refreshPeriodMillisecondsChecked().valid()
+// Caller must apply the documented IRQ-pad sleep/wake sequence separately.
+trusted fun Gt911.sleepCommand(): bool =
+    this.valid() && this.device().writeRegisterAddress16Byte(0x8040, 5)
+
+// Caller holds exclusive sensor ownership through this read-modify-write.
+// Preserve all184 current configuration bytes except the explicitly selected
+// contact limit. Nothing is written if the read fails. One188-byte write sends
+// register address, config, checksum and fresh flag; errors are not success.
+trusted fun Gt911.updateConfiguration(maximumContacts: int): bool {
+    if (!this.valid() || (maximumContacts != -1 &&
+        (maximumContacts < 1 || maximumContacts > 5))) return false
+    val address = nativeStackAllocate(188)
+    val packet = nativeBufferAt(address, 188)
+    val configuration = nativeBufferAt(address + 2, 184)
+    if (!this.device().readRegisterAddress16(0x8047, configuration, 184)) return false
+    if (maximumContacts != -1) {
+        if (configuration.load(5) == maximumContacts) return true
+        configuration.store(5, maximumContacts)
+    }
+    packet.store(0, 128)
+    packet.store(1, 71)
+    var sum = 0
+    var index = 0
+    while (index < 184) {
+        sum = checksum8Add(sum, configuration.load(index))
+        index = index + 1
+    }
+    packet.store(186, checksum8Complement(sum))
+    packet.store(187, 1)
+    this.device().write(packet, 188)
+}
+trusted fun Gt911.setMaximumContacts(count: int): bool =
+    count >= 1 && count <= 5 && this.updateConfiguration(count)
+trusted fun Gt911.refreshConfiguration(): bool = this.updateConfiguration(-1)
+
+// Up to five8-byte contacts, caller storage40bytes. Returns0..5 report count,
+// -1 transport/argument error, -2 not ready, -3 malformed status. The device
+// holds data until acknowledgment; read errors leave the report pending.
+// Acknowledgment failure returns error (no successfully consumed report).
+// Caller must serialize all readers/discard operations for this touch device.
+trusted fun Gt911.readFrame(destination: NativeBuffer): int {
+    if (!this.valid() || !destination.hasAddressRange(0, 40)) return -1
+    val status = this.device().readRegisterAddress16ByteChecked(0x814e)
+    if (!status.valid()) return -1
+    val count = gt911ReadyCount(status.value())
+    if (count < 0) return count
+    if (count > 0 && !this.device().readRegisterAddress16(0x814f, destination, count * 8)) return -1
+    if (!this.discardPending()) return -1
+    count
+}

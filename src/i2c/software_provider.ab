@@ -1,0 +1,229 @@
+import "./software_provider_owner.ab"
+import "./results.ab"
+import "./register_access.ab"
+// Select one provider per application. One software bus,16 generation slots.
+// Context0lock,4epoch,8owner64,16lastReport64,24phase,28publishedHandle.
+// Phases0closed,1ready,2partial cleanup. No allocator, SDK or opaque boundary.
+// GPIO/IOMUX clocks, pad leases and calibrated ROM timing belong to the caller.
+type I2cBus = int
+type I2cDevice = int
+val softwareI2cProviderState=nativeStaticMutableU32s([0,0,0,0,0,0,0,0])
+val softwareI2cProviderSlots=nativeStaticMutableU32s([
+    0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+fun softwareI2cProviderPool(): I2cDeviceSlots = i2cDeviceSlotsAt(softwareI2cProviderSlots)
+trusted fun softwareI2cProviderLoad(offset: int): int = nativeAddressLoadU32(softwareI2cProviderState,offset)
+trusted fun softwareI2cProviderStore(offset: int,value: int): void { nativeAddressStoreU32(softwareI2cProviderState,offset,value); return }
+trusted fun softwareI2cProviderOwner(): SoftwareI2cProviderOwner = SoftwareI2cProviderOwner(softwareI2cProviderLoad(8)|(softwareI2cProviderLoad(12)<<32))
+trusted fun softwareI2cProviderSave(owner: SoftwareI2cProviderOwner): void {
+    softwareI2cProviderStore(8,owner&4294967295); softwareI2cProviderStore(12,owner>>>32); return
+}
+trusted fun softwareI2cProviderEnter(): bool = atomicU32At(softwareI2cProviderState).tryClaim(u32(1))
+trusted fun softwareI2cProviderLeave(): bool = atomicU32At(softwareI2cProviderState).releaseClaim(u32(1))
+fun I2cBus.valid(): bool = this > 0 && this <= 16777215
+fun I2cDevice.valid(): bool = i2cDeviceSlotHandleValid(this)
+trusted fun I2cBus.current(): bool = this.valid() && this == softwareI2cProviderLoad(4) && softwareI2cProviderLoad(24) == 1
+// Failed attempts consume an epoch too: an old bus cannot close partial setup
+// from a newer attempt. Failed setup is reclaimed by explicit abortSetup.
+trusted fun i2cSoftwareMaster(sda: int,scl: int,halfPeriodUs: int = 5,stretchPolls: int = 2000): I2cBus {
+    val lines=softwareI2cLines(sda,scl,halfPeriodUs,stretchPolls)
+    if (!lines.valid() || !softwareI2cProviderPinsValid(sda,scl) || !softwareI2cProviderEnter()) return I2cBus(0)
+    var result=0
+    if (softwareI2cProviderLoad(24) == 0 && softwareI2cProviderLoad(4) < 16777215) {
+        val epoch=softwareI2cProviderLoad(4)+1
+        softwareI2cProviderStore(4,epoch)
+        softwareI2cProviderStore(16,0); softwareI2cProviderStore(20,0)
+        val owner=softwareI2cProviderOpenOwner(sda,scl,halfPeriodUs,stretchPolls)
+        softwareI2cProviderSave(owner)
+        softwareI2cProviderStore(28,if (owner.ready()) 1 else 0)
+        softwareI2cProviderStore(24,if (owner.ready()) 1 else if (owner.ownsSda() || owner.ownsScl()) 2 else 0)
+        if (owner.ready()) result=epoch
+    }
+    if (!softwareI2cProviderLeave()) return I2cBus(0)
+    return I2cBus(result)
+}
+trusted fun I2cBus.device(address: int,frequency: int = 400000): I2cDevice {
+    if (!this.valid() || !softwareI2cProviderEnter()) return I2cDevice(0)
+    var result=0
+    if (this.current()) result=softwareI2cProviderOwner().deviceOwned(softwareI2cProviderPool(),address,frequency)
+    if (!softwareI2cProviderLeave()) return I2cDevice(0)
+    return I2cDevice(result)
+}
+trusted fun I2cDevice.close(): bool {
+    if (!this.valid() || !softwareI2cProviderEnter()) return false
+    val result=softwareI2cProviderOwner().closeDeviceOwned(softwareI2cProviderPool(),this)
+    val unlocked=softwareI2cProviderLeave()
+    return result && unlocked
+}
+trusted fun I2cDevice.setFrequency(frequency: int): bool {
+    if (!this.valid() || !softwareI2cProviderEnter()) return false
+    val owner=softwareI2cProviderOwner()
+    val changed=softwareI2cProviderLoad(24) == 1 && owner.ready() &&
+        owner.lines().setDeviceFrequencyOwned(softwareI2cProviderPool(),this,frequency)
+    val released=softwareI2cProviderLeave()
+    return changed && released
+}
+// Caller owns an exclusive single-master scan interval. Observes idle only:
+// no clock-clear pulses, forced STOP, implicit retry or fault suppression.
+// Status1ready,2invalid/stale,3prior transport fault,4busy/not idle.
+trusted fun softwareI2cProviderPrepare(): int {
+    val report=SoftwareI2cTransfer(softwareI2cProviderLoad(16)|(softwareI2cProviderLoad(20)<<32))
+    if (report != 0 && !(report.stopStatus() == 1 && (report.status() == 1 || report.status() == 5))) return 3
+    val lines=softwareI2cProviderOwner().lines()
+    if (!softwareI2cSample(lines.scl()) || !softwareI2cSample(lines.sda())) return 4
+    return 1
+}
+trusted fun I2cBus.prepareProbeStatus(): int {
+    if (!this.valid()) return 2
+    if (!softwareI2cProviderEnter()) return 4
+    val result=if (this.current()) softwareI2cProviderPrepare() else 2
+    if (!softwareI2cProviderLeave()) return 4
+    return result
+}
+// Address-only wire transaction without allocating a device slot. Preparation
+// and transfer share one admission; a full device pool does not block scanning.
+// Transfer status codes as I2cDevice.transferStatus; status3 also reports a
+// prior transport fault refusing preparation (inspect the retained report).
+trusted fun I2cBus.probeStatus(address: int,timeoutMilliseconds: int = 50): int {
+    if (!this.valid() || address < 1 || address > 127 || timeoutMilliseconds < 1 || timeoutMilliseconds > 1000000) return 2
+    if (!softwareI2cProviderEnter()) return 4
+    var result=2
+    if (this.current()) {
+        result=softwareI2cProviderPrepare()
+        if (result == 1) {
+            val original=softwareI2cProviderOwner().lines()
+            val configured=(original>>>26)&1048575
+            val budget=timeoutMilliseconds*1000
+            val lines=softwareI2cLines(original.sda(),original.scl(),(original>>>16)&1023,if (budget < configured) budget else configured)
+            val report=lines.transfer(address,NativeBuffer(0),0,NativeBuffer(0),0)
+            softwareI2cProviderStore(16,report&4294967295); softwareI2cProviderStore(20,report>>>32)
+            result=if (report.complete()) 1 else if (report.stopStatus() != 0 && report.stopStatus() != 1) 6 else report.status()
+        }
+    }
+    if (!softwareI2cProviderLeave()) return 4
+    return result
+}
+trusted fun I2cBus.probe(address: int,timeoutMilliseconds: int = 50): bool = this.probeStatus(address,timeoutMilliseconds) == 1
+// Explicit single-master/quiesced recovery, not an automatic transfer retry.
+// Preserve the fault report on failure; clear it only after observed idle.
+trusted fun I2cBus.recoverStatus(timeoutMilliseconds: int = 1000,clearStuck: bool = false): int {
+    if (!this.valid() || timeoutMilliseconds < 1 || timeoutMilliseconds > 1000000) return 2
+    if (!softwareI2cProviderEnter()) return 4
+    var result=2
+    if (this.current()) {
+        val original=softwareI2cProviderOwner().lines()
+        val configured=(original>>>26)&1048575
+        val budget=timeoutMilliseconds*1000
+        val lines=softwareI2cLines(original.sda(),original.scl(),(original>>>16)&1023,if (budget < configured) budget else configured)
+        result=lines.recoverOwned(clearStuck)
+        if (result == 1) { softwareI2cProviderStore(16,0); softwareI2cProviderStore(20,0) }
+    }
+    if (!softwareI2cProviderLeave()) return 4
+    return result
+}
+trusted fun I2cBus.recover(): bool = this.recoverStatus() == 1
+trusted fun I2cBus.clearStuckBus(timeoutMilliseconds: int = 1000): bool = this.recoverStatus(timeoutMilliseconds,true) == 1
+trusted fun softwareI2cProviderClose(): bool {
+    val owner=softwareI2cProviderOwner().closeWithDevicesOwned(softwareI2cProviderPool())
+    softwareI2cProviderSave(owner)
+    val closed=owner.status() == 0
+    softwareI2cProviderStore(24,if (closed) 0 else 2)
+    if (closed) softwareI2cProviderStore(28,0)
+    return closed
+}
+trusted fun I2cBus.close(): bool {
+    if (!this.valid() || !softwareI2cProviderEnter()) return false
+    var result=false
+    if (this == softwareI2cProviderLoad(4) && softwareI2cProviderLoad(28) == 1) result=softwareI2cProviderClose()
+    val unlocked=softwareI2cProviderLeave()
+    return result && unlocked
+}
+trusted fun i2cSoftwareAbortSetup(): bool {
+    if (!softwareI2cProviderEnter()) return false
+    var result=false
+    if (softwareI2cProviderLoad(24) == 2 && softwareI2cProviderLoad(28) == 0) result=softwareI2cProviderClose()
+    val unlocked=softwareI2cProviderLeave()
+    return result && unlocked
+}
+// Explicitly finish this provider's unpublished busy-bus setup. The original
+// failed open already consumed an epoch and configured both pads; do not open
+// again or reset device-slot generations. Caller owns the failed attempt and
+// excludes other masters. clearStuck opts into slave clocks, never implicit.
+// Returns a newly published bus only after observed idle. Other setup failures
+// and failed close/revocation cannot be revived; use abortSetup/close instead.
+trusted fun i2cSoftwareRecoverSetup(clearStuck: bool = false): I2cBus {
+    if (!softwareI2cProviderEnter()) return I2cBus(0)
+    var result=0
+    if (softwareI2cProviderLoad(24) == 2 && softwareI2cProviderLoad(28) == 0) {
+        val previous=softwareI2cProviderOwner()
+        if (previous.status() == 6 || previous.status() == 10) {
+            val owner=previous.recoverOwned(clearStuck)
+            softwareI2cProviderSave(owner)
+            if (owner.ready()) {
+                softwareI2cProviderStore(16,0);softwareI2cProviderStore(20,0)
+                softwareI2cProviderStore(24,1);softwareI2cProviderStore(28,1)
+                result=softwareI2cProviderLoad(4)
+            }
+        }
+    }
+    if (!softwareI2cProviderLeave()) return I2cBus(0)
+    return I2cBus(result)
+}
+// Protect both context and pool from writes OR accidental disclosure via TX.
+fun softwareI2cProviderBufferSafe(buffer: NativeBuffer,length: int): bool =
+    buffer.hasAddressRange(0,length) && (length == 0 ||
+        ((buffer.addressValue()+length <= softwareI2cProviderState || buffer.addressValue() >= softwareI2cProviderState+32) &&
+        (buffer.addressValue()+length <= softwareI2cProviderSlots || buffer.addressValue() >= softwareI2cProviderSlots+200)))
+// Status1complete,2invalid,3stretch timeout,4busy/arbitration,5NACK,
+// 6STOP failure,7prior fault requires explicit recovery.
+// Timing budget is per clock-stretch, not total transaction time.
+// Existing timeoutMilliseconds parameter caps each stretch wait. No spinning
+// on admission and no implicit recovery/retry of failed transactions.
+trusted fun I2cDevice.transferStatus(output: NativeBuffer,written: int,input: NativeBuffer,read: int,timeoutMilliseconds: int = 1000,registerPrefix: int = -1): int {
+    if (!this.valid() || written < 0 || written > 65535 || read < 0 || read > 65535 ||
+        registerPrefix < -1 || registerPrefix > 255 || timeoutMilliseconds < 1 || timeoutMilliseconds > 1000000 ||
+        !softwareI2cProviderBufferSafe(output,written) || !softwareI2cProviderBufferSafe(input,read)) return 2
+    if (!softwareI2cProviderEnter()) return 4
+    var result=2
+    if (softwareI2cProviderLoad(24) == 1) {
+        val owner=softwareI2cProviderOwner()
+        val descriptor=softwareI2cProviderPool().resolve(this)
+        if (owner.matchesDevice(descriptor)) {
+            // A new transfer must not erase a retained wire/reset fault.
+            val previous=SoftwareI2cTransfer(softwareI2cProviderLoad(16)|(softwareI2cProviderLoad(20)<<32))
+            if (previous != 0 && !(previous.stopStatus() == 1 && (previous.status() == 1 || previous.status() == 5))) {
+                if (!softwareI2cProviderLeave()) return 4
+                return 7
+            }
+            val original=SoftwareI2cLines(descriptor&70368744177663)
+            val budget=timeoutMilliseconds*1000
+            val configured=(original>>>26)&1048575
+            val lines=softwareI2cLines(original.sda(),original.scl(),(original>>>16)&1023,if (budget < configured) budget else configured)
+            val report=lines.transfer((descriptor>>>46)&127,output,written,input,read,registerPrefix)
+            softwareI2cProviderStore(16,report&4294967295); softwareI2cProviderStore(20,report>>>32)
+            result=if (report.complete()) 1 else if (report.stopStatus() != 0 && report.stopStatus() != 1) 6 else report.status()
+        }
+    }
+    if (!softwareI2cProviderLeave()) return 4
+    return result
+}
+trusted fun I2cDevice.write(source: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(source,length,NativeBuffer(0),0,timeoutMilliseconds) == 1
+trusted fun I2cDevice.read(destination: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(NativeBuffer(0),0,destination,length,timeoutMilliseconds) == 1
+trusted fun I2cDevice.writeRead(source: NativeBuffer,length: int,destination: NativeBuffer,read: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(source,length,destination,read,timeoutMilliseconds) == 1
+trusted fun I2cDevice.readRegister(register: int,destination: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = register >= 0 && register <= 255 && this.transferStatus(NativeBuffer(0),0,destination,length,timeoutMilliseconds,register) == 1
+trusted fun I2cDevice.writeRegister(register: int,source: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = register >= 0 && register <= 255 && this.transferStatus(source,length,NativeBuffer(0),0,timeoutMilliseconds,register) == 1
+trusted fun I2cDevice.readRegister8Checked(register: int): I2cByteResult {
+    val buffer=nativeBufferAt(nativeStackAllocate(1),1)
+    if (!this.readRegister(register,buffer,1)) return I2cByteResult(0)
+    return I2cByteResult(256|buffer.load(0))
+}
+trusted fun I2cDevice.readRegister8(register: int,fallback: int = 0): int {
+    val result=this.readRegister8Checked(register)
+    return if (result.valid()) result.value() else fallback
+}
+trusted fun I2cDevice.writeRegister8(register: int,value: int): bool {
+    if (register < 0 || register > 255 || value < 0 || value > 255) return false
+    val buffer=nativeBufferAt(nativeStackAllocate(1),1)
+    buffer.store(0,value)
+    return this.writeRegister(register,buffer,1)
+}

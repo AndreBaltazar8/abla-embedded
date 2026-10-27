@@ -1,0 +1,59 @@
+import "./fat_file_overwrite_checked.ab"
+import "./fat_chain_plan.ab"
+import "./fat_link_write.ab"
+import "./fat_fsinfo.ab"
+// Whole transaction must hold volume ownership. Plan complete chain, invalidate
+// free hints, publish smaller size/head, detach kept tail, then free suffix.
+// Never free clusters while a published file still requires them. Partial
+// failure may leak clusters or leave mirrors inconsistent; fault mount, no
+// rollback/retry. Not secure erasure: old data sectors remain on the medium.
+type FatFileShrink=int
+//1complete2input3stale4readIO5chain6budget/capacity7hints8directory9detach10free11readonly.
+// Freed-cluster count20@8 counts fully completed mirrored entry updates only.
+fun FatFileShrink.status(): int = this&255
+fun FatFileShrink.freedClusters(): int = (this>>8)&0xfffff
+trusted fun fatFileShrinkOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    parent: int,ordinal: int,entryIndex: int,expected: NativeBuffer,newSize: int,budget: int,
+    modified: RtcDateTime,plan: NativeBuffer,workspace: NativeBuffer): FatFileShrink {
+    val geometry=fatBootValidate(boot,first,sectors);val timestamp=fatModifiedTimestamp(modified)
+    if (!geometry.valid() || timestamp < 0 || newSize < 0 || newSize > 4294967295 || entryIndex < 0 || entryIndex > 15 ||
+        !expected.hasAddressRange(0,32) || !workspace.hasAddressRange(0,2560) ||
+        fatBuffersOverlap(workspace,2560,reader,28) || fatBuffersOverlap(workspace,2560,boot,512) ||
+        fatBuffersOverlap(workspace,2560,expected,32) || fatBuffersOverlap(workspace,2560,plan,plan.capacity()) ||
+        fatBuffersOverlap(plan,plan.capacity(),expected,32)) return FatFileShrink(2)
+    val directory=nativeBufferAt(workspace.addressValue(),512);val work=nativeBufferAt(workspace.addressValue()+512,2048)
+    val located=fatDirectoryReadOwned(reader,boot,first,sectors,parent,ordinal,budget,directory,nativeBufferAt(work.addressValue(),1024))
+    if (located.status() != 1) return FatFileShrink(if (located.status() == 4) 4 else if (located.status() == 7) 6 else 5)
+    var i=0
+    while (i < 32) { if (expected.load(i) != directory.load(entryIndex*32+i)) return FatFileShrink(3);i=i+1 }
+    val file=fatDirectoryDecode(directory,entryIndex,geometry.fatBits(),geometry.clusters())
+    if (!file.isFile() || newSize > file.byteSize()) return FatFileShrink(2)
+    if ((directory.load(entryIndex*32+11)&1) != 0) return FatFileShrink(11)
+    if (newSize == file.byteSize()) return FatFileShrink(1)
+    val chain=fatPlanChainOwned(reader,boot,first,sectors,file.firstCluster(),budget,plan,nativeBufferAt(work.addressValue(),1024))
+    if (chain.status() != 1) return FatFileShrink(if (chain.status() == 3) 4 else if (chain.status() >= 5) 6 else 5)
+    val bytes=geometry.sectorsPerCluster()*512
+    if (chain.count()*bytes < file.byteSize()) return FatFileShrink(5)
+    var keep=if (newSize == 0) 0 else newSize-1;var divisor=bytes
+    while (divisor > 1) { keep=keep>>1;divisor=divisor>>1 }
+    if (newSize != 0) keep=keep+1
+    if (keep < chain.count() && fatInvalidateFreeHintsOwned(reader,boot,first,sectors,nativeBufferAt(work.addressValue(),1024)) != 1) return FatFileShrink(7)
+    val entry=entryIndex*32
+    directory.store(entry+11,directory.load(entry+11)|32);directory.storeU16(entry+18,0)
+    directory.storeU32(entry+22,timestamp);directory.storeU32(entry+28,newSize)
+    if (keep == 0) {
+        directory.storeU16(entry+26,0)
+        if (geometry.fatBits() == 32) directory.storeU16(entry+20,directory.loadU16(entry+20)&61440)
+    }
+    if (!fatStorageWriteOwned(reader,located.sector(),directory)) return FatFileShrink(8)
+    if (keep > 0 && keep < chain.count()) {
+        val eoc=if (geometry.fatBits() == 12) 4095 else if (geometry.fatBits() == 16) 65535 else 268435455
+        if (fatWriteLinkOwned(reader,boot,first,sectors,plan.loadU32((keep-1)*8),plan.loadU32((keep-1)*8+4),eoc,work).status() != 1) return FatFileShrink(9)
+    }
+    var freed=0;i=keep
+    while (i < chain.count()) {
+        if (fatWriteLinkOwned(reader,boot,first,sectors,plan.loadU32(i*8),plan.loadU32(i*8+4),0,work).status() != 1) return FatFileShrink(10|(freed<<8))
+        freed=freed+1;i=i+1
+    }
+    return FatFileShrink(1|(freed<<8))
+}

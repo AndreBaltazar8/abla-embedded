@@ -1,0 +1,63 @@
+import "./board_id.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Caller-owned24-byte context: tag0,borrowed IOE1 handle4,pin8,edge time12,
+// acknowledged edges16,status20. Status1 sequence sent,2 pending,3 invalid,
+// 4 I2C failure,6 explicitly released/cancelled. Neither success nor failure
+// proves physical power removal. Cancellation is not successful shutdown.
+// Before begin: stop all consumers of the board supplies and exclusively own
+// this context/power-off pin. Never overwrite a live context to restart it.
+// now is wrapping milliseconds; poll at least once every2^31ms. Calls are
+// serialized; caller retains the bus/device while pending or recovering.
+trusted fun m5PowerOffPulseStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,24) || context.loadU32(0) != 0x504f5031) return 3
+    val status=context.loadU32(20)
+    if (status == 5) 2 else if ((status >= 1 && status <= 4) || status == 6) status else 3
+}
+trusted fun M5BoardId.beginPowerOffPulse(context: NativeBuffer,ioe1: int,now: u32,releasedExclusive: bool): int {
+    val pin=if (this == m5BoardTab5 || this == m5BoardTab5X) 4 else if (this == m5BoardArduinoNessoN1) 0 else -1
+    if (!releasedExclusive || pin < 0 || ioe1 <= 0 || ioe1 > 4294967295 || !context.hasAddressRange(0,24)) return 3
+    m5PowerOffPulseBeginOwned(context,ioe1,pin,now,releasedExclusive)
+}
+// Shared timing engine. Handle0 selects the caller's GPIO backend; nonzero
+// selects the borrowed PI4 expander. Use the board wrappers for pin selection.
+trusted fun m5PowerOffPulseBeginOwned(context: NativeBuffer,ioe1: int,pin: int,now: u32,releasedExclusive: bool): int {
+    if (!releasedExclusive || ioe1 < 0 || ioe1 > 4294967295 || pin < 0 || pin > (if (ioe1 == 0) 48 else 7) || !context.hasAddressRange(0,24)) return 3
+    context.storeU32(0,0x504f5031); context.storeU32(4,ioe1); context.storeU32(8,pin)
+    context.storeU32(12,int(now)); context.storeU32(16,0); context.storeU32(20,2)
+    if (!m5PowerOffPulseWrite(ioe1,pin,false)) { context.storeU32(20,4); return 4 }
+    context.storeU32(16,1)
+    // Time is armed on the next poll, after this write has returned. A slow
+    // I2C transaction must never count as part of the required50ms hold.
+    context.storeU32(20,5)
+    2
+}
+trusted fun m5PowerOffPulsePoll(context: NativeBuffer,now: u32): int {
+    val status=m5PowerOffPulseStatus(context)
+    if (status != 2) return status
+    val edges=context.loadU32(16)
+    if (edges < 1 || edges > 10) return 3
+    if (context.loadU32(20) == 5) {
+        context.storeU32(12,int(now)); context.storeU32(20,2)
+        return 2
+    }
+    if (now-u32(context.loadU32(12)) < u32(50)) return 2
+    if (edges == 10) { context.storeU32(20,1); return 1 }
+    if (!m5PowerOffPulseWrite(context.loadU32(4),context.loadU32(8),(edges & 1) != 0)) {
+        context.storeU32(20,4); return 4
+    }
+    context.storeU32(16,edges+1); context.storeU32(20,5)
+    2
+}
+// Explicit recovery only: caller still owns the pin/bus and has kept supply
+// consumers quiescent. HIGH is the final level of the normal ten-edge train.
+// A failed write may have committed, so retry release, never resume toggling.
+// Keep edge count for diagnosis; already complete/released is an I/O-free no-op.
+trusted fun m5PowerOffPulseReleaseOwned(context: NativeBuffer): int {
+    val status=m5PowerOffPulseStatus(context)
+    if (status == 1 || status == 6 || status == 3) return status
+    val handle=context.loadU32(4);val pin=context.loadU32(8)
+    if (pin > (if (handle == 0) 48 else 7)) return 3
+    if (!m5PowerOffPulseWrite(handle,pin,true)) { context.storeU32(20,4);return 4 }
+    context.storeU32(20,6)
+    6
+}

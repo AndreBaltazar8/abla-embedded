@@ -1,0 +1,58 @@
+import "./sdmmc_batch.ab"
+import "./fat_file_extent.ab"
+// One contiguous read-at chunk. Short success can mean fragmentation or
+// bounce capacity, not EOF. Caller repeats at offset+bytesRead. Both readers
+// reference the SAME immutable card, with separate sessions/descriptors/bounce
+// buffers and exclusive host ownership throughout planning and data transfer.
+// No destination writes until all metadata and data operations succeed.
+type FatFileBatch = int
+fun FatFileBatch.status(): int = this&255
+fun FatFileBatch.bytesRead(): int = if (this.status() == 1) (this>>8)&0x7ffff else 0
+// Nine persistent regions: shared card, metadata reader/session/desc/bounce,
+// data reader/session/desc/bounce. Validated against all four transient regions.
+trusted fun fatFileBatchRegion(meta: NativeBuffer,batch: NativeBuffer,index: int): NativeBuffer {
+    if (index == 0) return nativeBufferAt(meta.loadU32(0),80)
+    if (index == 1) return nativeBufferAt(meta.addressValue(),28)
+    if (index == 2) return nativeBufferAt(meta.loadU32(4),52)
+    if (index == 3) return nativeBufferAt(meta.loadU32(8),16)
+    if (index == 4) return nativeBufferAt(meta.loadU32(12),512)
+    if (index == 5) return nativeBufferAt(batch.addressValue(),32)
+    if (index == 6) return nativeBufferAt(batch.loadU32(4),76)
+    if (index == 7) return nativeBufferAt(batch.loadU32(8),sdMmcDmaDescriptorCount(batch.loadU32(28)<<9)*16)
+    return nativeBufferAt(batch.loadU32(12),batch.loadU32(28)<<9)
+}
+trusted fun fatSdMmcFileReadBatchOwned(meta: NativeBuffer,batch: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,file: FatDirectoryEntry,offset: int,length: int,budget: int,destination: NativeBuffer,fatScratch: NativeBuffer,dataScratch: NativeBuffer): FatFileBatch {
+    if (!fatSdMmcReaderValid(meta) || !sdMmcBatchReaderValid(batch) || meta.loadU32(0) != batch.loadU32(0) ||
+        offset < 0 || length < 1 || length > 491520 || !boot.hasAddressRange(0,512) || !fatScratch.hasAddressRange(0,1024) ||
+        !destination.hasAddressRange(0,length)) return FatFileBatch(3)
+    val capacity=batch.loadU32(28)<<9
+    if (!dataScratch.hasAddressRange(0,capacity)) return FatFileBatch(3)
+    // Full pairwise validation includes both descriptor chains and entire
+    // bounce capacities, not only the bytes requested by this call.
+    var i=0
+    while (i < 13) {
+        val a=if (i < 9) fatFileBatchRegion(meta,batch,i) else if (i == 9) nativeBufferAt(boot.addressValue(),512) else if (i == 10) nativeBufferAt(fatScratch.addressValue(),1024) else if (i == 11) nativeBufferAt(dataScratch.addressValue(),capacity) else nativeBufferAt(destination.addressValue(),length)
+        if (!a.hasAddressRange(0,a.capacity())) return FatFileBatch(3)
+        var j=0
+        while (j < i) {
+            val b=if (j < 9) fatFileBatchRegion(meta,batch,j) else if (j == 9) nativeBufferAt(boot.addressValue(),512) else if (j == 10) nativeBufferAt(fatScratch.addressValue(),1024) else nativeBufferAt(dataScratch.addressValue(),capacity)
+            if (fatBuffersOverlap(a,a.capacity(),b,b.capacity())) return FatFileBatch(3)
+            j=j+1
+        }
+        i=i+1
+    }
+    val metadataSession=nativeBufferAt(meta.loadU32(4),52)
+    val dataSession=nativeBufferAt(batch.loadU32(4),76)
+    if (metadataSession.loadU32(48) != 0 || dataSession.loadU32(72) != 0) return FatFileBatch(3)
+    var wanted=length
+    if (wanted > capacity-(offset&511)) wanted=capacity-(offset&511)
+    val extent=fatFileExtentOwned(meta,boot,first,sectors,file,offset,wanted,budget,fatScratch)
+    if (extent.status() != 1) return FatFileBatch(extent.status())
+    val count=(extent.bytes()+(offset&511)+511)>>9
+    if (!sdMmcBatchReadOwned(batch,extent.sector(),count,dataScratch)) return FatFileBatch(4)
+    var copied=0
+    while (copied < extent.bytes()) {
+        destination.store(copied,dataScratch.load((offset&511)+copied)); copied=copied+1
+    }
+    return FatFileBatch((copied<<8)|1)
+}

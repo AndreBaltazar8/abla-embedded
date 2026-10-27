@@ -1,0 +1,68 @@
+import "./expander_open_sequence.ab"
+import "./pmic_open_sequence.ab"
+import "./c6_power_sequence.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Caller-owned40B RAM, borrowed current C6 bus. Explicit board-wide startup:
+// charger configuration and gauge reset/unseal are intentional side effects.
+// No rollback of hardware writes. Retain this owner and the bus after failure;
+// close revokes handles, NOT rails. No independent close/use of borrowed views.
+type NessoPower=int
+fun nessoPowerAt(storage: NativeBuffer): NessoPower =
+    if (storage.hasAddressRange(0,40) && (storage.addressValue()&3) == 0 && nessoPowerStorageSafe(storage)) NessoPower(storage|0) else NessoPower(0)
+fun NessoPower.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun NessoPower.valid(): bool = nessoPowerAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x4e535031
+trusted fun NessoPower.phase(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun NessoPower.ready(): bool = this.phase() == 1
+// Fresh storage only; never reinitialize a retained owner.
+trusted fun NessoPower.initialize(): bool {
+    if (nessoPowerAt(this.buffer()) == 0) return false
+    var at=4;while (at < 40) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x4e535031);return true
+}
+trusted fun NessoPower.expanderOwner(): M5ExpanderOpen = M5ExpanderOpen(this.buffer().loadU32(12)|(this.buffer().loadU32(16)<<32))
+trusted fun NessoPower.chargerOwner(): M5PmicOpen = M5PmicOpen(this.buffer().loadU32(20)|(this.buffer().loadU32(24)<<32))
+trusted fun NessoPower.saveExpander(value: M5ExpanderOpen): void {
+    this.buffer().storeU32(12,value&0xffffffff);this.buffer().storeU32(16,value>>>32);return
+}
+trusted fun NessoPower.saveCharger(value: M5PmicOpen): void {
+    this.buffer().storeU32(20,value&0xffffffff);this.buffer().storeU32(24,value>>>32);return
+}
+trusted fun NessoPower.openFailure(): int = if (this.valid()) this.buffer().loadU32(32) else 2
+trusted fun NessoPower.setupResult(): M5C6PowerInit = M5C6PowerInit(if (this.valid()) this.buffer().loadU32(36) else 3)
+trusted fun NessoPower.failOpen(status: int): int {
+    this.buffer().storeU32(32,status);this.buffer().storeU32(4,2);return status
+}
+// 1ready2admission3expander4charger5gaugeallocation6boardsetup.
+trusted fun NessoPower.openOwned(bus: int,exclusive: bool): int {
+    if (!exclusive || this.phase() != 0 || !nessoPowerBusCurrent(bus)) return 2
+    this.buffer().storeU32(4,3);this.buffer().storeU32(8,bus)
+    this.buffer().storeU32(32,0);this.buffer().storeU32(36,0)
+    val board=m5BoardArduinoNessoN1
+    val ioe=board.openExpanderOwned(bus,0);this.saveExpander(ioe)
+    if (!ioe.ready()) return this.failOpen(3)
+    val charger=board.openPmicOwned(bus);this.saveCharger(charger)
+    if (!charger.ready()) return this.failOpen(4)
+    val gauge=nessoPowerGaugeAllocate(bus);this.buffer().storeU32(28,gauge)
+    if (gauge == 0) return this.failOpen(5)
+    val result=board.configureC6PowerOwned(ioe.deviceHandle(),charger.deviceHandle(),gauge)
+    this.buffer().storeU32(36,result|0)
+    if (!result.valid()) return this.failOpen(6)
+    this.buffer().storeU32(4,1);return 1
+}
+trusted fun NessoPower.gaugeHandle(): int = if (this.ready()) this.buffer().loadU32(28) else 0
+trusted fun NessoPower.closeOwned(exclusive: bool): bool {
+    val phase=this.phase()
+    if (!exclusive || phase < 0 || phase == 3 || phase == 4) return false
+    if (phase == 0) return true
+    this.buffer().storeU32(4,4)
+    val gauge=this.buffer().loadU32(28)
+    if (gauge != 0) {
+        if (!nessoPowerGaugeClose(gauge)) { this.buffer().storeU32(4,2);return false }
+        this.buffer().storeU32(28,0)
+    }
+    val charger=this.chargerOwner().releaseOwned();this.saveCharger(charger)
+    if (charger.ownsDevice()) { this.buffer().storeU32(4,2);return false }
+    val ioe=this.expanderOwner().releaseOwned();this.saveExpander(ioe)
+    if (ioe.ownsDevice()) { this.buffer().storeU32(4,2);return false }
+    this.buffer().storeU32(8,0);this.buffer().storeU32(4,0);return true
+}

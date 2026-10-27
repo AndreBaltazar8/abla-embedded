@@ -1,0 +1,57 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "../peripheral_gate.ab"
+//112B caller-owned aggregate: header16,power40,display40,touch8,IMU8.
+// Borrows calibrated bus/SPI pads/clocks. All component views are borrowed:
+// never initialize/close them independently. Caller serializes whole owner.
+// Opening intentionally performs board power, display and sensor setup.
+// Failure retains every attempted child. Close is reverse dependency order;
+// a failed child close stops teardown before its parent. No hardware rollback.
+type NessoDevices=int
+fun nessoDevicesAt(storage: NativeBuffer): NessoDevices =
+    if (storage.hasAddressRange(0,112) && (storage.addressValue()&3) == 0 && nessoDevicesStorageSafe(storage)) NessoDevices(storage|0) else NessoDevices(0)
+fun NessoDevices.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun NessoDevices.phase(): int = if (nessoDevicesAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x4e534431+1) this.buffer().loadU32(4) else -1
+trusted fun NessoDevices.ready(): bool = this.phase() == 1
+trusted fun NessoDevices.pending(): int = if (this.phase() >= 0) this.buffer().loadU32(8) else 0
+trusted fun NessoDevices.failure(): int = if (this.phase() >= 0) this.buffer().loadU32(12) else 2
+// Fresh RAM only, never reinitialize retained ownership.
+trusted fun NessoDevices.initialize(): bool {
+    if (nessoDevicesAt(this.buffer()) == 0) return false
+    var at=4;while (at < 112) { this.buffer().storeU32(at,0);at=at+4 }
+    if (!nessoDevicesInitializeChildren(this.buffer())) return false
+    this.buffer().storeU32(0,0x4e534431+1);return true
+}
+trusted fun NessoDevices.fail(status: int): int {
+    this.buffer().storeU32(12,status);this.buffer().storeU32(4,2);return status
+}
+//1ready,2admission,11..14failed power/display/touch/IMU respectively.
+trusted fun NessoDevices.openOwned(bus: int,gate: PeripheralGate,owner: u32,exclusive: bool): int {
+    if (!exclusive || this.phase() != 0 || !nessoDevicesAdmission(this.buffer(),bus,gate,owner)) return 2
+    this.buffer().storeU32(4,3);this.buffer().storeU32(12,0)
+    var child=0
+    while (child < 4) {
+        val bit=int(u32(1)<<u32(child))
+        this.buffer().storeU32(8,this.buffer().loadU32(8)|bit)
+        if (!nessoDevicesOpenChild(this.buffer(),child,bus,gate,owner)) return this.fail(11+child)
+        child=child+1
+    }
+    this.buffer().storeU32(4,1);return 1
+}
+//21..24failed close at power/display/touch/IMU. Clocks/session remain caller
+// owned even after success; release borrowed SPI pads before gating clocks.
+trusted fun NessoDevices.closeOwned(exclusive: bool): bool {
+    val phase=this.phase()
+    if (!exclusive || phase < 0 || phase == 3 || phase == 4) return false
+    if (phase == 0) return true
+    this.buffer().storeU32(4,4)
+    var child=3
+    while (child >= 0) {
+        val bit=int(u32(1)<<u32(child))
+        if ((this.buffer().loadU32(8)&bit) != 0) {
+            if (!nessoDevicesCloseChild(this.buffer(),child)) { this.fail(21+child);return false }
+            this.buffer().storeU32(8,this.buffer().loadU32(8)&~bit)
+        }
+        child=child-1
+    }
+    this.buffer().storeU32(4,0);return true
+}

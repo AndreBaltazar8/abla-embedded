@@ -1,0 +1,94 @@
+import "./esp32/sdk/raw_buffer.ab"
+// Ten cooperative timers in caller-owned204bytes: run flag4, ten20-byte
+// slots {token,interval,previous,remaining,enabled}, all u32. No IRQs/heap.
+// Single-owner only, initialized once before use; never reinitialize/free
+// during callbacks. Dispatch hook cooperativeTimerDispatchOwned(owner,id,token)
+// is supplied by the application, permitting static token dispatch/inlining.
+// Time is monotonic modulo2^32; call run before a whole wrap elapses.
+type CooperativeTimers = int
+fun cooperativeTimersAt(address: int): CooperativeTimers = CooperativeTimers(address)
+fun CooperativeTimers.buffer(): NativeBuffer = nativeBufferAt(this|0,204)
+fun CooperativeTimers.valid(): bool = this > 0 && this <= 4294967092 && this.buffer().hasAddressRange(0,204)
+trusted fun CooperativeTimers.initialize(): bool {
+    if (!this.valid()) return false
+    var offset=0
+    while (offset < 204) { this.buffer().storeU32(offset,0); offset=offset+4 }
+    return true
+}
+trusted fun CooperativeTimers.setTimer(interval: u32,token: u32,times: u32,now: u32): int {
+    if (!this.valid() || token == u32(0)) return -1
+    var id=0
+    while (id < 10) {
+        val offset=4+id*20
+        if (this.buffer().loadU32(offset) == 0) {
+            this.buffer().storeU32(offset,int(token)); this.buffer().storeU32(offset+4,int(interval))
+            this.buffer().storeU32(offset+8,int(now)); this.buffer().storeU32(offset+12,int(times)); this.buffer().storeU32(offset+16,1)
+            return id
+        }
+        id=id+1
+    }
+    return -1
+}
+trusted fun CooperativeTimers.setInterval(interval: u32,token: u32,now: u32): int = this.setTimer(interval,token,u32(0),now)
+trusted fun CooperativeTimers.setTimeout(interval: u32,token: u32,now: u32): int = this.setTimer(interval,token,u32(1),now)
+trusted fun CooperativeTimers.occupied(id: int): bool = this.valid() && id >= 0 && id < 10 && this.buffer().loadU32(4+id*20) != 0
+trusted fun CooperativeTimers.deleteTimer(id: int): bool {
+    if (!this.occupied(id)) return false
+    this.buffer().storeU32(4+id*20,0)
+    return true
+}
+trusted fun CooperativeTimers.restartTimer(id: int,now: u32): bool {
+    if (!this.occupied(id)) return false
+    this.buffer().storeU32(12+id*20,int(now))
+    return true
+}
+trusted fun CooperativeTimers.setEnabled(id: int,enabled: bool): bool {
+    if (!this.occupied(id)) return false
+    this.buffer().storeU32(20+id*20,if (enabled) 1 else 0)
+    return true
+}
+trusted fun CooperativeTimers.enable(id: int): bool = this.setEnabled(id,true)
+trusted fun CooperativeTimers.disable(id: int): bool = this.setEnabled(id,false)
+trusted fun CooperativeTimers.isEnabled(id: int): bool = this.occupied(id) && this.buffer().loadU32(20+id*20) != 0
+trusted fun CooperativeTimers.toggle(id: int): bool = this.setEnabled(id,!this.isEnabled(id))
+trusted fun CooperativeTimers.getNumTimers(): int {
+    if (!this.valid()) return 0
+    var count=0
+    var id=0
+    while (id < 10) { if (this.occupied(id)) count=count+1; id=id+1 }
+    return count
+}
+trusted fun CooperativeTimers.getNumAvailableTimers(): int = if (this.valid()) 10-this.getNumTimers() else 0
+// At most one invocation per slot per run, including overdue/zero intervals.
+// As in M5Timer, disabled timers advance phase when due without consuming
+// repetitions. Finite countdown/expiry happens BEFORE dispatch here: a
+// callback can safely delete/reuse its slot without post-callback corruption.
+// New timers in later slots can run this pass. Recursive run returns -2.
+// Returns callbacks dispatched, -1 invalid owner. Hook must return normally.
+trusted fun CooperativeTimers.run(now: u32): int {
+    if (!this.valid()) return -1
+    val buffer=this.buffer()
+    if (buffer.loadU32(0) != 0) return -2
+    buffer.storeU32(0,1)
+    var id=0
+    var count=0
+    while (id < 10) {
+        val offset=4+id*20
+        val token=buffer.loadU32(offset)
+        val interval=buffer.loadU32(offset+4)
+        val previous=buffer.loadU32(offset+8)
+        if (token != 0 && ((int(now)-previous)&4294967295) >= interval) {
+            buffer.storeU32(offset+8,(previous+interval)&4294967295)
+            if (buffer.loadU32(offset+16) != 0) {
+                val remaining=buffer.loadU32(offset+12)
+                if (remaining == 1) buffer.storeU32(offset,0)
+                else if (remaining > 1) buffer.storeU32(offset+12,remaining-1)
+                cooperativeTimerDispatchOwned(this,id,u32(token))
+                count=count+1
+            }
+        }
+        id=id+1
+    }
+    buffer.storeU32(0,0)
+    return count
+}

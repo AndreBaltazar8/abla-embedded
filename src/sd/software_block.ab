@@ -1,0 +1,130 @@
+import "./software_init.ab"
+
+// Status:1 complete,2 bus busy,3 invalid,4 gate fault,5 ownership failure,
+// 6 command rejected/missing,7 token timeout,8 data error token,9 CRC mismatch,
+// 10 write rejected,11 busy timeout,12 post-write card status error.
+// Destination may contain untrusted/partial data on failure; only use on success.
+type SoftwareSdBlockResult = int
+fun SoftwareSdBlockResult.status(): int = this & 255
+fun SoftwareSdBlockResult.valid(): bool = this.status() == 1
+
+trusted fun softwareSdReadBlockSelected(clock: Pin, mosi: Pin, miso: Pin,
+    highCapacity: bool, block: int, destination: NativeBuffer,
+    halfPeriodMicroseconds: int): SoftwareSdBlockResult {
+    val response = softwareSdCommandSelected(clock, mosi, miso, 17,
+        sdSpiBlockArgument(highCapacity, block), nativeBufferAt(0, 0), 0, halfPeriodMicroseconds)
+    if (response != 0) return SoftwareSdBlockResult(6)
+    softwareSdReadPayloadSelected(clock, mosi, miso, destination, 512, halfPeriodMicroseconds)
+}
+
+// Shared token/data/CRC phase for sectors and 16-byte CID/CSD registers.
+// Caller validates destination, length and owns selected pins and the gate.
+trusted fun softwareSdReadPayloadSelected(clock: Pin, mosi: Pin, miso: Pin,
+    destination: NativeBuffer, length: int, halfPeriodMicroseconds: int): SoftwareSdBlockResult {
+    var token = 255
+    var attempts = 0
+    while (token == 255 && attempts < 250) {
+        token = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+        if (token == 255) peripheralDelayMicroseconds(1000)
+        attempts = attempts + 1
+    }
+    if (token == 255) return SoftwareSdBlockResult(7)
+    if (token != 254) return SoftwareSdBlockResult(8)
+    var crc = 0
+    var index = 0
+    while (index < length) {
+        val value = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+        destination.store(index, value)
+        crc = sdSpiCrc16Byte(crc, value)
+        index = index + 1
+    }
+    val high = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+    val low = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+    if (crc != ((high << 8) | low)) return SoftwareSdBlockResult(9)
+    SoftwareSdBlockResult(1)
+}
+
+// One 512-byte CMD17 read. Keep CS and the canonical bus gate throughout the
+// command, token wait, payload and CRC. The card must have been initialized
+// on these same pins and not power-cycled since obtaining cardState.
+trusted fun softwareSdReadBlock(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    cardState: SoftwareSdInitResult, block: int, destination: NativeBuffer,
+    halfPeriodMicroseconds: int = 2): SoftwareSdBlockResult {
+    if (!cardState.valid() || !sdSpiBlockAddressValid(cardState.highCapacity(), block) ||
+        !gate.bufferDisjoint(destination, 512) || mosi.number() < 0 || miso.number() < 0 ||
+        !softwareSpiConfigurationValid(clock, mosi, miso, 0, halfPeriodMicroseconds) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, 0, 0)) return SoftwareSdBlockResult(3)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SoftwareSdBlockResult(if (admission == 1) 2 else if (admission == 2) 4 else 3)
+    clock.write(false)
+    chipSelect.write(false)
+    val result = softwareSdReadBlockSelected(clock, mosi, miso, cardState.highCapacity(), block, destination, halfPeriodMicroseconds)
+    chipSelect.write(true)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(255), 8, 0, halfPeriodMicroseconds)
+    if (!gate.finish(owner, true)) return SoftwareSdBlockResult(5)
+    result
+}
+
+trusted fun softwareSdWaitReadySelected(clock: Pin, mosi: Pin, miso: Pin,
+    halfPeriodMicroseconds: int): bool {
+    var attempts = 0
+    while (attempts < 250) {
+        if (softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds) == u32(255)) return true
+        peripheralDelayMicroseconds(1000)
+        attempts = attempts + 1
+    }
+    false
+}
+
+trusted fun softwareSdWriteBlockSelected(clock: Pin, mosi: Pin, miso: Pin,
+    highCapacity: bool, block: int, source: NativeBuffer,
+    halfPeriodMicroseconds: int): SoftwareSdBlockResult {
+    if (!softwareSdWaitReadySelected(clock, mosi, miso, halfPeriodMicroseconds)) return SoftwareSdBlockResult(11)
+    if (softwareSdCommandSelected(clock, mosi, miso, 24,
+        sdSpiBlockArgument(highCapacity, block), nativeBufferAt(0, 0), 0, halfPeriodMicroseconds) != 0) return SoftwareSdBlockResult(6)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(254), 8, 0, halfPeriodMicroseconds)
+    var crc = 0
+    var index = 0
+    while (index < 512) {
+        val value = source.load(index)
+        softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(value), 8, 0, halfPeriodMicroseconds)
+        crc = sdSpiCrc16Byte(crc, value)
+        index = index + 1
+    }
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(crc), 16, 0, halfPeriodMicroseconds)
+    var response = 255
+    var attempts = 0
+    while (response == 255 && attempts < 8) {
+        response = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+        attempts = attempts + 1
+    }
+    if (!sdSpiWriteAccepted(response)) return SoftwareSdBlockResult(10)
+    if (!softwareSdWaitReadySelected(clock, mosi, miso, halfPeriodMicroseconds)) return SoftwareSdBlockResult(11)
+    // Accepted data is not proof of successful programming: inspect R2 status.
+    if (softwareSdCommandSelected(clock, mosi, miso, 13, 0, nativeBufferAt(0, 0), 0, halfPeriodMicroseconds) != 0) return SoftwareSdBlockResult(12)
+    if (softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds) != u32(0)) return SoftwareSdBlockResult(12)
+    SoftwareSdBlockResult(1)
+}
+
+// Explicit single-sector mutation. Failure after transmitting the token may
+// leave the sector changed; never retry automatically. On busy timeout, the
+// card may still be programming: callers must establish readiness before reuse.
+trusted fun softwareSdWriteBlock(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    cardState: SoftwareSdInitResult, block: int, source: NativeBuffer,
+    halfPeriodMicroseconds: int = 2): SoftwareSdBlockResult {
+    if (!cardState.valid() || !sdSpiBlockAddressValid(cardState.highCapacity(), block) ||
+        !gate.bufferDisjoint(source, 512) || mosi.number() < 0 || miso.number() < 0 ||
+        !softwareSpiConfigurationValid(clock, mosi, miso, 0, halfPeriodMicroseconds) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, 0, 0)) return SoftwareSdBlockResult(3)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SoftwareSdBlockResult(if (admission == 1) 2 else if (admission == 2) 4 else 3)
+    clock.write(false)
+    chipSelect.write(false)
+    val result = softwareSdWriteBlockSelected(clock, mosi, miso, cardState.highCapacity(), block, source, halfPeriodMicroseconds)
+    chipSelect.write(true)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(255), 8, 0, halfPeriodMicroseconds)
+    if (!gate.finish(owner, true)) return SoftwareSdBlockResult(5)
+    result
+}

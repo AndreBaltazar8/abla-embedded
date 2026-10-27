@@ -1,0 +1,91 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Exclusive128B: header64 + retained I2S pins48 + ring/pump16. Caller owns BOTH I2S1
+// directions, GDMA direction, codec/expander handles, ring and pad/input users;
+// powered board, stable PLL160MHz, calibrated delay, inactive codecs on entry.
+// TX PCM initialized before start. No duplex, ISR sharing or hidden allocation.
+// status0invalid,1prepared,2running,3cleanupneeded,4closed. On3 retain ALL
+// handles/storage and stop feeding buffers. Close leaves clocks powered.
+trusted fun coreS3AudioSessionValid(r: NativeBuffer): bool = r.hasAddressRange(0,128) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x43334133
+trusted fun coreS3AudioSessionPins(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+64,48)
+trusted fun coreS3AudioSessionSaveResult(r: NativeBuffer,offset: int,result: int): void {
+    r.storeU32(offset,result&4294967295);r.storeU32(offset+4,result>>>32);return
+}
+trusted fun coreS3AudioSessionBeginOwned(r: NativeBuffer,tx: bool,sampleHz: int,channel: int,
+    descriptors: int,count: int,buffers: int,blockBytes: int,owner: u32,codec: u32,expander: u32,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,128) || (r.addressValue()&3) != 0 || owner == u32(0) ||
+        sampleHz < 8000 || sampleHz > 96000 || channel < 0 || channel > 4 || count < 2 || (blockBytes&3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(descriptors,count,buffers,blockBytes,blockBytes)) return 0
+    if (!(if (tx) Aw88298(int(codec)).valid() && Aw9523(int(expander)).valid() else Es7210(int(codec)).valid())) return 0
+    val address=r.addressValue()
+    if ((address < descriptors+count*12 && descriptors < address+128) ||
+        (address < buffers+count*blockBytes && buffers < address+128)) return 0
+    if (r.loadU32(0) != 0 && (!coreS3AudioSessionValid(r) || r.loadU32(4) != 4)) return 0
+    var offset=4
+    while (offset < 128) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x43334133);r.storeU32(4,3);r.storeU32(8,if (tx) 1 else 0);r.storeU32(12,channel)
+    r.storeU32(16,int(codec));r.storeU32(20,int(expander));r.storeU32(24,descriptors)
+    r.storeU32(48,count);r.storeU32(52,blockBytes);r.storeU32(112,buffers);r.storeU32(116,0)
+    val pins=coreS3AudioSessionPins(r)
+    if (esp32S3I2sPinsCaptureOwned(pins,1,tx,pin(0),pin(34),pin(33),pin(if (tx) 13 else 14),0,true) != 1) return 3
+    val prepared=coreS3PrepareAudioDma(tx,sampleHz,channel,descriptors,count,buffers,blockBytes,owner)
+    r.storeU32(32,prepared|0)
+    if (!prepared.valid()) return 3
+    pins.storeU32(4,1);r.storeU32(28,prepared.sampleRate());r.storeU32(4,1)
+    return 1
+}
+trusted fun coreS3AudioSessionStartOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !coreS3AudioSessionValid(r) || r.loadU32(4) != 1 || polls < 1 || polls > 1000000) return 0
+    r.storeU32(4,3);r.storeU32(44,1)
+    val tx=r.loadU32(8) != 0
+    val result=if (tx) cores3StartSpeakerStream(Aw88298(r.loadU32(16)),Aw9523(r.loadU32(20)),r.loadU32(28),r.loadU32(12),r.loadU32(24),polls)|0
+        else cores3StartMicrophoneStream(Es7210(r.loadU32(16)),r.loadU32(12),r.loadU32(24),polls)|0
+    coreS3AudioSessionSaveResult(r,36,result)
+    if ((result&255) != 1) return 3
+    r.storeU32(4,2);return 2
+}
+trusted fun coreS3AudioSessionCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !coreS3AudioSessionValid(r) || polls < 1 || polls > 1000000) return 0
+    val status=r.loadU32(4)
+    if (status == 4) return 4
+    if (status < 1 || status > 3) return 0
+    r.storeU32(4,3)
+    if (r.loadU32(44) != 0) {
+        val result=if (r.loadU32(8) != 0) cores3StopSpeakerStream(Aw88298(r.loadU32(16)),Aw9523(r.loadU32(20)),r.loadU32(12),polls)|0
+            else cores3StopMicrophoneStream(Es7210(r.loadU32(16)),r.loadU32(12),polls)|0
+        coreS3AudioSessionSaveResult(r,56,result)
+        if ((result&255) != 1) return 3
+        r.storeU32(44,0)
+    }
+    val pins=coreS3AudioSessionPins(r)
+    if (pins.loadU32(0) != 0 && esp32S3I2sPinsCloseOwned(pins,true) != 2) return 3
+    r.storeU32(4,4);return 4
+}
+
+// One bounded ring operation (polls=1 is nonblocking). CPU PCM buffer must be
+// disjoint from the ENTIRE ring and session, not just the current descriptor.
+// TX always supplies one full stereo16 block; RX must receive that same size.
+// Status3 busy preserves running state/cursor. DMA/copy/rearm errors and short
+// blocks make cleanup sticky. Status8 means short/inconsistent completion.
+trusted fun coreS3AudioSessionPumpOwned(r: NativeBuffer,buffer: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    if (!exclusive || !coreS3AudioSessionValid(r) || r.loadU32(4) != 2 || polls < 1 || polls > 1000000) return Esp32S3GdmaPumpResult(2)
+    val count=r.loadU32(48);val bytes=r.loadU32(52);val cursor=r.loadU32(116)
+    val desc=r.loadU32(24);val payload=r.loadU32(112)
+    if (!esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes) || cursor >= count ||
+        !buffer.hasAddressRange(0,bytes)) return Esp32S3GdmaPumpResult(2)
+    val address=buffer.addressValue()
+    if ((address < r.addressValue()+128 && r.addressValue() < address+bytes) ||
+        (address < desc+count*12 && desc < address+bytes) ||
+        (address < payload+count*bytes && payload < address+bytes)) return Esp32S3GdmaPumpResult(2)
+    val tx=r.loadU32(8) != 0
+    var result=esp32s3GdmaPumpBlock(r.loadU32(12),tx,desc,count,cursor,
+        nativeBufferAt(address,bytes),if (tx) bytes else 0,polls)
+    if (result.status() == 1) {
+        val next=if (cursor+1 == count) 0 else cursor+1
+        if (result.transferredBytes() != bytes || result.nextIndex() != next)
+            result=Esp32S3GdmaPumpResult((result&~255)|8)
+        else r.storeU32(116,next)
+    }
+    coreS3AudioSessionSaveResult(r,120,result|0)
+    if (result.status() != 1 && result.status() != 3) r.storeU32(4,3)
+    return result
+}

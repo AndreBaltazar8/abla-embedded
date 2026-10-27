@@ -1,0 +1,115 @@
+import "./pcm16_mix.ab"
+import "../runtime/unsigned_division64.ab"
+// Caller-owned32B source: magic0,rate4,milliHz8,phase12,gainQ15@16,
+// remainingFrames64@20,flags28(bit0 endless,bit1 stereo,bit2 custom).
+// Custom sources use40B: borrowed wave address32/byte count36.
+// Phase is modulo rate*1000, retained across render blocks: no rounded-cycle
+// restart/pitch drift. Source shape matches M5Unified's16-point default tone.
+// No allocation, task, hardware access or implicit playback.
+type PcmTone=int
+val pcmToneWave=nativeStaticBytes("\xb1\xdb\xf6\xff\xf6\xdb\xb1\x80\x4f\x25\x0a\x01\x0a\x25\x4f\x80")
+fun PcmTone.storage(): NativeBuffer = NativeBuffer(this|0)
+trusted fun PcmTone.stateBytes(): int = if ((this.storage().loadU32(28)&4) != 0) 40 else 32
+trusted fun PcmTone.waveform(): NativeBuffer = if ((this.storage().loadU32(28)&4) != 0)
+    nativeBufferAt(this.storage().loadU32(32),this.storage().loadU32(36)) else nativeBufferAt(pcmToneWave,16)
+trusted fun PcmTone.valid(): bool {
+    val s=this.storage()
+    if (!(s.hasAddressRange(0,32) && (s.addressValue()&3) == 0 && s.loadU32(0) == 0x544f4e31 &&
+        s.loadU32(4) >= 8000 && s.loadU32(4) <= 96000 && s.loadU32(8) >= 1 &&
+        s.loadU32(8) <= s.loadU32(4)*500 && s.loadU32(12) < s.loadU32(4)*1000 &&
+        s.loadU32(16) <= 32768 && s.loadU32(28) <= 7)) return false
+    if ((s.loadU32(28)&4) == 0) return (s.loadU32(28)&2) == 0
+    if (!s.hasAddressRange(0,40)) return false
+    val wave=this.waveform();val channels=if ((s.loadU32(28)&2) != 0) 2 else 1
+    return wave.capacity() >= channels*2 && wave.capacity() <= channels*65536 &&
+        wave.capacity()%channels == 0 && wave.hasAddressRange(0,wave.capacity()) &&
+        !pcmMixSpansOverlap(s,40,wave,wave.capacity())
+}
+trusted fun PcmTone.disjointFrom(buffer: NativeBuffer,bytes: int): bool = this.valid() &&
+    buffer.hasAddressRange(0,bytes) && !pcmMixSpansOverlap(this.storage(),this.stateBytes(),buffer,bytes) &&
+    !pcmMixSpansOverlap(this.waveform(),this.waveform().capacity(),buffer,bytes)
+// UINT32_MAX duration means endless;0 is a valid silent source. Finite length
+// rounds UP to one output frame, never to a whole waveform cycle.
+trusted fun pcmToneAt(storage: NativeBuffer,rate: int,milliHz: int,durationMs: int,gainQ15: int=32768): PcmTone {
+    if (!storage.hasAddressRange(0,32) || (storage.addressValue()&3) != 0 || rate < 8000 || rate > 96000 ||
+        milliHz < 1 || milliHz > rate*500 || durationMs < 0 || durationMs > 4294967295 ||
+        gainQ15 < 0 || gainQ15 > 32768) return PcmTone(0)
+    val endless=durationMs == 4294967295
+    val frames=if (endless) 0 else int(unsignedDivide64(u64(durationMs*rate+999),u64(1000)))
+    storage.storeU32(0,0x544f4e31);storage.storeU32(4,rate);storage.storeU32(8,milliHz)
+    storage.storeU32(12,0);storage.storeU32(16,gainQ15)
+    storage.storeU32(20,frames);storage.storeU32(24,int(u64(frames)>>u64(32)));storage.storeU32(28,if (endless) 1 else 0)
+    return PcmTone(storage|0)
+}
+// Immutable unsigned8 mono/interleaved stereo single-cycle waveform. Caller
+// retains it until stopped AND all consumers have joined; no copying.
+trusted fun pcmToneWaveAt(storage: NativeBuffer,wave: NativeBuffer,waveStereo: bool,rate: int,milliHz: int,
+    durationMs: int,gainQ15: int=32768): PcmTone {
+    val channels=if (waveStereo) 2 else 1
+    if (!storage.hasAddressRange(0,40) || wave.capacity() < channels*2 || wave.capacity() > channels*65536 ||
+        wave.capacity()%channels != 0 || !wave.hasAddressRange(0,wave.capacity()) ||
+        pcmMixSpansOverlap(storage,40,wave,wave.capacity())) return PcmTone(0)
+    val tone=pcmToneAt(storage,rate,milliHz,durationMs,gainQ15)
+    if (tone == 0) return tone
+    storage.storeU32(32,wave.addressValue());storage.storeU32(36,wave.capacity())
+    storage.storeU32(28,storage.loadU32(28)|4|(if (waveStereo) 2 else 0))
+    return tone
+}
+trusted fun PcmTone.playing(): bool = this.valid() && ((this.storage().loadU32(28)&1) != 0 ||
+    this.storage().loadU32(20) != 0 || this.storage().loadU32(24) != 0)
+trusted fun PcmTone.stop(): bool {
+    if (!this.valid()) return false
+    this.storage().storeU32(20,0);this.storage().storeU32(24,0);this.storage().storeU32(28,this.storage().loadU32(28)&6)
+    return true
+}
+trusted fun PcmTone.setGain(gainQ15: int): bool {
+    if (!this.valid() || gainQ15 < 0 || gainQ15 > 32768) return false
+    this.storage().storeU32(16,gainQ15);return true
+}
+// Render signedLE PCM16; mono waves duplicate to stereo, stereo waves average
+// to mono when requested. Exhaustion pads zero. Invalid
+// spans leave phase/remaining and output untouched. DMA retries reuse rendered
+// staging, never call render again for the same logical block.
+trusted fun PcmTone.render(frames: int,output: NativeBuffer,stereo: bool=false): bool {
+    val stride=if (stereo) 4 else 2
+    if (!this.valid() || frames < 0 || frames > 268435455 || !output.hasAddressRange(0,frames*stride) ||
+        !this.disjointFrom(output,frames*stride)) return false
+    val s=this.storage();val period=u32(s.loadU32(4)*1000);val step=u32(s.loadU32(8))
+    var phase=u32(s.loadU32(12));var remaining=s.loadU32(20)|(s.loadU32(24)<<32)
+    val endless=(s.loadU32(28)&1) != 0;val gain=s.loadU32(16)
+    val wave=this.waveform();val channels=if ((s.loadU32(28)&2) != 0) 2 else 1
+    val waveFrames=wave.capacity()/channels
+    var at=0
+    while (at < frames) {
+        var sample=0;var right=0
+        if (endless || remaining != 0) {
+            val position=u64(phase)*u64(waveFrames)
+            val index=int(unsignedDivide64(position,u64(period)))
+            val remainder=position-u64(index)*u64(period)
+            val fraction=int(unsignedDivide64(remainder*u64(32768),u64(period)))
+            val next=if (index+1 == waveFrames) 0 else index+1
+            val a=wave.load(index*channels);val delta=wave.load(next*channels)-a
+            // Valid U8 endpoints and fraction0..32767 keep interpolation in
+            // signed16, and gain0..32768 keeps its product in signed32.
+            // Explicit signed32 division preserves truncation toward zero and
+            // avoids LLVM size lowering to a freestanding 64-bit libc helper.
+            val interpolated=(a-128)*256+int(i32(delta*fraction)/i32(128))
+            sample=int(i32(interpolated*gain)/i32(32768))
+            right=sample
+            if (channels == 2) {
+                val b=wave.load(index*2+1);val difference=wave.load(next*2+1)-b
+                val interpolatedRight=(b-128)*256+int(i32(difference*fraction)/i32(128))
+                right=int(i32(interpolatedRight*gain)/i32(32768))
+            }
+            if (!stereo) sample=(sample+right)/2
+            phase=phase+step
+            if (phase >= period) phase=phase-period
+            if (!endless) remaining=remaining-1
+        }
+        output.storeU16(at*stride,sample&65535)
+        if (stereo) output.storeU16(at*stride+2,right&65535)
+        at=at+1
+    }
+    s.storeU32(12,int(phase));s.storeU32(20,remaining);s.storeU32(24,int(u64(remaining)>>u64(32)))
+    return true
+}

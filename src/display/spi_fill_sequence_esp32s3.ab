@@ -1,0 +1,50 @@
+import "./color.ab"
+import "./lcd_logic.ab"
+import "../peripheral_gate.ab"
+import "../spi/transaction_result.ab"
+import "../esp32/spi/command_pins_sequence_esp32s3.ab"
+
+// Initialized RGB565 panel/view/SPI, all other CS inactive. Window and color
+// stream share one gate; clipping never allocates a framebuffer. The backend
+// stages at most32 pixels at a time. A failure may leave a partial rectangle;
+// CS/shared-D-C cleanup is checked and the gate faulted, without automatic
+// replay. Failed cleanup retains recovery obligations; see command pin detail.
+trusted fun esp32s3LcdFillRect(gate: PeripheralGate, owner: u32, peripheral: int,
+    pins: SpiPins, select: Pin, dc: Pin, view: LcdView, x: int, y: int,
+    width: int, height: int, color: Rgb565, shared: bool = false,resetRowWindow: bool = false): SpiTransactionResult {
+    if (!esp32s3SpiCommandPinsValid(peripheral,pins,select,dc,shared) ||
+        !view.valid() || width < 0 || height < 0)
+        return SpiTransactionResult(3 << 32)
+    val address = gate.word().address()
+    if (address <= 0 || address > 4294967292) return SpiTransactionResult(3 << 32)
+    val rectangle = clipDisplayRect(x,y,width,height,view.width(),view.height())
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    var detail = 1
+    if (!rectangle.empty()) {
+        val column = view.columnStart() + rectangle.x()
+        val row = view.rowStart() + rectangle.y()
+        if (resetRowWindow) detail=esp32s3SpiCommandWordOwned(peripheral,select,dc,43,u32(0xffffffff),4,shared)
+        if ((detail&255) == 1) detail = esp32s3SpiCommandWordOwned(peripheral,select,dc,42,
+            (u32(column) << u32(16)) | u32(column + rectangle.width() - 1),4,shared)
+        if ((detail & 255) == 1) detail = esp32s3SpiCommandWordOwned(peripheral,select,dc,43,
+            (u32(row) << u32(16)) | u32(row + rectangle.height() - 1),4,shared)
+        if ((detail & 255) == 1) {
+            detail=esp32s3SpiCommandPinsBegin(select,dc)
+            if (detail == 1) detail = esp32s3SpiTransmitByteOwned(peripheral,44,100000)
+            if ((detail & 255) == 1) {
+                if (!dc.writeLevelOwned(true)) detail=(detail&~255)|13
+                var remaining = rectangle.width() * rectangle.height()
+                while (remaining > 0 && (detail & 255) == 1) {
+                    val count = if (remaining < 32) remaining else 32
+                    detail = esp32s3SpiTransmitColorOwned(peripheral,u32(color & 65535),count)
+                    remaining = remaining - count
+                }
+            }
+            detail=esp32s3SpiCommandPinsEndQuiescent(peripheral,select,dc,shared,detail)
+        }
+    }
+    val healthy = (detail & 255) == 1
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5 << 32) | detail)
+    SpiTransactionResult(((if (healthy) 1 else 6) << 32) | detail)
+}

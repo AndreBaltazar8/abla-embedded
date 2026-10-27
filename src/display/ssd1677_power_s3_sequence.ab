@@ -1,0 +1,43 @@
+import "./ssd1677_session_s3_sequence.ab"
+// action0 analog power-save,1 analog power-on,2 deep sleep. Canonical gate
+// held, awake initialized panel and prepared BUSY input. Deep sleep does not
+// remove board rails and cannot be undone by a software command.
+trusted fun esp32s3Ssd1677PowerOwned(peripheral: int,select: Pin,dc: Pin,busy: Pin,action: int,polls: int): int {
+    if (action < 0 || action > 2) return 2
+    var result=ssd1677WaitReadyOwned(busy,polls)
+    if (result != 1) return result
+    result=esp32s3SpiCommandWordOwned(peripheral,select,dc,0x22,u32(if (action == 1) 192 else 3),1,false)
+    if ((result&255) != 1) return result
+    result=esp32s3SpiCommandOwned(peripheral,select,dc,0x20,NativeBuffer(0),0,false)
+    if ((result&255) != 1) return result
+    result=ssd1677WaitReadyOwned(busy,polls)
+    if (result != 1 || action != 2) return result
+    return esp32s3SpiCommandWordOwned(peripheral,select,dc,0x10,u32(1),1,false)
+}
+// Success invalidates optical history and makes the whole canvas dirty.
+// Status3 records deep sleep; refresh/power-on are refused until physical
+// reset +explicit bookkeeping recovery. Keep buffers/control ownership alive.
+trusted fun Ssd1677Session.powerOwned(gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,
+    select: Pin,dc: Pin,busy: Pin,action: int,polls: int,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || owner == u32(0) || !this.valid() || action < 0 || action > 2 || polls < 1 || polls > 10000 ||
+        !busy.valid() || busy == select || busy == dc || busy.number() == pins.clockPin() ||
+        busy.number() == pins.mosiPin() || busy.number() == pins.misoPin() ||
+        !esp32s3SpiCommandPinsValid(peripheral,pins,select,dc,false)) return SpiTransactionResult(3<<32)
+    val r=this.buffer()
+    if (r.loadU32(4) == 2) return SpiTransactionResult(4<<32)
+    if (r.loadU32(4) == 3 && action == 2) return SpiTransactionResult((1<<32)|1)
+    if (r.loadU32(4) != 1 || !gate.bufferDisjoint(r,64) || !gate.bufferDisjoint(this.canvas(),96000) ||
+        !gate.bufferDisjoint(this.history(),96000) || gate.word().address() <= 0 || gate.word().address() > 4294967292) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val detail=esp32s3Ssd1677PowerOwned(peripheral,select,dc,busy,action,polls)
+    val healthy=(detail&255) == 1
+    val released=gate.finish(owner,healthy)
+    val result=SpiTransactionResult(((if (!released) 5 else if (healthy) 1 else 6)<<32)|detail)
+    r.storeU32(44,result&4294967295);r.storeU32(48,result>>>32)
+    // Even a failed command may change analog power or enter sleep.
+    r.storeU32(24,(r.loadU32(24)&16)|(if (healthy && released && action == 1) 4 else 0))
+    r.storeU32(4,if (!healthy || !released) 2 else if (action == 2) 3 else 1)
+    r.storeU32(28,0);r.storeU32(32,0);r.storeU32(36,800);r.storeU32(40,480)
+    return result
+}

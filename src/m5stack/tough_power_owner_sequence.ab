@@ -1,0 +1,56 @@
+import "./tough_power_owner_view.ab"
+import "./tough_boot_types.ab"
+import "./expander_owner_sequence.ab"
+import "./pmic_open_sequence.ab"
+import "../power/pm1_battery_presence.ab"
+// Caller-owned96B, serialized by caller, never copied/reinitialized while live.
+// Header32B: magic,status,owned PMIC result,boot result,tone child24,reserved28. Embedded
+// expander owner32B and battery-presence32B have disjoint stable lifetimes.
+// The bus stays caller-owned and must outlive this owner and its borrowed views.
+fun M5ToughPowerOwner.expanders(): M5Expanders = m5ExpandersAt(nativeBufferAt(this.buffer().addressValue()+32,32))
+fun M5ToughPowerOwner.presence(): Pm1BatteryPresence = pm1BatteryPresenceAt(nativeBufferAt(this.buffer().addressValue()+64,32))
+trusted fun M5ToughPowerOwner.initialize(): bool {
+    val buffer=this.buffer()
+    if (!buffer.hasAddressRange(0,96) || (buffer.addressValue()&3) != 0) return false
+    var offset=0
+    while (offset < 96) { buffer.storeU32(offset,0); offset=offset+4 }
+    if (!this.expanders().initialize() || !this.presence().initialize()) return false
+    buffer.storeU32(0,0x54435057)
+}
+trusted fun M5ToughPowerOwner.storePmic(value: M5PmicOpen): void {
+    this.buffer().storeU32(8,value&4294967295); this.buffer().storeU32(12,value>>>32)
+    return
+}
+trusted fun M5ToughPowerOwner.storeBoot(value: M5ToughBoot): void {
+    this.buffer().storeU32(16,value&4294967295); this.buffer().storeU32(20,value>>>32)
+    this.buffer().storeU32(4,if (value.powerReady()) 1 else 5)
+    return
+}
+// Consume wake reasons before begin: PMIC input setup clears IRQ/wake status.
+// No automatic replay, bus recovery, or rail rollback on failure.
+trusted fun M5ToughPowerOwner.beginOwned(bus: int,now: int): int {
+    if (!this.valid() || this.status() != 0 || !m5PmicBusValid(bus)) return 2
+    val pmic=m5BoardToughC5.openPmicOwned(bus)
+    this.storePmic(pmic)
+    if (!pmic.ready()) { this.buffer().storeU32(4,3); return 3 }
+    if (this.expanders().openOwned(bus,m5BoardToughC5) != 1) { this.buffer().storeU32(4,4); return 4 }
+    this.storeBoot(toughOwnerConfigure(this.expanders(),pmic,this.presence(),now))
+    this.status()
+}
+// Retry held/partial GPIO4 setup only, never re-run charger/IRQ initialization.
+trusted fun M5ToughPowerOwner.retryWakeInput(): bool {
+    if (!this.valid() || this.status() != 5 || this.bootResult().status() != 6 || this.bootResult().stage() != 5) return false
+    this.storeBoot(toughOwnerFinishWake(this.bootResult()))
+    this.status() == 1
+}
+// Releases software handles, NOT power rails. Bus and hardware power state
+// remain caller-owned; retain the record if either release needs another try.
+trusted fun M5ToughPowerOwner.close(): bool {
+    if (!this.valid() || this.toneRetained()) return false
+    val closed=this.expanders().closeOwned()
+    val pmic=this.pmic().releaseOwned()
+    this.storePmic(pmic)
+    val success=closed && !pmic.ownsDevice()
+    this.buffer().storeU32(4,if (success) 7 else 6)
+    success
+}

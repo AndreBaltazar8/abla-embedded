@@ -1,0 +1,92 @@
+import "./epd_scanout_sequence.ab"
+// Exclusive frame coordinator,48B: magic,state,scanout,transport,framebuffer,
+// width,height,padding,anyActive,completedFrames,primary,waitStartMs.
+// States1idle/off,2begin,3render,4poll,5frame-end wait,6power-off,
+// 7fault,8closing,9closed. Caller serializes all framebuffer requests with pump;
+// no direct child operations after attach. State memory can be caller PSRAM,
+// but must remain accessible while rendering; payload/descriptors stay internal.
+// Pump returns1done,2pending,3invalid,4fault. Close returns5closed/6retry.
+fun epdFrameValid(r: NativeBuffer,s: NativeBuffer,t: NativeBuffer,f: NativeBuffer): bool =
+    r.hasAddressRange(0,48) && r.loadU32(0) == 0x45504652 &&
+    r.loadU32(8) == s.addressValue() && r.loadU32(12) == t.addressValue() &&
+    r.loadU32(16) == f.addressValue() && epdScanoutValid(s,t) &&
+    f.hasAddressRange(0,r.loadU32(20)*r.loadU32(24)*2)
+trusted fun epdFrameAttachOwned(r: NativeBuffer,s: NativeBuffer,t: NativeBuffer,f: NativeBuffer,width: int,padding: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,48) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !epdScanoutValid(s,t) || s.loadU32(4) != 1 || t.loadU32(4) != 1 ||
+        width < 16 || width > 65520 || (width&15) != 0 || padding < 0 || padding > 65535 ||
+        width/4+padding != s.loadU32(16)) return 3
+    val height=s.loadU32(20);val size=width*height*2
+    if (height < 1 || height > 65535 || size > 2147483647 || !f.hasAddressRange(0,size) ||
+        !epdWaveformDisjoint(r,48,f,size)) return 3
+    var item=0
+    while (item < 4) {
+        val other=if (item == 0) s else if (item == 1) t else if (item == 2) nativeBufferAt(t.loadU32(20),t.loadU32(24)) else nativeBufferAt(t.loadU32(28),t.loadU32(32))
+        val count=if (item == 0) 32 else if (item == 1) 160 else other.capacity()
+        if (!epdWaveformDisjoint(r,48,other,count) || !epdWaveformDisjoint(f,size,other,count)) return 3
+        item=item+1
+    }
+    // Reject malformed state before acquiring ownership or energizing the panel.
+    item=0
+    while (item < size) {
+        val pair=f.loadU32(item)
+        if (!epdWaveformIndexValid(pair&65535) || !epdWaveformIndexValid(pair>>>16)) return 3
+        item=item+4
+    }
+    r.storeU32(0,0x45504652);r.storeU32(4,1);r.storeU32(8,s.addressValue());r.storeU32(12,t.addressValue())
+    r.storeU32(16,f.addressValue());r.storeU32(20,width);r.storeU32(24,height);r.storeU32(28,padding)
+    r.storeU32(32,0);r.storeU32(36,0);r.storeU32(40,0);r.storeU32(44,0);return 1
+}
+trusted fun epdFrameStartOwned(r: NativeBuffer,s: NativeBuffer,t: NativeBuffer,f: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdFrameValid(r,s,t,f) || r.loadU32(4) != 1 || s.loadU32(4) != 1 || t.loadU32(4) != 1) return 3
+    r.storeU32(32,0);r.storeU32(36,0);r.storeU32(4,2);return 2
+}
+trusted fun epdFramePumpOwned(r: NativeBuffer,s: NativeBuffer,t: NativeBuffer,f: NativeBuffer,nowMs: int,exclusive: bool): int {
+    if (!exclusive || !epdFrameValid(r,s,t,f) || nowMs < 0 || nowMs > 4294967295) return 3
+    val phase=r.loadU32(4)
+    if (phase == 1) return 1
+    if (phase == 7) return 4
+    if (phase < 2 || phase > 6) return 3
+    var result=1
+    if (phase == 2) {
+        result=epdScanoutBeginFrameOwned(s,t,true)
+        if (result == 1) { r.storeU32(32,0);r.storeU32(4,3);return 2 }
+    } else if (phase == 3) {
+        val rowBytes=r.loadU32(20)*2
+        val row=nativeBufferAt(f.addressValue()+s.loadU32(24)*rowBytes,rowBytes)
+        result=epdScanoutRenderLineOwned(s,t,row,r.loadU32(20),r.loadU32(28),true)
+        if (result == 2 || result == 7) {
+            if (result == 7) r.storeU32(32,1)
+            r.storeU32(4,4);return 2
+        }
+    } else if (phase == 4) {
+        result=epdScanoutPollLineOwned(s,t,true)
+        if (result == 2) return 2
+        if (result == 1) {
+            if (s.loadU32(24) == r.loadU32(24)) { r.storeU32(44,nowMs);r.storeU32(4,5) }
+            else r.storeU32(4,3)
+            return 2
+        }
+    } else if (phase == 5) {
+        // Upstream yields one tick before ending the frame. Require >=1ms;
+        // caller can schedule a longer board-specific period without spinning.
+        if (((nowMs-r.loadU32(44))&4294967295) < 1) return 2
+        result=epdScanoutEndFrameOwned(s,t,true)
+        if (result == 1) {
+            r.storeU32(36,r.loadU32(36)+1)
+            r.storeU32(4,if (r.loadU32(32) != 0) 2 else 6);return 2
+        }
+    } else {
+        result=epdScanoutPowerOffOwned(s,t,true)
+        if (result == 1) { r.storeU32(4,1);return 1 }
+    }
+    r.storeU32(40,phase*256+result);r.storeU32(4,7);return 4
+}
+trusted fun epdFrameCloseOwned(r: NativeBuffer,s: NativeBuffer,t: NativeBuffer,f: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdFrameValid(r,s,t,f)) return 3
+    if (r.loadU32(4) == 9) return 5
+    if (r.loadU32(4) < 1 || r.loadU32(4) > 8) return 3
+    r.storeU32(4,8)
+    if (epdScanoutCloseOwned(s,t,true) != 5) return 6
+    r.storeU32(4,9);return 5
+}

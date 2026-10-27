@@ -1,0 +1,81 @@
+import "./mmc_card_s3_sequence.ab"
+// Explicit recovery of an abandoned native SD data transfer. DMA must already
+// be disabled/quiescent, both slots/IRQs exclusively owned, clocks running.
+// CMD12 does NOT wait for the failed data transfer (which could deadlock).
+// Then reset the abandoned FIFO, wait DAT0/host idle, and verify CMD13 TRAN
+// and READY. No card reset, power cycling, data-validity claim or retry bypass.
+// Caller-owned40bytes: tagged status0,phase4,slot5,RCA6..7,command8,
+// start12,budget16,CMD12 response20,CMD13 response scratch24..39.
+// 1ready2pending3invalid4hostbusy5transport6card-status7timeout.
+// Preserve failed/pending context and host lease; a timeout is NOT recovery.
+trusted fun sdMmcAbortStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,40) || (context.loadU32(0)&0xffffff00) != 0x53444100) return 3
+    return context.load(0)
+}
+trusted fun sdMmcAbortEnd(context: NativeBuffer,status: int): int {
+    context.store(0,status)
+    return status
+}
+trusted fun sdMmcAbortBeginOwned(context: NativeBuffer,slot: int,rca: int,now: u32,budgetMs: int,abandonedExclusive: bool): int {
+    if (!abandonedExclusive || !context.hasAddressRange(0,40) || slot < 0 || slot > 1 || rca < 1 || rca > 65535 || budgetMs < 1 || budgetMs > 60000) return 3
+    // DAT0/data FSM busy is admissible: that is precisely what CMD12 stops.
+    if ((sdMmcS3Read(0)&0x02000037) != 0 || (sdMmcS3Read(128)&0x83) != 0 ||
+        (sdMmcS3Read(140)&0x1e000) != 0 || (sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0xf0) != 0) return 4
+    var byte=0
+    while (byte < 40) { context.store(byte,0); byte=byte+1 }
+    context.storeU32(0,0x53444102); context.store(4,1); context.store(5,slot); context.storeU16(6,rca)
+    context.storeU32(12,int(now)); context.storeU32(16,budgetMs)
+    sdMmcS3Write(68,0x1546)
+    if ((sdMmcS3Read(68)&0x1546) != 0) return sdMmcAbortEnd(context,5)
+    sdMmcS3Write(40,0)
+    if (sdMmcS3Read(40) != 0) return sdMmcAbortEnd(context,5)
+    sdMmcS3Write(44,0xa000414c|(slot<<16))
+    // Poll R1 separately from R1b busy. The failed FIFO may still hold data;
+    // do not require the data FSM to empty before we can reset that FIFO.
+    context.storeU32(8,514)
+    return 2
+}
+trusted fun sdMmcAbortPollOwned(context: NativeBuffer,now: u32): int {
+    val state=sdMmcAbortStatus(context)
+    if (state != 2) return state
+    val phase=context.load(4)
+    if (phase < 1 || phase > 4 || context.load(5) > 1) return sdMmcAbortEnd(context,3)
+    if (int(now-u32(context.loadU32(12))) >= context.loadU32(16)) return sdMmcAbortEnd(context,7)
+    if ((sdMmcS3Read(0)&0x02000030) != 0 || (sdMmcS3Read(128)&0x83) != 0 || (sdMmcS3Read(140)&0x1e000) != 0) return sdMmcAbortEnd(context,4)
+    if (phase == 2 || phase == 3) {
+        val errors=sdMmcS3Read(68)&0x1542
+        if (errors != 0) {
+            sdMmcS3Write(68,errors); context.storeU32(8,(errors<<16)|5)
+            return sdMmcAbortEnd(context,5)
+        }
+    }
+    if (phase == 2) {
+        if ((sdMmcS3Read(0)&7) != 0 || (sdMmcS3Read(72)&0x3ffe06f0) != 0) return 2
+        context.store(4,3)
+        return 2
+    }
+    if (phase == 3) {
+        val rca=context.load(6)|(context.load(7)<<8)
+        val command=sdMmcCommandStartOwned(context.load(5),13,u32(rca<<16),1)
+        if (command.status() == 4) return 2
+        context.storeU32(8,command|0)
+        if (command.status() != 2) return sdMmcAbortEnd(context,5)
+        context.store(4,4)
+        return 2
+    }
+    val response=nativeBufferAt(context.addressValue()+24,16)
+    val command=SdMmcCommand(context.loadU32(8)).pollOwned(response)
+    context.storeU32(8,command|0)
+    if (command.status() == 2) return 2
+    if (command.status() != 1) return sdMmcAbortEnd(context,5)
+    val r1=response.loadU32(0)
+    if (phase == 1) context.storeU32(20,r1)
+    if (!sdMmcCardR1Valid(r1)) return sdMmcAbortEnd(context,6)
+    if (phase == 1) {
+        sdMmcS3Write(0,sdMmcS3Read(0)|2)
+        context.store(4,2)
+        return 2
+    }
+    if ((r1&0x1f00) != 0x900) return sdMmcAbortEnd(context,6)
+    return sdMmcAbortEnd(context,1)
+}

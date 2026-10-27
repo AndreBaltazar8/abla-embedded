@@ -1,0 +1,149 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "../i2c/results.ab"
+import "./unit_lcd_rle.ab"
+// M5GFX Panel_M5UnitLCD protocol; notice: epd_waveform.LICENSE. Borrowed
+// device and exclusive bus/queue access. No reset, hidden command retries,
+// retained credits or allocation. Caller supplies unitLcdDelayMicroseconds.
+fun unitLcdRectangleValid(x: int,y: int,w: int,h: int,rotation: int): bool {
+    val width=if ((rotation&1) == 0) 135 else 240
+    val height=if ((rotation&1) == 0) 240 else 135
+    return rotation >= 0 && rotation <= 7 && x >= 0 && y >= 0 && x < width && y < height &&
+        w > 0 && h > 0 && w <= width-x && h <= height-y
+}
+trusted fun I2cDevice.unitLcdIdentify(scratch: NativeBuffer): I2cByteResult {
+    if (!this.valid() || !scratch.hasAddressRange(0,5)) return I2cByteResult(0)
+    scratch.store(0,4)
+    val reply=nativeBufferAt(scratch.addressValue()+1,4)
+    if (!this.writeRead(scratch,1,reply,4) || reply.load(0) != 119 || reply.load(1) != 137) return I2cByteResult(0)
+    return I2cByteResult(256|reply.load(3))
+}
+//1ready2input3queryIO4budget. Upstream's conservative default refill threshold
+// is128 free command slots. Only retry successful low-capacity observations;
+// query transport faults abort. No drawing command is sent before admission.
+trusted fun I2cDevice.unitLcdWaitCapacity(scratch: NativeBuffer,polls: int,minimum: int = 128): int {
+    if (!this.valid() || !scratch.hasAddressRange(0,2) || polls < 1 || polls > 255 || minimum < 1 || minimum > 255) return 2
+    val reply=nativeBufferAt(scratch.addressValue()+1,1)
+    var attempt=0
+    while (attempt < polls) {
+        scratch.store(0,9)
+        if (!this.writeRead(scratch,1,reply,1)) return 3
+        if (reply.load(0) >= minimum) return 1
+        attempt=attempt+1
+        if (attempt < polls) unitLcdDelayMicroseconds(2000)
+    }
+    return 4
+}
+// Checked one-byte controls: brightness22h, rotation36h, power38h,
+// sleep39h, byte-swap3Ah. Setting rotation does not update caller geometry.
+// Result5 means command write failed after admission; hardware may have acted.
+trusted fun I2cDevice.unitLcdControl(command: int,value: int,scratch: NativeBuffer,polls: int): int {
+    val max=if (command == 34) 255 else if (command == 54) 7 else if (command == 56) 2 else if (command == 57 || command == 58) 1 else -1
+    if (value < 0 || value > max) return 2
+    val admission=this.unitLcdWaitCapacity(scratch,polls)
+    if (admission != 1) return admission
+    scratch.store(0,command);scratch.store(1,value)
+    return if (this.write(scratch,2)) 1 else 5
+}
+trusted fun I2cDevice.unitLcdInvert(invert: bool,scratch: NativeBuffer,polls: int): int {
+    val admission=this.unitLcdWaitCapacity(scratch,polls)
+    if (admission != 1) return admission
+    scratch.store(0,if (invert) 33 else 32)
+    return if (this.write(scratch,1)) 1 else 5
+}
+// Preclipped coordinates for configured rotation of135x240 native panel.
+// Explicit raw16 color, low byte first; caller owns the device byte-swap mode.
+// Always includes color (no dependency on a previous command's cached color).
+trusted fun I2cDevice.unitLcdFill16(x: int,y: int,w: int,h: int,rotation: int,rawColor: int,scratch: NativeBuffer,polls: int): int {
+    if (!unitLcdRectangleValid(x,y,w,h,rotation) || rawColor < 0 || rawColor > 65535 || !scratch.hasAddressRange(0,7)) return 2
+    val admission=this.unitLcdWaitCapacity(scratch,polls)
+    if (admission != 1) return admission
+    val pixel=w == 1 && h == 1
+    scratch.store(0,if (pixel) 98 else 106);scratch.store(1,x);scratch.store(2,y)
+    if (!pixel) { scratch.store(3,x+w-1);scratch.store(4,y+h-1) }
+    scratch.storeU16(if (pixel) 3 else 5,rawColor)
+    return if (this.write(scratch,if (pixel) 5 else 7)) 1 else 5
+}
+// Copy semantics are supplied by the unit firmware, including overlap; this
+// does not read pixels to host RAM or emulate an unsupported copy operation.
+trusted fun I2cDevice.unitLcdCopyRect(dx: int,dy: int,x: int,y: int,w: int,h: int,rotation: int,scratch: NativeBuffer,polls: int): int {
+    if (!unitLcdRectangleValid(x,y,w,h,rotation) || !unitLcdRectangleValid(dx,dy,w,h,rotation) || !scratch.hasAddressRange(0,7)) return 2
+    val admission=this.unitLcdWaitCapacity(scratch,polls)
+    if (admission != 1) return admission
+    scratch.store(0,35);scratch.store(1,x);scratch.store(2,y);scratch.store(3,x+w-1);scratch.store(4,y+h-1)
+    scratch.store(5,dx);scratch.store(6,dy)
+    return if (this.write(scratch,7)) 1 else 5
+}
+// Drain the queue before setting both window axes and issuing READ_RAW_16.
+// A single repeated-START read supports the entire135x240 RGB565 frame
+// (64800bytes). Keep exclusive access through the read; no cached window.
+// Status5windowwrite/6readfailure. On6, destination may contain a prefix and
+// MUST NOT be consumed as a complete image. Bytes follow unit byte-swap mode.
+trusted fun I2cDevice.unitLcdRead16(x: int,y: int,w: int,h: int,rotation: int,destination: NativeBuffer,scratch: NativeBuffer,polls: int): int {
+    if (!unitLcdRectangleValid(x,y,w,h,rotation) || !scratch.hasAddressRange(0,6)) return 2
+    val bytes=w*h*2
+    if (!destination.hasAddressRange(0,bytes) || (destination.addressValue() < scratch.addressValue()+6 && scratch.addressValue() < destination.addressValue()+bytes)) return 2
+    val admission=this.unitLcdWaitCapacity(scratch,polls,255)
+    if (admission != 1) return admission
+    scratch.store(0,42);scratch.store(1,x);scratch.store(2,x+w-1)
+    scratch.store(3,43);scratch.store(4,y);scratch.store(5,y+h-1)
+    if (!this.write(scratch,6)) return 5
+    scratch.store(0,130)
+    return if (this.writeRead(scratch,1,destination,bytes)) 1 else 6
+}
+// Wire-format pixel rows:1 RGB332,2 RGB565,3 RGB888,4 ARGB8888.
+// Source bytes are transmitted unchanged; caller owns channel/byte-swap layout.
+// Shared row engine also accepts explicit color for alpha-only uploads; the
+// public pixel/alpha wrappers select the appropriate validated mode.
+// Scratch>=max(6,w*(pixelBytes+(rle?1:0))+1). Each row admits capacity and
+// establishes its window. RLE reserves worst-case space but sends exact length.
+// pollsPerRow bounds each admission; total observations <=h*pollsPerRow.
+// Low8 status1complete2input3queryIO4budget5window6pixels7color; rows@8.
+// A failed pixel packet may have partially rendered the next row. Never
+// resume it from the acknowledged row count without explicit caller choice.
+trusted fun I2cDevice.unitLcdWriteRows(x: int,y: int,w: int,h: int,rotation: int,source: NativeBuffer,stride: int,pixelBytes: int,scratch: NativeBuffer,pollsPerRow: int,rle: bool,colorBytes: int,rawColor: int): int {
+    if (!this.valid() || pixelBytes < 1 || pixelBytes > 4 || !unitLcdRectangleValid(x,y,w,h,rotation) || stride < w*pixelBytes || stride > 2147483647 || pollsPerRow < 1 || pollsPerRow > 255) return 2
+    val colorMax=if (colorBytes == 1) 255 else if (colorBytes == 2) 65535 else if (colorBytes == 3) 16777215 else 4294967295
+    if (colorBytes < 0 || colorBytes > 4 || (colorBytes != 0 && (pixelBytes != 1 || rawColor < 0 || rawColor > colorMax))) return 2
+    val rowBytes=w*pixelBytes
+    val bytes=(h-1)*stride+rowBytes;val capacity=w*(pixelBytes+(if (rle) 1 else 0))+1;val work=if (capacity < 6) 6 else capacity
+    if (!source.hasAddressRange(0,bytes) || !scratch.hasAddressRange(0,work) ||
+        (source.addressValue() < scratch.addressValue()+work && scratch.addressValue() < source.addressValue()+bytes)) return 2
+    var row=0
+    while (row < h) {
+        val admission=this.unitLcdWaitCapacity(scratch,pollsPerRow)
+        if (admission != 1) return admission|(row<<8)
+        if (colorBytes != 0) {
+            scratch.store(0,80|colorBytes)
+            var component=0;var color=rawColor
+            while (component < colorBytes) { scratch.store(component+1,color&255);color=color>>>8;component=component+1 }
+            if (!this.write(scratch,colorBytes+1)) return 7|(row<<8)
+        }
+        scratch.store(0,42);scratch.store(1,x);scratch.store(2,x+w-1)
+        scratch.store(3,43);scratch.store(4,y+row);scratch.store(5,y+row)
+        if (!this.write(scratch,6)) return 5|(row<<8)
+        scratch.store(0,(if (rle) 72 else 64)|(if (colorBytes != 0) 5 else pixelBytes))
+        var payload=rowBytes
+        if (rle) {
+            payload=unitLcdRleEncode(nativeBufferAt(source.addressValue()+row*stride,rowBytes),w,pixelBytes,nativeBufferAt(scratch.addressValue()+1,work-1))
+            if (payload == 0) return 2|(row<<8)
+        } else {
+            var at=0;while (at < rowBytes) { scratch.store(at+1,source.load(row*stride+at));at=at+1 }
+        }
+        if (!this.write(scratch,payload+1)) return 6|(row<<8)
+        row=row+1
+    }
+    return 1|(h<<8)
+}
+trusted fun I2cDevice.unitLcdWritePixels(x: int,y: int,w: int,h: int,rotation: int,source: NativeBuffer,stride: int,pixelBytes: int,scratch: NativeBuffer,pollsPerRow: int,rle: bool = false): int =
+    this.unitLcdWriteRows(x,y,w,h,rotation,source,stride,pixelBytes,scratch,pollsPerRow,rle,0,0)
+// A8 coverage with explicit packed wire-color (least-significant byte first).
+// colorBytes1..4 selects RGB332/RGB565/RGB888/ARGB8888. The unit performs
+// blending; bytes follow its configured byte-swap mode. Re-establish color
+// for EVERY row before its window, under exclusive access. Status7=color I/O.
+// All validation precedes I/O; source contains one byte per alpha sample.
+trusted fun I2cDevice.unitLcdWriteAlpha(x: int,y: int,w: int,h: int,rotation: int,source: NativeBuffer,stride: int,rawColor: int,colorBytes: int,scratch: NativeBuffer,pollsPerRow: int,rle: bool = false): int =
+    if (colorBytes < 1 || colorBytes > 4) 2 else this.unitLcdWriteRows(x,y,w,h,rotation,source,stride,1,scratch,pollsPerRow,rle,colorBytes,rawColor)
+// Existing RGB565 surface is a constant-format specialization, not a second
+// uploader. Monolithic LLVM can prune unused format/encoding branches.
+trusted fun I2cDevice.unitLcdWrite16(x: int,y: int,w: int,h: int,rotation: int,source: NativeBuffer,stride: int,scratch: NativeBuffer,pollsPerRow: int,rle: bool = false): int =
+    this.unitLcdWritePixels(x,y,w,h,rotation,source,stride,2,scratch,pollsPerRow,rle)

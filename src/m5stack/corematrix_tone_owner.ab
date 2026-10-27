@@ -1,0 +1,61 @@
+import "./corematrix_buzzer.ab"
+import "../io_expander/m5ioe1_tone.ab"
+//56B:magic0/status4/control64@8/IOE tone32@16/primary48/cleanup52.
+// Caller serializes ALL shared PWM users and polls the cooperative deadline.
+// No PCM support, background task, allocation, or automatic pin restoration.
+type M5CoreMatrixTone=int
+fun m5CoreMatrixToneAt(storage: NativeBuffer): M5CoreMatrixTone =
+    if (storage.hasAddressRange(0,56) && (storage.addressValue()&3) == 0 && softwareI2cProviderBufferSafe(storage,56)) M5CoreMatrixTone(storage|0) else M5CoreMatrixTone(0)
+fun M5CoreMatrixTone.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5CoreMatrixTone.valid(): bool = m5CoreMatrixToneAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x434d5431
+trusted fun M5CoreMatrixTone.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5CoreMatrixTone.control(): M5CoreMatrixControl = M5CoreMatrixControl(this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32))
+fun M5CoreMatrixTone.tone(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+16,32)
+trusted fun M5CoreMatrixTone.initializeFresh(): bool {
+    if (m5CoreMatrixToneAt(this.buffer()) == 0) return false
+    var at=0;while (at < 56) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x434d5431);return true
+}
+//0closed1playing2admission3setup4PWMstart5powerenable6cleanupretry.
+// Nonzero volume uses upstream rounded duty=(volume*2048+127)/255.
+// Use closeOwned to stop; no claim of sound until physical verification.
+trusted fun M5CoreMatrixTone.startOwned(control: M5CoreMatrixControl,frequency: int,volume: int,now: int,duration: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || this.status() != 0 || !control.ready() || frequency < 1 || frequency > 65535 || volume < 1 || volume > 255 || now < 0 || now > 0xffffffff || duration < 1 || duration > 0x7fffffff ||
+        (this.buffer().addressValue() < control.buffer().addressValue()+64 && control.buffer().addressValue() < this.buffer().addressValue()+56)) return 2
+    if (!control.retainTone()) return 2
+    this.buffer().storeU32(8,control&0xffffffff);this.buffer().storeU32(12,control>>>32)
+    var at=16;while (at < 56) { this.buffer().storeU32(at,0);at=at+4 }
+    val setup=control.configureBuzzerOwned(true)
+    var status=1
+    if (!setup.valid()) { status=3;this.buffer().storeU32(48,setup|0) }
+    else {
+        val chip=M5Ioe1(control.expanders().device(0)|0)
+        if (ioe1ToneStartOwned(this.tone(),chip,2,frequency,(volume*2048+127)/255,now,duration,true) != 1) {
+            status=4;this.buffer().storeU32(48,this.tone().loadU32(16))
+        } else if (!chip.digitalWrite(1,true)) { status=5;this.buffer().storeU32(48,5) }
+    }
+    this.buffer().storeU32(4,status);return status
+}
+// Power-off and PWM-off are both attempted; restore shared frequency only
+// after the IOE tone's own acknowledged PWM stop. Every uncertainty retains
+// the parent lease, original failure and cleanup detail for explicit retry.
+trusted fun M5CoreMatrixTone.closeOwned(exclusiveSharedPwm: bool): bool {
+    if (!exclusiveSharedPwm || !this.valid()) return false
+    if (this.status() == 0) return true
+    val control=this.control()
+    if (!control.ready() || !control.toneRetained()) return false
+    val silent=control.silenceBuzzerOwned(true)
+    val stopped=if (this.tone().loadU32(0) == 0) 6 else ioe1ToneStopOwned(this.tone(),true)
+    this.buffer().storeU32(52,silent|(stopped<<16))
+    if ((silent&255) != 1 || stopped != 6) { this.buffer().storeU32(4,6);return false }
+    control.releaseTone()
+    this.buffer().storeU32(8,0);this.buffer().storeU32(12,0);this.buffer().storeU32(4,0);return true
+}
+//1playing0closed6cleanupretry; start errors stay latched until explicit close.
+trusted fun M5CoreMatrixTone.pollOwned(now: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !this.valid() || now < 0 || now > 0xffffffff) return 2
+    if (this.status() == 6) return if (this.closeOwned(true)) 0 else 6
+    if (this.status() != 1) return this.status()
+    if (((u32(now)-u32(this.tone().loadU32(12)))&u32(0x80000000)) != u32(0)) return 1
+    return if (this.closeOwned(true)) 0 else 6
+}

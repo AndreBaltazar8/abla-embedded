@@ -1,0 +1,109 @@
+import "./pcm_source_render.ab"
+// Borrowed mutable playback source: tag1 PCM channel,tag2 tone in bits56..63.
+// Caller pins source state/metadata/waveform and gives this queue exclusive
+// rendering ownership until consumed/dropped. Existing source phase is kept.
+type PcmPlaybackSource=int
+fun PcmPlaybackSource.kind(): int = this>>>56
+fun PcmPlaybackSource.channel(): PcmChannel = PcmChannel(this&4294967295)
+fun PcmPlaybackSource.tone(): PcmTone = PcmTone(this&72057594037927935)
+trusted fun PcmPlaybackSource.valid(): bool =
+    if (this.kind() == 1) ((this>>>32)&16777215) == 0 && this.channel().valid()
+    else this.kind() == 2 && this.tone().valid()
+trusted fun pcmPlaybackChannel(channel: PcmChannel): PcmPlaybackSource =
+    if (channel.valid() && (channel|0) > 0 && (channel|0) <= 4294967295) PcmPlaybackSource((1<<56)|(channel|0)) else PcmPlaybackSource(0)
+trusted fun pcmPlaybackTone(tone: PcmTone): PcmPlaybackSource =
+    if (tone.valid()) PcmPlaybackSource((2<<56)|(nativeBufferAt(tone.storage().addressValue(),tone.stateBytes())|0)) else PcmPlaybackSource(0)
+trusted fun PcmPlaybackSource.state(): NativeBuffer =
+    if (this.kind() == 1) this.channel().storage() else nativeBufferAt(this.tone().storage().addressValue(),this.tone().stateBytes())
+trusted fun PcmPlaybackSource.rate(): int = if (this.kind() == 1) this.channel().storage().loadU32(0) else this.tone().storage().loadU32(4)
+trusted fun PcmPlaybackSource.disjointFrom(buffer: NativeBuffer,bytes: int): bool =
+    if (this.kind() == 1) this.channel().disjointFrom(buffer,bytes) else this.kind() == 2 && this.tone().disjointFrom(buffer,bytes)
+trusted fun PcmPlaybackSource.renderAvailable(frames: int,output: NativeBuffer): int =
+    if (this.kind() == 1) this.channel().renderAvailable(frames,output) else this.tone().renderAvailable(frames,output,true)
+// Caller-owned32B queue: magic0,rate4,current64@8,next64@16,reserved24/28.
+// No allocator, threads, implicit source restart, or DMA operations.
+type PcmSourceQueue=int
+fun PcmSourceQueue.storage(): NativeBuffer = NativeBuffer(this|0)
+trusted fun PcmSourceQueue.source(slot: int): PcmPlaybackSource {
+    if (slot < 0 || slot > 1) return PcmPlaybackSource(0)
+    val s=this.storage();val offset=8+slot*8
+    return PcmPlaybackSource(s.loadU32(offset)|(s.loadU32(offset+4)<<32))
+}
+trusted fun PcmSourceQueue.storeSource(slot: int,source: PcmPlaybackSource): void {
+    if (slot < 0 || slot > 1) return
+    val s=this.storage();val offset=8+slot*8
+    s.storeU32(offset,source|0);s.storeU32(offset+4,int(u64(source|0)>>u64(32)));return
+}
+trusted fun PcmSourceQueue.valid(): bool {
+    val s=this.storage()
+    if (!s.hasAddressRange(0,32) || (s.addressValue()&3) != 0 || s.loadU32(0) != 0x53525131 ||
+        s.loadU32(4) < 8000 || s.loadU32(4) > 96000 || s.loadU32(24) != 0 || s.loadU32(28) != 0) return false
+    val first=this.source(0);val second=this.source(1)
+    if (first == 0 && second != 0) return false
+    var slot=0
+    while (slot < 2) {
+        val item=this.source(slot)
+        if (item != 0 && (!item.valid() || item.rate() != s.loadU32(4) || !item.disjointFrom(s,32))) return false
+        slot=slot+1
+    }
+    return second == 0 || (first.disjointFrom(second.state(),second.state().capacity()) &&
+        second.disjointFrom(first.state(),first.state().capacity()))
+}
+// Fresh, unpublished storage only. Never reinitialize an actively borrowed queue.
+trusted fun pcmSourceQueueAt(storage: NativeBuffer,rate: int): PcmSourceQueue {
+    if (!storage.hasAddressRange(0,32) || (storage.addressValue()&3) != 0 || rate < 8000 || rate > 96000) return PcmSourceQueue(0)
+    var offset=0
+    while (offset < 32) { storage.storeU32(offset,0);offset=offset+4 }
+    storage.storeU32(0,0x53525131);storage.storeU32(4,rate)
+    return PcmSourceQueue(storage|0)
+}
+// An endless current source keeps the pending source waiting until replaced.
+trusted fun PcmSourceQueue.enqueue(source: PcmPlaybackSource,replace: bool=false): bool {
+    if (!this.valid() || !source.valid() || source.rate() != this.storage().loadU32(4) ||
+        !source.disjointFrom(this.storage(),32)) return false
+    if (replace || this.source(0) == 0) {
+        this.storeSource(0,source);this.storeSource(1,PcmPlaybackSource(0));return true
+    }
+    if (this.source(1) != 0 || !source.disjointFrom(this.source(0).state(),this.source(0).state().capacity()) ||
+        !this.source(0).disjointFrom(source.state(),source.state().capacity())) return false
+    this.storeSource(1,source);return true
+}
+// Drop references only; does not reset/stop the borrowed sources or DMA.
+trusted fun PcmSourceQueue.stop(): bool {
+    if (!this.valid()) return false
+    this.storeSource(0,PcmPlaybackSource(0));this.storeSource(1,PcmPlaybackSource(0));return true
+}
+trusted fun PcmSourceQueue.disjointFrom(buffer: NativeBuffer,bytes: int): bool {
+    if (!this.valid() || !buffer.hasAddressRange(0,bytes) ||
+        pcmMixSpansOverlap(this.storage(),32,buffer,bytes)) return false
+    var slot=0
+    while (slot < 2) {
+        val item=this.source(slot)
+        if (item != 0 && !item.disjointFrom(buffer,bytes)) return false
+        slot=slot+1
+    }
+    return true
+}
+// Validate BOTH sources/output before touching samples or cursors. At most two
+// source transitions; exhausted tail is silence. Retain output for DMA retry.
+trusted fun PcmSourceQueue.render(frames: int,output: NativeBuffer): bool {
+    if (!this.valid() || frames < 0 || frames > 268435455 || !output.hasAddressRange(0,frames*4) ||
+        pcmMixSpansOverlap(this.storage(),32,output,frames*4)) return false
+    var slot=0
+    while (slot < 2) {
+        val item=this.source(slot)
+        if (item != 0 && !item.disjointFrom(output,frames*4)) return false
+        slot=slot+1
+    }
+    var position=0
+    while (position < frames && this.source(0) != 0) {
+        val item=this.source(0)
+        val count=item.renderAvailable(frames-position,nativeBufferAt(output.addressValue()+position*4,(frames-position)*4))
+        if (count < 0) return false
+        position=position+count
+        val remaining=if (item.kind() == 1) item.channel().availableFrames(1) else item.tone().availableFrames(1)
+        if (remaining == 0) { this.storeSource(0,this.source(1));this.storeSource(1,PcmPlaybackSource(0)) }
+    }
+    while (position < frames) { output.storeU32(position*4,0);position=position+1 }
+    return true
+}

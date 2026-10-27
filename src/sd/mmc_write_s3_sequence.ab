@@ -1,0 +1,57 @@
+import "./mmc_read_s3_sequence.ab"
+// Explicit one-sector write. Caller opts into destructive media mutation and
+// owns initialized card, exclusive host/pads/IRQs/source, context64, descriptor16
+// and immutable512-byte DMA payload. All four regions must be disjoint/pinned.
+// No filesystem metadata updates, retries or rollback: a failed write may
+// already have changed the medium. Do not alter/free payload while pending.
+// Shares read engine states/errors; 10 means CSD permanent/temporary protection.
+// Extra context bytes48..63 hold final CMD13 response; word44 command state.
+trusted fun sdMmcWriteBeginOwned(context: NativeBuffer,card: NativeBuffer,descriptor: NativeBuffer,payload: NativeBuffer,sector: int,now: u32,budgetMs: int,releasedExclusive: bool,allowWrite: bool): int {
+    if (!allowWrite || !context.hasAddressRange(0,64) || sdMmcCardStatus(card) != 1 ||
+        !sdMmcReadDisjoint(context.addressValue(),64,card.addressValue(),80) ||
+        !sdMmcReadDisjoint(context.addressValue(),64,descriptor.addressValue(),16) ||
+        !sdMmcReadDisjoint(context.addressValue(),64,payload.addressValue(),512)) return 3
+    val rca=card.loadU32(28)
+    if (rca < 1 || rca > 65535) return 3
+    if ((card.loadU32(48)&0x3000) != 0) return 10
+    val begun=sdMmcReadBeginOwned(nativeBufferAt(context.addressValue(),48),card,descriptor,payload,sector,now,budgetMs,releasedExclusive)
+    if (begun != 2) return begun
+    context.storeU32(40,1)
+    context.storeU32(44,rca)
+    return 2
+}
+trusted fun sdMmcWritePollOwned(context: NativeBuffer,now: u32): int {
+    if (!context.hasAddressRange(0,64) || context.loadU32(40) != 1) return 3
+    val status=sdMmcReadStatus(context)
+    if (status != 2) return status
+    val phase=context.load(4)
+    if (phase <= 4) {
+        val transferred=sdMmcTransferPollOwned(context,now)
+        if (transferred != 1) return transferred
+        // DMA stopped and DAT0 released are necessary but insufficient:
+        // programming/protection errors can be reported by the final R1.
+        context.store(0,2); context.store(4,5)
+        return 2
+    }
+    if (phase != 5 && phase != 6) return sdMmcReadEnd(context,3)
+    if (int(now-u32(context.loadU32(16))) >= context.loadU32(20)) return sdMmcReadEnd(context,6)
+    if (phase == 5) {
+        // Word44 holds RCA until this submission, then the command token.
+        val rca=context.loadU32(44)
+        if (rca < 1 || rca > 65535) return sdMmcReadEnd(context,3)
+        val command=sdMmcCommandStartOwned(context.load(5),13,u32(rca<<16),1)
+        if (command.status() == 4) return 2
+        context.storeU32(44,command|0)
+        if (command.status() != 2) return sdMmcReadEnd(context,4)
+        context.store(4,6)
+        return 2
+    }
+    val response=nativeBufferAt(context.addressValue()+48,16)
+    val command=SdMmcCommand(context.loadU32(44)).pollOwned(response)
+    context.storeU32(44,command|0)
+    if (command.status() == 2) return 2
+    if (command.status() != 1) return sdMmcReadEnd(context,4)
+    val r1=response.loadU32(0)
+    if (!sdMmcCardR1Valid(r1) || (r1&0x1f00) != 0x900) return sdMmcReadEnd(context,5)
+    return sdMmcReadEnd(context,1)
+}

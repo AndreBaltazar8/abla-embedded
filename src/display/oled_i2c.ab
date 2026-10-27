@@ -1,0 +1,88 @@
+import "./mono_page_canvas.ab"
+// SSD1306/SSD1315 and SH110x command/addressing sequences based on pinned
+// M5GFX Panel_SSD1306.hpp/.cpp; redistribution notice: epd_waveform.LICENSE.
+// Borrowed I2cDevice and exclusive caller scratch. Caller owns bus, reset,
+// power and configured address. No read probe, hidden retries or allocation.
+type OledProfile=int
+fun oledProfile(kind: int,width: int,height: int,column: int = 0,page: int = 0): OledProfile =
+    if (kind < 1 || kind > 2 || width < 1 || width > 128 || height < 8 || (height&7) != 0 ||
+        column < 0 || column+width > 128 || page < 0 || page+(height>>>3) > (if (kind == 1) 8 else 16) ||
+        (kind == 1 && ((width&3) != 0 || (column&3) != 0))) OledProfile(0)
+    else OledProfile(kind|(width<<8)|(height<<16)|(column<<24)|(page<<32))
+fun OledProfile.kind(): int = this&255
+fun OledProfile.width(): int = (this>>>8)&255
+fun OledProfile.height(): int = (this>>>16)&255
+fun OledProfile.column(): int = (this>>>24)&255
+fun OledProfile.page(): int = (this>>>32)&255
+fun OledProfile.valid(): bool = this != 0 && oledProfile(this.kind(),this.width(),this.height(),this.column(),this.page()) == this
+val oledSsdInit=nativeStaticU32s([0x80d5ae00,0xd33fa8,0xa0002040,0xa410dbc0,0xaf148d2e,0x11d90081,0xa612da])
+val oledShInit=nativeStaticU32s([0xee40ae00,0xd500dc20,0xd37fa850,0xa08bad00,0xdb20d9c0,0x81a435,0xa6af12da])
+trusted fun I2cDevice.oledInitialize(profile: OledProfile,scratch: NativeBuffer): bool {
+    if (!this.valid() || !profile.valid() || !scratch.hasAddressRange(0,28)) return false
+    val bytes=if (profile.kind() == 1) 27 else 28
+    val program=nativeBufferAt(if (profile.kind() == 1) oledSsdInit else oledShInit,28)
+    var at=0;while (at < bytes) { scratch.store(at,program.load(at));at=at+1 }
+    return this.write(scratch,bytes)
+}
+trusted fun I2cDevice.oledSetSleep(sleep: bool,scratch: NativeBuffer): bool {
+    if (!this.valid() || !scratch.hasAddressRange(0,2)) return false
+    scratch.store(0,0);scratch.store(1,if (sleep) 174 else 175)
+    return this.write(scratch,2)
+}
+trusted fun I2cDevice.oledSetInvert(invert: bool,scratch: NativeBuffer): bool {
+    if (!this.valid() || !scratch.hasAddressRange(0,2)) return false
+    scratch.store(0,0);scratch.store(1,if (invert) 167 else 166)
+    return this.write(scratch,2)
+}
+trusted fun I2cDevice.oledSetBrightness(profile: OledProfile,value: int,scratch: NativeBuffer): bool {
+    if (!this.valid() || !profile.valid() || value < 0 || value > 255 || !scratch.hasAddressRange(0,7)) return false
+    scratch.store(0,0)
+    if (profile.kind() == 1) {
+        scratch.store(1,217);scratch.store(2,((value+15)/17)*17)
+        scratch.store(3,219);scratch.store(4,value>>>1)
+        scratch.store(5,129);scratch.store(6,value)
+    } else { scratch.store(1,129);scratch.store(2,value) }
+    return this.write(scratch,if (profile.kind() == 1) 7 else 3)
+}
+// Publish whole immutable page framebuffer. Scratch >= max(7,width+1).
+// SSD horizontal mode window is reset per publication; SH page/column per
+// page. Stop immediately on failure; acknowledged page count is not a claim
+// that the failing page was untouched. Keep caller's framebuffer for retry.
+// Result low8:1complete2input3address-command failure4data failure; pages@8.
+trusted fun I2cDevice.oledDisplay(profile: OledProfile,frame: NativeBuffer,scratch: NativeBuffer): int {
+    return this.oledDisplayRegion(profile,frame,scratch,0,0,profile.width(),profile.height())
+}
+// Physical preclipped dirty rectangle; enclosing framebuffer remains complete
+// and immutable. Expand Y to page boundaries; SSD expands X to four columns
+// as required by M5GFX's controller workaround. SH keeps exact X bounds.
+// Adjacent pixels in expanded regions are sourced from the same framebuffer.
+// Acknowledged page count is relative to this transfer, not absolute page Y.
+trusted fun I2cDevice.oledDisplayRegion(profile: OledProfile,frame: NativeBuffer,scratch: NativeBuffer,x: int,y: int,w: int,h: int): int {
+    val width=profile.width();val height=profile.height()
+    if (!this.valid() || !profile.valid() || x < 0 || y < 0 || w < 1 || h < 1 ||
+        x >= width || y >= height || w > width-x || h > height-y) return 2
+    val left=if (profile.kind() == 1) x&~3 else x
+    val right=if (profile.kind() == 1) (x+w-1)|3 else x+w-1
+    val first=y>>>3;val end=(y+h-1)>>>3;val columns=right-left+1
+    val size=width*(height>>>3);val work=if (columns+1 < 7) 7 else columns+1
+    if (!frame.hasAddressRange(0,size) || !scratch.hasAddressRange(0,work) ||
+        (frame.addressValue() < scratch.addressValue()+work && scratch.addressValue() < frame.addressValue()+size)) return 2
+    if (profile.kind() == 1) {
+        scratch.store(0,0);scratch.store(1,33);scratch.store(2,profile.column()+left);scratch.store(3,profile.column()+right)
+        scratch.store(4,34);scratch.store(5,profile.page()+first);scratch.store(6,profile.page()+end)
+        if (!this.write(scratch,7)) return 3
+    }
+    var page=first
+    while (page <= end) {
+        if (profile.kind() == 2) {
+            scratch.store(0,0);scratch.store(1,176+profile.page()+page)
+            scratch.store(2,16+((profile.column()+left)>>>4));scratch.store(3,(profile.column()+left)&15)
+            if (!this.write(scratch,4)) return 3|((page-first)<<8)
+        }
+        scratch.store(0,64)
+        var column=0;while (column < columns) { scratch.store(column+1,frame.load(page*width+left+column));column=column+1 }
+        if (!this.write(scratch,columns+1)) return 4|((page-first)<<8)
+        page=page+1
+    }
+    return 1|((end-first+1)<<8)
+}

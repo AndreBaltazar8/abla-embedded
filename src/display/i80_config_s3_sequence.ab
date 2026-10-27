@@ -1,0 +1,53 @@
+import "abla/runtime/scalar"
+// S3 LCD_CAM LCD-only configuration. Caller owns a stopped/drained LCD and
+// GDMA channel, enabled LCD_CAM bus clock, released reset and stable PLL160M.
+// No shared LCD_CAM reset (camera may be live), clock gating, pad routing,
+// allocation, FIFO reset or DMA start. Returns1configured2invalid3busy4writefail.
+// All failures retain exclusive ownership; partial configuration may be retried.
+fun esp32S3LcdI80ClockWord(groupDivider: int,pixelDivider: int,idleHigh: bool,negativeEdge: bool): int {
+    if (groupDivider < 2 || groupDivider > 256 || pixelDivider < 1 || pixelDivider > 64) return -1
+    return 0xE0000000|((groupDivider&255)<<9)|(if (pixelDivider == 1) 65 else pixelDivider-1)|
+        (if (idleHigh) 128 else 0)|(if (negativeEdge) 256 else 0)
+}
+trusted fun s3I80Field(address: int,mask: int,value: int): bool {
+    val before=esp32S3I80Read(address)
+    val after=(before&(~mask))|(value&mask)
+    esp32S3I80Write(address,after)
+    return (esp32S3I80Read(address)&mask) == (after&mask)
+}
+trusted fun s3I80Idle(): bool = (esp32S3I80Read(0x600C001C)&256) != 0 &&
+    (esp32S3I80Read(0x600C0024)&256) == 0 &&
+    (esp32S3I80Read(0x60041014)&0x18100000) == 0 && (esp32S3I80Read(0x60041018)&0x08000000) == 0
+trusted fun esp32S3LcdI80ConfigureOwned(width: int,groupDivider: int,pixelDivider: int,idleHigh: bool,negativeEdge: bool,exclusiveDrained: bool): int {
+    val clock=esp32S3LcdI80ClockWord(groupDivider,pixelDivider,idleHigh,negativeEdge)
+    if (!exclusiveDrained || (width != 8 && width != 16) || clock < 0) return 2
+    if (!s3I80Idle()) return 3
+    if (!s3I80Field(0x60041000,0xFFFFFFFF,clock)) return 4
+    // Disable RGB and conversion without touching camera configuration.
+    if (!s3I80Field(0x6004101C,0x80000000,0) || !s3I80Field(0x60041010,0x80000000,0)) return 4
+    // User: DMA-length-controlled output; no byte/bit reversal or phases yet.
+    // Preserve reserved14..18, don't replay RESET/UPDATE/START command bits.
+    if (!s3I80Field(0x60041014,0xFFF83FFF,8192|(if (width == 16) 1<<23 else 0))) return 4
+    // One cycle each front/back blank, no auto-next-frame; DC defaults low.
+    // Preserve FIFO threshold/reserved bit0. AFIFO reset is excluded.
+    if (!s3I80Field(0x60041018,0xF7FFFFC0,1<<26)) return 4
+    // Polling transport uses RAW; don't enable CPU interrupts or clear camera
+    // events. Only LCD TRANS_DONE is disabled and acknowledged here.
+    if (!s3I80Field(0x60041064,2,0)) return 4
+    esp32S3I80Write(0x60041070,2)
+    return if ((esp32S3I80Read(0x60041068)&2) == 0) 1 else 4
+}
+// General i80 phases; dataCycles controls fixed-length mode or just enables
+// the DMA-length phase when continuous=true. Command register is caller's
+// already wire-ordered value (up to two cycles). Zero phases clear old lengths.
+trusted fun esp32S3LcdI80PhasesOwned(commandCycles: int,dummyCycles: int,dataCycles: int,command: int,continuous: bool,exclusiveDrained: bool): int {
+    if (!exclusiveDrained || commandCycles < 0 || commandCycles > 2 || dummyCycles < 0 || dummyCycles > 4 ||
+        dataCycles < 0 || dataCycles > 8192 || command < 0 || command > 0xFFFFFFFF ||
+        commandCycles+dummyCycles+dataCycles == 0) return 2
+    if (!s3I80Idle() || (esp32S3I80Read(0x6004101C)&0x80000000) != 0) return 3
+    val word=(if (continuous) 8192 else 0)|(if (dataCycles > 0) (1<<24)|(dataCycles-1) else 0)|
+        (if (dummyCycles > 0) (1<<25)|((dummyCycles-1)<<29) else 0)|
+        (if (commandCycles > 0) 1<<26 else 0)|(if (commandCycles == 2) 1<<31 else 0)
+    if (commandCycles > 0 && !s3I80Field(0x60041028,0xFFFFFFFF,command)) return 4
+    return if (s3I80Field(0x60041014,0xE7003FFF,word)) 1 else 4
+}

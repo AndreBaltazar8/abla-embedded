@@ -1,0 +1,99 @@
+import "./pcm_channel.ab"
+
+// Contiguous1..8 serialized-owner channels. No hidden allocation/thread/task.
+// Mutate/enqueue between renders only; retain staged output across DMA retries.
+type PcmChannels = int
+fun PcmChannels.storage(): NativeBuffer = NativeBuffer(this | 0)
+fun PcmChannels.count(): int = this.storage().capacity() >>> 5
+trusted fun PcmChannels.channel(index: int): PcmChannel =
+    if (index < 0 || index >= this.count()) PcmChannel(0)
+    else PcmChannel(this.storage().addressValue()+index*32)
+trusted fun pcmChannelsAt(storage: NativeBuffer,count: int,rate: int): PcmChannels {
+    if (count < 1 || count > 8 || rate < 8000 || rate > 96000 || !storage.hasAddressRange(0,count*32)) return PcmChannels(0)
+    var index=0
+    while (index < count) {
+        pcmChannelAt(nativeBufferAt(storage.addressValue()+index*32,32),rate)
+        index=index+1
+    }
+    PcmChannels(nativeBufferAt(storage.addressValue(),count*32) | 0)
+}
+trusted fun PcmChannels.valid(): bool {
+    val count=this.count()
+    if (count < 1 || count > 8 || this.storage().capacity() != count*32 ||
+        !this.storage().hasAddressRange(0,count*32)) return false
+    var index=0
+    while (index < count) {
+        val channel=this.channel(index)
+        if (!channel.valid() || channel.storage().loadU32(0) != this.channel(0).storage().loadU32(0)) return false
+        // Any channel may borrow the same immutable clip, but not another
+        // channel's mutable state (including its queued metadata/source).
+        var other=0
+        while (other < count) {
+            if (other != index && !channel.disjointFrom(this.channel(other).storage(),32)) return false
+            other=other+1
+        }
+        index=index+1
+    }
+    true
+}
+trusted fun PcmChannels.playingChannels(): int {
+    if (!this.valid()) return 0
+    var count=0
+    var index=0
+    while (index < this.count()) {
+        if (this.channel(index).isPlaying() != 0) count=count+1
+        index=index+1
+    }
+    count
+}
+trusted fun PcmChannels.stop(): bool {
+    if (!this.valid()) return false
+    var index=0
+    while (index < this.count()) { this.channel(index).stop(); index=index+1 }
+    true
+}
+// Returns the chosen channel, or-1 without mutation. Automatic selection uses
+// the highest idle channel, matching M5Unified's automatic selection order.
+trusted fun PcmChannels.enqueue(wav: PcmWav,repeats: int=1,index: int=-1,replace: bool=false): int {
+    if (!this.valid() || index < -1 || index >= this.count()) return -1
+    var selected=index
+    if (selected == -1) {
+        selected=this.count()-1
+        while (selected >= 0 && this.channel(selected).isPlaying() != 0) selected=selected-1
+    }
+    if (selected < 0) return -1
+    // Enqueue validates its own state; reject aliases against the entire bank.
+    if (wav.frames() < 1 || pcmMixSpansOverlap(this.storage(),this.storage().capacity(),nativeBufferAt(wav,20),20) ||
+        pcmMixSpansOverlap(this.storage(),this.storage().capacity(),wav.samples(),wav.samples().capacity())) return -1
+    if (this.channel(selected).enqueue(wav,repeats,replace)) selected else -1
+}
+trusted fun PcmChannels.render(frames: int,accumulator: NativeBuffer,scratch: NativeBuffer,
+    output: NativeBuffer,masterGainQ15: int=32768): bool =
+    this.renderOutput(frames,accumulator,scratch,output,true,masterGainQ15)
+
+// Output is interleaved stereo or averaged mono. Validate ALL workspaces
+// before touching an accumulator or advancing any channel/queued source.
+trusted fun PcmChannels.renderOutput(frames: int,accumulator: NativeBuffer,scratch: NativeBuffer,
+    output: NativeBuffer,stereo: bool,masterGainQ15: int=32768): bool {
+    val outputBytes=frames*(if (stereo) 4 else 2)
+    if (!this.valid() || frames < 0 || frames > 268435455 || masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !accumulator.hasAddressRange(0,frames*8) || !scratch.hasAddressRange(0,frames*4) || !output.hasAddressRange(0,outputBytes) ||
+        pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,output,outputBytes) ||
+        pcmMixSpansOverlap(scratch,frames*4,output,outputBytes)) return false
+    var index=0
+    while (index < this.count()) {
+        val channel=this.channel(index)
+        if (!channel.disjointFrom(accumulator,frames*8) || !channel.disjointFrom(scratch,frames*4) ||
+            !channel.disjointFrom(output,outputBytes)) return false
+        index=index+1
+    }
+    if (!clearPcm16Mix(accumulator,frames*2)) return false
+    index=0
+    while (index < this.count()) {
+        if (!this.channel(index).render(frames,scratch) || !addPcm16ToMix(accumulator,scratch,frames*2)) return false
+        index=index+1
+    }
+    if (stereo) finishPcm16Mix(accumulator,output,frames*2,masterGainQ15)
+    else finishPcm16MixMono(accumulator,output,frames,masterGainQ15)
+}

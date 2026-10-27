@@ -1,0 +1,53 @@
+import "./tough_rtc_interrupt_sequence.ab"
+// Cache-on caller-owned64B:tag,state,owner address,bus64@12,RTC64@20,
+// PMIC64@28,boot64@36,first board result64@44,latest result64@52,requestedms60.
+// State1configured3partial4closed5closing;2invalid return only. Keep parent,
+// RTC and bus live/exclusive until close, even if setup or cleanup failed.
+// Configuration is attempted once. RetryCleanup only repeats PM1 clears for
+// a successfully configured timer. Close stops timer/TF, not alarm/AIE;
+// consumes that timer's wake evidence, so inspect wanted events first.
+trusted fun toughRtcSessionRead64(r: NativeBuffer,offset: int): int = r.loadU32(offset)|(r.loadU32(offset+4)<<32)
+trusted fun toughRtcSessionWrite64(r: NativeBuffer,offset: int,value: int): void {
+    r.storeU32(offset,value&0xffffffff);r.storeU32(offset+4,value>>>32);return
+}
+trusted fun toughRtcTimerSessionMatches(owner: M5ToughPowerOwner,r: NativeBuffer,exclusive: bool): bool {
+    if (!exclusive || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x54525431 ||
+        r.loadU32(8) != owner.buffer().addressValue() || owner.pmic() != toughRtcSessionRead64(r,28) ||
+        owner.bootResult() != toughRtcSessionRead64(r,36)) return false
+    return toughRtcInterruptAdmitted(owner,M5RtcOpenResult(toughRtcSessionRead64(r,20)),toughRtcSessionRead64(r,12),true)
+}
+trusted fun M5ToughPowerOwner.beginRtcTimerSessionOwned(r: NativeBuffer,rtc: M5RtcOpenResult,bus: int,milliseconds: int,exclusive: bool): int {
+    if (!exclusive || milliseconds <= 0 || milliseconds > 0xffffffff || !r.hasAddressRange(0,64) ||
+        (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    val address=r.addressValue();val parent=this.buffer().addressValue()
+    if ((address < parent+96 && parent < address+64) || !toughRtcInterruptAdmitted(this,rtc,bus,true)) return 2
+    r.storeU32(8,parent);toughRtcSessionWrite64(r,12,bus);toughRtcSessionWrite64(r,20,rtc|0)
+    toughRtcSessionWrite64(r,28,this.pmic()|0);toughRtcSessionWrite64(r,36,this.bootResult()|0)
+    toughRtcSessionWrite64(r,44,0);toughRtcSessionWrite64(r,52,0);r.storeU32(60,milliseconds)
+    r.storeU32(4,3);r.storeU32(0,0x54525431)
+    val result=this.setRtcTimerOwned(rtc,bus,milliseconds,true)
+    toughRtcSessionWrite64(r,44,result|0);toughRtcSessionWrite64(r,52,result|0)
+    r.storeU32(4,if (result.success()) 1 else 3)
+    return r.loadU32(4)
+}
+trusted fun M5ToughPowerOwner.retryRtcTimerCleanupOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!toughRtcTimerSessionMatches(this,r,exclusive)) return 2
+    if (r.loadU32(4) == 1) return 1
+    if (r.loadU32(4) != 3) return 2
+    val first=M5RtcTimerResult(toughRtcSessionRead64(r,44))
+    if (!first.timer().valid()) return 2
+    val cleanup=m5RtcFinishCleanup(m5BoardToughC5,true,this.pmic().deviceHandle())
+    val result=M5RtcTimerResult((first&~65535)|(cleanup|0))
+    toughRtcSessionWrite64(r,52,result|0);r.storeU32(4,if (result.success()) 1 else 3)
+    return r.loadU32(4)
+}
+trusted fun M5ToughPowerOwner.closeRtcTimerSessionOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!toughRtcTimerSessionMatches(this,r,exclusive)) return 2
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3 && r.loadU32(4) != 5) return 2
+    r.storeU32(4,5)
+    val result=this.setRtcTimerOwned(M5RtcOpenResult(toughRtcSessionRead64(r,20)),toughRtcSessionRead64(r,12),0,true)
+    toughRtcSessionWrite64(r,52,result|0)
+    if (!result.success()) return 3
+    r.storeU32(4,4);return 4
+}

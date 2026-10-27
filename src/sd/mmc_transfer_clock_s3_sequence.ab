@@ -1,0 +1,94 @@
+import "./mmc_card_s3_sequence.ab"
+import "./mmc_clock_s3_sequence.ab"
+import "./mmc_host_clock_s3_sequence.ab"
+import "./mmc_frequency.ab"
+// Default-speed SD memory cards only: never selects HS/UHS/DDR or changes
+// voltage/bus width. Caller owns BOTH slots, stable XTAL40/PLL160, routed
+// pads and interrupt consumers. The other slot must be clock-disabled.
+// context64 and initialized card80 are disjoint and retained until recovery
+// after any error. No automatic retry/rollback of a partially changed clock.
+// tag0,phase4,slot5,PLL6,hostdiv7,carddiv8,ceilHz12,startMs16,budget20,
+// changedUs24,primitive28,RCA32,timeoutMs36,response40..55,detail56.
+// 1ready2pending3invalid4busy5hardware6deadline7card-status.
+trusted fun sdMmcTransferClockStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,64) || (context.loadU32(0)&0xffffff00) != 0x53444600) return 3
+    return context.load(0)
+}
+trusted fun sdMmcTransferClockEnd(context: NativeBuffer,status: int,detail: int): int {
+    context.store(0,status); context.storeU32(56,detail); return status
+}
+trusted fun sdMmcTransferClockIdleOwned(): bool =
+    (sdMmcS3Read(0)&0x02000037) == 0 && (sdMmcS3Read(128)&0x83) == 0 &&
+    (sdMmcS3Read(140)&0x1e000) == 0 && (sdMmcS3Read(44)&0x80000000) == 0 &&
+    (sdMmcS3Read(72)&0x3ffe06f0) == 0
+trusted fun sdMmcTransferClockBeginOwned(context: NativeBuffer,card: NativeBuffer,pll160: bool,maximumHz: int,timeoutMs: int,nowMs: u32,budgetMs: int,preparedExclusive: bool): int {
+    if (!preparedExclusive || !context.hasAddressRange(0,64) || sdMmcCardStatus(card) != 1 || card.load(5) > 1 ||
+        card.loadU32(28) < 1 || card.loadU32(28) > 65535 || maximumHz < 1 || maximumHz > 25000000 ||
+        timeoutMs < 1 || timeoutMs > 600 || budgetMs < 1 || budgetMs > 60000 ||
+        (context.addressValue() < card.addressValue()+80 && card.addressValue() < context.addressValue()+64)) return 3
+    val plan=sdMmcFrequency(if (pll160) 160000000 else 40000000,maximumHz)
+    if (!plan.valid()) return 3
+    val slot=card.load(5)
+    if (!sdMmcTransferClockIdleOwned() || (sdMmcS3Read(16)&65535) != (1<<slot) ||
+        (sdMmcS3Read(116)&(1<<(16+slot))) != 0 || (sdMmcS3Read(268)&(1<<slot)) != 0 ||
+        (sdMmcS3Read(24)&(1<<(16+slot))) != 0 || (sdMmcS3Read(68)&0xbfc2) != 0) return 4
+    var index=0
+    while (index < 64) { context.store(index,0); index=index+1 }
+    context.storeU32(0,0x53444602); context.store(4,1); context.store(5,slot); context.store(6,if (pll160) 1 else 0)
+    context.store(7,plan.hostDivider()); context.storeU32(8,plan.cardDivider()); context.storeU32(12,plan.actualHzCeiling())
+    context.storeU32(16,int(nowMs)); context.storeU32(20,budgetMs); context.storeU32(32,card.loadU32(28)); context.storeU32(36,timeoutMs)
+    val token=sdMmcClockStartOwned(slot,0,false,false)
+    context.storeU32(28,token|0)
+    if (token.status() != 2) return sdMmcTransferClockEnd(context,5,token.status())
+    return 2
+}
+trusted fun sdMmcTransferClockPollOwned(context: NativeBuffer,nowMs: u32,nowUs: u32): int {
+    val state=sdMmcTransferClockStatus(context)
+    if (state != 2) return state
+    val phase=context.load(4)
+    if (phase < 1 || phase > 6 || context.load(5) > 1) return sdMmcTransferClockEnd(context,3,0)
+    if (int(nowMs-u32(context.loadU32(16))) >= context.loadU32(20)) return sdMmcTransferClockEnd(context,6,0)
+    if ((sdMmcS3Read(68)&0xbfc2) != 0) return sdMmcTransferClockEnd(context,5,sdMmcS3Read(68)&0xbfc2)
+    if (phase == 1 || phase == 4) {
+        val clock=SdMmcClock(context.loadU32(28)).pollOwned()
+        context.storeU32(28,clock|0)
+        if (clock.status() == 2) return 2
+        if (clock.status() != 1) return sdMmcTransferClockEnd(context,5,clock.status())
+    }
+    if (phase == 2) {
+        if (!sdMmcTransferClockIdleOwned()) return sdMmcTransferClockEnd(context,4,0)
+        val changed=sdMmcHostClockConfigureOwned(context.load(7),context.load(6) != 0,true)
+        if (changed != 1) return sdMmcTransferClockEnd(context,5,changed)
+        context.storeU32(24,int(nowUs))
+    }
+    if (phase == 3) {
+        if (int(nowUs-u32(context.loadU32(24))) < 10) return 2
+        if (!sdMmcTransferClockIdleOwned() || (sdMmcS3Read(16)&65535) != 0) return sdMmcTransferClockEnd(context,4,0)
+        // <=25MHz *600ms <=15M cycles, below the 24-bit timeout limit.
+        // Split multiplication avoids overflowing u32 for Hz*milliseconds.
+        val hz=u32(context.loadU32(12)); val ms=u32(context.loadU32(36))
+        val cycles=(hz/u32(1000))*ms+((hz%u32(1000))*ms+u32(999))/u32(1000)
+        val timeout=(int(cycles)<<8)|255
+        sdMmcS3Write(20,timeout)
+        if (sdMmcS3Read(20) != timeout) return sdMmcTransferClockEnd(context,5,8)
+        val clock=sdMmcClockStartOwned(context.load(5),context.loadU32(8),true,false)
+        context.storeU32(28,clock|0)
+        if (clock.status() != 2) return sdMmcTransferClockEnd(context,5,clock.status())
+    }
+    if (phase == 5) {
+        val command=sdMmcCommandStartOwned(context.load(5),13,u32(context.loadU32(32)<<16),1)
+        context.storeU32(28,command|0)
+        if (command.status() != 2) return sdMmcTransferClockEnd(context,5,command.status())
+    }
+    if (phase == 6) {
+        val response=nativeBufferAt(context.addressValue()+40,16)
+        val command=SdMmcCommand(context.loadU32(28)).pollOwned(response)
+        context.storeU32(28,command|0)
+        if (command.status() == 2) return 2
+        if (command.status() != 1) return sdMmcTransferClockEnd(context,5,command.status())
+        val r1=response.loadU32(0)
+        return sdMmcTransferClockEnd(context,if (sdMmcCardR1Valid(r1) && (r1&0x1f00) == 0x900) 1 else 7,r1)
+    }
+    context.store(4,phase+1)
+    return 2
+}

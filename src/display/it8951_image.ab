@@ -1,0 +1,114 @@
+import "./it8951_device.ab"
+// Physical, unrotated4bpp grayscale rectangles. Source rows are MSB-nibble
+// first, pixel0 in the high nibble; explicit byte stride may include padding.
+// No allocation, implicit refresh, reset or VCOM changes. Caller owns the
+// initialized controller, buffers and pins throughout; info is not a lease.
+// An interrupted load may leave LD_IMG open or partially applied. Retain
+// ownership and repair/reset before another load; do not refresh that data.
+type It8951ImageResult = int
+fun It8951ImageResult.status(): int = this&255
+fun It8951ImageResult.stage(): int = (this>>>8)&255
+fun It8951ImageResult.words(): int = this>>>16
+fun It8951ImageResult.success(): bool = this.status() == 1
+// Status6controller-fault(FFFF LUT status),7refresh still busy after attempts.
+// Other statuses match transport. Stages1idle2area3pixels4end5idle6refresh.
+fun it8951RectangleValid(info: It8951DeviceInfo,x: int,y: int,w: int,h: int): bool =
+    info.valid() && x >= 0 && y >= 0 && w > 0 && h > 0 && x < info.width() && y < info.height() &&
+    w <= info.width()-x && h <= info.height()-y
+trusted fun it8951ReadRegister(context: int,address: int,scratch: NativeBuffer,polls: int): It8951Transfer {
+    if (address < 0 || address > 65535 || !scratch.hasAddressRange(0,2)) return It8951Transfer(2)
+    val command=it8951Command(context,16,NativeBuffer(0),0,polls)
+    if (!command.success()) return command
+    val index=it8951WriteWord(context,address,polls)
+    if (!index.success()) return index
+    it8951ReadWords(context,scratch,1,polls)
+}
+// HRDY means command-ready, not display-idle: LUTAFSR must also become zero.
+// Delay1ms between attempts; transport failures stop immediately, not retried.
+trusted fun it8951WaitDisplayIdle(context: int,scratch: NativeBuffer,polls: int,attempts: int): int {
+    if (!it8951Admission(context,polls) || !scratch.hasAddressRange(0,2) || attempts < 1 || attempts > 3000) return 2
+    var remaining=attempts
+    while (remaining > 0) {
+        val read=it8951ReadRegister(context,4644,scratch,polls)
+        if (!read.success()) return read.status()
+        val flags=scratch.loadU16(0)
+        if (flags == 0) return 1
+        if (flags == 65535) return 6
+        remaining=remaining-1
+        if (remaining > 0) it8951TransportDelay(context,1000)
+    }
+    7
+}
+trusted fun it8951Load4(context: int,info: It8951DeviceInfo,pixels: NativeBuffer,stride: int,
+    x: int,y: int,w: int,h: int,scratch: NativeBuffer,polls: int,attempts: int): It8951ImageResult {
+    if (!it8951Admission(context,polls) || !it8951RectangleValid(info,x,y,w,h) ||
+        attempts < 1 || attempts > 3000 || stride < (w+1)/2 || stride > 2147483647 ||
+        !scratch.hasAddressRange(0,14)) return It8951ImageResult(2)
+    val bytes=(h-1)*stride+(w+1)/2
+    if (!pixels.hasAddressRange(0,bytes) || (pixels.addressValue() < scratch.addressValue()+14 &&
+        scratch.addressValue() < pixels.addressValue()+bytes)) return It8951ImageResult(2)
+    val idle=it8951WaitDisplayIdle(context,scratch,polls,attempts)
+    if (idle != 1) return It8951ImageResult(idle|256)
+    scratch.storeU16(0,288) // Big-endian,4bpp,rotation0.
+    scratch.storeU16(2,x);scratch.storeU16(4,y);scratch.storeU16(6,w);scratch.storeU16(8,h)
+    val area=it8951Command(context,33,scratch,5,polls)
+    if (!area.success()) return It8951ImageResult(area.status()|512)
+    val begun=it8951Begin(context,polls)
+    if (begun != 1) return It8951ImageResult(it8951Finish(context,begun,0).status()|768)
+    if (it8951TransportExchange(context,0) < 0) return It8951ImageResult(it8951Finish(context,4,0).status()|768)
+    val leading=x&3
+    val rowWords=(leading+w+3)/4
+    var written=0
+    var row=0
+    while (row < h) {
+        var column=0
+        while (column < rowWords) {
+            var word=0
+            var lane=0
+            while (lane < 4) {
+                val source=column*4+lane-leading
+                var nibble=0
+                if (source >= 0 && source < w) {
+                    val byte=pixels.load(row*stride+source/2)
+                    nibble=if ((source&1) == 0) byte>>>4 else byte&15
+                }
+                word=(word<<4)|nibble;lane=lane+1
+            }
+            // Keep CS asserted while waiting between words.
+            val ready=it8951WaitReady(context,polls)
+            if (ready != 1) return It8951ImageResult(it8951Finish(context,ready,0).status()|768|(written<<16))
+            if (it8951TransportExchange(context,word) < 0) return It8951ImageResult(it8951Finish(context,4,0).status()|768|(written<<16))
+            written=written+1;column=column+1
+        }
+        row=row+1
+    }
+    val released=it8951Finish(context,1,0)
+    if (!released.success()) return It8951ImageResult(released.status()|768|(written<<16))
+    val end=it8951Command(context,34,NativeBuffer(0),0,polls)
+    It8951ImageResult(end.status()|1024|(written<<16))
+}
+// Submit only previously completed image data. This conservative path waits
+// for all LUT engines before refreshing; success means accepted, NOT visible.
+// Minimum horizontal span crosses a4-pixel boundary, avoiding the upstream
+// tiny overlapping-update freeze case without unsigned left-edge underflow.
+// Caller must have initialized surrounding pixels too: a tiny refresh can
+// include adjacent pixels already in controller RAM, but never writes them.
+trusted fun it8951Refresh(context: int,info: It8951DeviceInfo,x: int,y: int,w: int,h: int,
+    mode: int,scratch: NativeBuffer,polls: int,attempts: int): It8951ImageResult {
+    if (!it8951Admission(context,polls) || !it8951RectangleValid(info,x,y,w,h) ||
+        mode < 0 || mode > 7 || !scratch.hasAddressRange(0,14) || info.width() < 5 ||
+        attempts < 1 || attempts > 3000) return It8951ImageResult(2)
+    var left=x
+    var right=x+w-1
+    if ((left>>>2) == (right>>>2)) {
+        if ((right|3)+1 < info.width()) right=(right|3)+1
+        else left=(left&~3)-1
+    }
+    if (left < 0 || right >= info.width()) return It8951ImageResult(2)
+    val idle=it8951WaitDisplayIdle(context,scratch,polls,attempts)
+    if (idle != 1) return It8951ImageResult(idle|1280)
+    scratch.storeU16(0,left);scratch.storeU16(2,y);scratch.storeU16(4,right-left+1);scratch.storeU16(6,h)
+    scratch.storeU16(8,mode);scratch.storeU16(10,info.imageAddress()&65535);scratch.storeU16(12,info.imageAddress()>>>16)
+    val refresh=it8951Command(context,55,scratch,7,polls)
+    It8951ImageResult(refresh.status()|1536)
+}

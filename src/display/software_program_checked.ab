@@ -1,0 +1,43 @@
+import "./command_buffer.ab"
+import "../spi/software_shared_checked.ab"
+// Checked command path: no legacy Pin.output/input calls. Shared D/C cleanup
+// failures propagate with the SPI detail flags; never run another command or
+// a settling delay after a failed command/cleanup. Nonshared pins stay owned.
+trusted fun softwareLcdCommandCheckedOwned(clock: Pin,mosi: Pin,chipSelect: Pin,dataCommand: Pin,
+    command: int,data: NativeBuffer,length: int,halfPeriodMicroseconds: int,sharedDataCommand: bool): SpiTransactionResult {
+    if (sharedDataCommand) return softwareSpiSharedCommandCheckedOwned(clock,mosi,chipSelect,dataCommand,command,data,length,0,halfPeriodMicroseconds)
+    return SpiTransactionResult((if (softwareSpiCommandOwned(clock,mosi,chipSelect,dataCommand,command,data,length,0,halfPeriodMicroseconds)) 1 else 6)<<32)
+}
+// Internal: entire immutable program validated, canonical gate already held.
+trusted fun softwareLcdRunProgramCheckedOwned(clock: Pin,mosi: Pin,chipSelect: Pin,dataCommand: Pin,
+    program: NativeBuffer,length: int,halfPeriodMicroseconds: int,sharedDataCommand: bool): SpiTransactionResult {
+    var index=0
+    while (index < length) {
+        val command=program.load(index);val encoded=program.load(index+1);index=index+2
+        if (command == 255 && encoded == 255) return SpiTransactionResult(1<<32)
+        val count=encoded&127
+        val result=softwareLcdCommandCheckedOwned(clock,mosi,chipSelect,dataCommand,command,
+            nativeBufferAt(program.addressValue()+index,count),count,halfPeriodMicroseconds,sharedDataCommand)
+        if (!result.valid()) return result
+        index=index+count
+        if ((encoded&128) != 0) {
+            val delay=program.load(index);index=index+1
+            if (delay != 0) peripheralDelayMilliseconds(if (delay == 255) 500 else delay)
+        }
+    }
+    return SpiTransactionResult(6<<32)
+}
+// Fully preflight before GPIO. Hold the gate through all commands and delays;
+// failure faults it. Recovery must restore shared-pin hardware explicitly, not
+// rerun this program over a fault. Completion is not an acknowledgement from LCD.
+trusted fun softwareLcdRunProgramChecked(gate: PeripheralGate,owner: u32,
+    clock: Pin,mosi: Pin,chipSelect: Pin,dataCommand: Pin,program: NativeBuffer,length: int,
+    halfPeriodMicroseconds: int = 1,sharedDataCommand: bool = false): SpiTransactionResult {
+    if (!softwareSpiCommandPinsValid(clock,mosi,chipSelect,dataCommand,0,halfPeriodMicroseconds) ||
+        !gate.bufferDisjoint(program,length) || !lcdCommandBufferValid(program,length)) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val result=softwareLcdRunProgramCheckedOwned(clock,mosi,chipSelect,dataCommand,program,length,halfPeriodMicroseconds,sharedDataCommand)
+    if (!gate.finish(owner,result.valid())) return SpiTransactionResult((5<<32)|(result&0xffffffff))
+    return result
+}

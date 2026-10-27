@@ -1,0 +1,63 @@
+import "./selected_init.ab"
+import "../esp32/spi/transaction_c61_sequence.ab"
+// Extends SdSpiInitResult:11busy12faultedGate13ownership14liveAdmission
+// 15CS16releaseClock. Bit26 cleanup incomplete; original failure is retained.
+fun SdSpiInitResult.cleanupPending(): bool = (this&(1<<26)) != 0
+// Actual source frequency must remain pinned for this ownership lifetime.
+// Check live dividers, not a requested/rounded nominal clock rate.
+trusted fun c61SdClockReady(sourceHz: int,maximumHz: int): bool {
+    if (sourceHz < 1000000 || sourceHz > 160000000) return false
+    val root=c61SpiRead(0x60096098)
+    val source=(root>>u32(20))&u32(3)
+    if ((root&u32(1<<22)) == u32(0) || source == u32(3) ||
+        (source == u32(1) && sourceHz != 160000000)) return false
+    val rootDivider=int((root>>u32(12))&u32(255))+1
+    val clock=c61SpiRead(0x6008100c)
+    val pre=if ((clock&u32(0x80000000)) != u32(0)) 1 else int((clock>>u32(18))&u32(15))+1
+    val cycles=if ((clock&u32(0x80000000)) != u32(0)) 1 else int((clock>>u32(12))&u32(63))+1
+    return sourceHz <= maximumHz*rootDivider*pre*cycles &&
+        (c61SpiRead(0x60081020)&u32(1<<29)) == u32(0) &&
+        (c61SpiRead(0x60081010)&u32(512)) == u32(0) &&
+        (c61SpiRead(0x60081008)&u32(0x07800000)) == u32(0)
+}
+trusted fun c61SdIdentificationClockReady(sourceHz: int): bool = c61SdClockReady(sourceHz,400000)
+// Caller owns powered/settled card and initialized SPI master, stable calibrated
+// ROM delay, no other active CS, and uses this canonical gate for every bus user.
+// Generates 80 CS-high/MOSI-high clocks, negotiates while selected, then releases
+// CS and clocks one byte. Failed/busy controller is never reset or detached.
+trusted fun Esp32C61SpiMaster.initializeSd(gate: PeripheralGate,owner: u32,sourceHz: int,
+    scratch: NativeBuffer,response: NativeBuffer,readyPolls: int = 1000): SdSpiInitResult {
+    if (!this.ready() || !c61SpiGateValid(gate) || !c61SpiBufferValid(scratch,2) ||
+        !c61SpiBufferValid(response,4) || !gate.bufferDisjoint(scratch,2) || !gate.bufferDisjoint(response,4) ||
+        (scratch.addressValue() < response.addressValue()+4 && response.addressValue() < scratch.addressValue()+2) ||
+        readyPolls < 1 || readyPolls > 1000000 || sourceHz < 1000000 || sourceHz > 160000000) return SdSpiInitResult(2)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SdSpiInitResult(if (admission == 1) 11 else if (admission == 2) 12 else 2)
+    var result=SdSpiInitResult(14)
+    var healthy=false
+    if (c61SpiMasterDataReady(this,true) && c61SdIdentificationClockReady(sourceHz)) {
+        var count=0
+        result=SdSpiInitResult(1)
+        while (count < 10 && result.valid()) {
+            val byte=sdSpiSelectedExchange(this|0,255,scratch)
+            if ((byte>>>32) != 1) result=SdSpiInitResult(4|((byte&4294967295)<<32))
+            count=count+1
+        }
+        if (result.valid()) {
+            if (!c61SpiSelectLevel(this.pins().pinAt(3),false)) result=SdSpiInitResult(15)
+            else result=sdSpiInitializeSelected(this|0,scratch,response,readyPolls)
+        }
+        if (esp32C61SpiCpuIdleOwned() && c61SpiSelectLevel(this.pins().pinAt(3),true)) {
+            val released=sdSpiSelectedExchange(this|0,255,scratch)
+            if ((released>>>32) != 1) {
+                if (result.valid()) result=SdSpiInitResult(16|((released&4294967295)<<32))
+                result=SdSpiInitResult(result|(1<<26))
+            } else healthy=result.valid()
+        } else {
+            if (result.valid()) result=SdSpiInitResult(15)
+            result=SdSpiInitResult(result|(1<<26))
+        }
+    }
+    if (!gate.finish(owner,healthy)) return SdSpiInitResult((result&~255)|13)
+    return result
+}

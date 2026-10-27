@@ -1,0 +1,39 @@
+import "./corep4x_audio_storage.ab"
+// Raw interleaved stereo signed16LE,24kHz. Already running RX session; record
+// up to blocks successful DMA completions then reset codec/stop/restore pins.
+// Compact partial blocks using their actual lengths, never stale buffer tails.
+// Low8:1recorded+closed2invalid3timeout4DMA5malformedframe10closefailure.
+// High32 contiguous committed bytes. A failed rearm may have written beyond
+// this prefix: those bytes are NOT committed. Preserve original primary error
+// if close also fails; session remains recovery with its cleanup evidence.
+// maxIdle bounds consecutive empty polls per block,1ms spacing. Not ISR-safe.
+type M5P4RecordWindowResult=int
+fun M5P4RecordWindowResult.status(): int = this&255
+fun M5P4RecordWindowResult.bytes(): int = this >>> 32
+trusted fun m5P4RecordWindowOwned(r: NativeBuffer,output: NativeBuffer,blocks: int,
+    maxIdle: int,exclusive: bool,tab5: bool): M5P4RecordWindowResult {
+    if (!exclusive || blocks < 1 || blocks > 4095 || maxIdle < 1 || maxIdle > 1000 ||
+        !m5P4MicrophoneSessionValid(r,tab5) || r.loadU32(68) != 2 || r.loadU32(12) != 0) return M5P4RecordWindowResult(2)
+    val bytes=r.loadU32(36);val count=r.loadU32(24)
+    if (bytes < 4 || (bytes&3) != 0 || count < 2 || r.loadU32(40) >= count ||
+        !esp32p4AhbGdmaRingLayoutValid(r.loadU32(20),count,r.loadU32(28),r.loadU32(32),bytes) ||
+        !coreP4xMicrophoneStorageDisjoint(r,output,blocks*bytes)) return M5P4RecordWindowResult(2)
+    var completed=0;var committed=0;var idle=0;var status=1
+    while (completed < blocks && status == 1) {
+        val destination=nativeBufferAt(output.addressValue()+committed,bytes)
+        val pumped=m5P4MicrophonePumpOwned(r,destination,tab5)
+        val report=r.loadU32(48)
+        if (pumped != 2) status=4
+        else if ((report&255) == 1) {
+            val actual=(report >>> 16)&4095
+            if (actual < 4 || actual > bytes || (actual&3) != 0) { r.storeU32(68,3);status=5 }
+            else { committed=committed+actual;completed=completed+1;idle=0 }
+        } else if ((report&255) == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=4
+    }
+    val closed=m5P4MicrophoneStopOwned(r,tab5)
+    if (status == 1 && closed != 4) status=10
+    return M5P4RecordWindowResult(status|(committed << 32))
+}

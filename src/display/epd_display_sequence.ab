@@ -1,0 +1,86 @@
+import "./epd_frame_sequence.ab"
+import "./epd_canvas.ab"
+import "./epd_gate_pins_s3_sequence.ab"
+// Complete caller-owned display lifecycle. Record312:header32,gate40@32,
+// transport160@72,scanout32@232,frame48@264. Header magic,state,stateBuffer,
+// canvas,width,height,primary,reserved. States1ready2running7fault8closing9closed.
+// Buffers must already be accessible (PSRAM setup is a boot prerequisite).
+// Initial old pad state and rails OFF; exclusive LCD/GDMA/pads/PLL160 ownership.
+fun epdDisplayChild(r: NativeBuffer,index: int): NativeBuffer =
+    if (index == 0) nativeBufferAt(r.addressValue()+32,40) else if (index == 1) nativeBufferAt(r.addressValue()+72,160) else if (index == 2) nativeBufferAt(r.addressValue()+232,32) else nativeBufferAt(r.addressValue()+264,48)
+fun epdDisplayValid(r: NativeBuffer,f: NativeBuffer): bool =
+    r.hasAddressRange(0,312) && r.loadU32(0) == 0x45504449 && r.loadU32(8) == f.addressValue() &&
+    f.hasAddressRange(0,r.loadU32(16)*r.loadU32(20)*2)
+trusted fun epdDisplayOpenOwned(r: NativeBuffer,config: NativeBuffer,f: NativeBuffer,canvas: NativeBuffer,descriptors: NativeBuffer,payload: NativeBuffer,pins: EpdGatePins,width: int,height: int,padding: int,channel: int,owner: int,polls: int,exclusiveOff: bool): int {
+    if (!exclusiveOff || !r.hasAddressRange(0,312) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !epdCanvasDimensions(width,height) || (width&15) != 0 || padding < 0 || padding > 65535 ||
+        width/4+padding != payload.capacity() || !pins.valid() || channel < 0 || channel > 4 ||
+        owner < 1 || owner > 4294967295 || polls < 1 || polls > 1000000 ||
+        !config.hasAddressRange(0,76) || (config.addressValue()&3) != 0 ||
+        !f.hasAddressRange(0,width*height*2) || !canvas.hasAddressRange(0,width*height/2) ||
+        s3I80SessionCount(payload.capacity()) == 0 || !payload.hasAddressRange(0,payload.capacity()) ||
+        !descriptors.hasAddressRange(0,s3I80SessionCount(payload.capacity())*12) ||
+        !s3I80SessionDmaStorage(descriptors.addressValue(),payload.addressValue(),payload.capacity())) return 3
+    var index=0
+    while (index < 6) {
+        val a=if (index == 0) nativeBufferAt(r.addressValue(),312) else if (index == 1) nativeBufferAt(config.addressValue(),76) else if (index == 2) nativeBufferAt(f.addressValue(),width*height*2) else if (index == 3) nativeBufferAt(canvas.addressValue(),width*height/2) else if (index == 4) descriptors else payload
+        var previous=0
+        while (previous < index) {
+            val b=if (previous == 0) nativeBufferAt(r.addressValue(),312) else if (previous == 1) nativeBufferAt(config.addressValue(),76) else if (previous == 2) nativeBufferAt(f.addressValue(),width*height*2) else if (previous == 3) nativeBufferAt(canvas.addressValue(),width*height/2) else descriptors
+            if (!epdWaveformDisjoint(a,a.capacity(),b,b.capacity())) return 3
+            previous=previous+1
+        }
+        index=index+1
+    }
+    // Reject gate/LCD overlaps before either owner changes pin configuration.
+    index=0
+    while (index < 19) {
+        var gate=0
+        while (gate < 5) { if (config.loadU32(index*4) == pins.pin(gate)) return 3;gate=gate+1 }
+        index=index+1
+    }
+    index=0
+    while (index < 312) { r.storeU32(index,0);index=index+4 }
+    r.storeU32(0,0x45504449);r.storeU32(4,7);r.storeU32(8,f.addressValue());r.storeU32(12,canvas.addressValue())
+    r.storeU32(16,width);r.storeU32(20,height)
+    if (!epdWaveformInitialize(f,width*height,true) ||
+        !epdCanvasDrawOwned(canvas,width,height,0,0,width,height,0,canvas,0,255,1,true) ||
+        !epdCanvasSubmitOwned(canvas,f,width,height,0,0,width,height,1,true)) { r.storeU32(24,1);return 4 }
+    val g=epdDisplayChild(r,0);val t=epdDisplayChild(r,1);val s=epdDisplayChild(r,2);val frame=epdDisplayChild(r,3)
+    if (epdGatePinsOpenOwned(g,pins,true) != 1) { r.storeU32(24,2);return 4 }
+    if (esp32S3I80SessionOpenOwned(t,config,descriptors,payload,8,channel,2,5,owner,polls,true) != 1) { r.storeU32(24,3);return 4 }
+    if (epdScanoutAttachOwned(s,t,pins,payload.capacity(),height,true) != 1) { r.storeU32(24,4);return 4 }
+    if (epdFrameAttachOwned(frame,s,t,f,width,padding,true) != 1) { r.storeU32(24,5);return 4 }
+    r.storeU32(4,1);return 1
+}
+trusted fun epdDisplayStartOwned(r: NativeBuffer,f: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdDisplayValid(r,f) || r.loadU32(4) != 1) return 3
+    val result=epdFrameStartOwned(epdDisplayChild(r,3),epdDisplayChild(r,2),epdDisplayChild(r,1),f,true)
+    if (result != 2) { r.storeU32(4,7);r.storeU32(24,256+result);return 4 }
+    r.storeU32(4,2);return 2
+}
+trusted fun epdDisplayPumpOwned(r: NativeBuffer,f: NativeBuffer,nowMs: int,exclusive: bool): int {
+    if (!exclusive || !epdDisplayValid(r,f) || r.loadU32(4) != 2 || nowMs < 0 || nowMs > 4294967295) return 3
+    val result=epdFramePumpOwned(epdDisplayChild(r,3),epdDisplayChild(r,2),epdDisplayChild(r,1),f,nowMs,true)
+    if (result == 2) return 2
+    if (result == 1) { r.storeU32(4,1);return 1 }
+    r.storeU32(4,7);r.storeU32(24,512+result);return 4
+}
+trusted fun epdDisplayCloseOwned(r: NativeBuffer,f: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !epdDisplayValid(r,f)) return 3
+    if (r.loadU32(4) == 9) return 5
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 2 && r.loadU32(4) != 7 && r.loadU32(4) != 8) return 3
+    r.storeU32(4,8)
+    val g=epdDisplayChild(r,0);val t=epdDisplayChild(r,1);val s=epdDisplayChild(r,2);val frame=epdDisplayChild(r,3)
+    if (frame.loadU32(0) != 0) {
+        if (epdFrameCloseOwned(frame,s,t,f,true) != 5) return 6
+    } else if (s.loadU32(0) != 0) {
+        if (epdScanoutCloseOwned(s,t,true) != 5) return 6
+    } else if (t.loadU32(0) != 0) {
+        if (esp32S3I80SessionCloseOwned(t,true) != 5) return 6
+    }
+    // No scanout owner => startup never powered the gates. Otherwise the
+    // successful child close above proves transport stopped and rails OFF.
+    if (g.loadU32(0) != 0 && epdGatePinsCloseOwned(g,true) != 2) return 6
+    r.storeU32(4,9);return 5
+}

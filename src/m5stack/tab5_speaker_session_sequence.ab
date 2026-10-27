@@ -1,0 +1,91 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Exclusive192B aligned record: inner DMA session0..63; magic64,state68,
+// codec72,PI4IOE176,codecDirty80,prepare84,codecResult88,start92,stop96,
+// pinsCaptured100,pinClose104,channel108; retained pin session128..191.
+// State1 prepared,2 running,3 recovery,4 stopped with pads/routes restored.
+// Clocks/shared rail/control bus and handles remain owned after4.
+// Caller owns all relevant pads/routes/rails/codec and initialized DMA controller,
+// cache engine/ring; PI4IOE1 initialized asGPIO1output, amplifier initially OFF, TX data initialized.
+trusted fun tab5SpeakerSessionValid(r: NativeBuffer): bool = r.hasAddressRange(0,192) &&
+    (r.addressValue()&63) == 0 && r.loadU32(64) == 0x54355331
+trusted fun tab5SpeakerSessionDma(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue(),64)
+trusted fun tab5SpeakerSessionPins(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+128,64)
+trusted fun tab5SpeakerPrepareOwned(r: NativeBuffer,codec: Es8388,io: Pi4Ioe5v6408,
+    channel: int,descriptors: int,count: int,payload: int,stride: int,bytes: int,
+    revision: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !codec.valid() || !io.valid() || channel < 0 || channel > 2 || revision < 0 ||
+        polls < 1 || polls > 1000000 || count < 2 || (bytes&3) != 0 ||
+        !r.hasAddressRange(0,192) || (r.addressValue()&63) != 0 ||
+        !esp32p4AhbGdmaRingLayoutValid(descriptors,count,payload,stride,bytes)) return 0
+    val a=r.addressValue()
+    if ((a < descriptors+count*64 && a+192 > descriptors) || (a < payload+count*stride && a+192 > payload)) return 0
+    if (r.loadU32(64) == 0 && (r.loadU32(0) != 0 || r.loadU32(128) != 0)) return 0
+    if (r.loadU32(64) != 0 && (!tab5SpeakerSessionValid(r) || r.loadU32(68) != 4)) return 0
+    r.storeU32(0,0);r.storeU32(128,0);r.storeU32(64,0x54355331);r.storeU32(68,3)
+    r.storeU32(72,codec|0);r.storeU32(76,io|0);r.storeU32(80,0)
+    r.storeU32(84,0);r.storeU32(88,0);r.storeU32(92,0);r.storeU32(96,0)
+    r.storeU32(100,0);r.storeU32(104,0);r.storeU32(108,channel)
+    if (p4Tab5SessionPinsCapture(tab5SpeakerSessionPins(r),revision) != 1) return 3
+    r.storeU32(100,1)
+    val prepared=tab5PrepareSpeakerDmaOwned(channel,descriptors,count,payload,stride,bytes,revision,polls,true)
+    r.storeU32(84,prepared)
+    if (prepared != 1) return 3
+    if (esp32p4I2sDmaSessionAttachOwned(tab5SpeakerSessionDma(r),channel,true,0,descriptors,count,payload,stride,bytes,polls,true) != 1) return 3
+    r.storeU32(68,1)
+    return 1
+}
+trusted fun tab5SpeakerStartOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !tab5SpeakerSessionValid(r) || r.loadU32(68) != 1) return 0
+    r.storeU32(68,3);r.storeU32(80,1)
+    val codec=tab5SpeakerOwned(Es8388(r.loadU32(72)),Pi4Ioe5v6408(r.loadU32(76)),true,true)
+    r.storeU32(88,codec)
+    if (codec != 1) return 3
+    val started=esp32p4I2sDmaSessionStartOwned(tab5SpeakerSessionDma(r),true)
+    r.storeU32(92,started)
+    if (started != 2) return 3
+    r.storeU32(68,2)
+    return 2
+}
+trusted fun tab5SpeakerPumpOwned(r: NativeBuffer,cpu: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !tab5SpeakerSessionValid(r) || r.loadU32(68) != 2) return 0
+    val bytes=r.loadU32(36)
+    if (!cpu.hasAddressRange(0,bytes) || (cpu.addressValue() < r.addressValue()+192 && cpu.addressValue()+bytes > r.addressValue())) return 0
+    val result=esp32p4I2sDmaSessionPumpOwned(tab5SpeakerSessionDma(r),cpu,true)
+    if (result == 3) r.storeU32(68,3)
+    return result
+}
+// ES8388 shutdown requires live MCLK/BCLK: amplifierOFF -> mute ->1ms ->
+// DAC/CHIP powerdown BEFORE engine stop. On any callback failure, retain
+// codecDirty and do not stop engines or restore pins; retry the callback.
+// No draining tail is implied: caller queues silence before graceful stop.
+trusted fun tab5SpeakerStopOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !tab5SpeakerSessionValid(r) || r.loadU32(68) < 1 || r.loadU32(68) > 4) return 0
+    if (r.loadU32(68) == 4) return 4
+    r.storeU32(68,3)
+    if (r.loadU32(80) != 0) {
+        val disabled=tab5SpeakerOwned(Es8388(r.loadU32(72)),Pi4Ioe5v6408(r.loadU32(76)),false,true)
+        r.storeU32(96,disabled)
+        if (disabled != 1) return 3
+        r.storeU32(80,0)
+    }
+    val dma=tab5SpeakerSessionDma(r)
+    if (esp32p4I2sDmaSessionValid(dma)) {
+        if (esp32p4I2sDmaSessionStopOwned(dma,true) != 4) return 3
+    } else {
+        // Preparation failed before attach: no engine was started, but cache
+        // publication may still be in flight. Keep cache ownership until idle.
+        if (!p4I2sSessionCacheIdle()) return 3
+        if (!p4Tab5SpeakerI2sStopped() || p4Tab5SpeakerParked(r.loadU32(108)) != 1) return 3
+        p4I2sSessionStoppedFence()
+    }
+    if (r.loadU32(80) != 0) return 3
+    if (r.loadU32(100) != 0) {
+        val restored=p4Tab5SessionPinsClose(tab5SpeakerSessionPins(r))
+        r.storeU32(104,restored)
+        if (restored != 2) return 3
+        r.storeU32(100,0)
+    }
+    r.storeU32(68,4)
+    return 4
+}

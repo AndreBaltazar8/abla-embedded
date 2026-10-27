@@ -1,0 +1,74 @@
+import "./spi_fill_c5_sequence.ab"
+import "./rgb565_source.ab"
+// Big-endian input streams directly; little-endian needs disjoint64B staging.
+trusted fun c5LcdBlitStreamOwned(master: Esp32C5SpiMaster,dc: int,source: NativeBuffer,sourceX: int,sourceY: int,width: int,height: int,stride: int,littleEndian: bool,staging: NativeBuffer,polls: int): C5LcdDrawResult {
+    val packet=nativeBufferAt(nativeStackAllocate(1),1)
+    packet.store(0,44)
+    val cs=master.pins().pinAt(3)
+    var report=14;var completed=0;var commandDone=false;var healthy=false
+    if (c5SpiSelectLevel(dc,false)) {
+        report=11
+        if (c5SpiSelectLevel(cs,false)) {
+            report=esp32C5SpiTransferOwned(nativeBufferAt(packet.addressValue(),1),NativeBuffer(0),1,polls,false)
+            commandDone=report == 257
+            if (commandDone) {
+                if (!c5SpiSelectLevel(dc,true)) report=14
+                else {
+                    var line=0
+                    while (line < height && report == 257) {
+                        val offset=(sourceY+line)*stride+sourceX*2
+                        var sent=0
+                        while (sent < width*2 && report == 257) {
+                            val count=if (width*2-sent < 64) width*2-sent else 64
+                            var chunk=nativeBufferAt(source.addressValue()+offset+sent,count)
+                            if (littleEndian) {
+                                var i=0
+                                while (i < count) { staging.store(i,chunk.load(i+1));staging.store(i+1,chunk.load(i));i=i+2 }
+                                chunk=nativeBufferAt(staging.addressValue(),count)
+                            }
+                            report=esp32C5SpiTransferOwned(chunk,NativeBuffer(0),count,polls,false)
+                            if (report == 257) { completed=completed+int(u32(count)>>u32(1));sent=sent+count }
+                        }
+                        line=line+1
+                    }
+                }
+            }
+        }
+    }
+    if (esp32C5SpiCpuIdleOwned()) {
+        if (!c5SpiSelectLevel(cs,true)) report=report|(12<<16)|(1<<24)
+        else healthy=report == 257 && completed == width*height
+    } else report=report|(1<<24)
+    return C5LcdDrawResult(((if (healthy) 1 else 6)<<56)|(completed<<32)|report|(if (commandDone) 1<<25 else 0))
+}
+
+trusted fun esp32C5LcdBlitRgb565(master: Esp32C5SpiMaster,gate: PeripheralGate,owner: u32,dc: int,
+    view: LcdView,x: int,y: int,source: NativeBuffer,width: int,height: int,stride: int,
+    littleEndian: bool,staging: NativeBuffer,polls: int): C5LcdDrawResult {
+    if (!view.valid() ||
+        polls < 1 || polls > 1000000 || !c5SpiGateValid(gate) ||
+        !lcdRgb565SourceValid(source,width,height,stride)) return C5LcdDrawResult(3<<56)
+    val span=if (width == 0 || height == 0) 0 else (height-1)*stride+width*2
+    if (span > 0 && (!(source.addressValue()+span <= 0x60000000 || source.addressValue() >= 0x60100000) ||
+        !gate.bufferDisjoint(source,span))) return C5LcdDrawResult(3<<56)
+    val rectangle=clipDisplayRect(x,y,width,height,view.width(),view.height())
+    if (littleEndian && !rectangle.empty() && (!c5SpiBufferValid(staging,64) ||
+        !gate.bufferDisjoint(staging,64) ||
+        (staging.addressValue() < source.addressValue()+span && source.addressValue() < staging.addressValue()+64))) return C5LcdDrawResult(3<<56)
+    val program=nativeBufferAt(nativeStackAllocate(14),14)
+    if (!rectangle.empty() && !c5LcdWindowProgram(view,rectangle.x(),rectangle.y(),rectangle.width(),rectangle.height(),program)) return C5LcdDrawResult(3<<56)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return C5LcdDrawResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<56)
+    var result=C5LcdDrawResult(1<<56)
+    if (!rectangle.empty()) {
+        if (!c5LcdProgramAdmission(master|0,dc)) result=C5LcdDrawResult((6<<56)|13)
+        else {
+            val window=c5LcdWindowOwned(master|0,dc,program,polls)
+            if (!window.valid()) result=C5LcdDrawResult((6<<56)|window.detail())
+            else result=c5LcdBlitStreamOwned(master,dc,source,rectangle.x()-x,rectangle.y()-y,
+                rectangle.width(),rectangle.height(),stride,littleEndian,staging,polls)
+        }
+    }
+    if (!gate.finish(owner,result.valid())) return C5LcdDrawResult((result&((1<<56)-1))|(5<<56))
+    return result
+}

@@ -1,0 +1,71 @@
+import "./fat_link_patch.ab"
+// Active-FAT free search, no mutation or reservation. Caller holds exclusive
+// volume ownership through subsequent mirror comparison/reservation. A free
+// result alone is not an allocation and does not certify mirror consistency.
+// Two512B cache slots avoid rereading FAT sectors for each entry; a FAT12
+// straddle reuses the second sector when scanning the following cluster.
+type FatFreeScan=int
+//1free2full3input4readIO5budget. Candidate/continuation28@8,inspected28@36.
+fun FatFreeScan.status(): int = this&255
+fun FatFreeScan.cluster(): int = (this>>8)&0xfffffff
+fun FatFreeScan.inspected(): int = (this>>>36)&0xfffffff
+trusted fun fatFindFreeOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    start: int,maxCandidates: int,readBudget: int,workspace: NativeBuffer,freeCount: NativeBuffer = NativeBuffer(0)): FatFreeScan {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || maxCandidates < 1 || maxCandidates > 268435438 || readBudget < 1 || readBudget > 2097152 ||
+        !reader.hasAddressRange(0,28) || !workspace.hasAddressRange(0,1024) ||
+        fatBuffersOverlap(workspace,1024,reader,28) || fatBuffersOverlap(workspace,1024,boot,512)) return FatFreeScan(3)
+    val reserved=if (geometry.fatBits() == 12) 4080 else if (geometry.fatBits() == 16) 65520 else 268435440
+    val end=if (geometry.clusters()+2 < reserved) geometry.clusters()+2 else reserved
+    if (start < 2 || start >= end) return FatFreeScan(3)
+    val counting=(freeCount|0) != 0
+    if (counting && (!freeCount.hasAddressRange(0,4) || fatBuffersOverlap(freeCount,4,workspace,1024) ||
+        fatBuffersOverlap(freeCount,4,reader,28) || fatBuffersOverlap(freeCount,4,boot,512))) return FatFreeScan(3)
+    if (counting) freeCount.storeU32(0,0)
+    val a=nativeBufferAt(workspace.addressValue(),512);val b=nativeBufferAt(workspace.addressValue()+512,512)
+    var cachedA=-1;var cachedB=-1;var remaining=readBudget
+    var cluster=start;var inspected=0
+    while (inspected < maxCandidates && inspected < end-2) {
+        val location=fatLinkLocate(boot,first,sectors,cluster)
+        val lba=location.sector()
+        var current=a;var other=b
+        if (lba == cachedB) { current=b;other=a }
+        else if (lba != cachedA) {
+            if (remaining == 0) return FatFreeScan(5|(cluster<<8)|(inspected<<36))
+            remaining=remaining-1
+            if (!fatStorageReadOwned(reader,lba,a)) return FatFreeScan(4|(cluster<<8)|(inspected<<36))
+            cachedA=lba
+        }
+        if (location.needsSecondSector()) {
+            val cached=if (current == a) cachedB else cachedA
+            if (cached != lba+1) {
+                if (remaining == 0) return FatFreeScan(5|(cluster<<8)|(inspected<<36))
+                remaining=remaining-1
+                if (!fatStorageReadOwned(reader,lba+1,other)) return FatFreeScan(4|(cluster<<8)|(inspected<<36))
+                if (current == a) cachedB=lba+1 else cachedA=lba+1
+            }
+        }
+        val value=fatLinkRaw(location,current,other)
+        if (value < 0) return FatFreeScan(3)
+        inspected=inspected+1
+        if (value == 0) {
+            if (!counting) return FatFreeScan(1|(cluster<<8)|(inspected<<36))
+            freeCount.storeU32(0,freeCount.loadU32(0)+1)
+        }
+        cluster=cluster+1
+        if (cluster == end) cluster=2
+    }
+    return FatFreeScan((if (inspected == end-2) 2 else 5)|(cluster<<8)|(inspected<<36))
+}
+// Counts a bounded batch of active-FAT entries. Output is the free count for
+// exactly result.inspected() entries, including on budget exhaustion or IO.
+// Status2 means one full volume scan (not "disk full" in this counting mode),
+// 5 means partial;3 leaves output unchanged. To accumulate batches, keep the
+// volume gate throughout and cap the total inspected at the usable cluster
+// count. Resume at result.cluster(); never retry an IO-failed mount blindly.
+// No mirror-consistency or whole-volume integrity claim; no FSInfo mutation.
+trusted fun fatCountFreeOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    start: int,maxCandidates: int,readBudget: int,workspace: NativeBuffer,output: NativeBuffer): FatFreeScan {
+    if ((output|0) == 0) return FatFreeScan(3)
+    return fatFindFreeOwned(reader,boot,first,sectors,start,maxCandidates,readBudget,workspace,output)
+}

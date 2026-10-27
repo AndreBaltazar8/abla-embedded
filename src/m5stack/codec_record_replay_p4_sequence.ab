@@ -1,0 +1,87 @@
+import "../audio/microphone_process.ab"
+import "../audio/pcm_channels.ab"
+// Own both I2S0 directions, RX/TX DMA pair, initialized controller/controlbus,
+// codec/IOE1 handles, stopped speaker, stable40MHz XTAL, all pad/RCC/cache users.
+// r: zero-magic aligned192B. recorded: blocks*bytes. work:96+blocks*bytes+7*bytes
+// (DSP40, metadata20 at40, bank32 at64, processed at96, accumulator/scratch/TX).
+// All spans disjoint from each other and FULL descriptor/cache payload slots.
+// Stereo24kHz capture -> gain2/DC removal (no resampling) -> mono24kHz replay.
+// Low8:1complete2preflight3RXprepare4RXstart5record6DSP7TXprepare8TXstart9play;
+// subordinate status8..23, cleanupPending24, committedrawbytes32..63.
+// No new allocation/task/ISR. Retain r on cleanupPending; do not reset it.
+trusted fun m5P4ReplayDisjoint(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.hasAddressRange(0,an) && b.hasAddressRange(0,bn) && !pcmMixSpansOverlap(a,an,b,bn)
+trusted fun m5P4RecordReplayOwned(r: NativeBuffer,channel: int,desc: int,count: int,
+    payload: int,stride: int,bytes: int,revision: int,polls: int,mic: int,speaker: int,
+    io: int,recorded: NativeBuffer,work: NativeBuffer,blocks: int,maxIdle: int,exclusive: bool,tab5: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,192) || (r.addressValue()&63) != 0 ||
+        r.loadU32(0) != 0 || r.loadU32(64) != 0 || r.loadU32(128) != 0 ||
+        !m5P4ReplayHandlesValid(mic,speaker,io,tab5) || channel < 0 || channel > 2 ||
+        revision < 0 || polls < 1 || polls > 1000000 || blocks < 1 || blocks > 4095 ||
+        maxIdle < 1 || maxIdle > 1000 || count < 2 || bytes < 4 || (bytes&3) != 0 ||
+        !esp32p4AhbGdmaRingLayoutValid(desc,count,payload,stride,bytes)) return 2
+    val total=blocks*bytes;val workBytes=96+total+7*bytes
+    val descriptors=nativeBufferAt(desc,count*64);val ring=nativeBufferAt(payload,count*stride)
+    if (!m5P4ReplayDisjoint(r,192,recorded,total) || !m5P4ReplayDisjoint(r,192,work,workBytes) ||
+        !m5P4ReplayDisjoint(recorded,total,work,workBytes) || !m5P4ReplayDisjoint(r,192,descriptors,count*64) ||
+        !m5P4ReplayDisjoint(r,192,ring,count*stride) || !m5P4ReplayDisjoint(recorded,total,descriptors,count*64) ||
+        !m5P4ReplayDisjoint(recorded,total,ring,count*stride) || !m5P4ReplayDisjoint(work,workBytes,descriptors,count*64) ||
+        !m5P4ReplayDisjoint(work,workBytes,ring,count*stride)) return 2
+    // Do not capture or later overwrite a ring still consumed by the TX pair.
+    if (m5P4ReplaySpeakerParked(channel,tab5) != 1) return 2
+    val prepared=m5P4ReplayMicrophonePrepareOwned(r,mic,io,channel,desc,count,payload,stride,bytes,revision,polls,true,tab5)
+    if (prepared != 1) {
+        val closed=if (prepared == 0) 4 else m5P4MicrophoneStopOwned(r,tab5)
+        return 3|(prepared << 8)|(if (closed == 4) 0 else 1 << 24)
+    }
+    val started=m5P4ReplayMicrophoneStartOwned(r,tab5)
+    if (started != 2) {
+        val closed=m5P4MicrophoneStopOwned(r,tab5)
+        return 4|(started << 8)|(if (closed == 4) 0 else 1 << 24)
+    }
+    val captured=m5P4RecordWindowOwned(r,recorded,blocks,maxIdle,true,tab5)
+    val capturedBytes=captured.bytes();val prefix=capturedBytes << 32
+    if (captured.status() != 1 || r.loadU32(68) != 4)
+        return prefix|5|(captured.status() << 8)|(if (r.loadU32(68) == 4) 0 else 1 << 24)
+    if (capturedBytes < 4 || capturedBytes > total || (capturedBytes&3) != 0) return prefix|6
+    val dsp=nativeBufferAt(work.addressValue(),40)
+    val processed=nativeBufferAt(work.addressValue()+96,total)
+    if (!microphoneProcessInitialize(dsp,1,2,0,true,false,false)) return prefix|6
+    var offset=0
+    while (offset < capturedBytes) {
+        val chunk=if (capturedBytes-offset < bytes) capturedBytes-offset else bytes
+        // chunk is positive, <=4092 and four-byte aligned; exact word shifts
+        // avoid RV32 compiler-runtime signed64 division even without inlining.
+        if (microphoneProcess(dsp,nativeBufferAt(recorded.addressValue()+offset,chunk),int(u32(chunk)>>u32(2)),
+            nativeBufferAt(processed.addressValue()+offset,chunk),true,true) != int(u32(chunk)>>u32(1))) return prefix|6
+        offset=offset+chunk
+    }
+    val wav=pcmRaw(nativeBufferAt(processed.addressValue(),capturedBytes),nativeBufferAt(work.addressValue()+40,20),24000,2,16)
+    val bank=pcmChannelsAt(nativeBufferAt(work.addressValue()+64,32),1,24000)
+    if (!bank.valid() || bank.enqueue(wav,1) != 0) return prefix|6
+    val frames=bytes/2
+    val playBlocks=int((u32(wav.frames())+u32(frames)-u32(1))/u32(frames))
+    if (playBlocks < 1 || playBlocks > 4095) return prefix|6
+    // RX cleanup has succeeded. Reuse the same ring only now, with all full
+    // strided slots initialized to silence before TX rebuild/publication.
+    offset=0
+    while (offset < count*stride) { ring.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0);r.storeU32(64,0);r.storeU32(128,0)
+    val tx=m5P4ReplaySpeakerPrepareOwned(r,speaker,io,channel,desc,count,payload,stride,bytes,revision,polls,true,tab5)
+    if (tx != 1) {
+        val closed=if (tx == 0) 4 else m5P4SpeakerStopOwned(r,tab5)
+        return prefix|7|(tx << 8)|(if (closed == 4) 0 else 1 << 24)
+    }
+    val txStart=m5P4ReplaySpeakerStartOwned(r,tab5)
+    if (txStart != 2) {
+        val closed=m5P4SpeakerStopOwned(r,tab5)
+        return prefix|8|(txStart << 8)|(if (closed == 4) 0 else 1 << 24)
+    }
+    val acc=nativeBufferAt(work.addressValue()+96+total,bytes*4)
+    val scratch=nativeBufferAt(acc.addressValue()+bytes*4,bytes*2)
+    val staging=nativeBufferAt(scratch.addressValue()+bytes*2,bytes)
+    val played=m5P4PlaybackChannelsWindowOwned(r,bank,playBlocks,acc,scratch,staging,maxIdle,32768,true,tab5)
+    if (played.status() != 1 || r.loadU32(68) != 4)
+        return prefix|9|(played.status() << 8)|(if (r.loadU32(68) == 4) 0 else 1 << 24)
+    return prefix|1
+}

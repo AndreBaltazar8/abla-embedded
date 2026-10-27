@@ -1,0 +1,89 @@
+import "./epd_waveform.ab"
+// Packed 4-bit canvas, high nibble is even x, each row ceil(width/2) bytes.
+// Dithering/8 rotation conventions from LovyanGFX Panel_EPD.cpp;
+// see epd_waveform.LICENSE. All buffers caller-owned; no heap or pixelcopy ABI.
+fun epdCanvasDimensions(width: int,height: int): bool = width >= 1 && width <= 65535 && height >= 1 && height <= 65535
+fun epdCanvasSize(width: int,height: int): int = ((width+1)/2)*height
+// Packed physical x low16/y high16; -1 invalid. Logical bounds rotate with axes.
+fun epdCanvasPosition(width: int,height: int,x: int,y: int,rotation: int): int {
+    if (!epdCanvasDimensions(width,height) || rotation < 0 || rotation > 7 || x < 0 || y < 0 ||
+        x >= (if ((rotation&1) != 0) height else width) || y >= (if ((rotation&1) != 0) width else height)) return -1
+    var px=if ((rotation&1) != 0) y else x
+    var py=if ((rotation&1) != 0) x else y
+    if (((1<<rotation)&198) != 0) px=width-1-px
+    if (((1<<rotation)&156) != 0) py=height-1-py
+    return px|(py<<16)
+}
+fun epdCanvasDither(gray: int,x: int,y: int,mode: int): int {
+    if (gray < 0 || gray > 255 || mode < 1 || mode > 4) return -1
+    // Bayer4x4 packed as sixteen nibbles, split to avoid signed64 constants.
+    val index=((y&3)<<2)|(x&3)
+    val word=if (index < 8) 0x6E4CA280 else 0x5D7F91B3
+    val bayer=(word>>>((index&7)*4))&15
+    if (mode >= 3) return if (gray+bayer*16 < 248) 0 else 15
+    val value=(gray+bayer-8)>>4
+    return if (value < 0) 0 else if (value > 15) 15 else value
+}
+trusted fun epdCanvasRead(canvas: NativeBuffer,width: int,height: int,x: int,y: int,rotation: int): int {
+    val position=epdCanvasPosition(width,height,x,y,rotation)
+    if (position < 0 || !canvas.hasAddressRange(0,epdCanvasSize(width,height))) return -1
+    val px=position&65535;val py=position>>>16
+    val byte=canvas.load(py*((width+1)/2)+px/2)
+    return ((byte>>>(if ((px&1) == 0) 4 else 0))&15)*17
+}
+// Preclipped logical rectangle. fill0..255 fills; fill=-1 copies grayscale8
+// source rows with explicit stride. Reject any error/alias BEFORE mutation.
+// Dither uses physical coordinates, including rotated image traversal.
+trusted fun epdCanvasDrawOwned(canvas: NativeBuffer,width: int,height: int,x: int,y: int,w: int,h: int,rotation: int,source: NativeBuffer,stride: int,fill: int,mode: int,exclusive: bool): bool {
+    if (!exclusive || !epdCanvasDimensions(width,height) || rotation < 0 || rotation > 7 || mode < 1 || mode > 4 ||
+        x < 0 || y < 0 || w < 1 || h < 1 || w > 65535 || h > 65535 || fill < -1 || fill > 255 ||
+        epdCanvasPosition(width,height,x,y,rotation) < 0 ||
+        epdCanvasPosition(width,height,x+w-1,y+h-1,rotation) < 0 ||
+        !canvas.hasAddressRange(0,epdCanvasSize(width,height))) return false
+    if (fill == -1 && (stride < w || stride > 2147483647 || !source.hasAddressRange(0,(h-1)*stride+w) ||
+        !epdWaveformDisjoint(canvas,epdCanvasSize(width,height),source,(h-1)*stride+w))) return false
+    var row=0
+    while (row < h) {
+        var column=0
+        while (column < w) {
+            val position=epdCanvasPosition(width,height,x+column,y+row,rotation)
+            val px=position&65535;val py=position>>>16
+            val gray=if (fill == -1) source.load(row*stride+column) else fill
+            val value=epdCanvasDither(gray,px,py,mode)
+            val offset=py*((width+1)/2)+px/2
+            val shift=if ((px&1) == 0) 4 else 0
+            canvas.store(offset,(canvas.load(offset)&(255^(15<<shift)))|(value<<shift))
+            column=column+1
+        }
+        row=row+1
+    }
+    return true
+}
+// Queue a PHYSICAL rectangle into full-panel waveform state. Pair expansion
+// includes neighboring canvas pixels, never drops a final two-pixel group.
+// This changes waveform requests, not the canvas or hardware. Serialize with
+// frame pumping, and keep the canvas/state disjoint for the full allocation.
+trusted fun epdCanvasSubmitOwned(canvas: NativeBuffer,state: NativeBuffer,width: int,height: int,x: int,y: int,w: int,h: int,mode: int,exclusive: bool): bool {
+    if (!exclusive || !epdCanvasDimensions(width,height) || (width&15) != 0 || mode < 1 || mode > 4 ||
+        x < 0 || y < 0 || w < 1 || h < 1 || x >= width || y >= height || w > width-x || h > height-y ||
+        !canvas.hasAddressRange(0,width*height/2) || !state.hasAddressRange(0,width*height*2) ||
+        !epdWaveformDisjoint(canvas,width*height/2,state,width*height*2)) return false
+    val start=x/2;val end=(x+w+1)/2
+    var pass=0
+    while (pass < 2) {
+        var row=y
+        while (row < y+h) {
+            var pair=start
+            while (pair < end) {
+                val index=row*(width/2)+pair
+                val request=epdWaveformRequest(state.loadU32(index*4),canvas.load(index),mode)
+                if (request < 0) return false
+                if (pass == 1) state.storeU32(index*4,request)
+                pair=pair+1
+            }
+            row=row+1
+        }
+        pass=pass+1
+    }
+    return true
+}

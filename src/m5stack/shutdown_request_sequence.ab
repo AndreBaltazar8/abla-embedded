@@ -1,0 +1,73 @@
+import "./power_profile.ab"
+import "./pmic_shutdown_sequence.ab"
+import "./power_off_pulse_sequence.ab"
+// Caller-owned48-byte record: pulse0..23,tag24,status28,detail32,
+// acknowledged steps36(PMIC1,pulse2,PowerHub4),PowerHub scratch40..45.
+// Status1 requests complete,2 pending,3 invalid/notquiescent,4 unsupported,
+// 5 PMIC failure,6 pulse failure,7 PowerHub failure,8 pulse cancelled/released. Detail preserves the
+// underlying result. Completion is NOT proof of power-off or safe sleep entry.
+trusted fun m5ShutdownRequestStatus(record: NativeBuffer): int {
+    if (!record.hasAddressRange(0,48) || record.loadU32(24) != 0x53485231) return 3
+    record.loadU32(28)
+}
+// Non-timed power-off ONLY. Caller already stopped display/audio/DMA/storage
+// consumers, prepared GPIO/expander output modes, and owns this fresh/released
+// record and selected devices. Do not use for RTC timed wake (which may need
+// the very rail being cut), or restart a pending/failed operation implicitly.
+// Every required handle is admitted BEFORE the first hardware mutation.
+trusted fun M5BoardId.beginShutdownRequestOwned(record: NativeBuffer,pmic: M5PmicOpen,ioe1: int,hub: int,now: u32,quiescedExclusive: bool): int {
+    if (!quiescedExclusive || !record.hasAddressRange(0,48)) return 3
+    val kind=this.powerKind() | 0
+    val needsPmic=kind >= 2 && kind <= 5
+    val expander=this == m5BoardTab5 || this == m5BoardTab5X || this == m5BoardArduinoNessoN1
+    val powerHub=this == m5BoardPowerHub
+    val hold=m5ShutdownHoldPin(this)
+    if (!needsPmic && !expander && !powerHub && hold < 0) return 4
+    if (needsPmic && (!pmic.ready() || (if (kind == 2) pmic.kind() != 2 && pmic.kind() != 3 else pmic.kind() != kind))) return 3
+    if (expander && (ioe1 <= 0 || ioe1 > 4294967295)) return 3
+    if (powerHub && (hub <= 0 || hub > 4294967295)) return 3
+    if (hold > 48) return 3
+    record.storeU32(24,0x53485231); record.storeU32(28,2); record.storeU32(32,0); record.storeU32(36,0)
+    if (needsPmic) {
+        val result=pmic.preparePowerOffOwned(false)
+        record.storeU32(32,result | 0)
+        if (!result.requestAcknowledged()) { record.storeU32(28,5); return 5 }
+        record.storeU32(36,1)
+    }
+    if (powerHub) {
+        val result=m5ShutdownHubRequest(hub,nativeBufferAt(record.addressValue()+40,6))
+        record.storeU32(32,result)
+        if (result != 257) { record.storeU32(28,7); return 7 }
+        record.storeU32(36,4)
+    }
+    if (hold >= 0 || expander) {
+        val pulse=nativeBufferAt(record.addressValue(),24)
+        val result=if (hold >= 0) m5PowerOffPulseBeginOwned(pulse,0,hold,now,true) else this.beginPowerOffPulse(pulse,ioe1,now,true)
+        record.storeU32(32,result)
+        if (result != 2) { record.storeU32(28,6); return 6 }
+        return 2
+    }
+    record.storeU32(28,1)
+    1
+}
+trusted fun m5ShutdownRequestPoll(record: NativeBuffer,now: u32): int {
+    val status=m5ShutdownRequestStatus(record)
+    if (status != 2) return status
+    val result=m5PowerOffPulsePoll(nativeBufferAt(record.addressValue(),24),now)
+    record.storeU32(32,result)
+    if (result == 2) return 2
+    if (result != 1) { record.storeU32(28,6); return 6 }
+    record.storeU32(36,record.loadU32(36)|2); record.storeU32(28,1)
+    1
+}
+// Does not undo PMIC/PowerHub commands, restart requests, or restore supplies.
+// Only releases a pending/failed pulse. Other terminal results stay unchanged.
+trusted fun m5ShutdownRequestReleasePulseOwned(record: NativeBuffer): int {
+    val status=m5ShutdownRequestStatus(record)
+    if (status != 2 && status != 6) return status
+    val released=m5PowerOffPulseReleaseOwned(nativeBufferAt(record.addressValue(),24))
+    record.storeU32(32,released)
+    if (released != 6 && released != 1) { record.storeU32(28,6);return 6 }
+    record.storeU32(28,8)
+    8
+}

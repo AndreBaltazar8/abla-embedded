@@ -1,0 +1,63 @@
+import "./mmc_command_s3_sequence.ab"
+// Card-divider transaction only; host source/divider must already be stable.
+// Caller owns both slots' host registers/IRQ consumption through completion,
+// with no data/DMA commands. Does not configure pads/power/host PLL/timeouts.
+// Fcard=Fhost/(2*divider), divider0 bypass. Three CIU updates: disable,
+// program divider/mux, enable. Each poll is bounded, no polling loops.
+type SdMmcClock = int
+// status1done2pending3invalid4busy5failed; phasebits8..9,slot10,divider11..18,
+// enable19,lowpower20,HLE22. Failure retains phase; no automatic rollback or
+// retry. A pending/failed transaction keeps ownership until caller recovery.
+fun SdMmcClock.status(): int = this&255
+fun SdMmcClock.phase(): int = (this>>8)&3
+fun SdMmcClock.hardwareLocked(): bool = (this&(1<<22)) != 0
+trusted fun sdMmcClockLaunchOwned(slot: int): void {
+    sdMmcS3Write(44,0xa0202000|(slot<<16))
+    return
+}
+trusted fun sdMmcClockStartOwned(slot: int,divider: int,enabled: bool,lowPower: bool): SdMmcClock {
+    if (slot < 0 || slot > 1 || divider < 0 || divider > 255) return SdMmcClock(3)
+    if ((sdMmcS3Read(44)&0x80000000) != 0 || (sdMmcS3Read(72)&0x6f0) != 0) return SdMmcClock(4)
+    val clocks=sdMmcS3Read(16)
+    val sources=sdMmcS3Read(12)
+    val other=1-slot
+    // Refuse to change a divider selected by an enabled other slot.
+    if ((clocks&(1<<other)) != 0 && ((sources>>(other*2))&3) == slot) return SdMmcClock(4)
+    sdMmcS3Write(68,4096)
+    if ((sdMmcS3Read(68)&4096) != 0) return SdMmcClock(4)
+    val state=(slot<<10)|(divider<<11)|((if (enabled) 1 else 0)<<19)|((if (lowPower) 1 else 0)<<20)|256
+    val disabled=clocks&~(1<<slot)
+    sdMmcS3Write(16,disabled)
+    if (sdMmcS3Read(16) != disabled) return SdMmcClock(state|5)
+    sdMmcClockLaunchOwned(slot)
+    return SdMmcClock(state|2)
+}
+trusted fun SdMmcClock.pollOwned(): SdMmcClock {
+    if (this.status() != 2 || this.phase() == 0 || (this>>>21) != 0) return SdMmcClock(3)
+    if ((sdMmcS3Read(68)&4096) != 0) {
+        sdMmcS3Write(68,4096)
+        return SdMmcClock((this&~255)|(1<<22)|5)
+    }
+    if ((sdMmcS3Read(44)&0x80000000) != 0) return this
+    val slot=(this>>10)&1
+    if (this.phase() == 1) {
+        val divider=(this>>11)&255
+        val divs=(sdMmcS3Read(8)&~(255<<(slot*8)))|(divider<<(slot*8))
+        val sources=(sdMmcS3Read(12)&~(3<<(slot*2)))|(slot<<(slot*2))
+        sdMmcS3Write(12,sources)
+        if (sdMmcS3Read(12) != sources) return SdMmcClock((this&~255)|5)
+        sdMmcS3Write(8,divs)
+        if (sdMmcS3Read(8) != divs) return SdMmcClock((this&~255)|5)
+        sdMmcClockLaunchOwned(slot)
+        return SdMmcClock((this&~768)|512)
+    }
+    if (this.phase() == 2) {
+        val mask=(1<<slot)|(1<<(16+slot))
+        val clocks=(sdMmcS3Read(16)&~mask)|(((this>>19)&1)<<slot)|(((this>>20)&1)<<(16+slot))
+        sdMmcS3Write(16,clocks)
+        if (sdMmcS3Read(16) != clocks) return SdMmcClock((this&~255)|5)
+        sdMmcClockLaunchOwned(slot)
+        return SdMmcClock((this&~768)|768)
+    }
+    return SdMmcClock((this&~255)|1)
+}

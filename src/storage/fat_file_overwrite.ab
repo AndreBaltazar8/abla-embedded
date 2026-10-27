@@ -1,0 +1,35 @@
+import "./fat_file_extent.ab"
+// Data-only overwrite of an existing file, one sector boundary per call.
+// Caller exclusively owns the mounted medium and retains the current raw
+// directory sector; no concurrent FAT reader/writer or media replacement.
+// Does not allocate/resize or change directory timestamps/archive metadata.
+// Those are separate filesystem transactions; this is not a full write API.
+// Transport hook fatStorageWriteOwned writes exactly512bytes, returning true
+// only after device completion. False means the sector may have changed: do
+// not blindly retry, rollback, or claim atomicity/durability across power loss.
+type FatFileOverwrite=int
+//1complete2EOF3input4readIO5corrupt6cycle7budget8write-uncertain9read-only.
+fun FatFileOverwrite.status(): int = this&255
+fun FatFileOverwrite.bytesWritten(): int = if (this.status() == 1) (this>>8)&1023 else 0
+trusted fun fatFileOverwriteAtOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    directory: NativeBuffer,entryIndex: int,offset: int,length: int,budget: int,
+    source: NativeBuffer,workspace: NativeBuffer): FatFileOverwrite {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || !directory.hasAddressRange(0,512) || entryIndex < 0 || entryIndex > 15 ||
+        length < 1 || length > 512 || !source.hasAddressRange(0,length) || !workspace.hasAddressRange(0,1536) ||
+        !reader.hasAddressRange(0,28) || fatBuffersOverlap(workspace,1536,source,length) ||
+        fatBuffersOverlap(workspace,1536,directory,512) || fatBuffersOverlap(workspace,1536,boot,512) ||
+        fatBuffersOverlap(workspace,1536,reader,28)) return FatFileOverwrite(3)
+    val file=fatDirectoryDecode(directory,entryIndex,geometry.fatBits(),geometry.clusters())
+    if (!file.isFile()) return FatFileOverwrite(3)
+    if ((directory.load(entryIndex*32+11)&1) != 0) return FatFileOverwrite(9)
+    val maximum=if (length < 512-(offset&511)) length else 512-(offset&511)
+    val extent=fatFileExtentOwned(reader,boot,first,sectors,file,offset,maximum,budget,nativeBufferAt(workspace.addressValue(),1024))
+    if (extent.status() != 1) return FatFileOverwrite(extent.status())
+    val sector=nativeBufferAt(workspace.addressValue()+1024,512)
+    if (!fatStorageReadOwned(reader,extent.sector(),sector)) return FatFileOverwrite(4)
+    var index=0
+    while (index < extent.bytes()) { sector.store((offset&511)+index,source.load(index));index=index+1 }
+    if (!fatStorageWriteOwned(reader,extent.sector(),sector)) return FatFileOverwrite(8)
+    return FatFileOverwrite((extent.bytes()<<8)|1)
+}

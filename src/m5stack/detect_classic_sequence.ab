@@ -1,0 +1,116 @@
+import "./detect_logic.ab"
+import "./atom_signature_esp32_sequence.ab"
+import "../esp32/touch/session_esp32_sequence.ab"
+// Known M5 classic ESP32 boards only. Display/static selection takes priority.
+// Exclusive680B record: header32, GPIO2/34 records64, touch456, signature128.
+// Caller owns stopped HP/RTC/analog/I2S users of2,34,13,27,22,19,33; powered
+// idle touch/clock domain, calibrated ROM delay and shared registers. Prevent
+// sleep/global holds. Timing arguments are actual fast/slow hardware ticks.
+// Status0invalid,1pending,2detected and restored,3cleanup required,4failed clean.
+// Stage@12, error@16 remain inspectable. No failure becomes a guessed board.
+trusted fun m5ClassicDetectValid(r: NativeBuffer): bool = r.hasAddressRange(0,680) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x4D444331
+trusted fun m5ClassicDetectTouch(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+96,456)
+trusted fun m5ClassicDetectSignature(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+552,128)
+trusted fun m5ClassicDetectGpio(r: NativeBuffer,index: int): NativeBuffer = nativeBufferAt(r.addressValue()+32+index*32,32)
+trusted fun m5ClassicDetectCleanupOwned(r: NativeBuffer): int {
+    if (!m5ClassicDetectValid(r)) return 0
+    val touch=m5ClassicDetectTouch(r)
+    if (touch.loadU32(0) != 0) {
+        val closed=esp32TouchSessionCloseOwned(touch)
+        if (closed == 2) { r.storeU32(4,1); return 1 }
+        if (closed != 5) { r.storeU32(4,3); return 3 }
+    }
+    var okay=true
+    val signature=m5ClassicDetectSignature(r)
+    if (signature.loadU32(0) != 0 && m5AtomSignatureCloseOwned(signature) != 1) okay=false
+    var index=1
+    while (index >= 0) {
+        val gpio=m5ClassicDetectGpio(r,index)
+        if (gpio.loadU32(0) != 0 && esp32GpioProbeCloseOwned(gpio,true) != 1) okay=false
+        index=index-1
+    }
+    if (!okay) { r.storeU32(4,3); return 3 }
+    val status=if (r.loadU32(24) == 1) 2 else 4
+    r.storeU32(8,if (status == 2) r.loadU32(20) else 0); r.storeU32(4,status)
+    return status
+}
+trusted fun m5ClassicDetectFailOwned(r: NativeBuffer,stage: int,error: int): int {
+    r.storeU32(12,stage); r.storeU32(16,error); r.storeU32(24,0)
+    //6 means cleanup-only; polling must never resume identification after error.
+    r.storeU32(28,6)
+    return m5ClassicDetectCleanupOwned(r)
+}
+trusted fun m5ClassicDetectFinishOwned(r: NativeBuffer,board: M5BoardId): int {
+    r.storeU32(20,board | 0); r.storeU32(24,1); r.storeU32(28,6)
+    return m5ClassicDetectCleanupOwned(r)
+}
+trusted fun m5ClassicDetectBeginOwned(r: NativeBuffer,current: M5BoardId,waitTicks: int,chargeTicks: int,intervalTicks: int,exclusive: bool): int {
+    if (!r.hasAddressRange(0,680) || (r.addressValue()&3) != 0) return 0
+    if (r.loadU32(0) != 0 && (!m5ClassicDetectValid(r) || (r.loadU32(4) != 2 && r.loadU32(4) != 4))) return 0
+    if (current == m5BoardUnknown && (!exclusive || waitTicks < 0 || waitTicks > 255 || chargeTicks < 1 || chargeTicks > 65535 || intervalTicks < 0 || intervalTicks > 65535)) return 0
+    var offset=4
+    while (offset < 680) { r.storeU32(offset,0); offset=offset+4 }
+    r.storeU32(0,0x4D444331); r.storeU32(4,3)
+    if (current != m5BoardUnknown) return m5ClassicDetectFinishOwned(r,current)
+    val package=m5ClassicReadPackage()
+    if (package != 5) return m5ClassicDetectFinishOwned(r,m5DetectEsp32Package(current,package))
+    val g2=m5ClassicDetectGpio(r,0)
+    val g34=m5ClassicDetectGpio(r,1)
+    // Upstream first makes34 input, then2 input-pullup.
+    val prepared34=esp32GpioProbeOpenOwned(g34,34,0,true)
+    if (prepared34 != 1) return m5ClassicDetectFailOwned(r,1,prepared34)
+    val prepared2=esp32GpioProbeOpenOwned(g2,2,1,true)
+    if (prepared2 != 1) return m5ClassicDetectFailOwned(r,1,prepared2)
+    val high2=esp32GpioProbeReadOwned(g2)
+    if (high2 < 0) return m5ClassicDetectFailOwned(r,1,high2)
+    if (high2 == 0) return m5ClassicDetectFinishOwned(r,m5BoardStampPico)
+    val high34=esp32GpioProbeReadOwned(g34)
+    if (high34 < 0) return m5ClassicDetectFailOwned(r,1,high34)
+    if (high34 == 0) return m5ClassicDetectFinishOwned(r,m5BoardAtomU)
+    val touch=m5ClassicDetectTouch(r)
+    val opened=esp32TouchSessionOpenOwned(touch,144,waitTicks,chargeTicks,intervalTicks,7,0,7,2,true)
+    if (opened != 1) return m5ClassicDetectFailOwned(r,2,opened)
+    val started=esp32TouchSessionStartOwned(touch)
+    if (started != 2) return m5ClassicDetectFailOwned(r,2,started)
+    r.storeU32(28,2); r.storeU32(4,1)
+    return 1
+}
+trusted fun m5ClassicDetectPollOwned(r: NativeBuffer): int {
+    if (!m5ClassicDetectValid(r)) return 0
+    if (r.loadU32(4) == 2 || r.loadU32(4) == 4) return r.loadU32(4)
+    if (r.loadU32(28) == 6 || r.loadU32(4) == 3) return m5ClassicDetectCleanupOwned(r)
+    if (r.loadU32(4) != 1 || (r.loadU32(28) != 2 && r.loadU32(28) != 3)) return 0
+    val touch=m5ClassicDetectTouch(r)
+    // IDF v1 oneshot iterates both registered channels; its per-channel mask
+    // hook is a no-op, thus two full scans precede ONE software filter update.
+    if (r.loadU32(28) == 2) {
+        val discarded=esp32TouchSessionDiscardCompletedOwned(touch)
+        if (discarded == 2) return 1
+        if (discarded != 1) return m5ClassicDetectFailOwned(r,2,discarded)
+        val started=esp32TouchSessionStartOwned(touch)
+        if (started != 2) return m5ClassicDetectFailOwned(r,2,started)
+        r.storeU32(28,3)
+        return 1
+    }
+    val status=esp32TouchSessionPollOwned(touch)
+    if (status == 2) return 1
+    if (status != 3) return m5ClassicDetectFailOwned(r,2,status)
+    val reference=esp32TouchSessionRead(touch,4,true)
+    val led=esp32TouchSessionRead(touch,7,true)
+    if (reference < 0 || led < 0) return m5ClassicDetectFailOwned(r,2,-1)
+    val closed=esp32TouchSessionCloseOwned(touch)
+    if (closed != 5) return m5ClassicDetectFailOwned(r,2,closed)
+    if (led*3 < reference) return m5ClassicDetectFinishOwned(r,m5BoardAtomMatrix)
+    val signature=m5ClassicDetectSignature(r)
+    val probed=m5AtomSignatureProbeOwned(signature,true)
+    if (probed != 1) return m5ClassicDetectFailOwned(r,3,probed)
+    val bits=m5AtomSignatureValue(signature)
+    if (bits < 0) return m5ClassicDetectFailOwned(r,3,bits)
+    return m5ClassicDetectFinishOwned(r,if (bits == 56) m5BoardAtomVoice else m5BoardAtomLite)
+}
+trusted fun m5ClassicDetectCancelOwned(r: NativeBuffer): int {
+    if (!m5ClassicDetectValid(r)) return 0
+    if (r.loadU32(4) == 2 || r.loadU32(4) == 4) return r.loadU32(4)
+    return m5ClassicDetectFailOwned(r,4,-1)
+}
+trusted fun m5ClassicDetectResult(r: NativeBuffer): M5BoardId = if (m5ClassicDetectValid(r) && r.loadU32(4) == 2) M5BoardId(r.loadU32(8)) else m5BoardUnknown

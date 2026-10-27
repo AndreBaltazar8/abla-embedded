@@ -1,0 +1,142 @@
+import "./atom_s3_panel_probe_sequence_esp32s3.ab"
+import "../esp32/spi/shared_pin_session_s3_sequence.ab"
+import "./atom_s3_panel_reset_sequence.ab"
+import "../esp32/spi/mode_snapshot_sequence_esp32s3.ab"
+// Exclusive108B record binds board/port/gate/token to original pin/clock data.
+// magic,state(1running,2closed,3fault),board,port,gate,token,resultLo,status,
+// cleanupError,stage(0none,1pins,2probe,3clockRestored),pins36@40,clock16@76.
+// resetSnapshot@92,resetState@96(0untouched,1attempted,2completed,3restored).
+// modeSnapshot@100,modeState@104(0untouched,1changed,2restored).
+// Fresh zero record only; closed records may be reused. Never copy live records.
+// Caller owns powered/reset panel, idle master controller, stable original
+// and PLL80MHz sources, all old/new pad/matrix consumers and GPIO serialization.
+// resetMode0 leaves caller-reset panel untouched;1 releases reset;2 pulses it.
+// Modes1/2 additionally require reset-pad ownership. Restores original reset
+// GPIO configuration, NOT pre-reset panel contents/state. No power control.
+fun atomS3ProbeRecordRange(r: NativeBuffer): bool = r.hasAddressRange(0,108) &&
+    (r.addressValue()&3) == 0 && (r.addressValue()+108 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun atomS3ProbeSessionRunOwned(r: NativeBuffer,board: M5BoardId,port: int,
+    gate: PeripheralGate,owner: u32,polls: int,exclusive: bool,resetMode: int = 0): SpiTransactionResult {
+    if (!exclusive || !atomS3ProbeRecordRange(r) || (board != m5BoardAtomS3 && board != m5BoardAtomS3R) ||
+        esp32s3SpiBase(port) == 0 || polls < 1 || polls > 1000000 || resetMode < 0 || resetMode > 2 || !gate.bufferDisjoint(r,108) ||
+        gate.word().address() > 4294967292 || (gate.word().address() >= 0x60000000 && gate.word().address() < 0x60100000) ||
+        (r.loadU32(0) != 0 && (r.loadU32(0) != 0x41535033 || r.loadU32(4) != 2))) return SpiTransactionResult(3<<32)
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return SpiTransactionResult((if (admitted == 1) 2 else if (admitted == 2) 4 else 3)<<32)
+    var i=0;while (i < 108) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x41535033);r.storeU32(4,1);r.storeU32(8,board|0);r.storeU32(12,port)
+    r.storeU32(16,gate.word().address());r.storeU32(20,int(owner))
+    val pins=nativeBufferAt(r.addressValue()+40,36);val snapshot=nativeBufferAt(r.addressValue()+76,16)
+    val opened=esp32s3SpiSharedPinsOpenOwned(pins,port,Pin(if (board == m5BoardAtomS3) 17 else 15),
+        Pin(21),Pin(if (board == m5BoardAtomS3) 15 else 14),Pin(if (board == m5BoardAtomS3) 33 else 42),true)
+    var result=SpiTransactionResult((6<<32)|(8<<24)|opened)
+    // Open0 never mutates hardware. Open3 retains a complete original snapshot.
+    var clean=opened == 0
+    if (opened != 0) r.storeU32(36,1)
+    if (opened == 1) {
+        var ready=true
+        if (resetMode != 0) {
+            val saved=esp32S3GpioSnapshotOwned(if (board == m5BoardAtomS3) 34 else 48,true)
+            ready=saved.valid()
+            var resetResult=2
+            if (ready) {
+                r.storeU32(92,saved|0);r.storeU32(96,1)
+                resetResult=board.resetAtomPanelOwned(resetMode == 2,true)
+                ready=resetResult == 1
+                if (ready) r.storeU32(96,2)
+            }
+            if (!ready) result=SpiTransactionResult((6<<32)|(10<<24)|resetResult)
+        }
+        if (ready) {
+            val savedMode=esp32s3SpiModeCaptureOwned(port)
+            ready=savedMode != 0
+            if (ready) {
+                r.storeU32(100,savedMode);r.storeU32(104,1)
+                ready=esp32s3SpiConfigureModeOwned(port,0,false,false)
+            }
+            if (!ready) result=SpiTransactionResult((6<<32)|(12<<24))
+        }
+        if (ready) {
+            r.storeU32(36,2)
+            result=board.readAtomPanelIdNativeHeld(port,snapshot,polls)
+        }
+        if (result.valid()) {
+            r.storeU32(36,3)
+            val modeRestored=esp32s3SpiModeRestoreOwned(r.loadU32(100),polls)
+            if (modeRestored == 1) r.storeU32(104,2)
+            else { r.storeU32(32,modeRestored);result=SpiTransactionResult((6<<32)|(13<<24)|modeRestored) }
+        }
+        if (result.valid()) {
+            // Probe released CS; restore reset before potentially restoring
+            // an originally asserted CS. A reset restore failure retains pins.
+            var restored=1
+            if (r.loadU32(96) == 2) {
+                restored=S3GpioSnapshot(r.loadU32(92)).restoreOwned(true)
+                if (restored == 1) r.storeU32(96,3)
+            }
+            if (restored != 1) { r.storeU32(32,restored);result=SpiTransactionResult((6<<32)|(11<<24)|restored) }
+            else {
+                val closed=esp32s3SpiSharedPinsCloseOwned(pins,polls,true)
+                clean=closed == 2
+                if (!clean) { r.storeU32(32,pins.loadU32(12));result=SpiTransactionResult((6<<32)|(9<<24)|pins.loadU32(12)) }
+            }
+        }
+    }
+    r.storeU32(24,result&0xffffffff);r.storeU32(28,result.status())
+    r.storeU32(4,if (clean) 2 else 3)
+    if (!gate.finish(owner,clean)) { r.storeU32(4,3);return SpiTransactionResult(5<<32) }
+    return result
+}
+// Close/recover the retained context without replay or caller-supplied identity.
+// 1closed,2invalid,3gate unavailable,4still active,5clock restore,6pin restore,
+// 7ownership lost,8reset cleanup,9mode cleanup. Original probe result retained.
+trusted fun atomS3ProbeSessionRecoverOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !atomS3ProbeRecordRange(r) || r.loadU32(0) != 0x41535033 || r.loadU32(4) != 3 ||
+        polls < 1 || polls > 1000000 || r.loadU32(36) > 3 || r.loadU32(96) > 3 || r.loadU32(104) > 2 ||
+        (r.loadU32(8) != 11 && r.loadU32(8) != 18) || esp32s3SpiBase(r.loadU32(12)) == 0) return 2
+    val gate=peripheralGateAt(r.loadU32(16));val owner=u32(r.loadU32(20))
+    if (!gate.bufferDisjoint(r,108) || (gate.word().address() >= 0x60000000 && gate.word().address() < 0x60100000)) return 2
+    if (!gate.tryBeginRecovery(owner)) return 3
+    val pins=nativeBufferAt(r.addressValue()+40,36);val snapshot=nativeBufferAt(r.addressValue()+76,16)
+    val base=esp32s3SpiBase(r.loadU32(12))
+    var attempt=0;while (attempt < polls && !esp32s3SpiCpuBufferIdle(base)) attempt=attempt+1
+    var result=4
+    if (attempt < polls) {
+        result=1
+        if (r.loadU32(36) == 2 && snapshot.loadU32(0) == 0x53434c4b) {
+            // Clock-only restoration does not start a transfer; pin close
+            // subsequently establishes CS high before restoring original routes.
+            val restored=esp32s3SpiClockRestoreOwned(snapshot,polls,true)
+            if (restored != 1) { result=5;r.storeU32(32,restored) }
+            else r.storeU32(36,3)
+        }
+        if (result == 1 && r.loadU32(104) == 1) {
+            // CPOL restoration can change the physical clock level. Deselect
+            // the panel before mode writes, not merely before pad restoration.
+            val cs=Pin(if (r.loadU32(8) == 11) 15 else 14)
+            if (!cs.outputLevelOwned(true)) result=9
+            else {
+                val restored=esp32s3SpiModeRestoreOwned(r.loadU32(100),polls)
+                if (restored != 1) { result=9;r.storeU32(32,restored) }
+                else r.storeU32(104,2)
+            }
+        }
+        if (result == 1 && (r.loadU32(96) == 1 || r.loadU32(96) == 2)) {
+            val board=M5BoardId(r.loadU32(8))
+            // Establish CS inactive before changing reset, including retries.
+            val cs=Pin(if (board == m5BoardAtomS3) 15 else 14)
+            if (!cs.outputLevelOwned(true) || !board.releaseAtomPanelResetOwned(true)) result=8
+            else {
+                val restored=S3GpioSnapshot(r.loadU32(92)).restoreOwned(true)
+                if (restored != 1) { result=8;r.storeU32(32,restored) }
+                else r.storeU32(96,3)
+            }
+        }
+        if (result == 1 && r.loadU32(36) != 0) {
+            if (esp32s3SpiSharedPinsCloseOwned(pins,polls,true) != 2) { result=6;r.storeU32(32,pins.loadU32(12)) }
+        }
+    }
+    if (!gate.finishRecovery(owner,result == 1)) return 7
+    if (result == 1) { r.storeU32(4,2);r.storeU32(32,0) }
+    return result
+}

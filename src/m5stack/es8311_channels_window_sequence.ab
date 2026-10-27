@@ -1,0 +1,64 @@
+import "./es8311_channels_pump_sequence.ab"
+// Finite synchronous window on an ALREADY running/owned playbacksession.
+// Consume exactly1..4095 mixer blocks, then queue silence without advancing
+// channel cursors. Complete one ring rotation plus >=120ms silence and one
+// extra block before stop/park -> ampcleanup -> I2Spinrestore. This bounds a
+// digital tail; it is not proof of analog codec latency or audible completion.
+// maxIdle1..1000 is consecutive 1ms waits per block, not an overall deadline.
+// Never call under interrupt masks/from ISR. Retain all resources ifclose3.
+// Initial ringpayload must already be initialized; no otherpump/binding edits.
+// Result low8:1window+cleanup complete,2invalid,3timeout,4..8DMA,9render,
+// 10cleanup failure after otherwise successful tail. High32 counts QUEUED
+// source blocks (not physical playback). Detailed cleanup remains in session.
+type M5Es8311PlaybackWindowResult=int
+fun M5Es8311PlaybackWindowResult.status(): int = this&255
+fun M5Es8311PlaybackWindowResult.queuedBlocks(): int = this>>>32
+trusted fun m5Es8311PlaybackChannelsWindowOwned(r: NativeBuffer,bank: PcmChannels,blocks: int,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,maxIdle: int,
+    masterGainQ15: int,exclusive: bool,tone: PcmTone=PcmTone(0),
+    queues: PcmSourceQueues=PcmSourceQueues(0)): M5Es8311PlaybackWindowResult {
+    if (!exclusive || !m5Es8311PlaybackValid(r) || r.loadU32(4) != 2 || blocks < 1 || blocks > 4095 ||
+        maxIdle < 1 || maxIdle > 1000 ||
+        (if (queues == 0) !bank.valid() else bank != 0 || tone != 0 || !queues.valid()) ||
+        masterGainQ15 < 0 || masterGainQ15 > 32768) return M5Es8311PlaybackWindowResult(2)
+    val bytes=r.loadU32(40);val count=r.loadU32(32);val rate=r.loadU32(48)
+    val stereo=M5BoardId(r.loadU32(8)).speakerProfile().stereo()
+    if (bytes < 4 || (bytes&3) != 0 || rate < 8000 || rate > 96000 || count < 2 ||
+        !esp32s3GdmaRingLayoutValid(r.loadU32(28),count,r.loadU32(36),bytes,bytes)) return M5Es8311PlaybackWindowResult(2)
+    val frames=bytes/(if (stereo) 4 else 2)
+    val silenceFrames=(rate*120+999)/1000
+    val tail=count+int((u32(silenceFrames)+u32(frames)-u32(1))/u32(frames))+1
+    var queued=0;var silent=0;var idle=0;var status=1
+    var state=M5Es8311ChannelsPump(0)
+    while (queued < blocks && status == 1) {
+        state=m5Es8311PumpChannelsOwned(state,r,bank,accumulator,scratch,staging,masterGainQ15,true,tone,queues)
+        if (state.status() == 1) { queued=queued+1;idle=0 }
+        else if (state.status() == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=state.status()
+    }
+    // An initial preflight rejection neither rendered nor submitted a block.
+    // Do not surprise the caller by changing the existing session in this case.
+    if (status == 2 && queued == 0 && !state.pending()) return M5Es8311PlaybackWindowResult(2)
+    if (status == 1) {
+        var offset=0
+        while (offset < bytes) { staging.storeU32(offset,0);offset=offset+4 }
+    }
+    idle=0
+    while (silent < tail && status == 1) {
+        val pumped=m5Es8311PlaybackWriteOwned(r,nativeBufferAt(staging.addressValue(),bytes),1,true)
+        if (pumped.status() == 1) { silent=silent+1;idle=0 }
+        else if (pumped.status() == 3) {
+            idle=idle+1
+            if (idle >= maxIdle) status=3 else peripheralDelayMilliseconds(1)
+        } else status=pumped.status()
+    }
+    val closed=m5Es8311PlaybackCloseOwned(r,1000,true)
+    if (status == 1 && closed != 4) status=10
+    return M5Es8311PlaybackWindowResult(status|(queued<<32))
+}
+trusted fun m5Es8311PlaybackSourceQueuesWindowOwned(r: NativeBuffer,queues: PcmSourceQueues,blocks: int,
+    accumulator: NativeBuffer,scratch: NativeBuffer,staging: NativeBuffer,maxIdle: int,
+    masterGainQ15: int,exclusive: bool): M5Es8311PlaybackWindowResult =
+    m5Es8311PlaybackChannelsWindowOwned(r,PcmChannels(0),blocks,accumulator,scratch,staging,maxIdle,masterGainQ15,exclusive,PcmTone(0),queues)

@@ -1,0 +1,75 @@
+// Tab5 GPIO22, LEDC channel7/timer3, XTAL40MHz, 8-bit duty, ~44.1kHz.
+// Caller supplies a prepared GPIO-low pin22, holds its GPIO/IOMUX lease, and
+// exclusively owns LEDC globally (including ETM/IRQ); XTAL40 must be stable.
+// One authoritative value: always retain the returned owner, including failures.
+// Low8 status:0closed1ready2invalid3pad4clock5timer6route7duty8stop.
+// bits8 peripheral initialized,9 route attempted,10 configured,12..13 layout;
+// bits16..31 contain the underlying retained LEDC clock lease.
+type Tab5PwmBacklight = int
+fun Tab5PwmBacklight.bits(): int = this
+fun Tab5PwmBacklight.status(): int = this&255
+fun Tab5PwmBacklight.ready(): bool = (this&1024) != 0
+trusted fun p4Tab5PwmWaitTimer(polls: int): bool {
+    var remaining=polls
+    while (remaining > 0) {
+        if ((p4LedcRead(184)&0x4000000) == 0) return true
+        remaining=remaining-1
+    }
+    return false
+}
+trusted fun tab5PwmBacklightOpenOwned(layout: int,polls: int): Tab5PwmBacklight {
+    if ((layout != 1 && layout != 3) || polls < 1 || polls > 1000000) return Tab5PwmBacklight(2)
+    var flags=layout<<12
+    if (!p4Tab5PwmPadIsGpioLow(layout)) return Tab5PwmBacklight(flags|3)
+    val clock=esp32P4LedcClockOpenOwned(0)
+    flags=flags|(clock.bits()<<16)
+    if (clock.status() != 1) return Tab5PwmBacklight(flags|4)
+    flags=flags|256
+    if (p4LedcTimerConfigurePausedOwned(3,8,907) != 1 || !p4Tab5PwmWaitTimer(polls) ||
+        p4LedcTimerResumeOwned(3) != 1) return Tab5PwmBacklight(flags|5)
+    // Attach before starting duty; reset left channel7 disabled and idle-low.
+    flags=flags|512
+    if (p4LedcPinAttachLowOwned(layout,22,7,false) != 1) return Tab5PwmBacklight(flags|6)
+    flags=flags|1024
+    return Tab5PwmBacklight(flags|1)
+}
+// duty0..256: 0 dark,256 full; no implicit perceptual/gamma brightness curve.
+// Caller can retry a timed-out update after waitOwned succeeds; no forced reset.
+trusted fun Tab5PwmBacklight.setDutyOwned(duty: int,polls: int): Tab5PwmBacklight {
+    val flags=this&0xffffff00
+    if (!this.ready() || duty < 0 || duty > 256 || polls < 1 || polls > 1000000) return Tab5PwmBacklight(flags|2)
+    if (!p4Tab5PwmClockLive()) return Tab5PwmBacklight(flags|4)
+    if (!p4Tab5PwmPadIsRouted((this>>12)&3)) return Tab5PwmBacklight(flags|3)
+    return Tab5PwmBacklight(flags|(if (p4LedcChannelSetDutyOwned(7,3,duty,0,polls) == 1) 1 else 7))
+}
+trusted fun Tab5PwmBacklight.waitOwned(polls: int): Tab5PwmBacklight {
+    val flags=this&0xffffff00
+    if (!this.ready() || polls < 1 || polls > 1000000) return Tab5PwmBacklight(flags|2)
+    if (!p4Tab5PwmClockLive()) return Tab5PwmBacklight(flags|4)
+    return Tab5PwmBacklight(flags|(if (p4LedcChannelWaitOwned(7,polls) == 1) 1 else 7))
+}
+trusted fun Tab5PwmBacklight.closeOwned(polls: int): Tab5PwmBacklight {
+    var flags=this&0xfffffb00
+    if (polls < 1 || polls > 1000000) return Tab5PwmBacklight((this&0xffffff00)|2)
+    var clock=Esp32P4LedcClock((this>>16)&65535)
+    if ((flags&256) != 0) {
+        if (!p4Tab5PwmClockLive()) return Tab5PwmBacklight(flags|4)
+        if (p4LedcChannelWaitOwned(7,polls) != 1 || p4LedcChannelStopOwned(7,false,polls) != 1) return Tab5PwmBacklight(flags|8)
+        val layout=(this>>12)&3
+        if ((flags&512) != 0) {
+            // A failed attach write may leave either the original GPIO route
+            // or our PWM route. Never overwrite any unrelated routing state.
+            if (!p4Tab5PwmPadIsGpioLow(layout)) {
+                if (p4LedcPinDetachLowOwned(layout,22,7,false) != 1) return Tab5PwmBacklight(flags|6)
+            }
+            flags=flags&0xfffffdff
+        }
+        if (!p4Tab5PwmWaitTimer(polls) || p4LedcTimerPauseOwned(3) != 1) return Tab5PwmBacklight(flags|5)
+        // Clock.close may partially gate clocks. Clear peripheral access flag
+        // BEFORE it, so retries only use the clock owner's RCC-safe cleanup.
+        flags=flags&0xfffffeff
+    }
+    clock=clock.closeOwned()
+    flags=(flags&65535)|(clock.bits()<<16)
+    return if (clock.status() == 0) Tab5PwmBacklight(0) else Tab5PwmBacklight(flags|4)
+}

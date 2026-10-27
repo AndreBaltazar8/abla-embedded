@@ -1,0 +1,69 @@
+import "./selected_read.ab"
+// Status1complete2invalid3command4transport5busyTimeout6responseTimeout
+// 7dataRejected8postWriteStatus. Token-attempted bit8, card detail8@9,
+// transmitted payload count10@17, raw transport detail32@32.
+// Any failure after token attempt may leave the sector changed. Never replay
+// automatically; CS/gate/card readiness and recovery remain caller-owned.
+type SdSpiWriteResult=int
+fun SdSpiWriteResult.status(): int = this&255
+fun SdSpiWriteResult.valid(): bool = this.status() == 1
+fun SdSpiWriteResult.mayHaveWritten(): bool = (this&256) != 0
+fun SdSpiWriteResult.cardDetail(): int = (this>>>9)&255
+fun SdSpiWriteResult.transmittedBytes(): int = (this>>>17)&1023
+fun SdSpiWriteResult.transportDetail(): int = (this>>>32)&4294967295
+trusted fun sdSpiWriteWaitReadySelected(context: int,scratch: NativeBuffer,polls: int): int {
+    var remaining=polls
+    while (remaining > 0) {
+        val result=sdSpiSelectedExchange(context,255,scratch)
+        if ((result>>>32) != 1) return 4|((result&4294967295)<<32)
+        if ((result&255) == 255) return 1
+        remaining=remaining-1
+        if (remaining > 0) sdSpiSelectedDelay(1000)
+    }
+    return 5
+}
+trusted fun sdSpiWriteBlockSelected(context: int,highCapacity: bool,block: int,scratch: NativeBuffer,
+    source: NativeBuffer,busyPolls: int = 250): SdSpiWriteResult {
+    if (!sdSpiBlockAddressValid(highCapacity,block) || !sdSpiReadStorageValid(scratch,source,512) ||
+        busyPolls < 1 || busyPolls > 1000000 || !sdSpiSelectedAdmission(context,scratch,source,512)) return SdSpiWriteResult(2)
+    val ready=sdSpiWriteWaitReadySelected(context,scratch,busyPolls)
+    if (ready != 1) return SdSpiWriteResult(ready)
+    val command=sdSpiCommandSelected(context,24,sdSpiBlockArgument(highCapacity,block),scratch,NativeBuffer(0),0)
+    if (command.status() == 4) return SdSpiWriteResult(4|(command.transportDetail()<<32))
+    if (!command.valid() || command.r1() != 0) return SdSpiWriteResult(3|(command.r1()<<9))
+    var progress=256
+    val token=sdSpiSelectedExchange(context,254,scratch)
+    if ((token>>>32) != 1) return SdSpiWriteResult(progress|4|((token&4294967295)<<32))
+    var crc=0
+    var index=0
+    while (index < 512) {
+        val value=source.load(index)
+        val result=sdSpiSelectedExchange(context,value,scratch)
+        if ((result>>>32) != 1) return SdSpiWriteResult(progress|4|((result&4294967295)<<32))
+        crc=sdSpiCrc16Byte(crc,value)
+        index=index+1;progress=256|(index<<17)
+    }
+    val high=sdSpiSelectedExchange(context,(crc>>>8)&255,scratch)
+    if ((high>>>32) != 1) return SdSpiWriteResult(progress|4|((high&4294967295)<<32))
+    val low=sdSpiSelectedExchange(context,crc&255,scratch)
+    if ((low>>>32) != 1) return SdSpiWriteResult(progress|4|((low&4294967295)<<32))
+    var response=255
+    var attempts=0
+    while (response == 255 && attempts < 8) {
+        val result=sdSpiSelectedExchange(context,255,scratch)
+        if ((result>>>32) != 1) return SdSpiWriteResult(progress|4|((result&4294967295)<<32))
+        response=result&255;attempts=attempts+1
+    }
+    if (response == 255) return SdSpiWriteResult(progress|6)
+    if (!sdSpiWriteAccepted(response)) return SdSpiWriteResult(progress|7|(response<<9))
+    val finished=sdSpiWriteWaitReadySelected(context,scratch,busyPolls)
+    if (finished != 1) return SdSpiWriteResult(progress|finished)
+    // Data accepted is not proof of successful programming: CMD13 R2.
+    val status=sdSpiCommandSelected(context,13,0,scratch,NativeBuffer(0),0)
+    if (status.status() == 4) return SdSpiWriteResult(progress|4|(status.transportDetail()<<32))
+    if (!status.valid() || status.r1() != 0) return SdSpiWriteResult(progress|8|(status.r1()<<9))
+    val r2=sdSpiSelectedExchange(context,255,scratch)
+    if ((r2>>>32) != 1) return SdSpiWriteResult(progress|4|((r2&4294967295)<<32))
+    if ((r2&255) != 0) return SdSpiWriteResult(progress|8|((r2&255)<<9))
+    return SdSpiWriteResult(progress|1)
+}

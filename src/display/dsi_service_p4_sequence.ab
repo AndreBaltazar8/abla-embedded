@@ -1,0 +1,31 @@
+import "../service_gate.ab"
+import "../esp32/sdk/raw_buffer.ab"
+// Every refresh callback/task MUST enter the same gate; startup/teardown is
+// separately serialized by the owner. No callback uses resources before entry.
+// Rearm's normal report is preserved. Low8=10 admission refused;11 gate misuse.
+trusted fun esp32P4DsiServiceRefresh(gate: ServiceGate,token: u32,channel: int,descriptor: NativeBuffer,frame: NativeBuffer,bytes: int,line: int,polls: int): int {
+    // Gate writes must not corrupt the DMA descriptor or immutable pixels.
+    // Validate before admission or rearm can overwrite its own active token.
+    if (!gate.word().valid() || gate <= 0 || gate > 4294967292 || bytes < 1 ||
+        !descriptor.hasAddressRange(0,64) || !frame.hasAddressRange(0,bytes)) return 2
+    if ((gate < descriptor.addressValue()+64 && gate+4 > descriptor.addressValue()) ||
+        (gate < frame.addressValue()+bytes && gate+4 > frame.addressValue())) return 2
+    if (!gate.tryBegin(token)) return 10
+    val result=p4DsiServiceRearm(channel,descriptor,frame,bytes,line,polls)
+    val status=result&255
+    if (!gate.finish(token,status == 0 || status == 1 || status == 3)) return 11
+    return result
+}
+// Only call hardware shutdown after admission is closed AND no worker remains.
+// Gate remains closed after every outcome. Keep gate memory alive until the
+// event source is detached/joined. DMA/cache resources follow shutdown results.
+// Low8=10 gate wait/refused,detail=stop status;12 cache still active (retain
+// its lease and buffers); otherwise normal shutdown report. Caller continues
+// holding cache-engine serialization through this check and hardware shutdown.
+trusted fun esp32P4DsiServiceShutdown(gate: ServiceGate,channel: int,polls: int): int {
+    if (channel < 0 || channel > 3 || polls < 1 || polls > 1000000) return 2
+    val stopped=gate.requestStop(polls)
+    if (stopped != 1) return 10|(stopped<<8)
+    if (!p4DsiServiceCacheIdle()) return 12
+    return p4DsiServiceShutdownVideo(channel,polls)
+}

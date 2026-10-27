@@ -1,0 +1,53 @@
+import "./fat_boot.ab"
+// FAT entry addressing/decoding, based on FatFs get_fat in IDF6 ff.c.
+// Reader supplies sectors at the returned LBA (and LBA+1 only for FAT12
+// straddles). Buffers stay immutable. No I/O or mutation hidden in these APIs.
+type FatLinkLocation = int
+fun FatLinkLocation.valid(): bool = (this&(1<<44)) != 0
+fun FatLinkLocation.sector(): int = if (this.valid()) this&4294967295 else -1
+fun FatLinkLocation.offset(): int = (this>>32)&511
+fun FatLinkLocation.needsSecondSector(): bool = this.valid() && ((this>>41)&3) == 1 && this.offset() == 511
+trusted fun fatLinkLocate(boot: NativeBuffer,firstSector: int,availableSectors: int,cluster: int): FatLinkLocation {
+    val geometry=fatBootValidate(boot,firstSector,availableSectors)
+    if (!geometry.valid() || fatClusterFirstSector(boot,firstSector,availableSectors,cluster) < 0) return FatLinkLocation(0)
+    val bits=geometry.fatBits()
+    val byte=if (bits == 12) cluster+(cluster>>1) else if (bits == 16) cluster*2 else cluster*4
+    var active=0
+    if (bits == 32 && (fatBootU16(boot,40)&128) != 0) active=fatBootU16(boot,40)&15
+    val sector=firstSector+fatBootU16(boot,14)+active*fatBootFatSectors(boot)+(byte>>9)
+    val kind=if (bits == 12) 1 else if (bits == 16) 2 else 3
+    return FatLinkLocation(sector|((byte&511)<<32)|(kind<<41)|((cluster&1)<<43)|(1<<44))
+}
+type FatLink = int
+// 1next cluster2end3free4bad5reserved6outside-volume7invalidinput/buffer,
+// 8transport failure (returned by the read integration, not this decoder).
+fun FatLink.status(): int = this&255
+fun FatLink.nextCluster(): int = if (this.status() == 1) (this>>8)&0xfffffff else -1
+trusted fun fatLinkDecode(location: FatLinkLocation,clusters: int,first: NativeBuffer,second: NativeBuffer): FatLink {
+    if (!location.valid() || clusters < 1 || clusters > 0xffffff5 || !first.hasAddressRange(0,512)) return FatLink(7)
+    val kind=(location>>41)&3
+    val offset=location.offset()
+    var value=0
+    if (kind == 1) {
+        var high=0
+        if (location.needsSecondSector()) {
+            if (!second.hasAddressRange(0,512)) return FatLink(7)
+            high=second.load(0)
+        } else high=first.load(offset+1)
+        val word=first.load(offset)|(high<<8)
+        value=if ((location&(1<<43)) != 0) word>>4 else word&4095
+    } else if (kind == 2) {
+        if ((offset&1) != 0) return FatLink(7)
+        value=fatBootU16(first,offset)
+    } else if (kind == 3) {
+        if ((offset&3) != 0) return FatLink(7)
+        value=fatBootU32(first,offset)&0xfffffff
+    } else return FatLink(7)
+    val reserved=if (kind == 1) 0xff0 else if (kind == 2) 0xfff0 else 0xffffff0
+    if (value >= reserved+8) return FatLink(2)
+    if (value == reserved+7) return FatLink(4)
+    if (value == 0) return FatLink(3)
+    if (value == 1 || value >= reserved) return FatLink(5)
+    if (value >= clusters+2) return FatLink(6)
+    return FatLink((value<<8)|1)
+}

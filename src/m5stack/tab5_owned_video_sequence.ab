@@ -1,0 +1,57 @@
+import "./tab5_dsi_owner_sequence.ab"
+import "../display/dsi_worker_result.ab"
+// Caller lends inactive DMA channel/controller, descriptor64 and immutable
+// RGB565720x1280 frame until successful stop. Cache/RCC serialization and all
+// callback lifetimes remain caller-owned. Never close DMA while this owner is
+// in phase7/8, nor call lower-level host close around this lifecycle guard.
+trusted fun Tab5DsiOwner.videoBufferSafe(buffer: NativeBuffer,length: int): bool {
+    if (!buffer.hasAddressRange(0,length)) return false
+    val start=buffer.addressValue()
+    val owner=this.buffer().addressValue()
+    val ref=this.buffer().loadU32(32)
+    return (start+length <= owner || start >= owner+40) && (start+length <= ref || start >= ref+4)
+}
+// Full Tab5VideoStart returned/stored, including partial ownership flags.
+trusted fun Tab5DsiOwner.startVideoOwned(channel: int,descriptor: NativeBuffer,frame: NativeBuffer,line: int,polls: int): int {
+    if (!this.panelReady() || channel < 0 || channel > 3 || polls < 1 || polls > 1000000 ||
+        !this.videoBufferSafe(descriptor,64) || !this.videoBufferSafe(frame,1843200) ||
+        !tab5OwnedVideoBuffersValid(descriptor,frame,line)) return 2
+    val panel=this.wide(8)
+    val config=this.buffer().loadU32(36)
+    this.buffer().storeU32(36,(config&255)|(channel<<8))
+    this.buffer().storeU32(4,7)
+    val result=tab5OwnedVideoStart(panel,(config>>>4)&3,(config>>>2)&3,channel,descriptor,frame,line,polls)
+    this.save(8,result)
+    if ((result&15) == 1) this.buffer().storeU32(4,8)
+    return result
+}
+// Task-context refresh: derives DMA channel and frame dimensions from this
+// video owner, refuses partial/stopped lifetimes or a different register layout.
+// Caller retains the originally lent descriptor/frame and same service gate;
+// excludes owner mutation during this call, and holds cache serialization.
+// Does not overwrite last startup/stop evidence; returns full worker report.
+trusted fun Tab5DsiOwner.pollVideoOwned(mailbox: NativeBuffer,gate: int,token: u32,descriptor: NativeBuffer,frame: NativeBuffer,line: int,polls: int): P4DsiWorkerResult {
+    if (!this.valid() || this.buffer().loadU32(4) != 8 ||
+        !this.videoBufferSafe(mailbox,28) || !this.videoBufferSafe(descriptor,64) ||
+        !this.videoBufferSafe(frame,1843200) || gate <= 0 || gate > 4294967292 || (gate&3) != 0 ||
+        !this.videoBufferSafe(nativeBufferAt(gate,4),4) ||
+        (mailbox.addressValue()&3) != 0 || mailbox.loadU32(8) != ((this.buffer().loadU32(36)>>>4)&3) ||
+        !tab5OwnedVideoBuffersValid(descriptor,frame,line)) return p4DsiWorkerResult(1,0,0)
+    return tab5OwnedVideoPoll(mailbox,gate,token,(this.buffer().loadU32(36)>>>8)&3,descriptor,frame,line,polls)
+}
+// Every refresh task must use this same service gate. A failed stop preserves
+// Caller ensures the gate is disjoint from the borrowed descriptor/frame and
+// every other live owner; this compact record does not retain buffer pointers.
+// phase7/8 and blocks host/rail cleanup. Gate memory remains alive until event
+// sources are detached/joined, even after a successful hardware stop.
+trusted fun Tab5DsiOwner.stopVideoOwned(gate: int,polls: int): int {
+    if (!this.valid() || polls < 1 || polls > 1000000 || gate <= 0 || gate > 4294967292 || (gate&3) != 0 ||
+        !this.videoBufferSafe(nativeBufferAt(gate,4),4)) return 2
+    val phase=this.buffer().loadU32(4)
+    if (phase == 9) return 32769
+    if (phase != 7 && phase != 8) return 2
+    val result=tab5OwnedVideoStop(gate,(this.buffer().loadU32(36)>>>8)&3,polls)
+    this.save(8,result)
+    if ((result&255) == 1 && (result&32768) != 0) this.buffer().storeU32(4,9)
+    return result
+}

@@ -1,0 +1,75 @@
+import "../esp32/sdk/raw_buffer.ab"
+import "../esp32/gpio/snapshot_s3_logic.ab"
+import "abla/runtime/scalar"
+// Pin config76: data0..15 (u32 each), PCLK@64, optional CS@68/DC@72.
+// -1/0xffffffff means absent for optional pins and unused data8..15 on8bit.
+// Record96:magic,state,count,cursor,snapshots19@16,reserved@92.
+// States1ready2closed3parking4restoring; returns0invalid1ready2closed3cleanup.
+// Caller stops LCD/GDMA and old pad consumers, releases RTC/USB/holds, owns
+// immutable config and all shared GPIO RMWs. GPIO gates/rails are separate.
+fun s3I80PinSlot(index: int,width: int): int = if (index < width) index else index+16-width
+trusted fun esp32S3I80PinsCloseOwned(r: NativeBuffer,quiescentExclusive: bool): int {
+    if (!quiescentExclusive || !r.hasAddressRange(0,96) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x49385053) return 0
+    if (r.loadU32(4) == 2) return 2
+    val count=r.loadU32(8)
+    if (count < 9 || count > 19 || r.loadU32(12) > count || (r.loadU32(4) != 1 && r.loadU32(4) != 3 && r.loadU32(4) != 4)) return 0
+    var index=0
+    while (index < count) { if (!S3GpioSnapshot(r.loadU32(16+index*4)).valid()) return 0;index=index+1 }
+    if (r.loadU32(4) == 1) { r.storeU32(4,3);r.storeU32(12,0) }
+    if (r.loadU32(4) == 3) {
+        index=r.loadU32(12)
+        while (index < count) {
+            if (!s3I80PinPark(S3GpioSnapshot(r.loadU32(16+index*4)).pin())) return 3
+            index=index+1;r.storeU32(12,index)
+        }
+        r.storeU32(4,4);r.storeU32(12,0)
+    }
+    index=r.loadU32(12)
+    while (index < count) {
+        if (s3I80PinRestore(S3GpioSnapshot(r.loadU32(16+index*4))) != 1) return 3
+        index=index+1;r.storeU32(12,index)
+    }
+    r.storeU32(4,2);return 2
+}
+trusted fun esp32S3I80PinsOpenOwned(r: NativeBuffer,config: NativeBuffer,width: int,inversions: int,quiescentExclusive: bool): int {
+    if (!quiescentExclusive || !r.hasAddressRange(0,96) || !config.hasAddressRange(0,76) ||
+        ((r.addressValue()|config.addressValue())&3) != 0 || (width != 8 && width != 16) || inversions < 0 || inversions > 3 ||
+        (r.addressValue() < config.addressValue()+76 && config.addressValue() < r.addressValue()+96) ||
+        (r.loadU32(0) != 0 && (r.loadU32(0) != 0x49385053 || r.loadU32(4) != 2))) return 0
+    // Reject invalid/duplicate pins across the full configuration before any
+    // GPIO write or snapshot ownership publication.
+    var index=0
+    while (index < 19) {
+        val pin=config.loadU32(index*4)
+        if (index >= width && index < 16) { if (pin != 0xFFFFFFFF) return 0 }
+        else if (pin == 0xFFFFFFFF) { if (index < 17) return 0 }
+        else {
+            if (!s3I80PinValid(pin)) return 0
+            var earlier=0
+            while (earlier < index) { if (config.loadU32(earlier*4) == pin) return 0;earlier=earlier+1 }
+        }
+        index=index+1
+    }
+    var count=0;index=0
+    while (index < width+3) {
+        val slot=s3I80PinSlot(index,width);val pin=config.loadU32(slot*4)
+        if (pin != 0xFFFFFFFF) {
+            val snapshot=s3I80PinCapture(pin)
+            if (!snapshot.valid() || snapshot.pin() != pin) return 0
+            r.storeU32(16+count*4,snapshot|0);count=count+1
+        }
+        index=index+1
+    }
+    r.storeU32(0,0x49385053);r.storeU32(4,3);r.storeU32(8,count);r.storeU32(12,0);r.storeU32(92,0)
+    index=0
+    while (index < width+3) {
+        val slot=s3I80PinSlot(index,width);val pin=config.loadU32(slot*4)
+        if (pin != 0xFFFFFFFF) {
+            val signal=if (slot < 16) 133+slot else if (slot == 16) 154 else if (slot == 17) 132 else 153
+            val invert=if (slot == 17) (inversions&1) != 0 else if (slot == 18) (inversions&2) != 0 else false
+            if (!s3I80PinRoute(pin,signal,invert)) return 3
+        }
+        index=index+1
+    }
+    r.storeU32(4,1);return 1
+}

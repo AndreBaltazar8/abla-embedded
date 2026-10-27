@@ -1,0 +1,44 @@
+import "./fat_link_patch.ab"
+// Caller holds exclusive volume ownership. Compare expected value in ALL
+// enabled FAT copies before writing any; disagreements are not repaired here.
+// FAT32 disabled-mirroring uses only the BPB-selected active FAT.2048B scratch
+// retains up to2copies x2sectors so no read occurs after writes have started.
+// No journaling/rollback: a failed write can leave mirrors or FAT12 straddles
+// inconsistent. Caller must fault the mount, not retry allocation blindly.
+// FSInfo/free-count and directory publication belong to higher transactions.
+type FatLinkWrite=int
+//1success2input3readIO4expected-mismatch5write-uncertain; completed sectors@8.
+fun FatLinkWrite.status(): int = this&255
+fun FatLinkWrite.completedSectors(): int = (this>>8)&7
+trusted fun fatWriteLinkOwned(reader: NativeBuffer,boot: NativeBuffer,firstSector: int,sectors: int,
+    cluster: int,expected: int,replacement: int,workspace: NativeBuffer): FatLinkWrite {
+    val geometry=fatBootValidate(boot,firstSector,sectors)
+    val location=fatLinkLocate(boot,firstSector,sectors,cluster)
+    val limit=if (geometry.fatBits() == 12) 4095 else if (geometry.fatBits() == 16) 65535 else 268435455
+    if (!geometry.valid() || !location.valid() || expected < 0 || expected > limit || replacement < 0 || replacement > limit ||
+        !reader.hasAddressRange(0,28) || !workspace.hasAddressRange(0,2048) ||
+        fatBuffersOverlap(workspace,2048,reader,28) || fatBuffersOverlap(workspace,2048,boot,512)) return FatLinkWrite(2)
+    val copies=if (geometry.fatBits() == 32 && (fatBootU16(boot,40)&128) != 0) 1 else boot.load(16)
+    val spans=if (location.needsSecondSector()) 2 else 1
+    var copy=0
+    while (copy < copies) {
+        val a=nativeBufferAt(workspace.addressValue()+copy*1024,512)
+        val b=nativeBufferAt(workspace.addressValue()+copy*1024+512,512)
+        val lba=location.sector()+copy*fatBootFatSectors(boot)
+        if (!fatStorageReadOwned(reader,lba,a) || (spans == 2 && !fatStorageReadOwned(reader,lba+1,b))) return FatLinkWrite(3)
+        if (fatLinkRaw(location,a,b) != expected) return FatLinkWrite(4)
+        if (!fatLinkPatch(location,replacement,a,b)) return FatLinkWrite(2)
+        copy=copy+1
+    }
+    var completed=0;copy=0
+    while (copy < copies) {
+        var span=0
+        while (span < spans) {
+            val data=nativeBufferAt(workspace.addressValue()+copy*1024+span*512,512)
+            if (!fatStorageWriteOwned(reader,location.sector()+copy*fatBootFatSectors(boot)+span,data)) return FatLinkWrite(5|(completed<<8))
+            completed=completed+1;span=span+1
+        }
+        copy=copy+1
+    }
+    return FatLinkWrite(1|(completed<<8))
+}

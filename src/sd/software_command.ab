@@ -1,0 +1,70 @@
+import "./spi_protocol.ab"
+import "../spi/software_transaction.ab"
+
+// Caller owns the canonical physical bus gate and has asserted CS. This
+// helper deliberately retains selection for a following data/busy phase.
+// Returns R1 (including card error flags), -1 invalid, or -2 no response.
+// It is not an initialization/presence test. Pins must already be configured.
+trusted fun softwareSdCommandSelected(clock: Pin, mosi: Pin, miso: Pin,
+    command: int, argument: int, trailing: NativeBuffer, trailingBytes: int,
+    halfPeriodMicroseconds: int): int {
+    if (command < 0 || command > 63 || argument < 0 || argument > 4294967295 ||
+        trailingBytes < 0 || trailingBytes > 4 || !trailing.hasAddressRange(0, trailingBytes) ||
+        mosi.number() < 0 || miso.number() < 0 ||
+        !softwareSpiConfigurationValid(clock, mosi, miso, 0, halfPeriodMicroseconds)) return -1
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(64 | command), 8, 0, halfPeriodMicroseconds)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(argument), 32, 0, halfPeriodMicroseconds)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(sdSpiCommandFrameCrc(command, argument)), 8, 0, halfPeriodMicroseconds)
+    // STOP_TRANSMISSION has one stuff byte before its R1 response.
+    if (command == 12) softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds)
+    var response = -2
+    var attempts = 0
+    while (response < 0 && attempts < 8) {
+        val value = int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds))
+        if (sdSpiR1Available(value)) response = value
+        attempts = attempts + 1
+    }
+    // An illegal/rejected command has only R1, not its normal R3/R7 suffix.
+    if (response >= 0 && (response & 126) == 0) {
+        var index = 0
+        while (index < trailingBytes) {
+            trailing.store(index, int(softwareSpiExchangeWordOwned(clock, mosi, miso, u32(255), 8, 0, halfPeriodMicroseconds)))
+            index = index + 1
+        }
+    }
+    response
+}
+
+// Standalone command transaction. Block I/O uses the selected helper above
+// under one ownership interval encompassing command, data and busy phases.
+trusted fun softwareSdCommandOwned(clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    command: int, argument: int, trailing: NativeBuffer, trailingBytes: int,
+    halfPeriodMicroseconds: int): int {
+    chipSelect.write(false)
+    val response = softwareSdCommandSelected(clock, mosi, miso, command, argument,
+        trailing, trailingBytes, halfPeriodMicroseconds)
+    chipSelect.write(true)
+    softwareSpiExchangeWordOwned(clock, mosi, Pin(-1), u32(255), 8, 0, halfPeriodMicroseconds)
+    response
+}
+
+trusted fun softwareSdCommand(gate: PeripheralGate, owner: u32,
+    clock: Pin, mosi: Pin, miso: Pin, chipSelect: Pin,
+    command: int, argument: int, trailing: NativeBuffer, trailingBytes: int,
+    halfPeriodMicroseconds: int = 2): SpiTransactionResult {
+    if (command < 0 || command > 63 || argument < 0 || argument > 4294967295 ||
+        trailingBytes < 0 || trailingBytes > 4 || !gate.bufferDisjoint(trailing, trailingBytes) ||
+        mosi.number() < 0 || miso.number() < 0 ||
+        !softwareSpiConfigurationValid(clock, mosi, miso, 0, halfPeriodMicroseconds) ||
+        !softwareSpiSelectionValid(clock, mosi, miso, chipSelect, 0, 0)) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    clock.write(false)
+    val response = softwareSdCommandOwned(clock, mosi, miso, chipSelect, command, argument,
+        trailing, trailingBytes, halfPeriodMicroseconds)
+    // The card can release MISO during these CS-high clocks, before another
+    // device acquires the shared bus. MOSI remains high.
+    if (!gate.finish(owner, true)) return SpiTransactionResult(5 << 32)
+    if (response < 0) return SpiTransactionResult(6 << 32)
+    SpiTransactionResult((1 << 32) | response)
+}

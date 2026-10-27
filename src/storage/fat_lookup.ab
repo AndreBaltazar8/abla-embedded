@@ -1,0 +1,115 @@
+import "./fat_directory_read.ab"
+import "./fat_long_name.ab"
+import "./fat_unicode_upper.ab"
+// Exact single-component lookup of an already canonical 11-byte OEM short
+// name (space-padded 8+3, no dot separator; escaped E5 is supplied as E5).
+// No case folding, path parsing or LFN reconstruction. Medium, BPB, reader
+// and name stay immutable; sector512 and scratch1024 are exclusively owned.
+// Returns decoded file/directory/parent-root (status1/2/8); lookup failures:
+// 9notfound10input11IO12corrupt13cycle14budget. No allocation or writes.
+trusted fun fatLookupShortOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,startCluster: int,name: NativeBuffer,budget: int,sector: NativeBuffer,scratch: NativeBuffer): FatDirectoryEntry {
+    fatLookupNameOwned(reader,boot,first,sectors,startCluster,name,11,false,NativeBuffer(0),budget,sector,scratch,NativeBuffer(0),false)
+}
+// Exact UTF-16LE single-component LFN lookup (no terminator in length).
+// Case-sensitive, no Unicode normalization/OEM alias fallback. Caller owns
+// additional520-byte assembly storage; malformed LFN chains cannot attach to
+// unrelated short entries. Same I/O budgets/errors as short-name lookup.
+trusted fun fatLookupLongOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,startCluster: int,name: NativeBuffer,units: int,assembly: NativeBuffer,budget: int,sector: NativeBuffer,scratch: NativeBuffer): FatDirectoryEntry {
+    fatLookupNameOwned(reader,boot,first,sectors,startCluster,name,units,true,assembly,budget,sector,scratch,NativeBuffer(0),false)
+}
+// Uses the pinned FatFs uppercase mapping, without Unicode normalization.
+trusted fun fatLookupLongInsensitiveOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,startCluster: int,name: NativeBuffer,units: int,assembly: NativeBuffer,budget: int,sector: NativeBuffer,scratch: NativeBuffer): FatDirectoryEntry =
+    fatLookupNameOwned(reader,boot,first,sectors,startCluster,name,units,true,assembly,budget,sector,scratch,NativeBuffer(0),true)
+// Optional canonical11-byte short alias is checked in the SAME scan, not a
+// second traversal with a fresh budget. A null alias disables fallback.
+trusted fun fatLookupNameOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,startCluster: int,name: NativeBuffer,length: int,longName: bool,assembly: NativeBuffer,budget: int,sector: NativeBuffer,scratch: NativeBuffer,alias: NativeBuffer,fold: bool,location: NativeBuffer = NativeBuffer(0),excludedEntry: int = -1): FatDirectoryEntry {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (length < 1 || length > 255 || excludedEntry < -1 || excludedEntry > 68719476735) return FatDirectoryEntry(10<<60)
+    val nameBytes=if (longName) length*2 else 11
+    // Optional8B output: parent-relative sector ordinal and entry index.
+    // Written only on success; sector retains the exact matching snapshot.
+    if ((location|0) != 0 && (!location.hasAddressRange(0,8) ||
+        fatBuffersOverlap(location,8,reader,28) || fatBuffersOverlap(location,8,boot,512) ||
+        fatBuffersOverlap(location,8,name,nameBytes) || fatBuffersOverlap(location,8,sector,512) ||
+        fatBuffersOverlap(location,8,scratch,1024) || (longName && fatBuffersOverlap(location,8,assembly,520)) ||
+        ((alias|0) != 0 && fatBuffersOverlap(location,8,alias,11)))) return FatDirectoryEntry(10<<60)
+    if (!geometry.valid() || budget < 1 || budget > 1000000 || !name.hasAddressRange(0,nameBytes) ||
+        fatBuffersOverlap(name,nameBytes,sector,512) || fatBuffersOverlap(name,nameBytes,scratch,1024)) return FatDirectoryEntry(10<<60)
+    if (longName && (!fatLongNameUtf16Valid(name,length) || !assembly.hasAddressRange(0,520) ||
+        fatBuffersOverlap(assembly,520,reader,28) || fatBuffersOverlap(assembly,520,boot,512) ||
+        fatBuffersOverlap(assembly,520,name,nameBytes) || fatBuffersOverlap(assembly,520,sector,512) ||
+        fatBuffersOverlap(assembly,520,scratch,1024))) return FatDirectoryEntry(10<<60)
+    if ((alias | 0) != 0 && (!alias.hasAddressRange(0,11) || fatBuffersOverlap(alias,11,sector,512) ||
+        fatBuffersOverlap(alias,11,scratch,1024) || (longName && fatBuffersOverlap(alias,11,assembly,520)))) return FatDirectoryEntry(10<<60)
+    var longState=FatLongName(0)
+    val fixed=startCluster == 0 && geometry.fatBits() != 32
+    var cluster=if (startCluster == 0 && !fixed) fatBootU32(boot,44) else startCluster
+    var ordinal=0
+    var absoluteOrdinal=0
+    var remaining=budget
+    var anchor=cluster
+    var power=1
+    var distance=0
+    var visited=1
+    while (remaining > 0) {
+        val read=fatDirectoryReadOwned(reader,boot,first,sectors,cluster,ordinal,1,sector,scratch)
+        if (read.status() == 2) return FatDirectoryEntry(9<<60)
+        if (read.status() != 1) return FatDirectoryEntry((if (read.status() == 4) 11 else 10)<<60)
+        remaining=remaining-1
+        var index=0
+        while (index < 16) {
+            val entry=fatDirectoryDecode(sector,index,geometry.fatBits(),geometry.clusters())
+            if (entry.status() == 3) return FatDirectoryEntry(9<<60)
+            if (entry.status() == 7) return FatDirectoryEntry(12<<60)
+            if (longName && entry.status() == 5) {
+                longState=longState.consume(nativeBufferAt(sector.addressValue()+index*32,32),assembly)
+            } else if (entry.isFile() || entry.isDirectory()) {
+                var position=0
+                var matches=if (longName) longState.length() == length && longState.matches(nativeBufferAt(sector.addressValue()+index*32,32),assembly) else true
+                val compareUnits=if (longName && fold) length else nameBytes
+                while (matches && position < compareUnits) {
+                    if (longName && fold) {
+                        if (fatUnicodeUpper(assembly.loadU16(position*2)) != fatUnicodeUpper(name.loadU16(position*2))) matches=false
+                    } else if ((if (longName) assembly.load(position) else fatShortNameByte(sector,index,position)) != name.load(position)) matches=false
+                    position=position+1
+                }
+                if (!matches && (alias | 0) != 0) {
+                    matches=true; position=0
+                    while (position < 11) {
+                        if (fatShortNameByte(sector,index,position) != alias.load(position)) matches=false
+                        position=position+1
+                    }
+                }
+                // Rename may exclude one previously snapshot-validated source
+                // at its parent-relative ordinal*16+index. Never an alias-wide exclusion.
+                if (matches && absoluteOrdinal*16+index != excludedEntry) {
+                    if ((location|0) != 0) { location.storeU32(0,absoluteOrdinal);location.storeU32(4,index) }
+                    return entry
+                }
+            }
+            if (entry.status() != 5) longState=FatLongName(0)
+            index=index+1
+        }
+        ordinal=ordinal+1
+        absoluteOrdinal=absoluteOrdinal+1
+        if (fixed) {
+            if (ordinal >= (fatBootU16(boot,17)>>4)) return FatDirectoryEntry(9<<60)
+        } else if (ordinal == geometry.sectorsPerCluster()) {
+            val linkLocation=fatLinkLocate(boot,first,sectors,cluster)
+            val cost=if (linkLocation.needsSecondSector()) 2 else 1
+            if (remaining < cost) return FatDirectoryEntry(14<<60)
+            remaining=remaining-cost
+            val link=fatReadLinkOwned(reader,boot,first,sectors,cluster,scratch)
+            if (link.status() == 8) return FatDirectoryEntry(11<<60)
+            if (link.status() == 2) return FatDirectoryEntry(9<<60)
+            if (link.status() != 1) return FatDirectoryEntry(12<<60)
+            cluster=link.nextCluster()
+            distance=distance+1
+            if (cluster == anchor || visited >= geometry.clusters()) return FatDirectoryEntry(13<<60)
+            if (distance == power) { anchor=cluster; power=power*2; distance=0 }
+            visited=visited+1
+            ordinal=0
+        }
+    }
+    return FatDirectoryEntry(14<<60)
+}

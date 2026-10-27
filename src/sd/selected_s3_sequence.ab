@@ -1,0 +1,58 @@
+import "./selected_init.ab"
+import "./selected_read.ab"
+import "./selected_write.ab"
+import "../esp32/spi/pins_sequence_esp32s3.ab"
+import "../esp32/spi/buffer_sequence_esp32s3.ab"
+import "../esp32/spi/transfer_sequence_esp32s3.ab"
+// Compile-time backend for the shared SD protocol, not a second card owner.
+// Caller holds the canonical SPI gate and owns configured pins/CS/card power.
+// Scalar pins24, CS6, SPI3bit30, valid31. SPI0/1 flash buses are never admitted.
+type SdSpiS3Link=int
+fun sdSpiS3Link(peripheral: int,pins: SpiPins,select: Pin): SdSpiS3Link =
+    SdSpiS3Link(if (esp32s3SpiMasterPinsValid(peripheral,pins,select))
+        (pins&0xffffff)|((select|0)<<24)|((peripheral-2)<<30)|(1<<31) else 0)
+fun SdSpiS3Link.peripheral(): int = 2+((this>>>30)&1)
+fun SdSpiS3Link.pins(): SpiPins = SpiPins(this&0xffffff)
+fun SdSpiS3Link.select(): Pin = Pin((this>>>24)&63)
+fun SdSpiS3Link.valid(): bool = this > 0 && (this>>>32) == 0 && (this&(1<<31)) != 0 &&
+    esp32s3SpiMasterPinsValid(this.peripheral(),this.pins(),this.select())
+fun s3SdStorageValid(buffer: NativeBuffer,bytes: int): bool = bytes >= 0 && buffer.hasAddressRange(0,bytes) &&
+    (bytes == 0 || buffer.addressValue() >= 0x60100000 || buffer.addressValue()+bytes <= 0x60000000)
+// Live GPIO-matrix routing, push-pull, GPIO mux and OE checks. No pad mutation
+// or inference that latch readback is physical voltage/card presence proof.
+trusted fun s3SdOutputReady(number: int,signal: int): bool {
+    val bank=if (number >= 32) 12 else 0
+    return (esp32s3SpiRead(0x60004020+bank)&(1<<(number&31))) != 0 &&
+        (esp32s3SpiRead(0x60004554+number*4)&4095) == signal &&
+        (esp32s3SpiRead(0x60004074+number*4)&4) == 0 &&
+        (esp32s3SpiRead(s3SdMuxAddress(number))&0x7000) == 0x1000
+}
+trusted fun SdSpiS3Link.readyWithSelect(high: bool): bool {
+    if (!this.valid() || esp32s3SpiExchangeReady(this.peripheral()) != 1) return false
+    val base=esp32s3SpiBase(this.peripheral())
+    if ((esp32s3SpiRead(base+0x20)&(1<<29)) != 0 ||
+        (esp32s3SpiRead(base+0x10)&512) != 0 || (esp32s3SpiRead(base+8)&0x07800000) != 0) return false
+    val pins=this.pins();val cs=this.select()|0
+    val signal=if (this.peripheral() == 2) 101 else 66
+    val miso=pins.misoPin()
+    val csBank=if (cs >= 32) 12 else 0
+    val inBank=if (miso >= 32) 12 else 0
+    return s3SdOutputReady(cs,1280) && s3SdOutputReady(pins.clockPin(),signal) &&
+        s3SdOutputReady(pins.mosiPin(),signal+2) &&
+        ((esp32s3SpiRead(0x60004004+csBank)&(1<<(cs&31))) != 0) == high &&
+        (esp32s3SpiRead(0x60004020+inBank)&(1<<(miso&31))) == 0 &&
+        (esp32s3SpiRead(0x60004554+miso*4)&3072) == 1024 &&
+        (esp32s3SpiRead(s3SdMuxAddress(miso))&0x7200) == 0x1200 &&
+        (esp32s3SpiRead(0x60004154+(signal+1)*4)&255) == (128|miso)
+}
+trusted fun SdSpiS3Link.selectedReady(): bool = this.readyWithSelect(false)
+trusted fun sdSpiSelectedAdmission(context: int,scratch: NativeBuffer,trailing: NativeBuffer,bytes: int): bool =
+    s3SdStorageValid(scratch,2) && s3SdStorageValid(trailing,bytes) && SdSpiS3Link(context).selectedReady()
+trusted fun sdSpiSelectedExchange(context: int,value: int,scratch: NativeBuffer): int {
+    val link=SdSpiS3Link(context)
+    if (!link.valid() || !s3SdStorageValid(scratch,2)) return 2
+    scratch.store(0,value)
+    val result=esp32s3SpiExchangeOwned(link.peripheral(),nativeBufferAt(scratch.addressValue(),1),
+        nativeBufferAt(scratch.addressValue()+1,1),1,1000)
+    return if (result == 257) (1<<32)|scratch.load(1) else result
+}

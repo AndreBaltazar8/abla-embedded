@@ -1,0 +1,65 @@
+import "./ft5x06_snapshot.ab"
+import "../esp32/sdk/raw_buffer.ab"
+
+// Select I2cBus/I2cDevice separately. Register protocol follows M5GFX
+// Touch_FT5x06. Reset/wake/interrupt pads remain explicitly board-owned.
+type Ft5x06 = int
+trusted fun ft5x06(bus: I2cBus, address: int = 56, frequency: int = 400000): Ft5x06 =
+    Ft5x06(if (bus.valid()) bus.device(address, frequency) & 4294967295 else 0)
+fun Ft5x06.valid(): bool = this > 0 && this <= 4294967295
+fun Ft5x06.device(): I2cDevice = I2cDevice(if (this.valid()) this | 0 else 0)
+trusted fun Ft5x06.close(): bool = this.valid() && this.device().close()
+
+// Board must complete any required reset before begin. No hidden retry that
+// rewrites controller mode during ordinary reads or after a failed transfer.
+trusted fun Ft5x06.begin(): bool {
+    if (!this.valid()) return false
+    val identity = nativeBufferAt(nativeStackAllocate(6), 6)
+    this.device().writeRegister8(0, 0) &&
+        this.device().readRegister(163, identity, 6) &&
+        this.device().writeRegister8(164, 0) && identity.load(5) != 0
+}
+trusted fun Ft5x06.sleep(): bool = this.valid() && this.device().writeRegister8(165, 3)
+// This register write alone is not the optional512us interrupt-pad wake pulse.
+trusted fun Ft5x06.monitorMode(): bool = this.valid() && this.device().writeRegister8(165, 1)
+trusted fun Ft5x06.pollingMode(): bool = this.valid() && this.device().writeRegister8(164, 0)
+
+trusted fun Ft5x06.readSnapshot(destination: NativeBuffer): int {
+    if (!this.valid() || !destination.hasAddressRange(0, 29)) return -1
+    if (!this.device().readRegister(2, destination, 1)) return -1
+    val count = destination.load(0) & 15
+    val size = ft5x06SnapshotBytes(count)
+    if (size == 0) return -1
+    if (count == 0) return 0
+    if (!this.device().readRegister(2, destination, size)) return -1
+    if ((destination.load(0) & 15) != count) return -2
+    count
+}
+
+// Caller storage29bytes. Return0..5 points, -1 invalid/transport failure,
+// -2 unstable. Only successful captures may be decoded. Six captures max;
+// compare equal-sized snapshots, never stale/uninitialized bytes after error.
+trusted fun Ft5x06.readStable(destination: NativeBuffer): int {
+    if (!destination.hasAddressRange(0, 29)) return -1
+    val previous = nativeBufferAt(nativeStackAllocate(29), 29)
+    var lastCount = this.readSnapshot(previous)
+    if (lastCount == -1) return -1
+    var attempt = 0
+    while (attempt < 5) {
+        val count = this.readSnapshot(destination)
+        if (count == -1) return -1
+        var equal = count >= 0 && count == lastCount
+        val size = ft5x06SnapshotBytes(count)
+        var index = 0
+        while (index < size) {
+            val value = destination.load(index)
+            if (equal && previous.load(index) != value) equal = false
+            previous.store(index, value)
+            index = index + 1
+        }
+        if (equal) return count
+        lastCount = count
+        attempt = attempt + 1
+    }
+    return -2
+}

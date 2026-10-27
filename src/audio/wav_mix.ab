@@ -1,0 +1,154 @@
+import "./wav_pcm16.ab"
+import "./pcm16_mix.ab"
+import "./wav_resample.ab"
+
+// Up to eight immutable-during-render voice descriptors in caller memory.
+// Each16-byte slot: WAV metadata address, Q15gain, finite repeats, start frame.
+// One scalar view, no owned heap or decoded-clip copies. outputRate0 requires
+// matching source rates; an explicit8..96k rate enables linear resampling.
+// Start/duration use output frames; each repeat rounds its duration up to one
+// whole output frame. Linear downsampling is not an anti-alias filter.
+type PcmWavMix = int
+fun PcmWavMix.storage(): NativeBuffer = NativeBuffer(this | 0)
+fun PcmWavMix.voiceCount(): int = this.storage().capacity()/16
+trusted fun pcmWavMixAt(storage: NativeBuffer,voices: int): PcmWavMix {
+    if (voices < 1 || voices > 8 || !storage.hasAddressRange(0,voices*16)) return PcmWavMix(0)
+    var offset=0
+    while (offset < voices*16) { storage.storeU32(offset,0); offset=offset+4 }
+    PcmWavMix(nativeBufferAt(storage.addressValue(),voices*16) | 0)
+}
+
+// Returns the finite timeline length,0 for no active voices,-1 if invalid.
+trusted fun PcmWavMix.frames(outputRate: int=0): int {
+    if (outputRate != 0 && (outputRate < 8000 || outputRate > 96000)) return -1
+    val table=this.storage()
+    val count=this.voiceCount()
+    if (count < 1 || count > 8 || table.capacity() != count*16 ||
+        !table.hasAddressRange(0,count*16)) return -1
+    var end=0
+    var rate=0
+    var index=0
+    while (index < count) {
+        val offset=index*16
+        val wav=PcmWav(table.loadU32(offset))
+        if (wav != PcmWav(0)) {
+            val frames=if (outputRate == 0) wav.frames() else wav.resampledFrames(outputRate)
+            val gain=table.loadU32(offset+4)
+            val repeats=table.loadU32(offset+8)
+            val delay=table.loadU32(offset+12)
+            if (frames < 1 || frames > 2147483647 || gain > 32768 || repeats < 1 || repeats > 2147483647 ||
+                delay > 2147483647 || frames*repeats > 2147483647-delay ||
+                (outputRate == 0 && rate != 0 && rate != wav.sampleRate()) ||
+                pcmMixSpansOverlap(table,count*16,nativeBufferAt(wav,20),20) ||
+                pcmMixSpansOverlap(table,count*16,wav.samples(),wav.samples().capacity())) return -1
+            rate=wav.sampleRate()
+            val voiceEnd=delay+frames*repeats
+            if (voiceEnd > end) end=voiceEnd
+        }
+        index=index+1
+    }
+    end
+}
+
+trusted fun PcmWavMix.sampleRate(outputRate: int=0): int {
+    if (this.frames(outputRate) < 0) return 0
+    if (outputRate != 0) return outputRate
+    var index=0
+    while (index < this.voiceCount()) {
+        val wav=PcmWav(this.storage().loadU32(index*16))
+        if (wav != PcmWav(0)) return wav.sampleRate()
+        index=index+1
+    }
+    0
+}
+
+trusted fun PcmWavMix.setVoice(index: int,wav: PcmWav,gainQ15: int=32768,
+    repeats: int=1,startFrame: int=0,outputRate: int=0): bool {
+    if (this.frames(outputRate) < 0 || index < 0 || index >= this.voiceCount() || gainQ15 < 0 || gainQ15 > 32768 ||
+        repeats < 1 || repeats > 2147483647 || startFrame < 0 || startFrame > 2147483647) return false
+    val frames=if (outputRate == 0) wav.frames() else wav.resampledFrames(outputRate)
+    if (frames < 1 || frames > 2147483647 || frames*repeats > 2147483647-startFrame) return false
+    val table=this.storage()
+    if (pcmMixSpansOverlap(table,table.capacity(),nativeBufferAt(wav,20),20) ||
+        pcmMixSpansOverlap(table,table.capacity(),wav.samples(),wav.samples().capacity())) return false
+    var other=0
+    while (other < this.voiceCount()) {
+        val active=PcmWav(table.loadU32(other*16))
+        if (outputRate == 0 && other != index && active != PcmWav(0) && active.sampleRate() != wav.sampleRate()) return false
+        other=other+1
+    }
+    table.storeU32(index*16,wav); table.storeU32(index*16+4,gainQ15)
+    table.storeU32(index*16+8,repeats); table.storeU32(index*16+12,startFrame)
+    true
+}
+
+trusted fun PcmWavMix.clearVoice(index: int,outputRate: int=0): bool {
+    if (this.frames(outputRate) < 0 || index < 0 || index >= this.voiceCount()) return false
+    this.storage().storeU32(index*16,0)
+    true
+}
+
+// Check against ALL borrowed metadata/source before mutating any workspace.
+trusted fun PcmWavMix.disjointFrom(buffer: NativeBuffer,bytes: int,outputRate: int=0): bool {
+    if (this.frames(outputRate) < 0 || !buffer.hasAddressRange(0,bytes) ||
+        pcmMixSpansOverlap(this.storage(),this.storage().capacity(),buffer,bytes)) return false
+    var index=0
+    while (index < this.voiceCount()) {
+        val wav=PcmWav(this.storage().loadU32(index*16))
+        if (wav != PcmWav(0) &&
+            (pcmMixSpansOverlap(nativeBufferAt(wav,20),20,buffer,bytes) ||
+             pcmMixSpansOverlap(wav.samples(),wav.samples().capacity(),buffer,bytes))) return false
+        index=index+1
+    }
+    true
+}
+
+// Stateless timeline rendering makes busy/retried DMA blocks deterministic.
+// Accumulator needs8bytes/frame, scratch/output4bytes/frame; all disjoint.
+// Silence fills delayed starts, ended voices and the final partial block.
+trusted fun PcmWavMix.copyStereo16(firstFrame: int,frames: int,
+    accumulator: NativeBuffer,scratch: NativeBuffer,output: NativeBuffer,masterGainQ15: int=32768,outputRate: int=0): bool {
+    if (this.frames(outputRate) < 0 || firstFrame < 0 || firstFrame > 2147483647 || frames < 0 || frames > 268435455 ||
+        masterGainQ15 < 0 || masterGainQ15 > 32768 ||
+        !this.disjointFrom(accumulator,frames*8,outputRate) || !this.disjointFrom(scratch,frames*4,outputRate) ||
+        !this.disjointFrom(output,frames*4,outputRate) ||
+        pcmMixSpansOverlap(accumulator,frames*8,scratch,frames*4) ||
+        pcmMixSpansOverlap(accumulator,frames*8,output,frames*4) ||
+        pcmMixSpansOverlap(scratch,frames*4,output,frames*4)) return false
+    if (!clearPcm16Mix(accumulator,frames*2)) return false
+    var voice=0
+    while (voice < this.voiceCount()) {
+        val offset=voice*16
+        val table=this.storage()
+        val wav=PcmWav(table.loadU32(offset))
+        val gain=table.loadU32(offset+4)
+        if (wav != PcmWav(0) && gain != 0) {
+            var sample=0
+            while (sample < frames) { scratch.storeU32(sample*4,0); sample=sample+1 }
+            val delay=table.loadU32(offset+12)
+            val period=if (outputRate == 0) wav.frames() else wav.resampledFrames(outputRate)
+            val end=delay+period*table.loadU32(offset+8)
+            var position=0
+            while (position < frames) {
+                val current=firstFrame+position
+                if (current >= end) break
+                if (current < delay) {
+                    val gap=delay-current
+                    position=position+(if (gap < frames-position) gap else frames-position)
+                } else {
+                    val sourceFrame=int(u32(current-delay)%u32(period))
+                    val count=if (period-sourceFrame < frames-position) period-sourceFrame else frames-position
+                    val destination=nativeBufferAt(scratch.addressValue()+position*4,count*4)
+                    val copied=if (outputRate == 0 || outputRate == wav.sampleRate())
+                        wav.copyStereo16(sourceFrame,count,destination)
+                        else wav.copyResampledStereo16(sourceFrame,count,outputRate,destination)
+                    if (copied != count*4) return false
+                    position=position+count
+                }
+            }
+            if (!addPcm16ToMix(accumulator,scratch,frames*2,gain)) return false
+        }
+        voice=voice+1
+    }
+    finishPcm16Mix(accumulator,output,frames*2,masterGainQ15)
+}

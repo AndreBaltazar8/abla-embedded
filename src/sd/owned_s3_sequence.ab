@@ -1,0 +1,83 @@
+import "./selected_s3_sequence.ab"
+import "../spi/buffer_gate.ab"
+// Extends protocol statuses:11gatebusy12gatefault13ownership14liveadmission
+// 15CS16releaseclock. Failures latch the canonical gate; no automatic retry.
+fun SdSpiInitResult.cleanupPending(): bool = (this&(1<<26)) != 0
+fun SdSpiReadResult.cleanupPending(): bool = (this&(1<<31)) != 0
+fun SdSpiWriteResult.cleanupPending(): bool = (this&(1<<31)) != 0
+// sourceHz is actual stable XTAL or PLL80, not requested SPI bitrate. Check
+// live root gates/reset/source/dividers; never reset/configure another client.
+trusted fun SdSpiS3Link.clockReady(sourceHz: int,maximumHz: int): bool {
+    if (!this.valid() || sourceHz < 1000000 || sourceHz > 80000000 || maximumHz < 1) return false
+    val base=esp32s3SpiBase(this.peripheral())
+    val mask=if (this.peripheral() == 2) 64 else 65536
+    if ((esp32s3SpiRead(0x600c0018)&mask) == 0 || (esp32s3SpiRead(0x600c0020)&mask) != 0) return false
+    val root=esp32s3SpiRead(base+0xe8)
+    if ((root&3) != 3 || ((root&4) != 0 && sourceHz != 80000000)) return false
+    val clock=esp32s3SpiRead(base+12)
+    val pre=if ((clock&(1<<31)) != 0) 1 else ((clock>>>18)&15)+1
+    val cycles=if ((clock&(1<<31)) != 0) 1 else ((clock>>>12)&63)+1
+    return sourceHz <= maximumHz*pre*cycles
+}
+fun s3SdOwnedStorageReady(link: SdSpiS3Link,gate: PeripheralGate,scratch: NativeBuffer,
+    data: NativeBuffer,bytes: int,polls: int,sourceHz: int): bool =
+    link.valid() && gate.word().valid() && gate.word().address() > 0 && gate.word().address() <= 4294967292 &&
+    s3SdStorageValid(nativeBufferAt(gate.word().address(),4),4) &&
+    s3SdStorageValid(scratch,2) && s3SdStorageValid(data,bytes) &&
+    gate.bufferDisjoint(scratch,2) && gate.bufferDisjoint(data,bytes) &&
+    (scratch.addressValue()+2 <= data.addressValue() || data.addressValue()+bytes <= scratch.addressValue()) &&
+    polls >= 1 && polls <= 1000000 && sourceHz >= 1000000 && sourceHz <= 80000000
+// Return0 clean,15 cannot deselect safely,16 release-clock failure+raw32.
+// Do not deassert an active/busy controller and pretend its DMA/storage stopped.
+trusted fun SdSpiS3Link.finishSdSelected(scratch: NativeBuffer): int {
+    if (esp32s3SpiExchangeReady(this.peripheral()) != 1 || !s3SdSelectLevel(this.select(),true)) return 15
+    val release=sdSpiSelectedExchange(this|0,255,scratch)
+    return if ((release>>>32) == 1) 0 else 16|((release&4294967295)<<32)
+}
+trusted fun SdSpiS3Link.initializeSd(gate: PeripheralGate,owner: u32,sourceHz: int,
+    scratch: NativeBuffer,response: NativeBuffer,readyPolls: int = 1000): SdSpiInitResult {
+    if (!s3SdOwnedStorageReady(this,gate,scratch,response,4,readyPolls,sourceHz)) return SdSpiInitResult(2)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SdSpiInitResult(if (admission == 1) 11 else if (admission == 2) 12 else 2)
+    var result=SdSpiInitResult(14)
+    if (this.readyWithSelect(true) && this.clockReady(sourceHz,400000)) {
+        result=SdSpiInitResult(1)
+        var count=0
+        while (count < 10 && result.valid()) {
+            val byte=sdSpiSelectedExchange(this|0,255,scratch)
+            if ((byte>>>32) != 1) result=SdSpiInitResult(4|((byte&4294967295)<<32))
+            count=count+1
+        }
+        if (result.valid()) result=if (!s3SdSelectLevel(this.select(),false)) SdSpiInitResult(15)
+            else sdSpiInitializeSelected(this|0,scratch,response,readyPolls)
+        val cleanup=this.finishSdSelected(scratch)
+        if (cleanup != 0) result=SdSpiInitResult((if (result.valid()) cleanup else result|0)|(1<<26))
+    }
+    if (!gate.finish(owner,result.valid())) return SdSpiInitResult((result&~255)|13)
+    return result
+}
+// Same card/master lifetime as initialization. Default-speed <=25MHz only;
+// power/removal/reset invalidates state. Write failures may have changed media.
+trusted fun SdSpiS3Link.transferSdBlockOwned(gate: PeripheralGate,owner: u32,sourceHz: int,
+    state: SdSpiInitResult,block: int,scratch: NativeBuffer,data: NativeBuffer,polls: int,write: bool): int {
+    if (!state.valid() || !sdSpiBlockAddressValid(state.highCapacity(),block) ||
+        !s3SdOwnedStorageReady(this,gate,scratch,data,512,polls,sourceHz)) return 2
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return if (admission == 1) 11 else if (admission == 2) 12 else 2
+    var result=14
+    if (this.readyWithSelect(true) && this.clockReady(sourceHz,25000000)) {
+        if (!s3SdSelectLevel(this.select(),false)) result=15
+        else result=if (write) sdSpiWriteBlockSelected(this|0,state.highCapacity(),block,scratch,data,polls)|0
+            else sdSpiReadBlockSelected(this|0,state.highCapacity(),block,scratch,data,polls)|0
+        val cleanup=this.finishSdSelected(scratch)
+        if (cleanup != 0) result=(if ((result&255) == 1) (result&~255)|cleanup else result)|(1<<31)
+    }
+    if (!gate.finish(owner,(result&255) == 1)) return (result&~255)|13
+    return result
+}
+trusted fun SdSpiS3Link.readSdBlock(gate: PeripheralGate,owner: u32,sourceHz: int,state: SdSpiInitResult,
+    block: int,scratch: NativeBuffer,destination: NativeBuffer,polls: int = 250): SdSpiReadResult =
+    SdSpiReadResult(this.transferSdBlockOwned(gate,owner,sourceHz,state,block,scratch,destination,polls,false))
+trusted fun SdSpiS3Link.writeSdBlock(gate: PeripheralGate,owner: u32,sourceHz: int,state: SdSpiInitResult,
+    block: int,scratch: NativeBuffer,source: NativeBuffer,polls: int = 250): SdSpiWriteResult =
+    SdSpiWriteResult(this.transferSdBlockOwned(gate,owner,sourceHz,state,block,scratch,source,polls,true))

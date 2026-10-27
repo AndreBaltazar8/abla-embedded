@@ -1,0 +1,63 @@
+import "./selected_command.ab"
+// Status1ready2invalid3command4transport5idleTimeout6condition7appInit
+// 8readyTimeout9OCR10blockLength. Failed command6bits@8, R1@16,
+// highCapacity bit24, version2 bit25; raw transport detail32@32.
+type SdSpiInitResult=int
+fun SdSpiInitResult.status(): int = this&255
+fun SdSpiInitResult.valid(): bool = this.status() == 1
+fun SdSpiInitResult.command(): int = (this>>>8)&63
+fun SdSpiInitResult.r1(): int = (this>>>16)&255
+fun SdSpiInitResult.highCapacity(): bool = this.valid() && (this&(1<<24)) != 0
+fun SdSpiInitResult.version2(): bool = this.valid() && (this&(1<<25)) != 0
+fun SdSpiInitResult.transportDetail(): int = (this>>>32)&4294967295
+fun sdSpiInitFailure(status: int,command: int,result: SdSpiCommandResult): SdSpiInitResult =
+    SdSpiInitResult((if (result.status() == 4) 4 else status)|(command<<8)|(result.r1()<<16)|(result.transportDetail()<<32))
+// Negotiation only: caller holds the canonical gate and selected CS at mode0,
+// MSB-first <=400kHz, after settled card power and >=74 clocks with CS/MOSI high.
+// Keep selected for this whole chain. No implicit rail/clock changes or retry
+// after a transport failure. A ready state is invalidated by card removal/reset.
+trusted fun sdSpiInitializeSelected(context: int,scratch: NativeBuffer,response: NativeBuffer,
+    readyPolls: int = 1000): SdSpiInitResult {
+    if (readyPolls < 1 || readyPolls > 1000000 || !scratch.hasAddressRange(0,2) ||
+        !response.hasAddressRange(0,4) ||
+        (scratch.addressValue() < response.addressValue()+4 && response.addressValue() < scratch.addressValue()+2) ||
+        !sdSpiSelectedAdmission(context,scratch,response,4)) return SdSpiInitResult(2)
+    var attempts=0
+    var idle=false
+    while (!idle && attempts < 16) {
+        val result=sdSpiCommandSelected(context,0,0,scratch,NativeBuffer(0),0)
+        if (result.status() == 4) return sdSpiInitFailure(3,0,result)
+        if (result.status() == 2) return SdSpiInitResult(2)
+        idle=result.valid() && result.r1() == 1
+        attempts=attempts+1
+    }
+    if (!idle) return SdSpiInitResult(5)
+    val condition=sdSpiCommandSelected(context,8,426,scratch,response,4)
+    if (!condition.valid()) return sdSpiInitFailure(6,8,condition)
+    val version2=condition.r1() == 1
+    if (version2) {
+        if (condition.trailingBytes() != 4 || response.load(0) != 0 || response.load(1) != 0 ||
+            response.load(2) != 1 || response.load(3) != 170) return sdSpiInitFailure(6,8,condition)
+    } else if (condition.r1() != 5) return sdSpiInitFailure(6,8,condition)
+    var ready=false
+    attempts=0
+    while (!ready && attempts < readyPolls) {
+        val prefix=sdSpiCommandSelected(context,55,0,scratch,NativeBuffer(0),0)
+        if (!prefix.valid() || (prefix.r1() != 0 && prefix.r1() != 1)) return sdSpiInitFailure(7,55,prefix)
+        val state=sdSpiCommandSelected(context,41,if (version2) 1073741824 else 0,scratch,NativeBuffer(0),0)
+        if (!state.valid() || (state.r1() != 0 && state.r1() != 1)) return sdSpiInitFailure(7,41,state)
+        ready=state.r1() == 0;attempts=attempts+1
+        if (!ready && attempts < readyPolls) sdSpiSelectedDelay(1000)
+    }
+    if (!ready) return SdSpiInitResult(8|(41<<8)|(1<<16))
+    val power=sdSpiCommandSelected(context,58,0,scratch,response,4)
+    if (!power.valid() || power.r1() != 0 || power.trailingBytes() != 4) return sdSpiInitFailure(9,58,power)
+    val ocr=(response.load(0)<<24)|(response.load(1)<<16)|(response.load(2)<<8)|response.load(3)
+    if ((ocr&2147483648) == 0 || (ocr&16744448) == 0) return sdSpiInitFailure(9,58,power)
+    val highCapacity=version2 && (ocr&1073741824) != 0
+    if (!highCapacity) {
+        val length=sdSpiCommandSelected(context,16,512,scratch,NativeBuffer(0),0)
+        if (!length.valid() || length.r1() != 0) return sdSpiInitFailure(10,16,length)
+    }
+    return SdSpiInitResult(1|(if (highCapacity) 1<<24 else 0)|(if (version2) 1<<25 else 0))
+}

@@ -1,0 +1,42 @@
+// Shared SDMMC RCC lease. Caller serializes SYSTEM RMW across cores and
+// owns both slots through lease lifetime. A borrowed enabled/deasserted host
+// requires an upstream pinned lease; this is not a reference counter.
+// Snapshot clock/reset bits8/9, owned10,borrowed11. Preserve failed tokens.
+type SdMmcBus = int
+//0closed1available2exclusive-required3readback4busy5invalidtoken6lostborrow.
+fun SdMmcBus.status(): int = this&255
+trusted fun sdMmcBusFieldOwned(address: int,value: int): bool {
+    val before=sdMmcS3SystemRead(address)
+    val desired=(before&~128)|value
+    if (desired != before) sdMmcS3SystemWrite(address,desired)
+    return (sdMmcS3SystemRead(address)&128) == value
+}
+trusted fun sdMmcBusOpenOwned(exclusive: bool): SdMmcBus {
+    val clock=(sdMmcS3SystemRead(0x600c001c)>>7)&1
+    val reset=(sdMmcS3SystemRead(0x600c0024)>>7)&1
+    if (clock == 1 && reset == 0) return SdMmcBus(2049)
+    if (!exclusive) return SdMmcBus(2)
+    val token=(clock<<8)|(reset<<9)|1024
+    // Enable clock then release existing reset; never pulse a live host.
+    if (!sdMmcBusFieldOwned(0x600c001c,128) || !sdMmcBusFieldOwned(0x600c0024,0)) return SdMmcBus(token|3)
+    return SdMmcBus(token|1)
+}
+trusted fun SdMmcBus.closeOwned(quiescent: bool): SdMmcBus {
+    if (this == 0) return this
+    val flags=this&0xf00
+    if ((this>>>12) != 0 || this.status() < 1 || this.status() > 6 || (flags&3072) == 0 || (flags&3072) == 3072) return SdMmcBus(5)
+    val clock=(sdMmcS3SystemRead(0x600c001c)>>7)&1
+    val reset=(sdMmcS3SystemRead(0x600c0024)>>7)&1
+    if ((flags&2048) != 0) {
+        if (clock != 1 || reset != 0) return SdMmcBus(flags|6)
+        return SdMmcBus(0)
+    }
+    if (!quiescent) return SdMmcBus(flags|4)
+    // Read host only if accessible. After a partial failed open it may still
+    // be held reset/gated. Do not touch it merely to make cleanup possible.
+    if (clock == 1 && reset == 0 && ((sdMmcS3Read(16)&65535) != 0 || (sdMmcS3Read(44)&0x80000000) != 0 ||
+        (sdMmcS3Read(72)&0x6f0) != 0 || (sdMmcS3Read(0)&0x02000037) != 0 || (sdMmcS3Read(128)&128) != 0)) return SdMmcBus(flags|4)
+    // Reverse acquisition order; retry is safe after either failed write.
+    if (!sdMmcBusFieldOwned(0x600c0024,((flags>>9)&1)<<7) || !sdMmcBusFieldOwned(0x600c001c,((flags>>8)&1)<<7)) return SdMmcBus(flags|3)
+    return SdMmcBus(0)
+}

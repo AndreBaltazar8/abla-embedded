@@ -1,0 +1,125 @@
+// Import alongside the selected I2cBus/I2cDevice backend.
+import "../esp32/sdk/raw_buffer.ab"
+import "./types.ab"
+import "./calendar.ab"
+import "./powerhub_logic.ab"
+import "./alarm_result.ab"
+import "abla/unsafe/memory/raw"
+
+type PowerHubRtc = int
+
+// Partial reads do not depend on the validity of unrelated date/time fields.
+trusted fun PowerHubRtc.time(): RtcTime = this.timeWithBuffer(nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun PowerHubRtc.timeWithBuffer(bytes: NativeBuffer): RtcTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,3) || !this.device().readRegister(192,bytes,3)) return RtcTime(0)
+    powerHubDecodeDateTime(bytes.load(0),bytes.load(1),bytes.load(2),1,1,0,1).time()
+}
+trusted fun PowerHubRtc.date(): RtcDate = this.dateWithBuffer(nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun PowerHubRtc.dateWithBuffer(bytes: NativeBuffer): RtcDate {
+    if (!this.valid() || !bytes.hasAddressRange(0,4) || !this.device().readRegister(195,bytes,4)) return RtcDate(0)
+    powerHubDecodeDateTime(0,0,0,bytes.load(0),bytes.load(1),bytes.load(2),bytes.load(3)).date()
+}
+
+trusted fun powerHubRtc(bus: I2cBus): PowerHubRtc = PowerHubRtc(
+    if (bus.valid()) bus.device(80, 400000) & 4294967295 else 0
+)
+
+// No upper metadata bits: reject malformed casts rather than aliasing a live
+// low32 device during reads, writes, or close.
+fun PowerHubRtc.valid(): bool = this > 0 && this <= 4294967295
+fun PowerHubRtc.device(): I2cDevice = I2cDevice(this & 4294967295)
+trusted fun PowerHubRtc.begin(): bool = this.valid()
+trusted fun PowerHubRtc.close(): bool =
+    this.valid() && this.device().close()
+
+trusted fun PowerHubRtc.lowVoltageChecked(): I2cByteResult {
+    if (!this.valid()) return I2cByteResult(0)
+    val result=this.device().readRegister8Checked(2)
+    if (result.valid()) I2cByteResult(256 | (if ((result.value() & 128) != 0) 1 else 0)) else I2cByteResult(0)
+}
+trusted fun PowerHubRtc.lowVoltage(): bool {
+    val result=this.lowVoltageChecked()
+    result.valid() && result.value() != 0
+}
+
+trusted fun PowerHubRtc.dateTime(): RtcDateTime = this.dateTimeWithBuffer(nativeBufferAt(nativeStackAllocate(7),7))
+trusted fun PowerHubRtc.dateTimeWithBuffer(bytes: NativeBuffer): RtcDateTime {
+    if (!this.valid() || !bytes.hasAddressRange(0,7)) return RtcDateTime(0)
+    if (!this.device().readRegister(192, bytes, 7)) return RtcDateTime(0)
+    powerHubDecodeDateTime(
+        bytes.load(0), bytes.load(1), bytes.load(2), bytes.load(3),
+        bytes.load(4), bytes.load(5), bytes.load(6)
+    )
+}
+
+trusted fun PowerHubRtc.setDateTime(value: RtcDateTime): bool {
+    if (!this.valid() || !value.calendarValid() || value.year() < 2000 || value.year() > 2127) return false
+    this.setDateTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(7),7))
+}
+trusted fun PowerHubRtc.setDateTimeWithBuffer(value: RtcDateTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,7) || value.year() < 2000 ||
+        value.year() > 2127) return false
+    bytes.store(0, value.second() & 63)
+    bytes.store(1, value.minute() & 63)
+    bytes.store(2, value.hour() & 31)
+    bytes.store(3, value.day() & 31)
+    bytes.store(4, value.month() & 15)
+    bytes.store(5, (value.year() - 2000) & 127)
+    bytes.store(6, powerHubWeekdayValue(value.weekday()))
+    this.device().writeRegister(192, bytes, 7)
+}
+
+trusted fun PowerHubRtc.setTime(value: RtcTime): bool = this.setTimeWithBuffer(value,nativeBufferAt(nativeStackAllocate(3),3))
+trusted fun PowerHubRtc.setTimeWithBuffer(value: RtcTime,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.valid() || !bytes.hasAddressRange(0,3)) return false
+    bytes.store(0,value.second()); bytes.store(1,value.minute()); bytes.store(2,value.hour())
+    this.device().writeRegister(192,bytes,3)
+}
+trusted fun PowerHubRtc.setDate(value: RtcDate): bool = this.setDateWithBuffer(value,nativeBufferAt(nativeStackAllocate(4),4))
+trusted fun PowerHubRtc.setDateWithBuffer(value: RtcDate,bytes: NativeBuffer): bool {
+    if (!this.valid() || !value.calendarValid() || !bytes.hasAddressRange(0,4) || value.year() < 2000 || value.year() > 2127) return false
+    bytes.store(0,value.day()); bytes.store(1,value.month()); bytes.store(2,value.year()-2000)
+    bytes.store(3,powerHubWeekdayValue(value.weekday()))
+    this.device().writeRegister(195,bytes,4)
+}
+
+trusted fun PowerHubRtc.setAlarmInterrupt(
+    minute: int = -1,
+    hour: int = -1,
+    day: int = -1
+): bool = this.setAlarmInterruptChecked(minute,hour,day).valid()
+
+trusted fun PowerHubRtc.setAlarmInterruptChecked(minute: int=-1,hour: int=-1,day: int=-1): RtcAlarmResult =
+    this.setAlarmInterruptWithBuffer(nativeBufferAt(nativeStackAllocate(3),3),minute,hour,day)
+
+// Disable delivery before replacing alarm fields. Failed setup attempts to
+// leave delivery disabled; status5 means that cleanup could not be confirmed.
+// Register B0 is shared power configuration, so cleanup changes only D3 bit0.
+trusted fun PowerHubRtc.setAlarmInterruptWithBuffer(bytes: NativeBuffer,minute: int=-1,hour: int=-1,day: int=-1): RtcAlarmResult {
+    if (!this.valid() || minute < -1 || minute > 59 || hour < -1 ||
+        hour > 23 || day < -1 || day == 0 || day > 31 || !bytes.hasAddressRange(0,3)) return RtcAlarmResult(2)
+    val enabled = minute >= 0 || hour >= 0 || day >= 0
+    bytes.store(0, if (minute < 0) 0 else minute & 63)
+    bytes.store(1, if (hour < 0) 0 else hour & 31)
+    bytes.store(2, if (day < 0) 0 else day & 31)
+    val configured=this.device().updateRegister8(211,1,0) &&
+        this.device().writeRegister(208, bytes, 3) &&
+        this.device().updateRegister8(176, 1, if (enabled) 1 else 0) &&
+        this.device().updateRegister8(211, 1, if (enabled) 1 else 0)
+    if (configured) return RtcAlarmResult(1)
+    RtcAlarmResult(if (this.device().updateRegister8(211,1,0)) 4 else 5)
+}
+
+trusted fun PowerHubRtc.clearInterrupt(): bool {
+    if (!this.valid()) return false
+    val bytes = nativeBufferAt(nativeStackAllocate(4), 4)
+    nativeAddressClear(bytes.addressValue(), 4)
+    this.device().writeRegister(208, bytes, 4)
+}
+
+trusted fun PowerHubRtc.disableInterrupts(): bool =
+    this.valid() && this.device().updateRegister8(211, 1, 0)
+
+// M5Unified 0.2.21 does not implement these PowerHub operations either.
+fun PowerHubRtc.setTimerInterrupt(milliseconds: int): int = 0
+fun PowerHubRtc.interruptPending(): bool = false

@@ -1,0 +1,38 @@
+import "../esp32/cache_writeback_p4_sequence.ab"
+// Caller owns stopped DSI/its channel, descriptor, complete padded framebuffer,
+// and global cache-sync serialization. Clock/cache configuration is pinned.
+// Exclusive access must continue through the issued DMA and its observed stop.
+// Descriptor must be INTERNAL canonical RAM; no CPU-only aliases are accepted.
+// Low8 status:1 start issued,2 invalid,3 busy/pending/unavailable,4 prepare,
+// 5 frame writeback,6 descriptor writeback,7 channel config,8 start failure.
+// Failure detail in bits8+. Any failure retains ownership; cache timeout also
+// retains global sync-engine ownership. Start-issued is NOT frame completion.
+trusted fun esp32P4DsiFramePublishOwned(channel: int,descriptor: NativeBuffer,frame: NativeBuffer,bytes: int,l2Line: int,polls: int): int {
+    if (channel < 0 || channel > 3 || polls < 1 || polls > 1000000 ||
+        bytes < 8 || bytes > 33554432 || (bytes&7) != 0) return 2
+    val desc=descriptor.addressValue()
+    val pixels=frame.addressValue()
+    val span=esp32P4CacheWritebackSpan(frame,bytes,l2Line)
+    if (desc < 1341128704 || desc > 1341915072 ||
+        esp32P4CacheWritebackSpan(descriptor,64,l2Line) != 64 || span == 0 ||
+        (desc < pixels+span && pixels < desc+64)) return 2
+    // Refuse before touching a descriptor which might still be fetched by DMA.
+    val bit=u32(1)<<u32(channel)
+    if ((p4DwDmaRead(16)&u32(1)) == u32(0) || (p4DwDmaRead(88)&u32(1)) != u32(0) ||
+        ((p4DwDmaRead(24)|p4DwDmaRead(28))&bit) != u32(0) ||
+        p4DwDmaRead(392+channel*256) != u32(0) ||
+        (p4CacheSyncRead(152)&u32(15)) != u32(0)) return 3
+    if (!p4DsiPrepareFrame(descriptor,frame,bytes)) return 4
+    p4DsiPublicationFence()
+    val frameResult=p4DsiWritebackFrame(frame,bytes,l2Line,polls)
+    if (frameResult != 1) return 5|(frameResult<<8)
+    val descResult=p4DsiWritebackFrame(descriptor,64,l2Line,polls)
+    if (descResult != 1) return 6|(descResult<<8)
+    p4DsiPublicationFence()
+    val configResult=p4DsiConfigureFrameChannel(channel,desc)
+    if (configResult != 1) return 7|(configResult<<8)
+    p4DsiPublicationFence()
+    val startResult=p4DsiStartFrameChannel(channel)
+    if (startResult != 1) return 8|(startResult<<8)
+    return 1
+}

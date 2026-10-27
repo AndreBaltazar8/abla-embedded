@@ -1,0 +1,56 @@
+import "./fat_volume.ab"
+import "./fat_tree_ownership.ab"
+import "./fat_allocation_audit.ab"
+import "./fat_mirror_audit.ab"
+// Allocation consistency at one mounted generation under one shared gate.
+// No writes or repairs; all clients must obey this volume's serialization.
+// Optional mirror comparison remains inside the same gate. Not full filesystem
+// certification: no LFN/name, header/FSInfo validity or physical media proof.
+type FatVolumeAudit=int
+// Low60 bits retain phase-specific result. Phase60:0admission1tree2allocation3mirrors.
+// Admission12busy13stale14fault; phase-specific statuses documented by helpers.
+fun FatVolumeAudit.status(): int = this&255
+fun FatVolumeAudit.phase(): int = (this>>>60)&3
+fun FatVolumeAudit.detail(): int = (this>>>8)&0xfffffff
+fun FatVolumeAudit.consistent(): bool = (this.phase() == 2 || this.phase() == 3) && this.status() == 1
+// Mirroring-disabled returns phase3/status6, never claims mirror equality.
+fun FatVolumeAudit.mirrorsChecked(): bool = this.phase() == 3 && this.status() == 1
+fun FatVolumeAudit.mirrorOffset(): int = if (this.phase() == 3) (this>>>8)&0xffffffff else -1
+trusted fun FatVolume.auditAllocation(owner: u32,budget: int,queue: NativeBuffer,data: NativeBuffer,scratch: NativeBuffer,bitmap: NativeBuffer,compareMirrors: bool = false): FatVolumeAudit {
+    val s=this.storage()
+    if (budget < 1 || budget > 1000000 || !queue.hasAddressRange(0,queue.capacity()) || queue.capacity() < 8 || queue.capacity() > 8000000 ||
+        !data.hasAddressRange(0,512) || !scratch.hasAddressRange(0,1024) || !bitmap.hasAddressRange(0,bitmap.capacity()) ||
+        fatBuffersOverlap(s,32,queue,queue.capacity()) || fatBuffersOverlap(s,32,data,512) || fatBuffersOverlap(s,32,scratch,1024) || fatBuffersOverlap(s,32,bitmap,bitmap.capacity())) return FatVolumeAudit(2)
+    val admitted=this.begin(owner)
+    if (admitted != 0) return FatVolumeAudit(admitted)
+    val reader=nativeBufferAt(s.loadU32(16),28);val boot=nativeBufferAt(s.loadU32(20),512)
+    val first=s.loadU32(24);val sectors=s.loadU32(28);val geometry=fatBootValidate(boot,first,sectors)
+    var result=FatVolumeAudit(2)
+    if (geometry.valid() && fatTreeWorkspaceValid(reader,boot,queue,data,scratch,bitmap,geometry.usableClusters())) {
+        val tracker=fatClusterOwnershipAt(bitmap)
+        if (tracker.initialize(geometry.usableClusters())) {
+            val tree=fatWalkOwnershipTreeOwned(reader,boot,first,sectors,budget,queue,data,scratch,tracker)
+            result=FatVolumeAudit((tree|0)|(1<<60))
+            if (tree.status() == 1) {
+                val remaining=budget-tree.reads()
+                if (remaining == 0) result=FatVolumeAudit(6|(2<<60))
+                else {
+                    val allocation=fatAuditAllocationRangeOwned(reader,boot,first,sectors,2,geometry.usableClusters(),remaining,scratch,tracker)
+                    result=FatVolumeAudit((allocation|0)|(2<<60))
+                    if (compareMirrors && allocation.status() == 1) {
+                        val left=remaining-allocation.reads()
+                        // No reads are needed for single FAT/disabled mirroring.
+                        // The helper still needs a valid positive input budget.
+                        val noReads=boot.load(16) == 1 || (geometry.fatBits() == 32 && (fatBootU16(boot,40)&128) != 0)
+                        if (left == 0 && !noReads) result=FatVolumeAudit(5|(3<<60))
+                        else result=FatVolumeAudit((fatAuditMirrorsOwned(reader,boot,first,sectors,if (left == 0) 1 else left,scratch)|0)|(3<<60))
+                    }
+                }
+            }
+        }
+    }
+    // A read-only failed scan does not repair or invalidate the mount. Return
+    // evidence to caller; gate release is mandatory on every admitted path.
+    if (!peripheralGateAt(s.addressValue()).finish(owner,true)) return FatVolumeAudit(14)
+    return result
+}

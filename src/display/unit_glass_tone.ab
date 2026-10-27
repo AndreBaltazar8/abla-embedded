@@ -1,0 +1,59 @@
+import "./unit_glass.ab"
+// Original UnitGLASS, not GLASS2. Caller-exclusive24B state and separate5B
+// transaction scratch; borrowed device/bus must outlive successful stop.
+// Both buffers must exclude the selected provider's private bookkeeping;
+// provider-specific adapters/callers validate that before any initialization.
+// No background task: poll before half a uint32 clock wrap. No copying or
+// reinitializing a live owner. Raw buzzer access must be serialized with this.
+type UnitGlassTone = int
+fun unitGlassToneAt(storage: NativeBuffer): UnitGlassTone =
+    if (storage.hasAddressRange(0,24) && (storage.addressValue()&3) == 0)
+        UnitGlassTone(storage|0) else UnitGlassTone(0)
+fun UnitGlassTone.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun UnitGlassTone.valid(): bool = unitGlassToneAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x47544f4e
+trusted fun UnitGlassTone.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun UnitGlassTone.initialize(): bool {
+    if (unitGlassToneAt(this.buffer()) == 0) return false
+    var offset=4
+    while (offset < 24) { this.buffer().storeU32(offset,0);offset=offset+4 }
+    this.buffer().storeU32(0,0x47544f4e);return true
+}
+trusted fun UnitGlassTone.scratchSafe(scratch: NativeBuffer): bool =
+    scratch.hasAddressRange(0,5) && (scratch.addressValue() >= this.buffer().addressValue()+24 ||
+        this.buffer().addressValue() >= scratch.addressValue()+5)
+trusted fun UnitGlassTone.device(): I2cDevice = I2cDevice(
+    this.buffer().loadU32(8)|(this.buffer().loadU32(12)<<32))
+// 0idle1playing2admission3start-write-uncertain4stop-write-uncertain.
+// Store ownership BEFORE writing: even a failed command may enable the buzzer.
+trusted fun UnitGlassTone.startOwned(device: I2cDevice,frequency: int,duty: int,
+    now: int,duration: int,scratch: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || this.status() != 0 || !device.valid() || frequency < 1 ||
+        frequency > 65535 || duty < 1 || duty > 255 || now < 0 || now > 4294967295 ||
+        duration < 1 || duration > 2147483647 || !this.scratchSafe(scratch)) return 2
+    this.buffer().storeU32(8,device&4294967295);this.buffer().storeU32(12,device>>>32)
+    this.buffer().storeU32(16,(now+duration)&4294967295)
+    this.buffer().storeU32(4,3);this.buffer().storeU32(20,0)
+    val ok=device.glassBuzzer(frequency,duty,true,scratch)
+    this.buffer().storeU32(4,if (ok) 1 else 3)
+    this.buffer().storeU32(20,if (ok) 0 else 3)
+    return this.status()
+}
+// Original start error remains available after cleanup; initialize/start clears it.
+trusted fun UnitGlassTone.startFailure(): int = if (this.valid()) this.buffer().loadU32(20) else -1
+trusted fun UnitGlassTone.stopOwned(scratch: NativeBuffer,exclusive: bool): bool {
+    if (!exclusive || !this.valid() || !this.scratchSafe(scratch)) return false
+    if (this.status() == 0) return true
+    if (!this.device().glassBuzzerEnable(false,scratch)) {
+        this.buffer().storeU32(4,4);return false
+    }
+    this.buffer().storeU32(8,0);this.buffer().storeU32(12,0)
+    this.buffer().storeU32(4,0);return true
+}
+// Failed starts require explicit stop, not waiting for a supposedly active tone.
+trusted fun UnitGlassTone.pollOwned(now: int,scratch: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !this.valid() || now < 0 || now > 4294967295 || !this.scratchSafe(scratch)) return 2
+    if (this.status() == 3) return 3
+    if (this.status() == 4 || (this.status() == 1 &&
+        ((now-this.buffer().loadU32(16))&4294967295) < 2147483648)) this.stopOwned(scratch,true)
+    return this.status()
+}

@@ -1,0 +1,71 @@
+import "./corematrix_control_sequence.ab"
+import "./corematrix_power.ab"
+import "./expander_open.ab"
+import "./pmic_open.ab"
+import "../display/tm1680_device.ab"
+// Exclusive caller-owned96B. Header16, page framebuffer32@16, wire scratch33@48,
+// borrowed control64@84, power detail32@92. All calls serialized by caller;
+// keep control/provider/rail alive and unchanged until close returns true.
+// One retained matrix lease prevents parent teardown, including failed opens.
+type M5CoreMatrixMatrix=int
+fun m5CoreMatrixMatrixAt(storage: NativeBuffer): M5CoreMatrixMatrix =
+    if (storage.hasAddressRange(0,96) && (storage.addressValue()&3) == 0 &&
+        softwareI2cProviderBufferSafe(storage,96)) M5CoreMatrixMatrix(storage|0) else M5CoreMatrixMatrix(0)
+fun M5CoreMatrixMatrix.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun M5CoreMatrixMatrix.valid(): bool = m5CoreMatrixMatrixAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x434d4c31
+trusted fun M5CoreMatrixMatrix.status(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun M5CoreMatrixMatrix.device(): I2cDevice = I2cDevice(if (this.valid()) this.buffer().loadU32(8) else 0)
+fun M5CoreMatrixMatrix.frame(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+16,32)
+fun M5CoreMatrixMatrix.scratch(): NativeBuffer = nativeBufferAt(this.buffer().addressValue()+48,33)
+trusted fun M5CoreMatrixMatrix.control(): M5CoreMatrixControl =
+    M5CoreMatrixControl(this.buffer().loadU32(84)|(this.buffer().loadU32(88)<<32))
+trusted fun M5CoreMatrixMatrix.ready(): bool = this.status() == 1 && this.control().ready() && this.device().valid()
+// Fresh unpublished memory only; never erase an existing device owner.
+trusted fun M5CoreMatrixMatrix.initializeFresh(): bool {
+    if (m5CoreMatrixMatrixAt(this.buffer()) == 0) return false
+    var at=0
+    while (at < 96) { this.buffer().storeU32(at,0);at=at+4 }
+    this.buffer().storeU32(0,0x434d4c31);return true
+}
+// Status0closed1ready2admission3power4allocation5panel6sleep7release.
+// No power rollback or read probe; partial hardware effects remain explicit.
+trusted fun M5CoreMatrixMatrix.openOwned(control: M5CoreMatrixControl,exclusive: bool): int {
+    if (!exclusive || this.status() != 0 || !control.ready() ||
+        (this.buffer().addressValue() < control.buffer().addressValue()+64 &&
+            control.buffer().addressValue() < this.buffer().addressValue()+96)) return 2
+    if (!control.retainMatrix()) return 2
+    this.buffer().storeU32(84,control&4294967295);this.buffer().storeU32(88,control>>>32)
+    val power=control.expanders().configureCoreMatrixMatrixPower()
+    this.buffer().storeU32(92,power|0)
+    if (!power.valid()) { this.buffer().storeU32(4,3);return 3 }
+    coreMatrixMatrixDelay(20000)
+    val device=control.session().bus().device(114,100000)
+    this.buffer().storeU32(8,device|0)
+    if (!device.valid()) { this.buffer().storeU32(4,4);return 4 }
+    val initialized=tm1680FromDevice(device).begin(this.frame(),this.scratch())
+    this.buffer().storeU32(4,if (initialized) 1 else 5)
+    return this.status()
+}
+trusted fun M5CoreMatrixMatrix.setPixel(x: int,y: int,on: bool,rotation: int = 0): bool =
+    this.ready() && tm1680SetPixel(this.frame(),x,y,on,rotation)
+trusted fun M5CoreMatrixMatrix.display(invert: bool = false): bool =
+    this.ready() && tm1680FromDevice(this.device()).display(this.frame(),this.scratch(),invert)
+trusted fun M5CoreMatrixMatrix.setBrightness(value: int): bool =
+    this.ready() && tm1680FromDevice(this.device()).setBrightness(value,this.scratch())
+trusted fun M5CoreMatrixMatrix.setSleep(sleep: bool): bool =
+    this.ready() && tm1680FromDevice(this.device()).setSleep(sleep,this.scratch())
+// Attempt LED-off/system-disable before freeing the device slot. Preserve
+// handle on either failure so caller can recover transport then retry. Rail is
+// deliberately left on; this never changes unrelated expander outputs.
+trusted fun M5CoreMatrixMatrix.closeOwned(exclusiveUsersQuiesced: bool): bool {
+    if (!exclusiveUsersQuiesced || !this.valid()) return false
+    if ((this.device()|0) != 0) {
+        if (!this.control().ready() || !tm1680FromDevice(this.device()).setSleep(true,this.scratch())) {
+            this.buffer().storeU32(4,6);return false
+        }
+        if (!this.device().close()) { this.buffer().storeU32(4,7);return false }
+    }
+    if ((this.control()|0) != 0) this.control().releaseMatrix()
+    this.buffer().storeU32(84,0);this.buffer().storeU32(88,0)
+    this.buffer().storeU32(8,0);this.buffer().storeU32(4,0);return true
+}

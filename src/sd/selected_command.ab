@@ -1,0 +1,55 @@
+import "./spi_protocol.ab"
+import "../esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Checked byte-transport boundary selected at compile time by the backend.
+// Byte result: bit32success + low8value, otherwise low32transport failure.
+// Command result: low8status1R1received2invalid3noresponse4transport;
+// R1byte@8, completed trailing bytes@16, raw transport detail@32.
+type SdSpiCommandResult=int
+fun SdSpiCommandResult.status(): int = this&255
+fun SdSpiCommandResult.valid(): bool = this.status() == 1
+fun SdSpiCommandResult.r1(): int = (this>>>8)&255
+fun SdSpiCommandResult.trailingBytes(): int = (this>>>16)&7
+fun SdSpiCommandResult.transportDetail(): int = (this>>>32)&4294967295
+// CS and gate remain caller-owned/selected throughout. Command completion
+// means R1 received, NOT accepted: callers must inspect its error bits.
+trusted fun sdSpiCommandSelected(context: int,command: int,argument: int,scratch: NativeBuffer,
+    trailing: NativeBuffer,trailingBytes: int): SdSpiCommandResult {
+    if (command < 0 || command > 63 || argument < 0 || argument > 4294967295 ||
+        trailingBytes < 0 || trailingBytes > 4 || !scratch.hasAddressRange(0,2) ||
+        !trailing.hasAddressRange(0,trailingBytes) ||
+        (trailingBytes != 0 && scratch.addressValue() < trailing.addressValue()+trailingBytes &&
+            trailing.addressValue() < scratch.addressValue()+2) ||
+        !sdSpiSelectedAdmission(context,scratch,trailing,trailingBytes)) return SdSpiCommandResult(2)
+    var index=0
+    while (index < 6) {
+        val byte=if (index == 0) 64|command else if (index == 5) sdSpiCommandFrameCrc(command,argument)
+            else int(u32(argument)>>u32((4-index)*8))&255
+        val result=sdSpiSelectedExchange(context,byte,scratch)
+        if ((result>>>32) != 1) return SdSpiCommandResult(4|((result&4294967295)<<32))
+        index=index+1
+    }
+    // CMD12's first response byte belongs to the stopped data stream, not R1.
+    if (command == 12) {
+        val stuff=sdSpiSelectedExchange(context,255,scratch)
+        if ((stuff>>>32) != 1) return SdSpiCommandResult(4|((stuff&4294967295)<<32))
+    }
+    var response=255
+    index=0
+    while (index < 8 && !sdSpiR1Available(response)) {
+        val result=sdSpiSelectedExchange(context,255,scratch)
+        if ((result>>>32) != 1) return SdSpiCommandResult(4|((result&4294967295)<<32))
+        response=result&255;index=index+1
+    }
+    if (!sdSpiR1Available(response)) return SdSpiCommandResult(3)
+    index=0
+    // Illegal/rejected command has no ordinary R3/R7 suffix.
+    if ((response&126) == 0) {
+        while (index < trailingBytes) {
+            val result=sdSpiSelectedExchange(context,255,scratch)
+            if ((result>>>32) != 1) return SdSpiCommandResult(4|(response<<8)|(index<<16)|((result&4294967295)<<32))
+            trailing.store(index,result&255);index=index+1
+        }
+    }
+    return SdSpiCommandResult(1|(response<<8)|(index<<16))
+}

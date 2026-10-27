@@ -1,0 +1,74 @@
+import "../esp32/sdk/raw_buffer.ab"
+// SSD1677 abstract four-gray planes, matching LovyanGFX Panel_SSD1677.
+// Copyright(c)2020 lovyan03; FreeBSD license: epd_waveform.LICENSE.
+// Caller-owned contiguous LSB then MSB plane, each ceil(width/8)*height.
+// MSB-first pixels; row padding is preserved. No heap, PSRAM assumption or IO.
+// These are drawing planes, NOT mode-dependent controller wire encodings.
+fun ssd1677CanvasDimensions(width: int,height: int): bool = width >= 1 && width <= 65535 && height >= 1 && height <= 65535
+fun ssd1677PlaneBytes(width: int,height: int): int = if (ssd1677CanvasDimensions(width,height)) ((width+7)/8)*height else 0
+fun ssd1677CanvasPosition(width: int,height: int,x: int,y: int,rotation: int): int {
+    if (!ssd1677CanvasDimensions(width,height) || rotation < 0 || rotation > 7 || x < 0 || y < 0 ||
+        x >= (if ((rotation&1) == 0) width else height) || y >= (if ((rotation&1) == 0) height else width)) return -1
+    var px=if ((rotation&1) == 0) x else y
+    var py=if ((rotation&1) == 0) y else x
+    if (((1<<rotation)&198) != 0) px=width-1-px
+    if (((1<<rotation)&156) != 0) py=height-1-py
+    return px|(py<<16)
+}
+fun ssd1677CanvasGray(gray: int,x: int,y: int): int {
+    if (gray < 0 || gray > 255) return -1
+    // Bayer [-30,18,-22,26,...] = nibble*4-30, in physical coordinates.
+    val index=(x&3)|((y&3)<<2)
+    val word=if (index < 8) 0xA684E2C0 else 0x95B7D1F3
+    val dither=((word>>>((index&7)*4))&15)*4-30
+    val level=(gray+dither)>>6
+    return if (level < 0) 0 else if (level > 3) 3 else level
+}
+trusted fun ssd1677CanvasRead(canvas: NativeBuffer,width: int,height: int,x: int,y: int,rotation: int): int {
+    val pos=ssd1677CanvasPosition(width,height,x,y,rotation)
+    val plane=ssd1677PlaneBytes(width,height)
+    if (pos < 0 || !canvas.hasAddressRange(0,plane*2)) return -1
+    val px=pos&65535;val py=pos>>>16
+    val offset=py*((width+7)/8)+(px>>3);val bit=128>>(px&7)
+    return (if ((canvas.load(offset)&bit) != 0) 1 else 0)|(if ((canvas.load(offset+plane)&bit) != 0) 2 else 0)
+}
+// Clipped grayscale8 image/fill. Source describes the ORIGINAL rectangle.
+// fill=-1 copies rows;0..255 fills. Invalid/aliased input is rejected before
+// ANY mutation, including offscreen images. Initialize full planes before use.
+trusted fun ssd1677CanvasDrawOwned(canvas: NativeBuffer,width: int,height: int,x: int,y: int,w: int,h: int,
+    rotation: int,source: NativeBuffer,stride: int,fill: int,exclusive: bool): bool {
+    val plane=ssd1677PlaneBytes(width,height)
+    if (!exclusive || plane == 0 || rotation < 0 || rotation > 7 ||
+        x < -2147483648 || x > 2147483647 || y < -2147483648 || y > 2147483647 ||
+        w < 0 || w > 65535 || h < 0 || h > 65535 || fill < -1 || fill > 255 ||
+        !canvas.hasAddressRange(0,plane*2)) return false
+    if (fill == -1) {
+        if (stride < w || stride > 2147483647) return false
+        if (w != 0 && h != 0) {
+            val span=(h-1)*stride+w
+            if (!source.hasAddressRange(0,span) ||
+                (source.addressValue() < canvas.addressValue()+plane*2 && canvas.addressValue() < source.addressValue()+span)) return false
+        }
+    }
+    val logicalWidth=if ((rotation&1) == 0) width else height
+    val logicalHeight=if ((rotation&1) == 0) height else width
+    val left=if (x < 0) 0 else x;val top=if (y < 0) 0 else y
+    val right=if (x+w > logicalWidth) logicalWidth else x+w
+    val bottom=if (y+h > logicalHeight) logicalHeight else y+h
+    var row=top
+    while (row < bottom && left < right) {
+        var column=left
+        while (column < right) {
+            val pos=ssd1677CanvasPosition(width,height,column,row,rotation)
+            val px=pos&65535;val py=pos>>>16
+            val gray=if (fill == -1) source.load((row-y)*stride+column-x) else fill
+            val level=ssd1677CanvasGray(gray,px,py)
+            val offset=py*((width+7)/8)+(px>>3);val bit=128>>(px&7)
+            canvas.store(offset,(canvas.load(offset)&~bit)|(if ((level&1) != 0) bit else 0))
+            canvas.store(offset+plane,(canvas.load(offset+plane)&~bit)|(if ((level&2) != 0) bit else 0))
+            column=column+1
+        }
+        row=row+1
+    }
+    return true
+}

@@ -1,0 +1,49 @@
+import "./m5ioe1_device.ab"
+
+//32B retained:tag0,state4,device8,deadline12,primary16,cleanup20,
+// old shared PWM frequency24,captured+channel28. Own the selected PWM and shared
+// frequency for the entire lease; other PWM users must be quiesced.
+// Caller has configured the selected channel pin safely; no pin mux is changed.
+// Cooperative deadline: caller must poll; IOE1 continues while ESP sleeps.
+fun ioe1ToneStorage(r: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0
+trusted fun ioe1ToneStartOwned(r: NativeBuffer,chip: M5Ioe1,channel: int,frequency: int,duty12: int,now: int,duration: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !ioe1ToneStorage(r) || r.loadU32(0) != 0 || !chip.valid() || !chip.device().valid() || channel < 0 || channel > 3 || frequency < 1 || frequency > 65535 || duty12 < 1 || duty12 > 4095 || now < 0 || now > 0xffffffff || duration < 1 || duration > 0x7fffffff) return 2
+    var at=0
+    while (at < 32) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x494f544e);r.storeU32(4,4);r.storeU32(8,chip|0);r.storeU32(12,int(u32(now)+u32(duration)))
+    r.storeU32(28,channel<<8)
+    val old=chip.device().readRegister16LittleEndianChecked(37)
+    if (!old.valid()) { r.storeU32(16,1);return 4 }
+    r.storeU32(24,old.value());r.storeU32(28,1|(channel<<8))
+    if (!chip.setPwmDuty12(channel,0,false,false)) { r.storeU32(16,2);return 4 }
+    if (!chip.setPwmFrequency(frequency)) { r.storeU32(16,3);return 4 }
+    if (!chip.setPwmDuty12(channel,duty12,false,true)) { r.storeU32(16,4);return 4 }
+    r.storeU32(4,1);return 1
+}
+//6silent/frequency restored,2invalid,4retry needed. Silence MUST be
+// acknowledged before restoring frequency. Primary failure never overwritten.
+trusted fun ioe1ToneStopOwned(r: NativeBuffer,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !ioe1ToneStorage(r) || r.loadU32(0) != 0x494f544e) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 4 && r.loadU32(4) != 5) return 2
+    r.storeU32(4,5)
+    val chip=M5Ioe1(r.loadU32(8));val channel=(r.loadU32(28)>>>8)&3
+    // Even a failed frequency snapshot requires an acknowledged stop before
+    // reporting silence; never infer that the pre-existing PWM was disabled.
+    if (!chip.setPwmDuty12(channel,0,false,false)) { r.storeU32(20,1);return 4 }
+    if ((r.loadU32(28)&1) != 0) {
+        if (!chip.setPwmFrequency(r.loadU32(24))) { r.storeU32(20,2);return 4 }
+    }
+    r.storeU32(20,0);r.storeU32(4,6);return 6
+}
+//5pending,6finished,4latched start failure/cleanup retry,2invalid. Poll at
+// least once per2^31 milliseconds; unsigned subtraction handles timer wrap.
+trusted fun ioe1TonePollOwned(r: NativeBuffer,now: int,exclusiveSharedPwm: bool): int {
+    if (!exclusiveSharedPwm || !ioe1ToneStorage(r) || r.loadU32(0) != 0x494f544e || now < 0 || now > 0xffffffff) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) == 5) return ioe1ToneStopOwned(r,true)
+    if (r.loadU32(4) != 1) return 2
+    if (((u32(now)-u32(r.loadU32(12)))&u32(0x80000000)) != u32(0)) return 5
+    return ioe1ToneStopOwned(r,true)
+}

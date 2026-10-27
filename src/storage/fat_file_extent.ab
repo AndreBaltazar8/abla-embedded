@@ -1,0 +1,62 @@
+import "./fat_read_sequence.ab"
+import "./fat_directory_entry.ab"
+// Discover one physically contiguous file extent without reading file data.
+// Immutable volume/reader and exclusive1024-byte FAT scratch required. Stops
+// before a valid fragmented link, never assumes cluster-number adjacency.
+// Supports unaligned offsets and EOF tails. Caller transfers ceil((offset&511
+// +bytes)/512) sectors then copies only bytes at offset&511, preserving bounds.
+// Returned extent is valid only while medium/BPB/file metadata stay immutable.
+type FatFileExtent = int
+// status1extent2EOF3input4IO5corrupt/truncated6cycle7budget; LBA32@8,bytes19@40.
+fun FatFileExtent.status(): int = this&255
+fun FatFileExtent.sector(): int = if (this.status() == 1) (this>>8)&0xffffffff else -1
+fun FatFileExtent.bytes(): int = if (this.status() == 1) (this>>40)&0x7ffff else 0
+trusted fun fatFileExtentOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,file: FatDirectoryEntry,offset: int,maximumBytes: int,budget: int,scratch: NativeBuffer): FatFileExtent {
+    val geometry=fatBootValidate(boot,first,sectors)
+    if (!geometry.valid() || !file.isFile() || offset < 0 || offset > file.byteSize() || maximumBytes < 1 || maximumBytes > 491520 ||
+        budget < 1 || budget > 1000000 || !reader.hasAddressRange(0,28) || !scratch.hasAddressRange(0,1024) ||
+        fatBuffersOverlap(scratch,1024,reader,28) || fatBuffersOverlap(scratch,1024,boot,512) ||
+        file.byteSize() > geometry.clusters()*geometry.sectorsPerCluster()*512) return FatFileExtent(3)
+    var cluster=file.firstCluster()
+    if (file.byteSize() > 0 && fatClusterFirstSector(boot,first,sectors,cluster) < 0) return FatFileExtent(3)
+    if (offset == file.byteSize()) return FatFileExtent(2)
+    val clusterBytes=geometry.sectorsPerCluster()<<9
+    var steps=offset
+    var divisor=clusterBytes
+    while (divisor > 1) { steps=steps>>1; divisor=divisor>>1 }
+    if (steps >= geometry.clusters()) return FatFileExtent(5)
+    var wanted=maximumBytes
+    if (wanted > file.byteSize()-offset) wanted=file.byteSize()-offset
+    // Include the leading partial sector in the bounded DMA capacity.
+    if (wanted > 491520-(offset&511)) wanted=491520-(offset&511)
+    var anchor=cluster
+    var power=1
+    var distance=0
+    var visited=1
+    var remaining=budget
+    var start=-1
+    var count=0
+    while (true) {
+        if (steps == 0 && start < 0) {
+            start=fatClusterFirstSector(boot,first,sectors,cluster)+((offset&(clusterBytes-1))>>9)
+            count=clusterBytes-(offset&(clusterBytes-1))
+        }
+        if (steps == 0 && count >= wanted) return FatFileExtent((wanted<<40)|(start<<8)|1)
+        val location=fatLinkLocate(boot,first,sectors,cluster)
+        val cost=if (location.needsSecondSector()) 2 else 1
+        if (remaining < cost) return FatFileExtent(7)
+        remaining=remaining-cost
+        val link=fatReadLinkOwned(reader,boot,first,sectors,cluster,scratch)
+        if (link.status() == 8) return FatFileExtent(4)
+        if (link.status() != 1) return FatFileExtent(5)
+        val next=link.nextCluster()
+        distance=distance+1; visited=visited+1
+        if (next == anchor || visited > geometry.clusters()) return FatFileExtent(6)
+        if (steps == 0 && next != cluster+1) return FatFileExtent((count<<40)|(start<<8)|1)
+        if (distance == power) { anchor=next; power=power*2; distance=0 }
+        cluster=next
+        if (steps > 0) steps=steps-1
+        else count=count+clusterBytes
+    }
+    return FatFileExtent(3)
+}

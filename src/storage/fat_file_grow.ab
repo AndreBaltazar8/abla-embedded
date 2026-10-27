@@ -1,0 +1,87 @@
+import "./fat_file_overwrite_checked.ab"
+import "./fat_allocate.ab"
+// Bounded growth by at most65536bytes/call, including empty files. Validate
+// complete existing chain before writes, zero newly exposed bytes, allocate
+// zeroed clusters and link them, then publish directory size LAST.
+// Caller holds volume gate across entire call. Not shrink/create/journaled.
+// Failed writes may leave extended chains or orphan reservations: no rollback
+// or blind retry. Caller faults mount and inspects before recovery.
+type FatFileGrow=int
+//1success2input3stale4readIO5chain6budget7zeroIO8allocation9linkIO10directoryIO11readonly.
+// Candidate28@8 for allocation/link failure; detail8@36.
+fun FatFileGrow.status(): int = this&255
+fun FatFileGrow.cluster(): int = (this>>8)&0xfffffff
+trusted fun fatFileGrowOwned(reader: NativeBuffer,boot: NativeBuffer,first: int,sectors: int,
+    parent: int,ordinal: int,entryIndex: int,expected: NativeBuffer,newSize: int,budget: int,
+    modified: RtcDateTime,workspace: NativeBuffer): FatFileGrow {
+    val geometry=fatBootValidate(boot,first,sectors);val timestamp=fatModifiedTimestamp(modified)
+    if (!geometry.valid() || timestamp < 0 || newSize < 0 || newSize > 4294967295 || budget < 1 || budget > 1000000 ||
+        entryIndex < 0 || entryIndex > 15 || !expected.hasAddressRange(0,32) || !workspace.hasAddressRange(0,2560) ||
+        fatBuffersOverlap(workspace,2560,reader,28) || fatBuffersOverlap(workspace,2560,boot,512) ||
+        fatBuffersOverlap(workspace,2560,expected,32)) return FatFileGrow(2)
+    val directory=nativeBufferAt(workspace.addressValue(),512)
+    val work=nativeBufferAt(workspace.addressValue()+512,2048)
+    val located=fatDirectoryReadOwned(reader,boot,first,sectors,parent,ordinal,budget,directory,nativeBufferAt(work.addressValue(),1024))
+    if (located.status() != 1) return FatFileGrow(if (located.status() == 4) 4 else if (located.status() == 7) 6 else 5)
+    var i=0
+    while (i < 32) { if (expected.load(i) != directory.load(entryIndex*32+i)) return FatFileGrow(3);i=i+1 }
+    val file=fatDirectoryDecode(directory,entryIndex,geometry.fatBits(),geometry.clusters())
+    if (!file.isFile() || newSize < file.byteSize() || newSize-file.byteSize() > 65536) return FatFileGrow(2)
+    if ((directory.load(entryIndex*32+11)&1) != 0) return FatFileGrow(11)
+    if (newSize == file.byteSize()) return FatFileGrow(1)
+    val clusterBytes=geometry.sectorsPerCluster()*512
+    var head=file.firstCluster();var tail=0;var tailRaw=0;var capacity=0;var current=head
+    var remaining=budget;var anchor=head;var power=1;var distance=0;var visited=0
+    while (current != 0) {
+        if (fatClusterFirstSector(boot,first,sectors,current) < 0 || visited >= geometry.clusters()) return FatFileGrow(5)
+        val location=fatLinkLocate(boot,first,sectors,current);val cost=if (location.needsSecondSector()) 2 else 1
+        if (remaining < cost) return FatFileGrow(6)
+        remaining=remaining-cost
+        val link=fatReadLinkOwned(reader,boot,first,sectors,current,nativeBufferAt(work.addressValue(),1024))
+        if (link.status() == 8) return FatFileGrow(4)
+        capacity=capacity+clusterBytes;visited=visited+1
+        if (link.status() == 2) {
+            tail=current;tailRaw=fatLinkRaw(location,nativeBufferAt(work.addressValue(),512),nativeBufferAt(work.addressValue()+512,512));current=0
+        } else {
+            if (link.status() != 1) return FatFileGrow(5)
+            current=link.nextCluster();distance=distance+1
+            if (current == anchor) return FatFileGrow(5)
+            if (distance == power) { anchor=current;power=power*2;distance=0 }
+        }
+    }
+    if (capacity < file.byteSize()) return FatFileGrow(5)
+    // Zero only old allocation's newly exposed range, preserving existingdata.
+    val exposed=if (capacity < newSize) capacity else newSize
+    var position=file.byteSize()
+    while (position < exposed) {
+        val bounded=if (capacity > 4294967295) 4294967295 else capacity
+        val allocated=FatDirectoryEntry((1<<60)|(bounded<<28)|head)
+        val count=if (exposed-position < 512-(position&511)) exposed-position else 512-(position&511)
+        val extent=fatFileExtentOwned(reader,boot,first,sectors,allocated,position,count,budget,nativeBufferAt(work.addressValue(),1024))
+        if (extent.status() != 1) return FatFileGrow(if (extent.status() == 4) 4 else if (extent.status() == 7) 6 else 5)
+        val data=nativeBufferAt(work.addressValue()+1024,512)
+        if (!fatStorageReadOwned(reader,extent.sector(),data)) return FatFileGrow(4)
+        i=0
+        while (i < count) { data.store((position&511)+i,0);i=i+1 }
+        if (!fatStorageWriteOwned(reader,extent.sector(),data)) return FatFileGrow(7)
+        position=position+count
+    }
+    while (capacity < newSize) {
+        val allocation=fatAllocateClusterOwned(reader,boot,first,sectors,2,budget,budget,work)
+        if (allocation.status() != 1) return FatFileGrow(8|(allocation.cluster()<<8)|(allocation.status()<<36))
+        val next=allocation.cluster()
+        if (tail != 0) {
+            val linked=fatWriteLinkOwned(reader,boot,first,sectors,tail,tailRaw,next,work)
+            if (linked.status() != 1) return FatFileGrow(9|(next<<8)|(linked.status()<<36))
+        } else head=next
+        tail=next;tailRaw=if (geometry.fatBits() == 12) 4095 else if (geometry.fatBits() == 16) 65535 else 268435455
+        capacity=capacity+clusterBytes
+    }
+    val entry=entryIndex*32
+    directory.store(entry+11,directory.load(entry+11)|32);directory.storeU16(entry+18,0)
+    directory.storeU32(entry+22,timestamp);directory.storeU16(entry+26,head&65535)
+    if (geometry.fatBits() == 32) directory.storeU16(entry+20,(directory.loadU16(entry+20)&61440)|(head>>16))
+    directory.storeU32(entry+28,newSize)
+    if (!fatStorageWriteOwned(reader,located.sector(),directory)) return FatFileGrow(10)
+    return FatFileGrow(1)
+}

@@ -1,0 +1,95 @@
+import "./gc9a01_software.ab"
+import "./gc9a01_read.ab"
+// Exclusive caller-owned64B controller session; no pin/power allocation.
+// Caller keeps configured GPIOs/power/reset and canonical gate alive, and
+// serializes ALL access to this record (the SPI gate is not a record mutex).
+// 0detached1ready2fault3detaching4asleep5transition. Never copy/reinitialize live ownership. Bound rotation
+// changes only after successful MADCTL publication; draw/read cannot override it.
+type Gc9a01Session=int
+fun gc9a01SessionAt(r: NativeBuffer): Gc9a01Session =
+    if (r.hasAddressRange(0,64) && (r.addressValue()&3) == 0) Gc9a01Session(r|0) else Gc9a01Session(0)
+fun Gc9a01Session.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun Gc9a01Session.valid(): bool = gc9a01SessionAt(this.buffer()) != 0 && this.buffer().loadU32(0) == 0x47433931
+trusted fun Gc9a01Session.state(): int = if (this.valid()) this.buffer().loadU32(4) else -1
+trusted fun Gc9a01Session.initializeFresh(): bool {
+    if (gc9a01SessionAt(this.buffer()) == 0) return false
+    var i=4;while (i < 64) { this.buffer().storeU32(i,0);i=i+4 }
+    this.buffer().storeU32(0,0x47433931);return true
+}
+trusted fun Gc9a01Session.gate(): PeripheralGate = peripheralGateAt(this.buffer().loadU32(8))
+trusted fun Gc9a01Session.owner(): u32 = u32(this.buffer().loadU32(12))
+trusted fun Gc9a01Session.pin(at: int): Pin = Pin(this.buffer().loadU32(at))
+trusted fun Gc9a01Session.rotation(): int = this.buffer().loadU32(36)&7
+trusted fun Gc9a01Session.shared(): bool = (this.buffer().loadU32(36)&32) != 0
+trusted fun Gc9a01Session.safe(data: NativeBuffer,count: int): bool = data.hasAddressRange(0,count) &&
+    (count == 0 || data.addressValue()+count <= this.buffer().addressValue() || data.addressValue() >= this.buffer().addressValue()+64)
+trusted fun Gc9a01Session.remember(result: SpiTransactionResult,read: bool): SpiTransactionResult {
+    this.buffer().storeU32(44,result.status());this.buffer().storeU32(48,result.value())
+    this.buffer().storeU32(52,if (read && result.status() == 6) 1 else 0)
+    if (result.status() >= 4) this.buffer().storeU32(4,2)
+    return result
+}
+trusted fun Gc9a01Session.openOwned(gate: PeripheralGate,owner: u32,clock: Pin,data: Pin,cs: Pin,dc: Pin,
+    miso: Pin,rotation: int,shared: bool,exclusive: bool,inverted: bool = false,bgr: bool = true,halfPeriod: int = 1): SpiTransactionResult {
+    if (!exclusive || this.state() != 0 || !peripheralOwnerValid(owner) || rotation < 0 || rotation > 7 ||
+        !gate.bufferDisjoint(this.buffer(),64) || !softwareSpiCommandPinsValid(clock,data,cs,dc,0,halfPeriod) ||
+        clock.number() > 255 || data.number() > 255 || cs.number() > 255 || dc.number() > 255 ||
+        (if (shared) miso != data else (miso.number() != -1 && (!miso.valid() || miso == data || miso == clock || miso == cs || miso == dc))) ||
+        miso.number() > 255) return SpiTransactionResult(3<<32)
+    val result=gc9a01BeginChecked(gate,owner,clock,data,cs,dc,rotation,inverted,bgr,halfPeriod)
+    // Admission failures never bind storage or invent controller ownership.
+    if (result.status() == 2 || result.status() == 3 || result.status() == 4) return result
+    val r=this.buffer()
+    r.storeU32(8,gate|0);r.storeU32(12,owner);r.storeU32(16,clock.number());r.storeU32(20,data.number())
+    r.storeU32(24,cs.number());r.storeU32(28,dc.number());r.storeU32(32,if (miso.number() < 0) 0xffffffff else miso.number())
+    r.storeU32(36,rotation|(if (bgr) 8 else 0)|(if (inverted) 16 else 0)|(if (shared) 32 else 0));r.storeU32(40,halfPeriod)
+    r.storeU32(4,if (result.valid()) 1 else 2)
+    return this.remember(result,false)
+}
+trusted fun Gc9a01Session.fillRectOwned(x: int,y: int,width: int,height: int,color: Rgb565,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || this.state() != 1) return SpiTransactionResult(3<<32)
+    return this.remember(gc9a01FillRectChecked(this.gate(),this.owner(),this.pin(16),this.pin(20),this.pin(24),this.pin(28),
+        this.rotation(),x,y,width,height,color,this.buffer().loadU32(40)),false)
+}
+trusted fun Gc9a01Session.blitOwned(x: int,y: int,data: NativeBuffer,width: int,height: int,stride: int,littleEndian: bool,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || this.state() != 1 || !lcdRgb565SourceValid(data,width,height,stride) ||
+        !this.safe(data,if (width == 0 || height == 0) 0 else (height-1)*stride+width*2)) return SpiTransactionResult(3<<32)
+    return this.remember(gc9a01BlitChecked(this.gate(),this.owner(),this.pin(16),this.pin(20),this.pin(24),this.pin(28),
+        this.rotation(),x,y,data,width,height,stride,littleEndian,this.buffer().loadU32(40)),false)
+}
+trusted fun Gc9a01Session.readRectOwned(x: int,y: int,width: int,height: int,data: NativeBuffer,stride: int,rgb565: bool,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || this.state() != 1 || width < 1 || width > 240 || height < 1 || height > 240 ||
+        stride < width*(if (rgb565) 2 else 3) || stride > 2147483647 || this.buffer().loadU32(32) == 0xffffffff ||
+        !this.safe(data,(height-1)*stride+width*(if (rgb565) 2 else 3))) return SpiTransactionResult(3<<32)
+    return this.remember(gc9a01ReadRectChecked(this.gate(),this.owner(),this.pin(16),this.pin(20),this.pin(32),this.pin(24),this.pin(28),
+        this.rotation(),x,y,width,height,data,stride,rgb565,this.buffer().loadU32(40),this.shared()),true)
+}
+trusted fun Gc9a01Session.setRotationOwned(rotation: int,exclusive: bool): SpiTransactionResult {
+    if (!exclusive || this.state() != 1 || rotation < 0 || rotation > 7) return SpiTransactionResult(3<<32)
+    val r=this.buffer();val flags=r.loadU32(36)
+    val packet=nativeBufferAt(nativeStackAllocate(1),1);packet.store(0,lcdMadctl(rotation,(flags&8) != 0))
+    val result=softwareSpiCommand(this.gate(),this.owner(),this.pin(16),this.pin(20),this.pin(24),this.pin(28),54,packet,1,0,r.loadU32(40))
+    if (result.valid()) r.storeU32(36,(flags&~7)|rotation)
+    return this.remember(result,false)
+}
+// Only our own failed shared read is recoverable without reinitializing the
+// controller. Does not excuse unrelated gate faults or external panel resets.
+trusted fun Gc9a01Session.recoverSharedReadOwned(exclusiveUsersQuiesced: bool): bool {
+    if (!exclusiveUsersQuiesced || this.state() != 2 || !this.shared() || this.buffer().loadU32(52) != 1) return false
+    if (!gc9a01SharedReadRecover(this.gate(),this.owner(),this.pin(24),this.pin(20),true)) return false
+    this.buffer().storeU32(4,1);this.buffer().storeU32(52,0);return true
+}
+// Detach is not sleep/power-off. Caller retains pad/rail ownership until this
+// succeeds, and must turn off backlight/panel separately if desired.
+// Retrying state3 additionally requires all bus users quiesced and unrelated
+// faults ruled out. A failed CS release retains state3 and the faulted gate.
+trusted fun Gc9a01Session.detachOwned(exclusive: bool): bool {
+    if (!exclusive || (this.state() != 1 && this.state() != 3 && this.state() != 4)) return false
+    val retry=this.state() == 3
+    if (if (retry) !this.gate().tryBeginRecovery(this.owner()) else this.gate().tryBegin(this.owner()) != 0) return false
+    val released=this.pin(24).writeLevelOwned(true)
+    val finished=if (retry) this.gate().finishRecovery(this.owner(),released) else this.gate().finish(this.owner(),released)
+    if (!released || !finished) { this.buffer().storeU32(4,3);this.buffer().storeU32(52,0);return false }
+    var i=4;while (i < 64) { this.buffer().storeU32(i,0);i=i+4 }
+    return true
+}

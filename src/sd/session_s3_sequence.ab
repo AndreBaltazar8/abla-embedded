@@ -1,0 +1,127 @@
+import "./register_s3_sequence.ab"
+// Canonical caller-owned64B storage: lock0, magic4, generation8, state12,
+// master16, bus gate24, initialization32, sourceHz40, last result48, sector count56.
+// Handle: address32 + generation24. Copies share one owner; generations never
+// wrap. Storage must remain live and must NEVER be reinitialized/recycled while
+// stale handles exist. Explicit invalidation is required before removal/reset,
+// rail changes or master reconfiguration; no electrical card detect is implied.
+type Esp32S3SdSession=int
+fun Esp32S3SdSession.storage(): NativeBuffer = nativeBufferAt(this&4294967295,64)
+fun s3SdSessionSpan(storage: NativeBuffer): bool =
+    s3SdStorageValid(storage,64) && (storage.addressValue()&3) == 0
+fun s3SdSessionDisjoint(storage: NativeBuffer,buffer: NativeBuffer,bytes: int): bool =
+    buffer.hasAddressRange(0,bytes) && (buffer.addressValue()+bytes <= storage.addressValue() ||
+        storage.addressValue()+64 <= buffer.addressValue())
+trusted fun s3SdSessionLoad64(storage: NativeBuffer,offset: int): int =
+    storage.loadU32(offset)|(storage.loadU32(offset+4)<<32)
+trusted fun s3SdSessionStore64(storage: NativeBuffer,offset: int,value: int): void {
+    storage.storeU32(offset,value);storage.storeU32(offset+4,value>>>32);return
+}
+// Fresh, unpublished storage only. This does not close a previous owner.
+trusted fun esp32S3SdSessionInitializeFresh(storage: NativeBuffer): bool {
+    if (!s3SdSessionSpan(storage)) return false
+    var offset=0
+    while (offset < 64) { storage.storeU32(offset,0);offset=offset+4 }
+    storage.storeU32(4,0x53445333);return true
+}
+trusted fun s3SdSessionStorageValid(storage: NativeBuffer): bool =
+    s3SdSessionSpan(storage) && storage.loadU32(4) == 0x53445333
+trusted fun s3SdSessionCurrentLocked(session: Esp32S3SdSession): bool {
+    val storage=session.storage();val generation=(session>>>32)&16777215
+    return session > 0 && (session>>>56) == 0 && generation != 0 && storage.loadU32(8) == generation && storage.loadU32(12) == 1
+}
+// Exclusive opening/reopening under session lock, then physical bus lock.
+// Returns zero on failure; last result at48 is readable under exclusive access.
+// A failed bus operation requires explicit physical-bus recovery before reopen.
+// response is16B, reused for R7/OCR then validated CSD. No extra allocation.
+// Last result17 means unsupported capacity or CSD/addressing-mode mismatch.
+trusted fun esp32S3SdSessionOpen(storage: NativeBuffer,master: SdSpiS3Link,gate: PeripheralGate,
+    owner: u32,sourceHz: int,scratch: NativeBuffer,response: NativeBuffer,polls: int = 1000): Esp32S3SdSession {
+    if (!s3SdSessionStorageValid(storage) || !gate.bufferDisjoint(storage,64) ||
+        !s3SdOwnedStorageReady(master,gate,scratch,response,16,polls,sourceHz) ||
+        !s3SdSessionDisjoint(storage,scratch,2) || !s3SdSessionDisjoint(storage,response,16)) return Esp32S3SdSession(0)
+    val lock=peripheralGateAt(storage.addressValue())
+    if (lock.tryBegin(owner) != 0) return Esp32S3SdSession(0)
+    val generation=storage.loadU32(8)
+    if (storage.loadU32(12) == 1 || generation >= 16777215) {
+        lock.finish(owner,true);return Esp32S3SdSession(0)
+    }
+    storage.storeU32(8,generation+1);storage.storeU32(12,2)
+    s3SdSessionStore64(storage,16,master|0);s3SdSessionStore64(storage,24,gate|0)
+    storage.storeU32(40,sourceHz);s3SdSessionStore64(storage,56,0)
+    val result=master.initializeSd(gate,owner,sourceHz,scratch,response,polls)
+    s3SdSessionStore64(storage,32,result|0);s3SdSessionStore64(storage,48,result|0)
+    var count=0
+    if (result.valid()) {
+        val register=master.readSdRegister(gate,owner,sourceHz,result,9,scratch,response,polls)
+        if (register.valid()) {
+            count=sdCsdBlockCount(response)
+            if ((response.load(0)>>>6) != (if (result.highCapacity()) 1 else 0)) count=0
+            if (count == 0) s3SdSessionStore64(storage,48,17)
+        } else s3SdSessionStore64(storage,48,register|0)
+    }
+    s3SdSessionStore64(storage,56,count)
+    storage.storeU32(12,if (count != 0) 1 else 3)
+    if (!lock.finish(owner,true)) return Esp32S3SdSession(0)
+    return if (count != 0) Esp32S3SdSession(storage.addressValue()|((generation+1)<<32)) else Esp32S3SdSession(0)
+}
+// Zero means stale/busy/invalid; a valid card always has at least one sector.
+trusted fun Esp32S3SdSession.blockCount(owner: u32): int {
+    val storage=this.storage()
+    if (!s3SdSessionStorageValid(storage)) return 0
+    val lock=peripheralGateAt(storage.addressValue())
+    if (lock.tryBegin(owner) != 0) return 0
+    val count=if (s3SdSessionCurrentLocked(this)) s3SdSessionLoad64(storage,56) else 0
+    if (!lock.finish(owner,true)) return 0
+    return count
+}
+// Revokes every copy of this generation. Does not release pads, reset a busy
+// controller or power down the card. Caller handles that lifecycle separately.
+trusted fun Esp32S3SdSession.invalidate(owner: u32): bool {
+    val storage=this.storage()
+    if (!s3SdSessionStorageValid(storage)) return false
+    val lock=peripheralGateAt(storage.addressValue())
+    if (lock.tryBegin(owner) != 0) return false
+    val current=s3SdSessionCurrentLocked(this)
+    if (current) storage.storeU32(12,0)
+    val released=lock.finish(owner,true)
+    return current && released
+}
+trusted fun Esp32S3SdSession.transferBlock(owner: u32,block: int,scratch: NativeBuffer,
+    payload: NativeBuffer,write: bool,polls: int = 250,registerCommand: int = 0): int {
+    val storage=this.storage()
+    if ((registerCommand != 0 && registerCommand != 9 && registerCommand != 10) || (write && registerCommand != 0) ||
+        !s3SdSessionStorageValid(storage) || !s3SdSessionDisjoint(storage,scratch,2) ||
+        !s3SdSessionDisjoint(storage,payload,if (registerCommand == 0) 512 else 16)) return 2
+    val lock=peripheralGateAt(storage.addressValue())
+    val admission=lock.tryBegin(owner)
+    if (admission != 0) return if (admission == 1) 11 else if (admission == 2) 12 else 2
+    var result=2
+    if (s3SdSessionCurrentLocked(this) &&
+        (registerCommand != 0 || sdCardContainsBlocks(s3SdSessionLoad64(storage,56),block,1))) {
+        val master=SdSpiS3Link(s3SdSessionLoad64(storage,16))
+        val gate=PeripheralGate(s3SdSessionLoad64(storage,24))
+        val state=SdSpiInitResult(s3SdSessionLoad64(storage,32))
+        val sourceHz=storage.loadU32(40)
+        result=if (registerCommand != 0) master.readSdRegister(gate,owner,sourceHz,state,registerCommand,scratch,payload,polls)|0
+            else if (write) master.writeSdBlock(gate,owner,sourceHz,state,block,scratch,payload,polls)|0
+            else master.readSdBlock(gate,owner,sourceHz,state,block,scratch,payload,polls)|0
+        s3SdSessionStore64(storage,48,result)
+        // Invalid arguments and bus contention did not touch the card. Every
+        // other failure revokes this generation until explicit reopen.
+        val status=result&255
+        if (status != 1 && status != 2 && status != 11) storage.storeU32(12,3)
+    }
+    if (!lock.finish(owner,true)) return (result&~255)|13
+    return result
+}
+trusted fun Esp32S3SdSession.readBlock(owner: u32,block: int,scratch: NativeBuffer,
+    destination: NativeBuffer,polls: int = 250): SdSpiReadResult =
+    SdSpiReadResult(this.transferBlock(owner,block,scratch,destination,false,polls))
+trusted fun Esp32S3SdSession.writeBlock(owner: u32,block: int,scratch: NativeBuffer,
+    source: NativeBuffer,polls: int = 250): SdSpiWriteResult =
+    SdSpiWriteResult(this.transferBlock(owner,block,scratch,source,true,polls))
+trusted fun Esp32S3SdSession.readRegister(owner: u32,command: int,scratch: NativeBuffer,
+    destination: NativeBuffer,polls: int = 250): SdSpiReadResult =
+    if (command != 9 && command != 10) SdSpiReadResult(2)
+    else SdSpiReadResult(this.transferBlock(owner,0,scratch,destination,false,polls,command))
