@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Normalize recovered Xtensa symbolic address loads in Abla sources."""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+
+
+LOAD = re.compile(
+    r"movi(?:\.n)?[\t ]+(a(?:[0-9]|1[0-5])),[\t ]+"
+    r"([.$A-Za-z_][.$A-Za-z0-9_\\]*)\+0x([0-9A-Fa-f]+)"
+)
+LITERAL = re.compile(
+    r"\.literal[\t ]+(\S+),[\t ]*"
+    r"([.$A-Za-z_][.$A-Za-z0-9_\\]*)\+0x([0-9A-Fa-f]+)(?=\\n|\")"
+)
+BRANCH_INVERSE = {
+    "ball": "bnall", "bnall": "ball",
+    "bany": "bnone", "bnone": "bany",
+    "bbc": "bbs", "bbs": "bbc",
+    "bbci": "bbsi", "bbsi": "bbci",
+    "beq": "bne", "bne": "beq",
+    "beqi": "bnei", "bnei": "beqi",
+    "beqz": "bnez", "bnez": "beqz",
+    "beqz.n": "bnez.n", "bnez.n": "beqz.n",
+    "bf": "bt", "bt": "bf",
+    "bge": "blt", "blt": "bge",
+    "bgei": "blti", "blti": "bgei",
+    "bgeu": "bltu", "bltu": "bgeu",
+    "bgeui": "bltui", "bltui": "bgeui",
+    "bgez": "bltz", "bltz": "bgez",
+}
+BRANCH = re.compile(r"^(\S+)\s+(.+,\s*)([^,\s]+)$")
+TLS_BLOCK = re.compile(
+    r"\.pushsection \.(?:tbss|tdata).*?\\n\.popsection",
+    re.DOTALL,
+)
+TEXT_SECTION_TARGET = re.compile(
+    r"\.text\.((?:[.$A-Za-z0-9_]|\\\$)+)(?:\+0x([0-9A-Fa-f]+))?"
+)
+
+
+def replace(match: re.Match[str]) -> str:
+    register, symbol, encoded = match.groups()
+    addend = int(encoded, 16)
+    high = ((addend + 128) // 256) * 256
+    low = addend - high
+    if high < -32768 or high > 32512 or low < -128 or low > 127:
+        raise ValueError(
+            f"symbol addend is outside Xtensa immediates: {symbol}+0x{encoded}"
+        )
+    lines = [f"movi {register}, {symbol}"]
+    if high:
+        lines.append(f"addmi {register}, {register}, {high}")
+    if low:
+        lines.append(f"addi {register}, {register}, {low}")
+    return r"\n".join(lines)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(f"usage: {sys.argv[0]} SOURCE.ab [...]", file=sys.stderr)
+        return 2
+    changed = 0
+    for value in sys.argv[1:]:
+        path = pathlib.Path(value)
+        source = path.read_text()
+        normalized, count = LOAD.subn(replace, source)
+        tls_count = 0
+
+        def normalize_tls(block: re.Match[str]) -> str:
+            nonlocal tls_count
+            value, replacements = re.subn(
+                r"(\.type[\t ]+\S+,[\t ]+)@object",
+                r"\1@tls_object",
+                block.group(0),
+            )
+            tls_count += replacements
+            return value
+
+        normalized = TLS_BLOCK.sub(normalize_tls, normalized)
+        section_target_count = 0
+        original_abi_symbols = set(re.findall(
+            r"^// Original ABI symbol: ([^\n]+)$", normalized, re.MULTILINE
+        ))
+
+        def normalize_text_section_target(match: re.Match[str]) -> str:
+            nonlocal section_target_count
+            raw_name, encoded = match.groups()
+            # This expression matcher also sees assembler definitions. A
+            # section symbol is only normalized at a use site; changing just
+            # part of `.local`/`.type`/`.size` creates two symbols and makes
+            # the size expression cross-section. Keep every defining
+            # directive intact.
+            line_start = max(
+                normalized.rfind(r"\n", 0, match.start()) + 2,
+                normalized.rfind("\n", 0, match.start()) + 1,
+            )
+            prefix = normalized[line_start:match.start()].lstrip()
+            suffix = normalized[match.end():match.end() + 1]
+            if (prefix.startswith(".local ") or
+                    prefix.startswith(".type ") or
+                    prefix.startswith(".size ") or suffix == ":"):
+                return match.group(0)
+            # A reconstructed local function already carries its final label;
+            # the old `.text.` prefix was only an input-section symbol.
+            if raw_name.startswith(".Labla_recovered_"):
+                candidate = raw_name
+                if candidate + ":" in normalized:
+                    section_target_count += 1
+                    return candidate
+                return match.group(0)
+            # Jump tables target instruction offsets within a recovered body.
+            # The reconstruction labels every such destination explicitly.
+            if encoded is not None:
+                safe = re.sub(r"[^A-Za-z0-9_]", "_", raw_name)
+                candidate = f".Labla_recovered_{safe}_{int(encoded, 16):x}"
+                if candidate + ":" in normalized:
+                    section_target_count += 1
+                    return candidate
+                return match.group(0)
+            # A zero-addend section relocation denotes the function entry.
+            if (raw_name in original_abi_symbols or
+                    f".global {raw_name}" in normalized):
+                section_target_count += 1
+                return raw_name
+            return match.group(0)
+
+        normalized = TEXT_SECTION_TARGET.sub(
+            normalize_text_section_target, normalized
+        )
+        literal_count = 0
+        literals = list(LITERAL.finditer(normalized))
+        for literal in literals:
+            label, symbol, encoded = literal.groups()
+            addend = int(encoded, 16)
+            high = ((addend + 128) // 256) * 256
+            low = addend - high
+            if high < -32768 or high > 32512 or low < -128 or low > 127:
+                raise ValueError(
+                    "literal addend is outside Xtensa immediates: "
+                    f"{symbol}+0x{encoded}"
+                )
+            exact_literal = re.compile(
+                rf"\.literal[\t ]+{re.escape(label)},[\t ]*"
+                rf"{re.escape(symbol)}\+0x[0-9A-Fa-f]+(?=\\n|\")"
+            )
+            normalized, definitions = exact_literal.subn(
+                f".literal {label}, {symbol}", normalized
+            )
+            load = re.compile(
+                rf"l32r[\t ]+(a(?:[0-9]|1[0-5])),[\t ]*"
+                rf"{re.escape(label)}(?=\\n|\")"
+            )
+
+            def expand_literal(match: re.Match[str]) -> str:
+                register = match.group(1)
+                lines = [match.group(0)]
+                if high:
+                    lines.append(f"addmi {register}, {register}, {high}")
+                if low:
+                    lines.append(f"addi {register}, {register}, {low}")
+                return r"\n".join(lines)
+
+            normalized, loads = load.subn(expand_literal, normalized)
+            if definitions and not loads:
+                raise ValueError(f"literal has no recovered load: {label}")
+            literal_count += definitions
+        branch_count = 0
+        pieces = normalized.split(r"\n")
+        source_identity = path.as_posix()
+        marker = source_identity.rfind("/src/")
+        if marker >= 0:
+            source_identity = source_identity[marker + 1:]
+        namespace = re.sub(r"[^A-Za-z0-9_]", "_", source_identity)
+        local_symbols = set(re.findall(
+            r"\.local\s+(\S+?)(?=\\n|\")", normalized
+        ))
+        # Undo islands created by older normalization rules when their final
+        # target is actually a label in the same recovered function.
+        index = 0
+        while index + 2 < len(pieces):
+            branch_match = BRANCH.fullmatch(pieces[index])
+            jump_match = re.fullmatch(r"j\s+(\S+)", pieces[index + 1])
+            definition = pieces[index + 2].removesuffix(":")
+            if (branch_match and jump_match and
+                    "_far_branch_" in definition and
+                    branch_match.group(3) == definition):
+                target = jump_match.group(1)
+                target_base = re.sub(
+                    r"[+-](?:0x[0-9A-Fa-f]+|[0-9]+)$", "", target
+                )
+                required = (
+                    target_base in local_symbols or
+                    not target.startswith(".Labla_recovered_")
+                )
+                if not required:
+                    pieces[index] = (
+                        f"{BRANCH_INVERSE[branch_match.group(1)]} "
+                        f"{branch_match.group(2)}{target}"
+                    )
+                    del pieces[index + 1:index + 3]
+                    branch_count += 1
+                    continue
+            index += 1
+        for index, piece in enumerate(pieces):
+            match = BRANCH.fullmatch(piece)
+            if not match or match.group(1) not in BRANCH_INVERSE:
+                continue
+            target = match.group(3)
+            target_base = re.sub(
+                r"[+-](?:0x[0-9A-Fa-f]+|[0-9]+)$", "", target
+            )
+            cross_local = target_base in local_symbols
+            external_target = not target.startswith(".Labla_recovered_")
+            if "_far_branch_" in target:
+                continue
+            if cross_local or external_target:
+                label = (
+                    f".Labla_recovered_{namespace}_far_branch_{branch_count}"
+                )
+                pieces[index] = r"\n".join([
+                    f"{BRANCH_INVERSE[match.group(1)]} "
+                    f"{match.group(2)}{label}",
+                    f"j {target}",
+                    f"{label}:",
+                ])
+                branch_count += 1
+        if branch_count:
+            normalized = r"\n".join(pieces)
+        # Re-number all previously and newly generated branch islands across
+        # the complete source file. This makes repeated normalization
+        # idempotent even when a later pass discovers another branch shape.
+        pieces = normalized.split(r"\n")
+        renumbered = 0
+        far_label = re.compile(
+            r"\.Labla_recovered_[A-Za-z0-9_]+_far_branch_[0-9]+"
+        )
+        index = 0
+        while index + 2 < len(pieces):
+            definition = pieces[index + 2]
+            if far_label.fullmatch(definition.removesuffix(":")):
+                old = definition[:-1]
+                branch_match = BRANCH.fullmatch(pieces[index])
+                if branch_match and branch_match.group(3) == old:
+                    new = (
+                        f".Labla_recovered_{namespace}_far_branch_{renumbered}"
+                    )
+                    pieces[index] = (
+                        f"{branch_match.group(1)} "
+                        f"{branch_match.group(2)}{new}"
+                    )
+                    pieces[index + 2] = f"{new}:"
+                    if new != old:
+                        branch_count += 1
+                    renumbered += 1
+                    index += 3
+                    continue
+            index += 1
+        normalized = r"\n".join(pieces)
+        if (count or tls_count or section_target_count or literal_count or
+                branch_count):
+            path.write_text(normalized)
+            changed += (count + tls_count + section_target_count +
+                        literal_count + branch_count)
+    print(f"normalized {changed} symbolic Xtensa address expression(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Check every emitted CP0/CP3 save/restore instruction and frame offset.
+
+Instruction encodings checked against S3 GNU assembler and IDF tie-asm.h;
+does not prove hardware state switching or lazy ownership integration.
+"""
+import struct
+import sys
+from pathlib import Path
+
+data=Path(sys.argv[1]).read_bytes()
+assert len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == '--save-only')
+save_only=len(sys.argv) == 3
+assert data[:6] == b'\x7fELF\x01\x01'
+table=struct.unpack_from('<I',data,32)[0]
+stride,count,names_index=struct.unpack_from('<HHH',data,46)
+assert stride == 40 and names_index < count
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+n=headers[names_index]; names=data[n[4]:n[4]+n[5]]
+sections={names[s[0]:].split(b'\0',1)[0].decode():data[s[4]:s[4]+s[5]] for s in headers}
+
+def access_user(register,restore):
+    return bytes((0x30,register,0xF3)) if restore else bytes(((register & 15)<<4,0x30 | (register>>4),0xE3))
+
+def memory_word(slot,restore):
+    if slot < 16: return bytes((0x38 if restore else 0x39,(slot<<4)|2))
+    return bytes((0x32,0x22 if restore else 0x62,slot))
+
+for cp in (0,3):
+    for restore in (False,True):
+        if restore and save_only:
+            name=f'.iram1.abla.s3Cp{cp}Restore'
+            assert name not in sections and name+'Windowed' not in sections, 'save-only closure retained unused restore'
+            continue
+        expected=bytearray()
+        if cp == 0:
+            for reg in range(16): expected+=bytes(((reg<<4)|3,2 if restore else 0x42,reg))
+            registers=(232,233)
+            first=16
+        else:
+            registers=(0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18)
+            first=0
+        for slot,reg in enumerate(registers,first):
+            mem=memory_word(slot,restore); access=access_user(reg,restore)
+            expected+=mem+access if restore else access+mem
+        if cp == 3:
+            for reg in range(8):
+                if reg == 3: expected+=bytes.fromhex('22d201 22c280') # pointer +=128
+                slot=5+reg if reg < 3 else reg-3
+                expected+=bytes((0x24,(0x20 if restore else 0x60)|((reg&1)<<7)|slot,0xCD+(reg>>1)*16))
+            expected+=bytes.fromhex('22c280') # pointer restored; padding72..79 untouched
+        if restore: expected+=bytes.fromhex('102000')
+        expected+=bytes.fromhex('0df0') # CALL0 return, no compiler/window prologue
+        name=f'.iram1.abla.s3Cp{cp}{"Restore" if restore else "Save"}'
+        if name in sections:
+            assert sections[name] == expected, f'{name}: register/offset/ABI encoding mismatch'
+        else:
+            # Windowed bridge uses exactly one ENTRY32 and RETW, same state
+            # instructions and offsets in between. No compiler-added wrapper.
+            windowed=name+'Windowed'
+            assert sections[windowed] == bytes.fromhex('364100')+expected[:-2]+bytes.fromhex('1df0'), f'{windowed}: windowed ABI/context mismatch'
+print('PASS: CP0(72byte)/CP3(208byte) '+('save-only' if save_only else 'save/restore')+' encodings,pointer preservation,CALL0 or windowed ABI; not hardware proof')

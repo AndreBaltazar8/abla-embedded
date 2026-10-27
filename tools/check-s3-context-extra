@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Check emitted CALL0 extra-context leaves against the S3 register map.
+
+Checks every instruction byte, register, offset and return convention. This
+does not simulate hardware or prove integration with the exception frame.
+"""
+import struct
+import sys
+from pathlib import Path
+
+
+def check(data):
+    if data[:6] != b'\x7fELF\x01\x01':
+        raise ValueError('expected little-endian ELF32')
+    table = struct.unpack_from('<I', data, 32)[0]
+    stride, count, names_index = struct.unpack_from('<HHH', data, 46)
+    assert stride == 40 and names_index < count
+    sections = [struct.unpack_from('<10I', data, table+i*40) for i in range(count)]
+    header = sections[names_index]
+    names = data[header[4]:header[4]+header[5]]
+    # S3 tie-asm.h full NCP layout: THREADPTR(user231), ACCLO16, ACCHI17,
+    # BR4, SCOMPARE1(12), M0..3(32..35), all saved consecutively as nine u32s.
+    special = (None, 16, 17, 4, 12, 32, 33, 34, 35)
+    for restore in (False, True):
+        name = b'.iram1.abla.s3ContextExtra' + (b'Restore' if restore else b'Save')
+        matches = [s for s in sections if names[s[0]:].split(b'\0', 1)[0] == name]
+        assert len(matches) == 1, 'missing/duplicate context leaf'
+        section = matches[0]
+        code = data[section[4]:section[4]+section[5]]
+        expected = bytearray()
+        for slot, register in enumerate(special):
+            # Narrow L32I/S32I: a3, base a2, offset slot*4.
+            memory = bytes((0x38 if restore else 0x39, (slot << 4) | 2))
+            if register is None:
+                access = bytes.fromhex('30e7f3' if restore else '703ee3')
+            else:
+                access = bytes((0x30, register, 0x13 if restore else 3))
+            expected += memory+access if restore else access+memory
+        if restore:
+            expected += bytes.fromhex('102000')  # RSYNC before return
+        expected += bytes.fromhex('0df0')        # RET.N, never RETW
+        assert code == expected, f'{name.decode()}: context encoding/prologue/layout mismatch'
+    return True
+
+
+if __name__ == '__main__':
+    try:
+        data = Path(sys.argv[1]).read_bytes()
+        check(data)
+    except (AssertionError, ValueError, OSError, IndexError, struct.error) as error:
+        sys.exit(str(error))
+    print('PASS: nine S3 extra registers,36-byte layout,CALL0 returns; no hardware proof')

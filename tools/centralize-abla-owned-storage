@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Move cyclic zero-initialized ESP32 data into a cycle-free Abla module."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pathlib
+import re
+
+
+ADDRESS = re.compile(
+    r"\$xtensa\s+address\s+\{\{?\s*([^{}\s]+)\s*\}\}?"
+)
+PAIR = re.compile(
+    r"(?m)^val\s+(?P<storage>esp32Data_[A-Za-z0-9_]+Storage)\s*=\s*"
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)\n"
+    r"val\s+(?P<value>esp32Data_[A-Za-z0-9_]+)\s*=\s*"
+    r"u32\((?P=storage)\)\n?"
+)
+INITIALIZED = re.compile(
+    r"(?ms)^val\s+(?P<storage>esp32Data_[A-Za-z0-9_]+Storage)\s*=\s*"
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)\n"
+    r"trusted\s+fun\s+(?P<initialize>esp32Data_[A-Za-z0-9_]+Initialize)"
+    r"\(\):\s*int\s*\{\n(?P<body>.*?)^\}\n"
+    r"val\s+(?P<initialized>esp32Data_[A-Za-z0-9_]+Initialized)\s*=\s*"
+    r"(?P=initialize)\(\)\n"
+    r"val\s+(?P<value>esp32Data_[A-Za-z0-9_]+)\s*=\s*"
+    r"u32\((?P=initialized)\)\n?"
+)
+
+
+def data_identifier(symbol: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
+    if not readable or readable[0].isdigit():
+        readable = "data_" + readable
+    digest = hashlib.sha1(symbol.encode()).hexdigest()[:10]
+    return f"esp32Data_{readable}_{digest}"
+
+
+def relative_import(caller: pathlib.Path, owner: pathlib.Path) -> str:
+    value = os.path.relpath(owner, caller.parent)
+    if not value.startswith("."):
+        value = "./" + value
+    return pathlib.PurePath(value).as_posix()
+
+
+def ensure_import(source: str, imported: str) -> str:
+    statement = f'import "{imported}"'
+    if statement in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    insertion = 0
+    while insertion < len(lines) and lines[insertion].startswith("import "):
+        insertion += 1
+    lines.insert(insertion, statement + "\n")
+    return "".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--initialized-constants", action="store_true")
+    parser.add_argument("root", type=pathlib.Path)
+    parser.add_argument("shared", type=pathlib.Path)
+    arguments = parser.parse_args()
+    paths = sorted(arguments.root.rglob("*.ab"))
+    shared = arguments.shared.resolve()
+    unresolved = {
+        data_identifier(symbol)
+        for path in paths if path.resolve() != shared
+        for symbol in ADDRESS.findall(path.read_text())
+    }
+
+    moved: list[tuple[str, str, str]] = []
+    initialized_blocks: dict[str, str] = {}
+    changed: dict[pathlib.Path, str] = {}
+    for path in paths:
+        if path.resolve() == shared:
+            continue
+        source = path.read_text()
+
+        def remove(match: re.Match[str]) -> str:
+            value = match.group("value")
+            if value not in unresolved:
+                return match.group(0)
+            moved.append((match.group("storage"), value, match.group("size")))
+            return ""
+
+        lowered = PAIR.sub(remove, source)
+        if arguments.initialized_constants:
+            def remove_initialized(match: re.Match[str]) -> str:
+                value = match.group("value")
+                if value not in unresolved:
+                    return match.group(0)
+                local_names = {
+                    match.group("storage"), match.group("initialize"),
+                    match.group("initialized"), value,
+                }
+                dependencies = set(re.findall(
+                    r"esp32Data_[A-Za-z0-9_]+", match.group(0)
+                )) - local_names
+                if dependencies:
+                    return match.group(0)
+                initialized_blocks[value] = match.group(0).rstrip()
+                return ""
+
+            lowered = INITIALIZED.sub(remove_initialized, lowered)
+        if lowered != source:
+            lowered = ensure_import(lowered, relative_import(path, arguments.shared))
+            changed[path] = lowered
+
+    unique: dict[str, tuple[str, str]] = {}
+    for storage, value, size in moved:
+        previous = unique.get(value)
+        candidate = (storage, size)
+        if previous is not None and previous != candidate:
+            raise ValueError(f"conflicting storage declarations for {value}")
+        unique[value] = candidate
+
+    action = "centralized" if arguments.write else "would centralize"
+    print(
+        f"{action} {len(unique)} zero-initialized and "
+        f"{len(initialized_blocks)} constant-initialized values from "
+        f"{len(changed)} modules"
+    )
+    if not arguments.write or (not unique and not initialized_blocks):
+        return 0
+    for path, source in changed.items():
+        path.write_text(source)
+    shared_source = arguments.shared.read_text().rstrip() + "\n\n"
+    for value in sorted(unique):
+        storage, size = unique[value]
+        shared_source += (
+            f"val {storage} = nativeStaticAllocate({size})\n"
+            f"val {value} = u32({storage})\n\n"
+        )
+    for value in sorted(initialized_blocks):
+        shared_source += initialized_blocks[value] + "\n\n"
+    arguments.shared.write_text(shared_source.rstrip() + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

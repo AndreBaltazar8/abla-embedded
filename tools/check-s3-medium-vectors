@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Validate final linked medium vector positions and actual J destinations."""
+import struct
+import sys
+from pathlib import Path
+
+data=Path(sys.argv[1]).read_bytes()
+assert data[:6] == b'\x7fELF\x01\x01' and struct.unpack_from('<H',data,16)[0] == 2, 'expected linked ELF32'
+table=struct.unpack_from('<I',data,32)[0]
+stride,count,names_index=struct.unpack_from('<HHH',data,46)
+assert stride == 40 and names_index < count
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+n=headers[names_index]; names=data[n[4]:n[4]+n[5]]
+sections={names[s[0]:].split(b'\0',1)[0].decode():(i,s) for i,s in enumerate(headers)}
+irq_index,irq_section=sections['.iram1.abla.s3IrqEntries']
+functions=[]
+for s in headers:
+    if s[1] != 2: continue
+    assert s[9] == 16
+    for offset in range(s[4],s[4]+s[5],16):
+        _,value,size,info,_,shndx=struct.unpack_from('<IIIBBH',data,offset)
+        if shndx == irq_index and info & 15 == 2: functions.append(value)
+assert len(functions) == 1
+irq_base=functions[0] # excludes any literal pool before the function
+_,window=sections['.iram1.abla.s3WindowVectors']
+vecbase=window[3]
+assert vecbase & 1023 == 0 and window[5] == 384
+for level in (2,3):
+    _,s=sections[f'.iram1.abla.s3Level{level}Vector']
+    assert s[3] == vecbase+0x180+(level-2)*64 and s[5] == 64
+    code=data[s[4]:s[4]+s[5]]
+    instruction=int.from_bytes(code[:3],'little')
+    assert instruction & 63 == 6 and not any(code[3:]), 'vector must be only J, with no register clobber/prologue'
+    displacement=instruction>>6
+    if displacement & (1<<17): displacement-=1<<18
+    target=s[3]+4+displacement
+    assert target == irq_base+(level-1)*512, 'wrong linked IRQ destination'
+    offset=irq_section[4]+target-irq_section[3]
+    assert data[offset:offset+3] == bytes((0,0xD0+level,0x13)), 'destination must first preserve a0 in EXCSAVEn'
+print('PASS: final VECBASE offsets,J destinations and a0 preservation for levels2/3; partial table only')
+
+if '.iram1.abla.s3UserVector' in sections:
+    _,user=sections['.iram1.abla.s3UserVector']
+    assert user[3] == vecbase+0x340 and user[5] == 64
+    fault_index,_=sections['.iram1.abla.s3ExceptionEntry']
+    faults=[]
+    for s in headers:
+        if s[1] != 2: continue
+        for offset in range(s[4],s[4]+s[5],16):
+            _,value,_,info,_,shndx=struct.unpack_from('<IIIBBH',data,offset)
+            if shndx == fault_index and info & 15 == 2: faults.append(value)
+    assert len(faults) == 1
+    _,fault_section=sections['.iram1.abla.s3ExceptionEntry']
+    # Check the cross-section CALL0 relocations after linking, not the zero
+    # displacement placeholders in the object. Both must use the shared ABI.
+    for relative,destination in ((30,irq_base+1536),(139,irq_base+1792)):
+        address=faults[0]+relative
+        offset=fault_section[4]+address-fault_section[3]
+        instruction=int.from_bytes(data[offset:offset+3],'little')
+        assert instruction & 63 == 5, 'exception context boundary must use CALL0'
+        displacement=instruction>>6
+        if displacement & (1<<17): displacement-=1<<18
+        assert (address & ~3)+4+displacement*4 == destination, 'exception context call target mismatch'
+    code=data[user[4]:user[4]+64]
+    for seed in range(4):
+        for cause in range(64):
+            original=0xABC00000+seed*64+cause
+            a0=original; excsave=0; pc=0; destination=None
+            for step in range(12):
+                instruction=code[pc:pc+3]
+                if instruction == bytes.fromhex('00d113'): excsave=a0; pc+=3
+                elif instruction == bytes.fromhex('00e803'): a0=cause; pc+=3
+                elif instruction == bytes.fromhex('00d103'): a0=excsave; pc+=3
+                elif instruction[0] == 0x66 and instruction[1] in (0x40,0x50):
+                    immediate=instruction[2] if instruction[2] < 128 else instruction[2]-256
+                    pc=pc+4+immediate if a0 != instruction[1]>>4 else pc+3
+                else:
+                    word=int.from_bytes(instruction,'little')
+                    assert word & 63 == 6, 'unexpected user vector instruction/register write'
+                    displacement=word>>6
+                    if displacement & (1<<17): displacement-=1<<18
+                    destination=user[3]+pc+4+displacement
+                    break
+            assert destination == (irq_base if cause == 4 else vecbase+0x50 if cause == 5 else faults[0])
+            assert excsave == original
+            if cause == 4: assert a0 == original
+    print('PASS:256 linked user-router cases preserve a0 and reach IRQ1/MOVSP/fault entries; not hardware proof')

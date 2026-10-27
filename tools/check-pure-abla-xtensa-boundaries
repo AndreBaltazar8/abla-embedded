@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Target assembly is permitted only at CPU/ABI boundaries. Driver, protocol,
+# scheduler policy, radio, Wi-Fi, libc, and application behavior must remain
+# structured Abla so the complete implementation is visible to LLVM.
+allowed='^(src/xtensa/(assembly|dispatcher_owned|window_spill_esp32)\.ab|src/esp32/xtensa/(context_esp32|restore_extra_esp32|save_extra_esp32|vectors_esp32)\.ab|src/esp32/freertos/(port_assembly_esp32|port_esp32)\.ab|src/esp32/system/(debug_helpers_assembly_esp32|high_interrupt_handler_esp32|ipc_isr_handler_esp32|panic_handler_assembly_esp32)\.ab|src/esp32/rom/printf_esp32\.ab)$'
+
+status=0
+while IFS= read -r source; do
+    relative=${source#"$project_root/"}
+    # IPC CALL0 wait leaf is checked by exact naked function name below.
+    if [[ ! $relative =~ $allowed && $relative != src/esp32/system/ipc_isr_routines_esp32.ab ]]; then
+        printf 'non-boundary Xtensa operation remains in %s\n' "$relative" >&2
+        status=1
+    fi
+done < <(rg -l '\$xtensa' "$project_root/src" --glob '*.ab' | sort)
+
+if ! python3 - "$project_root" <<'PY'
+import pathlib
+import re
+import sys
+root = pathlib.Path(sys.argv[1])
+# Exact naked CALL0 leaves restored from the working exception/IPC ABI.
+# No general allowance for instructions blocks in the containing files.
+leaves = {
+    ('src/esp32/system/ipc_isr_routines_esp32.ab', 'esp32IpcIsrWaitingForFinishCommand'),
+    ('src/esp32/freertos/port_assembly_esp32.ab', 'esp32RecoveredFrxtTaskCoprocState'),
+    ('src/esp32/freertos/port_assembly_esp32.ab', 'esp32RecoveredFrxtCoprocExcHook'),
+}
+naked = re.compile(r'@naked\s+(?:@section\("[^"\n]*"\)\s+)?trusted fun (\w+)\([^)]*\): void =\s*$')
+failed = False
+for path in sorted((root / 'src').rglob('*.ab')):
+    source = path.read_text()
+    relative = path.relative_to(root).as_posix()
+    for operation in re.finditer(r'\$xtensa\s+(instructions|call|callVoid|callWide)[\s{(]', source):
+        declaration = naked.search(source[:operation.start()])
+        if operation.group(1) == 'instructions' and declaration and (relative, declaration.group(1)) in leaves:
+            continue
+        print(f'{relative}:{source.count(chr(10), 0, operation.start()) + 1}: forbidden {operation.group(1)} boundary')
+        failed = True
+sys.exit(1 if failed else 0)
+PY
+then
+    echo 'lifted instruction block or ordinary recovered call remains in Abla source' >&2
+    status=1
+fi
+
+if rg -n 'when[[:space:]]*\([[:space:]]*programCounter[[:space:]]*\)' \
+    "$project_root/src" --glob '*.ab'; then
+    echo 'lifted program-counter dispatcher remains in Abla source' >&2
+    status=1
+fi
+
+exit "$status"

@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Lower target subparser calls that already have ordinary Abla equivalents.
+
+Recovered ESP32 functions should use the Xtensa subparser only for operations
+that cannot be represented by Abla or its target-neutral native intrinsics.
+This pass makes indirect calls, ordinary memory accesses, device accesses, and
+memory barriers ordinary Abla calls so LLVM can see their operands and the
+source no longer presents them as recovered Xtensa instructions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+
+
+PREFIX = "$xtensa "
+LOWERABLE = {
+    "callAddress",
+    "callAddressWide",
+    "atomicCompareExchange",
+    "deviceLoad32",
+    "deviceStore32",
+    "dataSynchronize",
+    "eventSynchronize",
+    "externalRegisterRead",
+    "instructionSynchronize",
+    "memoryBarrier",
+    "read",
+    "restoreProcessorState",
+    "returnAddress",
+    "semihosting",
+    "stackPointer",
+    "load8",
+    "load16",
+    "load32",
+    "store8",
+    "store16",
+    "store32",
+    "tlsAddress",
+    "trapLoop",
+    "write",
+    "writeDataTlb",
+    "writeInstructionTlb",
+    "raiseInterruptLevel",
+}
+
+OWNED_TLS_SIZES = {
+    ".Labla_recovered_picolibc_strtok_data__tbss__strtok_last": 4,
+    "_localtime_buf": 36,
+    "errno": 4,
+}
+
+REGISTER_READS = {
+    "rsr.ccount": "xtensaReadCycleCount()",
+    "rsr.debugcause": "xtensaReadDebugCause()",
+    "rsr.epc1": "xtensaReadExceptionProgramCounter1()",
+    "rsr.epc2": "xtensaReadExceptionProgramCounter2()",
+    "rsr.epc3": "xtensaReadExceptionProgramCounter3()",
+    "rsr.epc4": "xtensaReadExceptionProgramCounter4()",
+    "rsr.ibreakenable": "xtensaReadInstructionBreakpointEnable()",
+    "rsr.intenable": "xtensaReadInterruptEnableRegister()",
+    "rsr.interrupt": "xtensaReadPendingInterruptRegister()",
+    "rsr.prid": "xtensaReadProcessorId()",
+    "rsr.ps": "xtensaReadProcessorState()",
+    "rur.threadptr": "xtensaReadThreadPointer()",
+}
+
+REGISTER_WRITES = {
+    "wsr.ccount": "xtensaWriteCycleCount",
+    "wsr.dbreaka0": "xtensaWriteDataBreakpointAddress0",
+    "wsr.dbreaka1": "xtensaWriteDataBreakpointAddress1",
+    "wsr.dbreakc0": "xtensaWriteDataBreakpointControl0",
+    "wsr.dbreakc1": "xtensaWriteDataBreakpointControl1",
+    "wsr.ibreaka0": "xtensaWriteInstructionBreakpointAddress0",
+    "wsr.ibreaka1": "xtensaWriteInstructionBreakpointAddress1",
+    "wsr.ibreakenable": "xtensaWriteInstructionBreakpointEnable",
+    "wsr.intclear": "xtensaWritePendingInterruptClear",
+    "wsr.intenable": "xtensaWriteInterruptEnableRegister",
+    "wsr.ps": "xtensaWriteProcessorState",
+    "wsr.vecbase": "xtensaWriteVectorBase",
+    "wur.threadptr": "xtensaWriteThreadPointer",
+}
+
+
+def matching_parenthesis(source: str, opening: int) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    index = opening
+    while index < len(source):
+        character = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in ('"', "'"):
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise ValueError(f"unterminated call at byte {opening}")
+
+
+def split_arguments(source: str) -> list[str]:
+    if not source.strip():
+        return []
+    arguments: list[str] = []
+    start = 0
+    round_depth = square_depth = brace_depth = 0
+    quote = ""
+    escaped = False
+    for index, character in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character == "(":
+            round_depth += 1
+        elif character == ")":
+            round_depth -= 1
+        elif character == "[":
+            square_depth += 1
+        elif character == "]":
+            square_depth -= 1
+        elif character == "{":
+            brace_depth += 1
+        elif character == "}":
+            brace_depth -= 1
+        elif (character == "," and round_depth == 0 and
+              square_depth == 0 and brace_depth == 0):
+            arguments.append(source[start:index].strip())
+            start = index + 1
+    arguments.append(source[start:].strip())
+    return arguments
+
+
+def indirect_call(arguments: list[str], wide: bool) -> str:
+    if not arguments:
+        raise ValueError("indirect call has no target address")
+    if len(arguments) > 8:
+        raise ValueError("indirect call has more than seven scalar arguments")
+    result = "I64" if wide else "I32"
+    intrinsic = f"ablaUnsafeCall{result}" + "I32" * (len(arguments) - 1)
+    operands = ", ".join(f"int({argument})" for argument in arguments)
+    conversion = "u64" if wide else "u32"
+    return f"{conversion}({intrinsic}({operands}))"
+
+
+def lower_call(mode: str, arguments: list[str]) -> tuple[str, bool, bool]:
+    if mode == "atomicCompareExchange":
+        if len(arguments) != 3:
+            raise ValueError("atomicCompareExchange expects three arguments")
+        return (
+            "u32(nativeAtomicCompareExchangeU32("
+            + ", ".join(f"int({argument})" for argument in arguments)
+            + "))",
+            True,
+            False,
+        )
+    if mode == "callAddress":
+        return indirect_call(arguments, False), True, False
+    if mode == "callAddressWide":
+        return indirect_call(arguments, True), True, False
+    if mode == "eventSynchronize":
+        if arguments:
+            raise ValueError("eventSynchronize expects no arguments")
+        return "xtensaEventSynchronize()", False, False
+    if mode == "dataSynchronize":
+        if arguments:
+            raise ValueError("dataSynchronize expects no arguments")
+        return "xtensaDataSynchronize()", False, False
+    if mode == "instructionSynchronize":
+        if arguments:
+            raise ValueError("instructionSynchronize expects no arguments")
+        return "xtensaInstructionSynchronize()", False, False
+    if mode == "restoreProcessorState":
+        if len(arguments) != 1:
+            raise ValueError("restoreProcessorState expects one argument")
+        return f"xtensaRestoreProcessorState({arguments[0]})", False, False
+    if mode == "returnAddress":
+        if arguments:
+            raise ValueError("returnAddress expects no arguments")
+        return "xtensaReturnAddress()", False, False
+    if mode == "stackPointer":
+        if arguments:
+            raise ValueError("stackPointer expects no arguments")
+        return "xtensaStackPointer()", False, False
+    if mode == "externalRegisterRead":
+        if len(arguments) != 1:
+            raise ValueError("externalRegisterRead expects one argument")
+        return f"xtensaExternalRegisterRead({arguments[0]})", False, False
+    if mode == "semihosting":
+        if len(arguments) != 2:
+            raise ValueError("semihosting expects two arguments")
+        return (
+            f"xtensaSemihosting({arguments[0]}, {arguments[1]})",
+            False,
+            False,
+        )
+    if mode in {"writeDataTlb", "writeInstructionTlb"}:
+        if len(arguments) != 2:
+            raise ValueError(f"{mode} expects two arguments")
+        wrapper = (
+            "xtensaWriteDataTlb" if mode == "writeDataTlb"
+            else "xtensaWriteInstructionTlb"
+        )
+        return f"{wrapper}({arguments[0]}, {arguments[1]})", False, False
+    if mode in {"load8", "load16", "load32"}:
+        if len(arguments) != 1:
+            raise ValueError(f"{mode} expects one argument")
+        width = mode.removeprefix("load")
+        return (
+            f"u32(ablaUnsafeLoadU{width}("
+            f"nativePointerFromAddress(int({arguments[0]}))))",
+            False,
+            True,
+        )
+    if mode in {"store8", "store16", "store32"}:
+        if len(arguments) != 2:
+            raise ValueError(f"{mode} expects two arguments")
+        width = mode.removeprefix("store")
+        return (
+            f"ablaUnsafeStoreU{width}("
+            f"nativePointerFromAddress(int({arguments[0]})), "
+            f"int({arguments[1]}))",
+            False,
+            True,
+        )
+    if mode == "deviceLoad32":
+        if len(arguments) != 1:
+            raise ValueError("deviceLoad32 expects one argument")
+        return f"xtensaDeviceLoadU32({arguments[0]})", False, False
+    if mode == "deviceStore32":
+        if len(arguments) != 2:
+            raise ValueError("deviceStore32 expects two arguments")
+        return f"xtensaDeviceStoreU32({arguments[0]}, {arguments[1]})", False, False
+    if mode == "memoryBarrier":
+        if arguments:
+            raise ValueError("memoryBarrier expects no arguments")
+        return "xtensaMemoryBarrier()", False, False
+    raise ValueError(f"unsupported lowering mode: {mode}")
+
+
+def ensure_import(source: str, statement: str) -> str:
+    if statement in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    insertion = 0
+    while insertion < len(lines) and lines[insertion].startswith("import "):
+        insertion += 1
+    lines.insert(insertion, statement + "\n")
+    return "".join(lines)
+
+
+def lower_source(source: str) -> tuple[str, dict[str, int]]:
+    counts = {mode: 0 for mode in LOWERABLE}
+    needs_native = False
+    needs_memory = False
+    output: list[str] = []
+    cursor = 0
+    while True:
+        start = source.find(PREFIX, cursor)
+        if start < 0:
+            output.append(source[cursor:])
+            break
+        output.append(source[cursor:start])
+        mode_start = start + len(PREFIX)
+        mode_end = mode_start
+        while mode_end < len(source) and source[mode_end].isalnum():
+            mode_end += 1
+        mode = source[mode_start:mode_end]
+        if mode not in LOWERABLE:
+            output.append(source[start:mode_end])
+            cursor = mode_end
+            continue
+        opening = mode_end
+        while opening < len(source) and source[opening].isspace():
+            opening += 1
+        if mode in {"raiseInterruptLevel", "trapLoop"}:
+            if opening >= len(source) or source[opening] != "{":
+                raise ValueError(f"{mode} does not have a braced operand")
+            closing = source.find("}", opening + 1)
+            if closing < 0:
+                raise ValueError(f"unterminated {mode} operand")
+            operand = source[opening + 1:closing].strip()
+            if mode == "raiseInterruptLevel" and operand in {"0", "3", "5"}:
+                output.append(f"xtensaRaiseInterruptLevel{operand}()")
+                counts[mode] += 1
+            elif mode == "trapLoop" and operand == "ill":
+                output.append("xtensaTrapForever()")
+                counts[mode] += 1
+            else:
+                output.append(source[start:closing + 1])
+            cursor = closing + 1
+            continue
+        if mode == "read":
+            if opening >= len(source) or source[opening] != "{":
+                raise ValueError("read does not have a braced instruction")
+            closing = source.find("}", opening + 1)
+            if closing < 0:
+                raise ValueError("unterminated read instruction")
+            instruction = source[opening + 1:closing].strip()
+            replacement = REGISTER_READS.get(instruction)
+            output.append(
+                source[start:closing + 1] if replacement is None
+                else replacement
+            )
+            if replacement is not None:
+                counts[mode] += 1
+            cursor = closing + 1
+            continue
+        if mode == "tlsAddress":
+            if opening >= len(source) or source[opening] != "{":
+                raise ValueError("tlsAddress does not have a braced symbol")
+            closing = source.find("}", opening + 1)
+            if closing < 0:
+                raise ValueError("unterminated tlsAddress symbol")
+            symbol = source[opening + 1:closing].strip()
+            size = OWNED_TLS_SIZES.get(symbol)
+            if size is None:
+                output.append(source[start:closing + 1])
+            else:
+                output.append(
+                    f'u32(nativeLinkedThreadLocalAllocate({size}, "{symbol}"))'
+                )
+                counts[mode] += 1
+                needs_memory = True
+            cursor = closing + 1
+            continue
+        if opening >= len(source) or source[opening] != "(":
+            raise ValueError(f"{mode} does not have a parenthesized call")
+        closing = matching_parenthesis(source, opening)
+        arguments = split_arguments(source[opening + 1:closing])
+        if mode == "write":
+            instruction_opening = closing + 1
+            while (instruction_opening < len(source) and
+                   source[instruction_opening].isspace()):
+                instruction_opening += 1
+            if (instruction_opening >= len(source) or
+                source[instruction_opening] != "{"):
+                raise ValueError("write does not have a braced instruction")
+            instruction_closing = source.find("}", instruction_opening + 1)
+            if instruction_closing < 0:
+                raise ValueError("unterminated write instruction")
+            instruction = source[
+                instruction_opening + 1:instruction_closing
+            ].strip()
+            wrapper = REGISTER_WRITES.get(instruction)
+            if wrapper is None:
+                output.append(source[start:instruction_closing + 1])
+            else:
+                if len(arguments) != 1:
+                    raise ValueError("write expects one value")
+                output.append(f"{wrapper}({arguments[0]})")
+                counts[mode] += 1
+            cursor = instruction_closing + 1
+            continue
+        replacement, native, memory = lower_call(mode, arguments)
+        output.append(replacement)
+        counts[mode] += 1
+        needs_native = needs_native or native
+        needs_memory = needs_memory or memory
+        cursor = closing + 1
+    lowered = "".join(output)
+    if needs_native:
+        lowered = ensure_import(lowered, 'import "abla/unsafe/native"')
+    if needs_memory:
+        lowered = ensure_import(lowered, 'import "abla/unsafe/memory"')
+    return lowered, counts
+
+
+def source_paths(arguments: list[pathlib.Path]) -> list[pathlib.Path]:
+    paths: list[pathlib.Path] = []
+    for argument in arguments:
+        if argument.is_dir():
+            paths.extend(sorted(argument.rglob("*.ab")))
+        elif argument.suffix == ".ab":
+            paths.append(argument)
+    return list(dict.fromkeys(paths))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("paths", nargs="+", type=pathlib.Path)
+    arguments = parser.parse_args()
+    totals = {mode: 0 for mode in LOWERABLE}
+    changed = 0
+    for path in source_paths(arguments.paths):
+        original = path.read_text()
+        lowered, counts = lower_source(original)
+        if lowered == original:
+            continue
+        changed += 1
+        for mode, count in counts.items():
+            totals[mode] += count
+        if arguments.write:
+            path.write_text(lowered)
+    action = "lowered" if arguments.write else "would lower"
+    details = ", ".join(
+        f"{mode}={totals[mode]}" for mode in sorted(totals)
+    )
+    print(f"{action} {sum(totals.values())} boundary calls in {changed} files")
+    print(details)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

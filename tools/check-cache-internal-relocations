@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Reject IRAM/DRAM relocations into flash in mixed-placement ELF32 objects.
+
+Complements the LLVM noinline boundary check. Not final linker, computed
+pointer, stack or hardware proof; ROM absolute symbols remain allowed.
+"""
+import struct
+import sys
+from pathlib import Path
+
+
+def validate(data):
+    if data[:6] != b'\x7fELF\x01\x01':
+        raise ValueError('expected little-endian ELF32')
+    offset = struct.unpack_from('<I', data, 32)[0]
+    stride, count, names_index = struct.unpack_from('<HHH', data, 46)
+    if stride != 40 or not count or names_index >= count:
+        raise ValueError('unsupported section table')
+    sections = [struct.unpack_from('<10I', data, offset+i*40) for i in range(count)]
+    strings = sections[names_index]
+    names = data[strings[4]:strings[4]+strings[5]]
+    labels = [names[s[0]:].split(b'\0', 1)[0].decode('ascii') for s in sections]
+    internal = lambda name: name in ('.iram1', '.dram1') or name.startswith(('.iram1.', '.dram1.'))
+    checked = 0
+    for section in sections:
+        if section[1] not in (4, 9):  # SHT_RELA / SHT_REL
+            continue
+        if section[7] >= count or section[6] >= count:
+            raise ValueError('invalid relocation section links')
+        origin = section[7]
+        if not internal(labels[origin]) or not sections[origin][2] & 2:
+            continue
+        symbols = sections[section[6]]
+        expected_stride = 12 if section[1] == 4 else 8
+        if section[9] != expected_stride or symbols[9] != 16 or section[5] % expected_stride:
+            raise ValueError('invalid relocation or symbol stride')
+        for pos in range(section[4], section[4]+section[5], expected_stride):
+            info = struct.unpack_from('<I', data, pos+4)[0]
+            if info & 255 == 0:  # R_XTENSA_NONE
+                continue
+            symbol = info >> 8
+            if symbol*16 >= symbols[5]:
+                raise ValueError('relocation symbol outside table')
+            target = struct.unpack_from('<H', data, symbols[4]+symbol*16+14)[0]
+            if target == 0xfff1:  # SHN_ABS, e.g. permitted hardware ROM
+                continue
+            if target == 0 or target >= count:
+                raise ValueError('unresolved cache-critical relocation')
+            if not internal(labels[target]) or not sections[target][2] & 2:
+                raise ValueError(f'{labels[origin]} references non-internal section {labels[target]}')
+            checked += 1
+    if not checked:
+        raise ValueError('no internal relocations checked')
+    return checked
+
+
+if __name__ == '__main__':
+    try:
+        checked = validate(Path(sys.argv[1]).read_bytes())
+    except (IndexError, ValueError, OSError, struct.error) as error:
+        sys.exit(str(error))
+    print(f'PASS: {checked} internal-memory relocations remain internal (object-level only)')

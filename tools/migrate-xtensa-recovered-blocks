@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Move opaque Xtensa strings into the parsed `$xtensa instructions` form."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import sys
+
+
+DEFAULT_CONSTRAINTS = '"~{memory}"'
+RECOVERED_CALLS = (
+    ("xtensaAssemblyVoid(", "instructions"),
+    ("xtensaAssemblyReadU32(", "instructionsU32"),
+)
+ADDRESS_CALL = re.compile(
+    r'xtensaAssemblyReadU32\(\s*"movi \$0, '
+    r'([A-Za-z_.$][A-Za-z0-9_.$]*)"\s*,\s*"=a"\s*\)'
+)
+IMMEDIATE_CALL = re.compile(
+    r'xtensaAssemblyReadU32\(\s*"movi \$0, ([0-9]+)"'
+    r'\s*,\s*"=a"\s*\)'
+)
+TYPED_CALLS = tuple(
+    [(f"xtensaAssemblyCallVoid{count}(", "callVoid", count)
+     for count in (1, 2, 3, 5, 6, 9)] +
+    [("xtensaAssemblyReadU32(", "call", 0),
+     ("xtensaAssemblyReadU32WithU32(", "call", 1),
+     ("xtensaAssemblyReadU32WithU32U32(", "call", 2),
+     ("xtensaAssemblyReadU32WithU32U32U32(", "call", 3),
+     ("xtensaAssemblyReadU32WithU32U32U32U32(", "call", 4)]
+)
+CALL_TARGET = r"([A-Za-z_.$][A-Za-z0-9_.$]*)"
+VOID_CALL_TEMPLATE = re.compile(
+    rf"^(?:movi\s+a8,\s*{CALL_TARGET}\ncallx8\s+a8|"
+    rf"call8\s+{CALL_TARGET})$"
+)
+ABI_BODY = re.compile(
+    r"(?P<header>^// Original ABI symbol: (?P<symbol>[^\n]+)\n"
+    r"(?:(?!^// Original ABI symbol:).)*?"
+    r"\$xtensa instructions(?:U32|U32Pure)? \{\n)"
+    r"(?P<body>.*?)(?=^\}$)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def string_end(source: str, begin: int) -> int:
+    if begin >= len(source) or source[begin] != '"':
+        raise ValueError("expected string literal")
+    index = begin + 1
+    escaped = False
+    while index < len(source):
+        byte = source[index]
+        if escaped:
+            escaped = False
+        elif byte == "\\":
+            escaped = True
+        elif byte == '"':
+            return index + 1
+        index += 1
+    raise ValueError("unterminated string literal")
+
+
+def call_arguments(source: str, begin: int) -> tuple[int, int, int]:
+    """Return top-level comma, closing parenthesis, and next position."""
+    index = begin
+    depth = 0
+    comma = -1
+    while index < len(source):
+        byte = source[index]
+        if byte == '"':
+            index = string_end(source, index)
+            continue
+        if byte in "([{":
+            depth += 1
+        elif byte in ")]}":
+            if byte == ")" and depth == 0:
+                if comma < 0:
+                    raise ValueError("recovered assembly call has one argument")
+                return comma, index, index + 1
+            depth -= 1
+            if depth < 0:
+                raise ValueError("unbalanced recovered assembly call")
+        elif byte == "," and depth == 0 and comma < 0:
+            comma = index
+        index += 1
+    raise ValueError("unterminated recovered assembly call")
+
+
+def split_arguments(source: str, begin: int, end: int) -> list[str]:
+    arguments: list[str] = []
+    argument = begin
+    index = begin
+    depth = 0
+    while index < end:
+        byte = source[index]
+        if byte == '"':
+            index = string_end(source, index)
+            continue
+        if byte in "([{":
+            depth += 1
+        elif byte in ")]}":
+            depth -= 1
+        elif byte == "," and depth == 0:
+            arguments.append(source[argument:index].strip())
+            argument = index + 1
+        index += 1
+    arguments.append(source[argument:end].strip())
+    return arguments
+
+
+def typed_call_target(template: str, argument_count: int) -> str | None:
+    void = VOID_CALL_TEMPLATE.fullmatch(template)
+    if void is not None:
+        return void.group(1) or void.group(2)
+
+    lines = template.splitlines()
+    for index in range(argument_count):
+        if index >= len(lines):
+            return None
+        if re.fullmatch(
+            rf"mov(?:\.n)?\s+a{10 + index},\s*\${index + 1}", lines[index]
+        ) is None:
+            return None
+    target: re.Match[str] | None = None
+    result_line = -1
+    if len(lines) == argument_count + 3:
+        target = re.fullmatch(rf"movi\s+a8,\s*{CALL_TARGET}", lines[-3])
+        if target is None or re.fullmatch(r"callx8\s+a8", lines[-2]) is None:
+            return None
+        result_line = -1
+    elif len(lines) == argument_count + 2:
+        target = re.fullmatch(rf"call8\s+{CALL_TARGET}", lines[-2])
+        result_line = -1
+    else:
+        return None
+    if re.fullmatch(
+        r"mov(?:\.n)?\s+\$0,\s*a10", lines[result_line]
+    ) is None:
+        return None
+    return target.group(1)
+
+
+def migrate_typed_calls(source: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for call_name, mode, argument_count in TYPED_CALLS:
+        search = 0
+        while True:
+            call = source.find(call_name, search)
+            if call < 0:
+                break
+            begin = call + len(call_name)
+            try:
+                _, close, after = call_arguments(source, begin)
+            except ValueError:
+                search = begin
+                continue
+            arguments = split_arguments(source, begin, close)
+            if len(arguments) != argument_count + 2:
+                search = after
+                continue
+            template = decode_concatenated_strings(arguments[0])
+            target = None if template is None else typed_call_target(
+                template, argument_count
+            )
+            if target is not None:
+                values = ", ".join(arguments[2:])
+                replacements.append((
+                    call, after, f"$xtensa {mode} {{{target}}}({values})"
+                ))
+            search = after
+    migrated = source
+    for begin, end, replacement in sorted(replacements, reverse=True):
+        migrated = migrated[:begin] + replacement + migrated[end:]
+    return migrated, len(replacements)
+
+
+def hex_value(byte: str) -> int:
+    if "0" <= byte <= "9":
+        return ord(byte) - ord("0")
+    if "a" <= byte <= "f":
+        return ord(byte) - ord("a") + 10
+    if "A" <= byte <= "F":
+        return ord(byte) - ord("A") + 10
+    return -1
+
+
+def decode_abla_string(literal: str) -> str:
+    """Mirror bootstrapDecodeString, including Abla-specific `\\$`/`\\0`."""
+    raw = literal[1:-1]
+    output: list[str] = []
+    index = 0
+    while index < len(raw):
+        if raw[index] != "\\" or index + 1 == len(raw):
+            output.append(raw[index])
+            index += 1
+            continue
+
+        escaped = raw[index + 1]
+        simple = {
+            "n": "\n", "r": "\r", "t": "\t", "b": "\b",
+            '"': '"', "'": "'", "\\": "\\", "$": "$",
+        }
+        if escaped in simple:
+            output.append(simple[escaped])
+            index += 2
+            continue
+        # Abla deliberately preserves `\\0` for inline-assembly operands.
+        if escaped == "0":
+            output.append("\\0")
+            index += 2
+            continue
+        if escaped == "x" and index + 3 < len(raw):
+            high = hex_value(raw[index + 2])
+            low = hex_value(raw[index + 3])
+            if high >= 0 and low >= 0:
+                output.append(chr(high * 16 + low))
+                index += 4
+                continue
+        if escaped == "u" and index + 5 < len(raw):
+            digits = raw[index + 2:index + 6]
+            values = [hex_value(byte) for byte in digits]
+            if all(value >= 0 for value in values):
+                codepoint = 0
+                for value in values:
+                    codepoint = codepoint * 16 + value
+                if codepoint in (9, 10, 13) or 32 <= codepoint <= 126:
+                    output.append(chr(codepoint))
+                else:
+                    output.append(raw[index:index + 6])
+                index += 6
+                continue
+        # Unknown escapes survive unchanged in Abla.
+        output.append("\\" + escaped)
+        index += 2
+    return "".join(output)
+
+
+def decode_concatenated_strings(expression: str) -> str | None:
+    values: list[str] = []
+    index = 0
+    expecting_string = True
+
+    def skip_trivia(position: int) -> int:
+        while True:
+            while position < len(expression) and expression[position].isspace():
+                position += 1
+            if expression.startswith("//", position):
+                newline = expression.find("\n", position + 2)
+                position = len(expression) if newline < 0 else newline + 1
+                continue
+            return position
+
+    while True:
+        index = skip_trivia(index)
+        if index == len(expression):
+            break
+        if expecting_string:
+            if expression[index] != '"':
+                return None
+            end = string_end(expression, index)
+            values.append(decode_abla_string(expression[index:end]))
+            index = end
+        else:
+            if expression[index] != "+":
+                return None
+            index += 1
+        expecting_string = not expecting_string
+    if expecting_string or not values:
+        return None
+    return "".join(values)
+
+
+def parsed_form(assembly: str, mode: str) -> str | None:
+    # The closing fence is deliberately a complete line. Assembler labels and
+    # string data may contain `}`, but a bare closing-brace record is invalid.
+    if "\n}" in assembly:
+        return None
+    ending = "" if assembly.endswith("\n") else "\n"
+    return f"$xtensa {mode} {{\n{assembly}{ending}}}"
+
+
+def top_level_entry_offset(body: str) -> int | None:
+    """Find the owning function's ENTRY, ignoring pushed helper sections."""
+    depth = 0
+    offset = 0
+    for line in body.splitlines(keepends=True):
+        token = line.lstrip().split(None, 1)[0] if line.strip() else ""
+        if token == ".popsection" and depth > 0:
+            depth -= 1
+        if depth == 0 and token == "entry":
+            return offset
+        if token == ".pushsection":
+            depth += 1
+        offset += len(line)
+    return None
+
+
+def retarget_recovered_self_offsets(source: str) -> tuple[str, int]:
+    """Retarget recovered symbol+offset tables to the post-literal body.
+
+    A naked Xtensa body gets a short branch and literal pool before its ENTRY.
+    Recovered jump tables are relative to the original entry symbol, so leaving
+    `function+offset` anchored at LLVM's wrapper symbol makes every destination
+    early by the pool size.  The Xtensa subparser emits numeric label 99991 at
+    the real body entry; use the nearest forward/backward instance so each
+    inline-assembly unit remains independent and prunable.
+    """
+    replacements = 0
+
+    def retarget(match: re.Match[str]) -> str:
+        nonlocal replacements
+        symbol = match.group("symbol")
+        body = match.group("body")
+        entry = top_level_entry_offset(body)
+        if entry is None:
+            return match.group(0)
+        target = re.compile(
+            rf"(?<![.$A-Za-z0-9_]){re.escape(symbol)}"
+            r"\+0x[0-9A-Fa-f]+"
+        )
+
+        def replace_target(target_match: re.Match[str]) -> str:
+            nonlocal replacements
+            replacements += 1
+            direction = "f" if target_match.start() < entry else "b"
+            addend = target_match.group(0)[len(symbol):]
+            return f"99991{direction}{addend}"
+
+        rewritten = target.sub(replace_target, body)
+        return match.group("header") + rewritten
+
+    return ABI_BODY.sub(retarget, source), replacements
+
+
+def migrate_source(source: str) -> tuple[str, int, int]:
+    replacements: list[tuple[int, int, str]] = []
+    skipped = 0
+    for call_name, mode in RECOVERED_CALLS:
+        search = 0
+        while True:
+            call = source.find(call_name, search)
+            if call < 0:
+                break
+            arguments_begin = call + len(call_name)
+            try:
+                comma, close, after = call_arguments(source, arguments_begin)
+            except ValueError:
+                skipped += 1
+                search = arguments_begin
+                continue
+            constraints = source[comma + 1 : close].strip()
+            assembly = decode_concatenated_strings(
+                source[arguments_begin:comma]
+            )
+            replacement = None if assembly is None else parsed_form(
+                assembly, mode
+            )
+            if constraints == DEFAULT_CONSTRAINTS and replacement is not None:
+                replacements.append((call, after, replacement))
+            elif call_name == "xtensaAssemblyVoid(":
+                skipped += 1
+            search = after
+
+    migrated = source
+    for begin, end, replacement in sorted(replacements, reverse=True):
+        migrated = migrated[:begin] + replacement + migrated[end:]
+    migrated, addresses = ADDRESS_CALL.subn(
+        lambda match: f"$xtensa address {{{match.group(1)}}}", migrated
+    )
+    migrated, immediates = IMMEDIATE_CALL.subn(
+        lambda match: f"u32({match.group(1)})", migrated
+    )
+    migrated, calls = migrate_typed_calls(migrated)
+    migrated, self_offsets = retarget_recovered_self_offsets(migrated)
+    return (
+        migrated,
+        len(replacements) + addresses + immediates + calls + self_offsets,
+        skipped,
+    )
+
+
+def source_paths(arguments: list[str]) -> list[Path]:
+    if arguments:
+        paths = [Path(argument) for argument in arguments]
+    else:
+        paths = list(Path("src").rglob("*.ab"))
+    excluded = Path("src/xtensa/assembly.ab")
+    return sorted(
+        path for path in paths
+        if path.is_file() and path != excluded
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("paths", nargs="*")
+    arguments = parser.parse_args()
+
+    changed_files = 0
+    migrated_blocks = 0
+    skipped_blocks = 0
+    for path in source_paths(arguments.paths):
+        source = path.read_text()
+        migrated, count, skipped = migrate_source(source)
+        skipped_blocks += skipped
+        if count == 0:
+            continue
+        changed_files += 1
+        migrated_blocks += count
+        if not arguments.check:
+            path.write_text(migrated)
+
+    print(
+        f"{migrated_blocks} recovered block(s) in {changed_files} file(s); "
+        f"{skipped_blocks} non-default or dynamic block(s) left explicit"
+    )
+    if arguments.check and changed_files > 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

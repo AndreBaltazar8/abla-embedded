@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Replace object-local executable-section relocations with function symbols.
+
+Xtensa GCC often relocates a call or data pointer against a local section such
+as `.iram1.16` instead of against the function which starts that section. That
+is safe while every C input remains a separate object. Recovered Abla is one
+LLVM unit, so identical section spellings from unrelated inputs would otherwise
+coalesce and point at whichever function happened to be emitted first.
+
+This source-recovery pass identifies the archive member represented by each
+Abla module, reads that member's function table, and replaces every executable
+section reference with the stable ABI symbol or recovered local-helper label.
+Section-placement annotations and definitions are intentionally left intact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import pathlib
+import re
+import subprocess
+import tempfile
+
+
+ABI_SYMBOL = re.compile(r"^// Original ABI symbol: (\S+)$", re.MULTILINE)
+EXECUTABLE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_.$])(?P<section>\.(?:iram|text)[A-Za-z0-9_.$-]*)"
+    r"(?P<addend>[+-]0x[0-9A-Fa-f]+)?(?![A-Za-z0-9_.$])"
+)
+NM_MEMBER = re.compile(
+    r"^(?P<archive>.*\.a):(?P<member>[^:]+):[0-9A-Fa-f]+\s+"
+    r"(?P<kind>\S)\s+(?P<symbol>\S+)$"
+)
+
+
+def run(*command: str, binary: bool = False) -> str | bytes:
+    return subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=not binary,
+    ).stdout
+
+
+def source_references(source: str) -> set[str]:
+    references: set[str] = set()
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if (stripped.startswith("@section(") or
+                stripped.startswith(".section ") or
+                stripped.startswith(".pushsection ")):
+            continue
+        references.update(
+            match.group("section")
+            for match in EXECUTABLE_REFERENCE.finditer(line)
+        )
+    return references
+
+
+def archive_members(
+    archives: list[pathlib.Path], wanted: set[str]
+) -> dict[str, set[tuple[pathlib.Path, str]]]:
+    owners: dict[str, set[tuple[pathlib.Path, str]]] = collections.defaultdict(set)
+    for archive in archives:
+        output = run("nm", "-A", "--defined-only", str(archive))
+        assert isinstance(output, str)
+        for line in output.splitlines():
+            match = NM_MEMBER.match(line)
+            if match is None or match.group("symbol") not in wanted:
+                continue
+            owners[match.group("symbol")].add(
+                (pathlib.Path(match.group("archive")), match.group("member"))
+            )
+    return owners
+
+
+def choose_member(
+    path: pathlib.Path,
+    symbols: set[str],
+    owners: dict[str, set[tuple[pathlib.Path, str]]],
+) -> tuple[pathlib.Path, str]:
+    scores: collections.Counter[tuple[pathlib.Path, str]] = collections.Counter()
+    for symbol in symbols:
+        scores.update(owners.get(symbol, ()))
+    if not scores:
+        raise ValueError(f"{path}: none of its ABI symbols exist in the archives")
+    best_score = max(scores.values())
+    candidates = sorted(owner for owner, score in scores.items()
+                        if score == best_score)
+    if len(candidates) != 1:
+        rendered = ", ".join(f"{a.name}:{m}" for a, m in candidates)
+        raise ValueError(
+            f"{path}: archive member is ambiguous at score {best_score}: "
+            f"{rendered}"
+        )
+    return candidates[0]
+
+
+def member_contents(archive: pathlib.Path, member: str) -> bytes:
+    listing = run("ar", "t", str(archive))
+    assert isinstance(listing, str)
+    if sum(line == member for line in listing.splitlines()) != 1:
+        raise ValueError(f"duplicate archive member is unsupported: {archive}:{member}")
+    result = run("ar", "p", str(archive), member, binary=True)
+    assert isinstance(result, bytes)
+    return result
+
+
+def section_functions(
+    objdump: str, archive: pathlib.Path, member: str
+) -> dict[str, list[tuple[str, int]]]:
+    # `steam-run` cannot see the host's private `/tmp` mount on NixOS. Keep
+    # the short-lived member beside the invocation directory instead.
+    with tempfile.NamedTemporaryFile(suffix=".o", dir=pathlib.Path.cwd()) as extracted:
+        extracted.write(member_contents(archive, member))
+        extracted.flush()
+        output = run(*objdump.split(), "-t", extracted.name)
+    assert isinstance(output, str)
+    result: dict[str, list[tuple[str, int]]] = collections.defaultdict(list)
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[2] != "F":
+            continue
+        section = fields[3]
+        if not (section.startswith(".iram") or section.startswith(".text")):
+            continue
+        result[section].append((fields[-1], int(fields[0], 16)))
+    return result
+
+
+def local_target(source: str, symbol: str) -> str | None:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", symbol)
+    pattern = re.compile(
+        rf"(?m)^(\.Labla_recovered_[A-Za-z0-9_]+_local_{re.escape(safe)}):$"
+    )
+    matches = sorted(set(pattern.findall(source)))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def targets_for_source(
+    path: pathlib.Path,
+    source: str,
+    functions: dict[str, list[tuple[str, int]]],
+    references: set[str],
+) -> dict[str, tuple[str, int]]:
+    abi_symbols = set(ABI_SYMBOL.findall(source))
+    result: dict[str, tuple[str, int]] = {}
+    for section in sorted(references):
+        entries = functions.get(section, [])
+        starts = [(symbol, offset) for symbol, offset in entries if offset == 0]
+        if len(starts) != 1:
+            raise ValueError(
+                f"{path}: {section} has {len(starts)} function entries in its "
+                "source member"
+            )
+        symbol, offset = starts[0]
+        target = symbol if symbol in abi_symbols else local_target(source, symbol)
+        if target is None:
+            raise ValueError(
+                f"{path}: cannot bind local {section} target {symbol} to a "
+                "recovered Abla label"
+            )
+        result[section] = (target, offset)
+    return result
+
+
+def local_placements(
+    source: str, functions: dict[str, list[tuple[str, int]]]
+) -> dict[str, str]:
+    """Recover the original placement section for nested local functions."""
+    result: dict[str, str] = {}
+    for section, entries in functions.items():
+        for symbol, offset in entries:
+            if offset != 0:
+                continue
+            target = local_target(source, symbol)
+            if target is not None:
+                result[target] = section
+    return result
+
+
+def rewrite_local_placements(
+    source: str, placements: dict[str, str]
+) -> tuple[str, int]:
+    changed = 0
+    for label, section in placements.items():
+        local = f".local {label}"
+        local_offset = source.find(local)
+        if local_offset < 0:
+            continue
+        begin = source.rfind(".pushsection ", 0, local_offset)
+        if begin < 0 or source.rfind(".popsection", 0, local_offset) > begin:
+            raise ValueError(f"local helper {label} has no owning pushsection")
+        name_begin = begin + len(".pushsection ")
+        name_end = source.find(",", name_begin, local_offset)
+        if name_end < 0:
+            raise ValueError(f"local helper {label} has malformed pushsection")
+        old = source[name_begin:name_end]
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", label)
+        new = (
+            old if section.startswith(".text")
+            else f"{section}.abla.{safe}"
+        )
+        if old != new:
+            source = source[:name_begin] + new + source[name_end:]
+            changed += 1
+    return source, changed
+
+
+def rewrite(source: str, targets: dict[str, tuple[str, int]]) -> tuple[str, int]:
+    changed = 0
+    output: list[str] = []
+    for line in source.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if (stripped.startswith("@section(") or
+                stripped.startswith(".section ") or
+                stripped.startswith(".pushsection ")):
+            output.append(line)
+            continue
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal changed
+            mapping = targets.get(match.group("section"))
+            if mapping is None:
+                return match.group(0)
+            target, start = mapping
+            addend_text = match.group("addend")
+            addend = int(addend_text, 16) if addend_text else 0
+            delta = addend - start
+            changed += 1
+            if delta > 0:
+                return f"{target}+0x{delta:x}"
+            if delta < 0:
+                return f"{target}-0x{-delta:x}"
+            return target
+
+        output.append(EXECUTABLE_REFERENCE.sub(replace, line))
+    return "".join(output), changed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--archives", required=True, type=pathlib.Path)
+    parser.add_argument("--objdump", required=True)
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("sources", nargs="+", type=pathlib.Path)
+    arguments = parser.parse_args()
+
+    pending: list[tuple[pathlib.Path, str, set[str], set[str]]] = []
+    wanted: set[str] = set()
+    for path in arguments.sources:
+        source = path.read_text()
+        references = source_references(source)
+        if not references and ".pushsection .text.abla_" not in source:
+            continue
+        symbols = set(ABI_SYMBOL.findall(source))
+        if not symbols:
+            raise ValueError(f"{path}: has section references but no ABI symbols")
+        pending.append((path, source, references, symbols))
+        wanted.update(symbols)
+
+    archives = sorted(arguments.archives.rglob("*.a"))
+    owners = archive_members(archives, wanted)
+    total = 0
+    for path, source, references, symbols in pending:
+        archive, member = choose_member(path, symbols, owners)
+        functions = section_functions(arguments.objdump, archive, member)
+        targets = targets_for_source(path, source, functions, references)
+        result, target_changes = rewrite(source, targets)
+        result, placement_changes = rewrite_local_placements(
+            result, local_placements(result, functions)
+        )
+        changed = target_changes + placement_changes
+        if arguments.write:
+            path.write_text(result)
+        total += changed
+        action = "rewrote" if arguments.write else "would rewrite"
+        print(
+            f"{path}: {action} {target_changes} target(s) and "
+            f"{placement_changes} local placement(s) from "
+            f"{archive.name}:{member}"
+        )
+    action = "rewrote" if arguments.write else "would rewrite"
+    print(f"{action} {total} recovered executable-section target(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

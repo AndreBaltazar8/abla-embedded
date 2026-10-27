@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Turn recovered ESP32 object constant-pool references into pure Abla data."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import struct
+import subprocess
+import tempfile
+
+
+POOLS = (
+    ("src/esp32/wifi/api_esp32.ab", "libnet80211.a", "ieee80211_api.o",
+     "esp32WifiApiConstantPool"),
+    ("src/esp32/wifi/connection_esp32.ab", "libnet80211.a", "wl_cnx.o",
+     "esp32WifiConnectionConstantPool"),
+    ("src/esp32/wifi/mesh_config_esp32.ab", "libmesh.a", "mesh_config.o",
+     "esp32MeshConfigConstantPool"),
+    ("src/esp32/wifi/mesh_main_esp32.ab", "libmesh.a", "mesh_main.o",
+     "esp32MeshMainConstantPool"),
+    ("src/esp32/wifi/mesh_route_esp32.ab", "libmesh.a", "mesh_route.o",
+     "esp32MeshRouteConstantPool"),
+    ("src/esp32/wifi/mesh_utilities_esp32.ab", "libmesh.a",
+     "mesh_utilities.o", "esp32MeshUtilitiesConstantPool"),
+)
+REFERENCE = re.compile(
+    r"\$xtensa\s+address\s+\{\{?\s*\.rodata\.str1\.1\s*\}\}?"
+)
+
+
+def extract_section(
+    archive: pathlib.Path,
+    member: str,
+) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="abla-constant-pool.") as directory:
+        root = pathlib.Path(directory)
+        object_path = root / member
+        object_path.write_bytes(subprocess.check_output(
+            ["ar", "p", str(archive), member]
+        ))
+        elf = object_path.read_bytes()
+        if elf[:6] != b"\x7fELF\x01\x01":
+            raise ValueError(f"{member} is not a little-endian ELF32 object")
+        section_offset = struct.unpack_from("<I", elf, 32)[0]
+        section_entry_size = struct.unpack_from("<H", elf, 46)[0]
+        section_count = struct.unpack_from("<H", elf, 48)[0]
+        names_index = struct.unpack_from("<H", elf, 50)[0]
+
+        def section_header(index: int) -> tuple[int, int, int]:
+            offset = section_offset + index * section_entry_size
+            return (
+                struct.unpack_from("<I", elf, offset)[0],
+                struct.unpack_from("<I", elf, offset + 16)[0],
+                struct.unpack_from("<I", elf, offset + 20)[0],
+            )
+
+        _, names_offset, names_size = section_header(names_index)
+        names = elf[names_offset:names_offset + names_size]
+        for index in range(section_count):
+            name_offset, data_offset, data_size = section_header(index)
+            end = names.find(b"\0", name_offset)
+            name = names[name_offset:end].decode()
+            if name == ".rodata.str1.1":
+                return elf[data_offset:data_offset + data_size]
+        raise ValueError(f"{member} has no .rodata.str1.1 section")
+
+
+def abla_bytes(value: bytes) -> str:
+    chunks = []
+    width = 32
+    for offset in range(0, len(value), width):
+        chunks.append('"' + "".join(
+            f"\\x{byte:02x}" for byte in value[offset:offset + width]
+        ) + '"')
+    if len(chunks) == 1:
+        return chunks[0]
+    return "\n        ".join(
+        chunk + (" +" if index + 1 < len(chunks) else "")
+        for index, chunk in enumerate(chunks)
+    )
+
+
+def insert_after_imports(source: str, declaration: str) -> str:
+    lines = source.splitlines(keepends=True)
+    insertion = 0
+    while insertion < len(lines) and lines[insertion].startswith("import "):
+        insertion += 1
+    lines.insert(insertion, declaration)
+    return "".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--archive-root", required=True, type=pathlib.Path)
+    parser.add_argument("root", type=pathlib.Path)
+    arguments = parser.parse_args()
+
+    changed = 0
+    references = 0
+    total_bytes = 0
+    for relative, archive_name, member, variable in POOLS:
+        path = arguments.root / relative
+        source = path.read_text()
+        found = len(REFERENCE.findall(source))
+        if found == 0:
+            continue
+        data = extract_section(arguments.archive_root / archive_name, member)
+        lowered = REFERENCE.sub(variable, source)
+        declaration = (
+            "\n// Immutable bytes recovered from the original object's "
+            ".rodata.str1.1.\n"
+            f"val {variable} = u32(nativeStaticBytes(\n"
+            f"        {abla_bytes(data)}\n"
+            "))\n"
+        )
+        lowered = insert_after_imports(lowered, declaration)
+        if arguments.write:
+            path.write_text(lowered)
+        changed += 1
+        references += found
+        total_bytes += len(data)
+        print(f"{path}: {found} references, {len(data)} bytes from {member}")
+
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {references} constant-pool references in {changed} files "
+        f"to {total_bytes} Abla-owned immutable bytes"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

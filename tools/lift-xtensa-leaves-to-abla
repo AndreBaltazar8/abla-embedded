@@ -1,0 +1,2791 @@
+#!/usr/bin/env python3
+"""Lift mechanically safe Xtensa leaf bodies to ordinary typed Abla.
+
+Recovered archive members initially use naked `$xtensa instructions` bodies so
+they can be linked and checked before a source-level reconstruction exists.
+This tool removes that boundary for straight-line scalar leaves.  It is
+deliberately all-or-nothing per function: branches, calls, nested sections,
+unknown instructions, ambiguous register inputs, and observable secondary
+return registers leave the original body byte-for-byte unchanged.
+
+The generated functions use the Xtensa windowed ABI's six register arguments
+plus ten possible stack words.  LLVM only reads a stack argument when the
+lifted body uses it, so the common fixed signature remains ABI-compatible with
+callers that pass fewer words while retaining enough information for the
+recovered ESP32 corpus.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import pathlib
+import re
+import sys
+from dataclasses import dataclass
+
+
+BLOCK = re.compile(
+    r"(?P<head>(?:^@[^\n]+\n)*"
+    r"^(?:trusted\s+)?fun\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P<signature>\([^\n]*?\):\s*void)\s*=\s*)"
+    r"\$xtensa instructions \{\n(?P<body>.*?)\n\}",
+    re.MULTILINE | re.DOTALL,
+)
+U32_BLOCK = re.compile(
+    r"(?P<head>(?:^@[^\n]+\n)*"
+    r"^(?:trusted\s+)?fun\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P<parameters>\([^)]*\))\s*:\s*u32\s*=\s*)"
+    r"\$xtensa instructionsU32 \{\n(?P<body>.*?)\n\}",
+    re.MULTILINE | re.DOTALL,
+)
+TYPED_VOID_BLOCK = re.compile(
+    r"(?P<head>(?:^@[^\n]+\n)*"
+    r"^(?:trusted\s+)?fun\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P<parameters>\((?=[^)]*[A-Za-z_])[^)]*\))\s*:\s*void\s*=\s*)"
+    r"\$xtensa instructions \{\n(?P<body>.*?)\n\}",
+    re.MULTILINE | re.DOTALL,
+)
+INLINE_BLOCK = re.compile(
+    r"(?P<indent>^[ \t]*)\$xtensa instructions \{\n"
+    r"(?P<body>.*?)\n^[ \t]*\}",
+    re.MULTILINE | re.DOTALL,
+)
+INITIALIZED_DATA = re.compile(
+    r"(?ms)^val\s+(?P<storage>esp32Data_[A-Za-z0-9_]+Storage)\s*=\s*"
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)\n"
+    r"trusted\s+fun\s+(?P<initialize>esp32Data_[A-Za-z0-9_]+Initialize)"
+    r"\(\):\s*int\s*\{\n(?P<body>.*?)^\}\n"
+    r"val\s+(?P<initialized>esp32Data_[A-Za-z0-9_]+Initialized)\s*=\s*"
+    r"(?P=initialize)\(\)\n"
+    r"val\s+(?P<value>esp32Data_[A-Za-z0-9_]+)\s*=\s*"
+    r"u32\((?P=initialized)\)\n?"
+)
+LITERAL_DATA_STORE = re.compile(
+    r"^\s*ablaUnsafeStoreU(?P<bits>8|16|32)\(nativePointerFromAddress\("
+    r"(?P<storage>esp32Data_[A-Za-z0-9_]+Storage)\s*\+\s*"
+    r"(?P<offset>[0-9]+)\),\s*(?P<value>[0-9]+)\)\s*$"
+)
+NESTED_SECTION = re.compile(
+    r"(?P<whole>^\.pushsection\s+(?P<header>[^\n]+)\n"
+    r"(?P<body>.*?)^\.popsection\s*$)",
+    re.MULTILINE | re.DOTALL,
+)
+REGISTER = re.compile(r"a(?:[0-9]|1[0-5])$")
+FLOAT_REGISTER = re.compile(r"f(?:[0-9]|1[0-5])$")
+BOOL_REGISTER = re.compile(r"b(?:[0-9]|1[0-5])$")
+LABEL = re.compile(r"[.$A-Za-z_][.$A-Za-z0-9_]*:$")
+SYMBOL_EXPRESSION = re.compile(
+    r"(?P<symbol>[.$A-Za-z_][.$A-Za-z0-9_]*)"
+    r"(?:(?P<operator>[+-])(?P<offset>0x[0-9A-Fa-f]+|[0-9]+))?$"
+)
+SPECIAL_READS = {
+    "rsr.intenable", "rsr.interrupt", "rsr.prid", "rsr.ccount",
+    "rsr.ccompare0", "rsr.cpenable", "rsr.ibreakenable", "rsr.ps",
+    "rsr.excsave4", "rsr.excsave5", "rsr.excsave7",
+    "rsr.debugcause", "rsr.exccause",
+    "rsr.epc1", "rsr.epc2", "rsr.epc3", "rsr.epc4", "rsr.epc5",
+    "rsr.epc6", "rsr.epc7",
+    "rur.threadptr",
+}
+SPECIAL_WRITES = {
+    "wsr.intenable", "wsr.intset", "wsr.intclear", "wsr.ccompare0",
+    "wsr.cpenable", "wsr.ibreakenable", "wsr.ibreaka0", "wsr.ibreaka1",
+    "wsr.dbreaka0", "wsr.dbreaka1", "wsr.dbreakc0", "wsr.dbreakc1",
+    "wsr.ps", "wsr.ccount", "wsr.eps2", "wsr.epc1", "wsr.epc2",
+    "wsr.epc3", "wsr.eps3", "wsr.vecbase", "wur.threadptr",
+}
+
+
+class Unsupported(Exception):
+    pass
+
+
+class UnsafeSemanticInstruction(RuntimeError):
+    """An instruction that must never be approximated or silently omitted."""
+
+
+# These Xtensa FP operations carry target-specific intermediate/rounding or
+# exponent-adjustment semantics.  A partial scalar reconstruction is worse
+# than retaining the architecture boundary: it can compile successfully while
+# replacing a real result with one of the synthetic zero-initialized FP
+# registers.  Keep ordinary, exactly represented FP moves/arithmetic out of
+# this list; these instructions instead require either a complete typed
+# implementation or the original `$xtensa instructions` body.
+UNSAFE_XTENSA_FP_MNEMONICS = frozenset({
+    "addexp.s",
+    "addexpm.s",
+    "const.s",
+    "div0.s",
+    "divn.s",
+    "madd.s",
+    "maddn.s",
+    "mkdadj.s",
+    "msub.s",
+    "nexp01.s",
+    "recip0.s",
+    "rsqrt0.s",
+    "sqrt0.s",
+})
+
+
+@dataclass
+class Lifted:
+    source: str
+    uses_memory: bool
+
+
+@dataclass
+class ExtractedHelpers:
+    body: str
+    declarations: list[str]
+    count: int
+    uses_memory: bool
+    reasons: list[str]
+
+
+@dataclass
+class ExtractedData:
+    body: str
+    declarations: list[str]
+    addresses: dict[str, str]
+    count: int
+
+
+def abla_byte_string(value: bytes) -> str:
+    """Render exact native bytes without introducing a C terminator."""
+    chunks = [
+        "".join(f"\\x{byte:02x}" for byte in value[offset:offset + 32])
+        for offset in range(0, len(value), 32)
+    ]
+    if len(chunks) == 1:
+        return f'"{chunks[0]}"'
+    return "(\n        " + " +\n        ".join(
+        f'"{chunk}"' for chunk in chunks
+    ) + "\n    )"
+
+
+def data_identifier(symbol: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
+    if not readable or readable[0].isdigit():
+        readable = "data_" + readable
+    digest = hashlib.sha1(symbol.encode()).hexdigest()[:10]
+    return f"esp32Data_{readable}_{digest}"
+
+
+def parse_data_section(
+    header: str, section_body: str
+) -> tuple[str, dict[str, int], dict[int, int], list[tuple[int, int, str]], int]:
+    """Return section name, labels, initialized bytes, and symbolic stores."""
+    section_name = header.split(",", 1)[0].strip()
+    offset = 0
+    labels: dict[str, int] = {}
+    bytes_at: dict[int, int] = {}
+    symbolic: list[tuple[int, int, str]] = []
+    constants: dict[str, int] = {}
+
+    # Expand the simple assembler repetition used by SDK tables.  Keeping this
+    # here means the resulting table is emitted as ordinary Abla static data;
+    # no assembler macro survives in the source implementation.
+    original_lines = section_body.splitlines()
+    expanded_lines: list[str] = []
+    line_index = 0
+    while line_index < len(original_lines):
+        line = original_lines[line_index]
+        stripped = line.strip()
+        if stripped.startswith(".rept "):
+            count = immediate(stripped.split(None, 1)[1])
+            if count is None or count < 0 or count > 4096:
+                raise Unsupported("unsupported data repetition")
+            repeated: list[str] = []
+            line_index += 1
+            while (line_index < len(original_lines) and
+                   original_lines[line_index].strip() != ".endr"):
+                if original_lines[line_index].strip().startswith(".rept "):
+                    raise Unsupported("nested data repetition")
+                repeated.append(original_lines[line_index])
+                line_index += 1
+            if line_index >= len(original_lines):
+                raise Unsupported("unterminated data repetition")
+            for _ in range(count):
+                expanded_lines.extend(repeated)
+            line_index += 1
+            continue
+        if stripped == ".endr":
+            raise Unsupported("unmatched data repetition")
+        expanded_lines.append(line)
+        line_index += 1
+
+    def align(amount: int) -> None:
+        nonlocal offset
+        if amount < 1 or amount > 4096:
+            raise Unsupported("unsupported data alignment")
+        offset = (offset + amount - 1) // amount * amount
+
+    for raw in expanded_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if LABEL.fullmatch(line):
+            labels[line[:-1]] = offset
+            continue
+        if line.startswith((
+            ".local ", ".global ", ".hidden ", ".weak ",
+            ".type ", ".size ",
+        )):
+            continue
+        if line.startswith(".set "):
+            fields = split_operands(line[len(".set "):])
+            if len(fields) != 2:
+                raise Unsupported("malformed data constant")
+            constant_name, expression = fields
+            value = immediate(expression)
+            if value is None:
+                reference = re.fullmatch(
+                    r"([.$A-Za-z_][.$A-Za-z0-9_]*)"
+                    r"(?:\s*([+-])\s*(0x[0-9A-Fa-f]+|[0-9]+))?",
+                    expression,
+                )
+                if reference is None or reference.group(1) not in constants:
+                    raise Unsupported("unsupported data constant")
+                value = constants[reference.group(1)]
+                if reference.group(2):
+                    amount = int(reference.group(3), 0)
+                    value += amount if reference.group(2) == "+" else -amount
+            constants[constant_name] = value
+            continue
+        if line.startswith(".p2align "):
+            value = immediate(line.split(None, 1)[1].split(",", 1)[0])
+            if value is None or value < 0 or value > 12:
+                raise Unsupported("unsupported data alignment")
+            align(1 << value)
+            continue
+        if line.startswith((".align ", ".balign ")):
+            value = immediate(line.split(None, 1)[1].split(",", 1)[0])
+            if value is None:
+                raise Unsupported("unsupported data alignment")
+            align(value)
+            continue
+        if line.startswith((".zero ", ".space ")):
+            value = immediate(line.split(None, 1)[1].split(",", 1)[0])
+            if value is None or value < 0:
+                raise Unsupported("unsupported zero fill")
+            offset += value
+            continue
+        directive_width = 0
+        directive = ""
+        for candidate, width in ((".byte", 1), (".short", 2),
+                                 (".word", 4), (".long", 4)):
+            if line == candidate or line.startswith(candidate + " "):
+                directive, directive_width = candidate, width
+                break
+        if directive_width:
+            values = split_operands(line[len(directive):].strip())
+            if not values or values == [""]:
+                raise Unsupported("empty data directive")
+            for value_text in values:
+                value = constants.get(value_text)
+                if value is None:
+                    value = immediate(value_text)
+                if value is not None:
+                    encoded = value & ((1 << (directive_width * 8)) - 1)
+                    for byte_index in range(directive_width):
+                        bytes_at[offset + byte_index] = (
+                            encoded >> (byte_index * 8)
+                        ) & 0xFF
+                else:
+                    if directive_width not in (2, 4):
+                        raise Unsupported("symbolic byte data")
+                    # Validate now so the section remains intact when its
+                    # relocation expression cannot yet be represented by a
+                    # typed link-address expression.
+                    symbol_value(value_text)
+                    symbolic.append((offset, directive_width, value_text))
+                offset += directive_width
+            continue
+        if line.startswith((".ascii ", ".asciz ")):
+            literal = line.split(None, 1)[1]
+            try:
+                value = ast.literal_eval(literal)
+            except (SyntaxError, ValueError):
+                raise Unsupported("unsupported assembler string")
+            if not isinstance(value, str):
+                raise Unsupported("unsupported assembler string")
+            encoded = value.encode("latin1")
+            if line.startswith(".asciz "):
+                encoded += b"\0"
+            for byte in encoded:
+                bytes_at[offset] = byte
+                offset += 1
+            continue
+        raise Unsupported(f"data directive: {line.split()[0]}")
+    if not labels:
+        raise Unsupported("data section without a label")
+    if offset < 1:
+        offset = 1
+    return section_name, labels, bytes_at, symbolic, offset
+
+
+def extract_liftable_data_sections(
+    body: str, raw_bodies: list[str], allowed_cross: set[str] | None = None
+) -> ExtractedData:
+    declarations: list[str] = []
+    addresses: dict[str, str] = {}
+    count = 0
+
+    def replace_section(match: re.Match[str]) -> str:
+        nonlocal count
+        header = match.group("header")
+        section_name = header.split(",", 1)[0].strip()
+        if ('"ax"' in header or section_name.startswith(
+                (".text", ".iram", ".rtc.text"))):
+            return match.group("whole")
+        # TLS storage needs an LLVM thread-local global rather than ordinary
+        # process static allocation. Leave its definition intact until that
+        # general source-level storage primitive is emitted by the compiler;
+        # TLS accesses themselves are still lifted to typed Abla.
+        if re.search(r'"[A-Za-z]*T[A-Za-z]*"', header):
+            return match.group("whole")
+        try:
+            _, labels, bytes_at, symbolic, section_size = parse_data_section(
+                header, match.group("body")
+            )
+        except Unsupported:
+            return match.group("whole")
+        # A raw body cannot consume a dynamic Abla address. Only move this
+        # section once every remaining raw reference is in the owning body,
+        # which is translated atomically with the data extraction.
+        for symbol in labels:
+            total = sum(candidate.count(symbol) for candidate in raw_bodies)
+            if (total > body.count(symbol) and
+                    (allowed_cross is None or symbol not in allowed_cross)):
+                return match.group("whole")
+
+        first_symbol = next(iter(labels))
+        base_name = data_identifier(first_symbol)
+        storage_name = base_name + "Storage"
+        size = max(1, section_size)
+        if bytes_at:
+            size = max(size, max(bytes_at) + 1)
+        for position, width, _ in symbolic:
+            size = max(size, position + width)
+        if labels:
+            size = max(size, max(labels.values()) + 1)
+        stores: list[str] = []
+        occupied_symbolic: set[int] = set()
+        for position, width, expression in symbolic:
+            occupied_symbolic.update(range(position, position + width))
+            intrinsic = "ablaUnsafeStoreU16" if width == 2 else "ablaUnsafeStoreU32"
+            stores.append(
+                f"    {intrinsic}(nativePointerFromAddress("
+                f"{storage_name} + {position}), int({symbol_value(expression)}))"
+            )
+        position = 0
+        while position < size:
+            if position in occupied_symbolic:
+                position += 1
+                continue
+            width = 0
+            if (position % 4 == 0 and all(
+                    position + index in bytes_at and
+                    position + index not in occupied_symbolic
+                    for index in range(4))):
+                width = 4
+            elif (position % 2 == 0 and all(
+                    position + index in bytes_at and
+                    position + index not in occupied_symbolic
+                    for index in range(2))):
+                width = 2
+            elif position in bytes_at:
+                width = 1
+            if width == 0:
+                position += 1
+                continue
+            value = sum(bytes_at[position + index] << (8 * index)
+                        for index in range(width))
+            if value != 0:
+                intrinsic = {
+                    1: "ablaUnsafeStoreU8", 2: "ablaUnsafeStoreU16",
+                    4: "ablaUnsafeStoreU32",
+                }[width]
+                stores.append(
+                    f"    {intrinsic}(nativePointerFromAddress("
+                    f"{storage_name} + {position}), {value})"
+                )
+            position += width
+
+        lines = [f"val {storage_name} = nativeStaticAllocate({size})"]
+        address_base = storage_name
+        if stores:
+            initialize_name = base_name + "Initialize"
+            initialized_name = base_name + "Initialized"
+            lines.extend([
+                f"trusted fun {initialize_name}(): int {{",
+                *stores,
+                f"    {storage_name}",
+                "}",
+                f"val {initialized_name} = {initialize_name}()",
+            ])
+            address_base = initialized_name
+        for symbol, label_offset in labels.items():
+            identifier = data_identifier(symbol)
+            expression = f"u32({address_base})"
+            if label_offset:
+                expression = f"u32({address_base} + {label_offset})"
+            lines.append(f"val {identifier} = {expression}")
+            addresses[symbol] = identifier
+        declarations.append("\n".join(lines))
+        count += 1
+        return ""
+
+    transformed = NESTED_SECTION.sub(replace_section, body)
+    return ExtractedData(transformed.strip(), declarations, addresses, count)
+
+
+def strip_parseable_data_sections(body: str) -> tuple[str, set[str]]:
+    symbols: set[str] = set()
+
+    def replace(match: re.Match[str]) -> str:
+        header = match.group("header")
+        section_name = header.split(",", 1)[0].strip()
+        if ('"ax"' in header or section_name.startswith(
+                (".text", ".iram", ".rtc.text"))):
+            return match.group("whole")
+        try:
+            _, labels, _, _, _ = parse_data_section(
+                header, match.group("body")
+            )
+        except Unsupported:
+            return match.group("whole")
+        symbols.update(labels)
+        return ""
+
+    return NESTED_SECTION.sub(replace, body).strip(), symbols
+
+
+def internal_helper_name(symbol: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
+    if not readable or readable[0].isdigit():
+        readable = "local_" + readable
+    digest = hashlib.sha1(symbol.encode()).hexdigest()[:10]
+    return f"esp32Internal_{readable}_{digest}"
+
+
+def extract_function_aliases(body: str) -> tuple[str, list[str]]:
+    """Remove top-level GNU .set aliases and return their exact names."""
+    lines = body.splitlines()
+    depth = 0
+    aliases: list[str] = []
+    declared: set[str] = set()
+    kept: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith(".pushsection "):
+            depth += 1
+            kept.append(raw)
+            continue
+        if line == ".popsection":
+            depth = max(0, depth - 1)
+            kept.append(raw)
+            continue
+        if depth == 0 and line.startswith((".local ", ".global ", ".weak ")):
+            declared.add(line.split(None, 1)[1].strip())
+            continue
+        if depth == 0 and line.startswith(".set "):
+            values = split_operands(line[len(".set "):])
+            if len(values) == 2 and values[0] in declared:
+                aliases.append(values[0])
+                continue
+        kept.append(raw)
+    return "\n".join(kept), aliases
+
+
+def extract_liftable_text_helpers(owner: str, body: str) -> ExtractedHelpers:
+    """Move assembler-owned local functions into ordinary Abla definitions.
+
+    The recovered object corpus co-located private helper functions, constants,
+    and the public function in one naked inline-assembly body.  An internal
+    function binding preserves the old local ELF name while raw callers still
+    exist; it does not publish or externally retain the helper.
+    """
+    declarations: list[str] = []
+    count = 0
+    uses_memory = False
+    reasons: list[str] = []
+
+    def replace_section(match: re.Match[str]) -> str:
+        nonlocal count, uses_memory
+        header = match.group("header")
+        section_name = header.split(",", 1)[0].strip()
+        executable = '"ax"' in header or section_name.startswith(
+            (".text", ".iram", ".rtc.text")
+        )
+        if not executable:
+            return match.group("whole")
+
+        section_body = match.group("body")
+        type_match = re.search(
+            r"^\.type\s+([^,\s]+)\s*,\s*@function\s*$",
+            section_body,
+            re.MULTILINE,
+        )
+        if not type_match:
+            reasons.append("nested executable section without function type")
+            return match.group("whole")
+        symbol = type_match.group(1)
+        helper_name = internal_helper_name(symbol)
+
+        kept: list[str] = []
+        for raw in section_body.splitlines():
+            line = raw.strip()
+            if line.startswith((
+                ".p2align ", ".align ", ".balign ", ".local ",
+                ".global ", ".hidden ", ".type ", ".size ",
+            )):
+                continue
+            if line == symbol + ":":
+                continue
+            kept.append(raw)
+        helper_body = resolve_self_offset_tables("\n".join(kept).strip())
+        try:
+            result = lift(helper_name, helper_body)
+        except Unsupported as error:
+            reasons.append(f"nested helper: {error}")
+            return match.group("whole")
+
+        declarations.append(
+            result.source + "\n\n" +
+            f'val {helper_name}Link = #internalFunction('
+            f'"{helper_name}", "{symbol}")'
+        )
+        count += 1
+        uses_memory = uses_memory or result.uses_memory
+        return ""
+
+    transformed = NESTED_SECTION.sub(replace_section, body)
+    return ExtractedHelpers(
+        transformed.strip(), declarations, count, uses_memory, reasons
+    )
+
+
+def split_operands(text: str) -> list[str]:
+    return [part.strip() for part in text.split(",")]
+
+
+def unsigned(value: int) -> int:
+    return value & 0xFFFFFFFF
+
+
+def immediate(text: str) -> int | None:
+    try:
+        return int(text, 0)
+    except ValueError:
+        return None
+
+
+def register_name(text: str) -> str:
+    if not REGISTER.fullmatch(text):
+        raise Unsupported(f"not a scalar register: {text}")
+    return "r" + text[1:]
+
+
+def float_register_name(text: str) -> str:
+    if not FLOAT_REGISTER.fullmatch(text):
+        raise Unsupported(f"not a float register: {text}")
+    return text
+
+
+def bool_register_name(text: str) -> str:
+    if not BOOL_REGISTER.fullmatch(text):
+        raise Unsupported(f"not a boolean register: {text}")
+    return text
+
+
+def symbol_value(text: str) -> str:
+    value = immediate(text)
+    if value is not None:
+        return f"u32({unsigned(value)})"
+    match = SYMBOL_EXPRESSION.fullmatch(text)
+    if not match:
+        raise Unsupported(f"unsupported literal expression: {text}")
+    symbol = match.group("symbol")
+    result = f"$xtensa address {{{{{symbol}}}}}"
+    if match.group("offset"):
+        offset = int(match.group("offset"), 0)
+        operator = match.group("operator")
+        result = f"({result} {operator} u32({offset}))"
+    return result
+
+
+def operand(text: str, assigned: set[str]) -> str:
+    if REGISTER.fullmatch(text):
+        name = register_name(text)
+        if name not in assigned:
+            raise Unsupported(f"read before definition: {text}")
+        return name
+    return symbol_value(text)
+
+
+def store(destination: str, value: str, statements: list[str], assigned: set[str]) -> None:
+    name = register_name(destination)
+    statements.append(f"    {name} = {value}")
+    assigned.add(name)
+
+
+def signed(value: str) -> str:
+    return f"i32({value})"
+
+
+def float_operand(text: str, assigned: set[str]) -> str:
+    name = float_register_name(text)
+    if name not in assigned:
+        raise Unsupported(f"read before definition: {text}")
+    return name
+
+
+def memory_address(base: str, offset: str, assigned: set[str]) -> str:
+    base_value = operand(base, assigned)
+    amount = immediate(offset)
+    if amount is None:
+        raise Unsupported(f"nonconstant memory offset: {offset}")
+    if amount == 0:
+        return base_value
+    if amount > 0:
+        return f"({base_value} + u32({amount}))"
+    return f"({base_value} - u32({-amount}))"
+
+
+def load_expression(width: int, address: str, signed_load: bool = False) -> str:
+    intrinsic = {
+        8: "ablaUnsafeLoadU8",
+        16: "ablaUnsafeLoadU16",
+        32: "ablaUnsafeLoadU32",
+    }[width]
+    loaded = (
+        f"u32({intrinsic}(nativePointerFromAddress(int({address}))))"
+    )
+    if signed_load and width == 16:
+        return f"u32(i32(i16({loaded})))"
+    return loaded
+
+
+def stack_argument(offset: int, frame_size: int) -> str | None:
+    relative = offset - frame_size
+    if relative < 0 or relative % 4 != 0:
+        return None
+    index = relative // 4
+    if index >= 10:
+        raise Unsupported("more than ten incoming stack words")
+    return f"stack{index}"
+
+
+def incoming_stack_load(
+    width: int, signed_load: bool, offset: int, frame_size: int
+) -> str | None:
+    relative = offset - frame_size
+    if relative < 0:
+        return None
+    index = relative // 4
+    byte_offset = relative % 4
+    if index >= 10 or byte_offset + width // 8 > 4:
+        return None
+    if width == 32 and byte_offset != 0:
+        return None
+    word = f"incomingStack{index}"
+    shifted = word if byte_offset == 0 else (
+        f"({word} >>> u32({byte_offset * 8}))"
+    )
+    if width == 32:
+        return shifted
+    mask = (1 << width) - 1
+    value = f"({shifted} & u32({mask}))"
+    if signed_load and width == 16:
+        return f"u32(i32(i16({value})))"
+    return value
+
+
+def incoming_stack_location(
+    offset: int, frame_size: int, width: int
+) -> tuple[int, int] | None:
+    relative = offset - frame_size
+    if relative < 0:
+        return None
+    index = relative // 4
+    byte_offset = relative % 4
+    if index >= 10 or byte_offset + width // 8 > 4:
+        return None
+    if width == 32 and byte_offset != 0:
+        return None
+    return index, byte_offset
+
+
+def parse_instruction(line: str) -> tuple[str, list[str]]:
+    fields = line.strip().split(None, 1)
+    mnemonic = fields[0].lower()
+    operands = split_operands(fields[1]) if len(fields) == 2 else []
+    return mnemonic, operands
+
+
+def reject_unsafe_semantic_instruction(mnemonic: str) -> None:
+    if mnemonic in UNSAFE_XTENSA_FP_MNEMONICS:
+        raise UnsafeSemanticInstruction(
+            "refusing lossy Xtensa FP translation of " + mnemonic
+        )
+
+
+def call_secondary_result_used(
+    instructions: list[tuple[str, list[str]]], call_index: int
+) -> bool:
+    """Whether the CALL8 result in a11 is observed before being replaced."""
+    stores = {"s8i", "s16i", "s32i", "s32i.n"}
+    no_destination = BRANCHES | {
+        "memw", "rsync", "esync", "ret", "ret.n", "retw", "retw.n",
+        "ssr", "ssl", "ssai", "ssa8l", "ssa8b", "wsr.scompare1",
+        "break", "ill", "ill.n",
+    }
+    conditional_destination = {"moveqz", "movnez", "movgez", "movltz"}
+    for mnemonic, operands in instructions[call_index + 1:]:
+        if mnemonic in ("call8", "callx8"):
+            # The next windowed call consumes every contiguous argument word;
+            # an untouched a11 is therefore an observable second word.
+            return True
+        if "a11" in operands:
+            destination = bool(operands) and operands[0] == "a11"
+            if destination and "a11" in operands[1:]:
+                return True
+            if (destination and mnemonic not in stores and
+                    mnemonic not in no_destination and
+                    mnemonic not in conditional_destination):
+                return False
+            return True
+    return False
+
+
+def body_has_control_flow(body: str) -> bool:
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(".") or line.startswith("#"):
+            continue
+        mnemonic = line.split(None, 1)[0].lower()
+        if (mnemonic in BRANCHES or mnemonic in ("j", "jx") or
+                mnemonic.startswith("loop")):
+            return True
+    return False
+
+
+def ambiguous_callx8_stack_arguments(body: str) -> list[int]:
+    """Return outgoing stack offsets a lifted CALLX8 could silently lose.
+
+    Xtensa's windowed ABI passes arguments seven and later in the caller's
+    stack frame starting at a1+0.  A dynamic CALLX8 has no prototype from
+    which the lifter can prove how many of those words are live.  Retaining
+    the original body is therefore the only lossless action when a candidate
+    outgoing slot is written before the call.  In a control-flow body, textual
+    order is not execution order, so any such store and CALLX8 combination is
+    conservatively ambiguous.
+    """
+    records: list[tuple[str, list[str]]] = []
+    frame_size = 0
+    for raw in body.splitlines():
+        line = raw.strip()
+        if (not line or line.startswith(("#", ".")) or
+                LABEL.fullmatch(line)):
+            continue
+        mnemonic, operands = parse_instruction(line)
+        if mnemonic == "entry" and len(operands) == 2 and operands[0] == "a1":
+            amount = immediate(operands[1])
+            if amount is not None:
+                frame_size = amount
+        records.append((mnemonic, operands))
+    if frame_size <= 0:
+        return []
+    stores: list[tuple[int, int]] = []
+    calls: list[int] = []
+    for index, (mnemonic, operands) in enumerate(records):
+        if mnemonic == "callx8":
+            calls.append(index)
+        if (mnemonic in {"s8i", "s16i", "s32i", "s32i.n"} and
+                len(operands) == 3 and operands[1] == "a1"):
+            offset = immediate(operands[2])
+            if offset is not None and 0 <= offset < min(frame_size, 40):
+                stores.append((index, offset))
+    if not calls or not stores:
+        return []
+    if body_has_control_flow(body):
+        return sorted({offset for _, offset in stores})
+    return sorted({
+        offset for store_index, offset in stores
+        if any(store_index < call_index for call_index in calls)
+    })
+
+
+def normalize_encoded_instructions(body: str) -> str:
+    # Older objdump builds emitted SSA8B aN as its three raw little-endian
+    # bytes (0x403N00). This is a BYTE-index shift, not SSL's bit-index
+    # shift. Confusing the two corrupts byte packing in MPI and other code.
+    body = re.sub(
+        r"(?m)^\.byte\s+0x00\s*\n^\.byte\s+0x3([0-9a-f])\s*\n"
+        r"^\.byte\s+0x40\s*$",
+        lambda match: f"ssa8b\ta{int(match.group(1), 16)}",
+        body,
+    )
+    # GCC emits a five-instruction/directive sequence for a local-exec TLS
+    # address.  The literal and relocation are link metadata, not executable
+    # behavior.  Recover the operation before the generic lifter rejects the
+    # nested relocation directive, leaving the target-specific relocation in
+    # the small typed `$xtensa tlsAddress` primitive.
+    tls_address = re.compile(
+        r"(?m)^rur\.threadptr\s+(?P<destination>a(?:[0-9]|1[0-5]))\s*$\n"
+        r"^\.literal\s+(?P<label>[^,\s]+)\s*,\s*0\s*$\n"
+        r"^\.reloc\s+(?P=label)\s*,\s*R_XTENSA_TLS_TPOFF\s*,\s*"
+        r"(?P<symbol>[.$A-Za-z_][.$A-Za-z0-9_]*)\s*$\n"
+        r"^l32r\s+(?P<offset>a(?:[0-9]|1[0-5]))\s*,\s*(?P=label)\s*$\n"
+        r"^add(?:\.n)?\s+(?P=destination)\s*,\s*(?P=destination)\s*,\s*"
+        r"(?P=offset)\s*$"
+    )
+    body = tls_address.sub(
+        lambda match: (
+            f"abla.tlsaddress\t{match.group('destination')}, "
+            f"{match.group('symbol')}"
+        ),
+        body,
+    )
+    # Some compiler schedules place the THREADPTR read after the relocated
+    # L32R, or move unrelated instructions between the read and ADD. Recover
+    # those too, but only when neither temporary register is touched in the
+    # gap; that makes the rewrite a checked data-flow substitution rather than
+    # a textual guess.
+    lines = body.splitlines()
+    removed: set[int] = set()
+    replacements: dict[int, str] = {}
+    for reloc_index, raw in enumerate(lines):
+        reloc = re.fullmatch(
+            r"\.reloc\s+([^,\s]+)\s*,\s*R_XTENSA_TLS_TPOFF\s*,\s*"
+            r"([.$A-Za-z_][.$A-Za-z0-9_]*)\s*",
+            raw.strip(),
+        )
+        if reloc is None or reloc_index == 0:
+            continue
+        label, symbol = reloc.groups()
+        literal = re.fullmatch(
+            r"\.literal\s+([^,\s]+)\s*,\s*0\s*",
+            lines[reloc_index - 1].strip(),
+        )
+        if literal is None or literal.group(1) != label:
+            continue
+        offset_index = -1
+        offset_register = ""
+        for index in range(reloc_index + 1, min(len(lines), reloc_index + 8)):
+            match = re.fullmatch(
+                r"l32r\s+(a(?:[0-9]|1[0-5]))\s*,\s*" +
+                re.escape(label) + r"\s*",
+                lines[index].strip(),
+            )
+            if match:
+                offset_index = index
+                offset_register = match.group(1)
+                break
+        if offset_index < 0:
+            continue
+        thread_index = -1
+        destination = ""
+        for index in range(
+            max(0, reloc_index - 4), min(len(lines), offset_index + 8)
+        ):
+            match = re.fullmatch(
+                r"rur\.threadptr\s+(a(?:[0-9]|1[0-5]))\s*",
+                lines[index].strip(),
+            )
+            if match:
+                thread_index = index
+                destination = match.group(1)
+                break
+        if thread_index < 0:
+            continue
+        add_index = -1
+        for index in range(
+            max(thread_index, offset_index) + 1,
+            min(len(lines), max(thread_index, offset_index) + 9),
+        ):
+            match = re.fullmatch(
+                r"add(?:\.n)?\s+(a(?:[0-9]|1[0-5]))\s*,\s*"
+                r"(a(?:[0-9]|1[0-5]))\s*,\s*"
+                r"(a(?:[0-9]|1[0-5]))\s*",
+                lines[index].strip(),
+            )
+            if (match and match.group(1) == destination and
+                    {match.group(2), match.group(3)} ==
+                    {destination, offset_register}):
+                add_index = index
+                break
+        if add_index < 0:
+            continue
+        designated = {
+            reloc_index - 1, reloc_index, offset_index, thread_index, add_index
+        }
+        unsafe = False
+        register_use = re.compile(
+            rf"(?<![A-Za-z0-9_])(?:{re.escape(destination)}|"
+            rf"{re.escape(offset_register)})(?![A-Za-z0-9_])"
+        )
+        for index in range(min(thread_index, offset_index), add_index + 1):
+            if index not in designated and register_use.search(lines[index]):
+                unsafe = True
+                break
+        if unsafe:
+            continue
+        insertion = min(thread_index, offset_index)
+        replacements[insertion] = f"abla.tlsaddress\t{destination}, {symbol}"
+        removed.update(designated - {insertion})
+    if removed or replacements:
+        body = "\n".join(
+            replacements.get(index, line)
+            for index, line in enumerate(lines)
+            if index not in removed
+        )
+    return body
+
+
+def resolve_self_offset_tables(body: str) -> str:
+    """Turn recovered ENTRY-relative code pointers into Abla block ids.
+
+    The parser's numeric label 99991 names the real instruction following the
+    literal-pool skip. Recovered GCC jump tables store `99991f+offset`, then
+    dispatch with JX. In a typed control-flow function those code addresses
+    become the corresponding state-machine block number instead.
+    """
+    if "99991f+0x" not in body:
+        return body
+    requested = {
+        int(value, 16)
+        for value in re.findall(r"99991f\+0x([0-9A-Fa-f]+)", body)
+    }
+    lines = body.splitlines()
+    rewritten_lines: list[str] = []
+    depth = 0
+    started = False
+    code_offset = 0
+    inserted: set[int] = set()
+    existing_targets: dict[int, str] = {}
+    last_top_label = ""
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith(".pushsection "):
+            depth += 1
+            rewritten_lines.append(raw)
+            continue
+        if line == ".popsection":
+            depth = max(0, depth - 1)
+            rewritten_lines.append(raw)
+            continue
+        if depth != 0:
+            rewritten_lines.append(raw)
+            continue
+        if LABEL.fullmatch(line):
+            last_top_label = line[:-1]
+            rewritten_lines.append(raw)
+            continue
+        if not started and line.startswith("entry"):
+            started = True
+            code_offset = 0
+        executable_record = (
+            started and line and not line.startswith("#") and
+            not LABEL.fullmatch(line) and
+            not line.startswith((
+                ".literal ", ".literal_position", ".local ", ".global ",
+                ".hidden ", ".type ", ".size ",
+            ))
+        )
+        if executable_record and code_offset in requested:
+            if last_top_label:
+                existing_targets[code_offset] = last_top_label
+            else:
+                rewritten_lines.append(f".Labla_lift_self_{code_offset:x}:")
+            inserted.add(code_offset)
+        rewritten_lines.append(raw)
+        if not executable_record:
+            continue
+        last_top_label = ""
+        if line.startswith(".byte "):
+            code_offset += len(split_operands(line[len(".byte "):]))
+            continue
+        if line.startswith(".p2align "):
+            amount = immediate(line.split(None, 1)[1].split(",", 1)[0])
+            if amount is not None and 0 <= amount <= 12:
+                alignment = 1 << amount
+                code_offset = (code_offset + alignment - 1) // alignment * alignment
+            continue
+        if line.startswith((".align ", ".balign ")):
+            amount = immediate(line.split(None, 1)[1].split(",", 1)[0])
+            if amount is not None and amount > 0:
+                code_offset = (code_offset + amount - 1) // amount * amount
+            continue
+        if line.startswith("."):
+            continue
+        mnemonic, _ = parse_instruction(line)
+        code_offset += 2 if mnemonic.endswith(".n") else 3
+    if started and code_offset in requested:
+        rewritten_lines.append(f".Labla_lift_self_{code_offset:x}:")
+        inserted.add(code_offset)
+    if not inserted:
+        return body
+    with_labels = "\n".join(rewritten_lines)
+    executable = NESTED_SECTION.sub("", with_labels)
+    try:
+        _, blocks, _ = control_flow_records(
+            normalize_encoded_instructions(executable)
+        )
+    except Unsupported:
+        return body
+    offsets: dict[int, int] = {0: 0}
+    for index, block in enumerate(blocks):
+        match = re.fullmatch(r"\.Labla_lift_self_([0-9A-Fa-f]+)", block.label)
+        if match:
+            offsets[int(match.group(1), 16)] = index
+        for offset, label in existing_targets.items():
+            if block.label == label:
+                offsets[offset] = index
+    replaced = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal replaced
+        offset = int(match.group(1), 16)
+        if offset not in offsets:
+            return match.group(0)
+        replaced += 1
+        return str(offsets[offset])
+
+    transformed = re.sub(
+        r"99991f\+0x([0-9A-Fa-f]+)", replace, with_labels
+    )
+    if replaced:
+        transformed = "# ABLA_LIFT_INTERNAL_JUMP_TABLE\n" + transformed
+    return transformed
+
+
+def lift(
+    name: str,
+    body: str,
+    assume_all_registers: bool = False,
+    assume_wide_calls: bool = False,
+) -> Lifted:
+    body = normalize_encoded_instructions(body)
+    if ".pushsection" in body or ".section" in body or ".reloc" in body:
+        raise Unsupported("nested assembler-owned definitions")
+    ambiguous_stack = ambiguous_callx8_stack_arguments(body)
+    if ambiguous_stack:
+        offsets = ", ".join(f"a1+{offset}" for offset in ambiguous_stack)
+        raise Unsupported(
+            "dynamic CALLX8 may consume untyped outgoing stack arguments at " +
+            offsets
+        )
+    if body_has_control_flow(body):
+        return lift_control_flow(name, body)
+    if re.search(r"\b(?:call0|call4|call12|callx0|callx4|callx12|jx)\b", body):
+        raise Unsupported("non-windowed or non-call8 transfer")
+
+    literals: dict[str, str] = {}
+    instructions: list[tuple[str, list[str]]] = []
+    frame_size = 0
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or LABEL.fullmatch(line):
+            continue
+        if line.startswith(".literal "):
+            parts = split_operands(line[len(".literal "):])
+            if len(parts) != 2:
+                raise Unsupported("malformed literal")
+            literals[parts[0]] = parts[1]
+            continue
+        if line.startswith((".literal_position", ".align ", ".p2align ")):
+            continue
+        if line in (".byte 0x00", ".byte 0"):
+            continue
+        if line.startswith("."):
+            raise Unsupported(f"assembler directive: {line.split()[0]}")
+        mnemonic, operands = parse_instruction(line)
+        reject_unsafe_semantic_instruction(mnemonic)
+        if mnemonic == "entry":
+            if len(operands) != 2 or operands[0] != "a1":
+                raise Unsupported("nonstandard ENTRY")
+            value = immediate(operands[1])
+            if value is None or value < 0:
+                raise Unsupported("nonconstant ENTRY frame")
+            frame_size = value
+            continue
+        instructions.append((mnemonic, operands))
+
+    parameter_names = [f"a{index}" for index in range(2, 8)] + [
+        f"stack{index}" for index in range(10)
+    ]
+    assigned = {f"r{index}" for index in range(2, 8)}
+    if assume_all_registers:
+        assigned.update(f"r{index}" for index in range(1, 16))
+    if frame_size > 0:
+        assigned.add("r1")
+    statements = [
+        f"    var r{index} = a{index}" for index in range(2, 8)
+    ]
+    for index in range(8, 16):
+        statements.append(f"    var r{index} = u32(0)")
+    uses_return_address = bool(re.search(r"\ba0\b", body))
+    if uses_return_address and frame_size > 0:
+        statements.insert(0, "    var r0 = $xtensa returnAddress()")
+        assigned.add("r0")
+    register_prologue_size = len(statements)
+    for index in range(10):
+        statements.append(f"    var incomingStack{index} = stack{index}")
+    uses_float = any(
+        any(FLOAT_REGISTER.fullmatch(value) or BOOL_REGISTER.fullmatch(value)
+            for value in operands)
+        for _, operands in instructions
+    )
+    if uses_float:
+        for index in range(16):
+            statements.append(
+                f"    var f{index} = f32FromBits(u32(0))"
+            )
+        for index in range(16):
+            statements.append(f"    var b{index} = false")
+        # The zero initializers only make Abla's locals definite; they are not
+        # architectural FP inputs.  A recovered instruction must establish a
+        # floating register or predicate before reading it.  In particular,
+        # this prevents a partially decoded helper from treating the missing
+        # result of DIV0.S/NEXP01.S as a real zero value.  Cross-block FP state
+        # likewise remains at the raw architecture boundary until the lifter
+        # has whole-CFG data-flow proof.
+    statements.append("    var shiftAmount = u32(0)")
+    statements.append("    var compareExchangeExpected = u32(0)")
+    uses_memory = False
+    uses_local_frame = False
+    returned = False
+    register_symbols: dict[str, str] = {}
+
+    binary = {
+        "add": "+", "add.n": "+", "sub": "-", "and": "&",
+        "or": "|", "xor": "^", "mull": "*",
+    }
+    scaled = {"addx2": 1, "addx4": 2, "addx8": 3}
+    load = {
+        "l8ui": (8, False), "l16ui": (16, False),
+        "l16si": (16, True), "l32i": (32, False),
+        "l32i.n": (32, False),
+    }
+    store_width = {
+        "s8i": 8, "s16i": 16, "s32i": 32, "s32i.n": 32,
+    }
+
+    for instruction_index, (mnemonic, operands) in enumerate(instructions):
+        if returned:
+            raise Unsupported("instructions after return")
+        if mnemonic in ("retw", "retw.n", "ret", "ret.n"):
+            if operands:
+                raise Unsupported("return operands")
+            statements.append("    return r2")
+            returned = True
+            continue
+        if mnemonic in ("nop", "nop.n"):
+            # NOPs in recovered peripheral code are not necessarily padding.
+            # ESP32 PHY objects deliberately place four cycles after selected
+            # register writes; retaining the architecture operation preserves
+            # that device timing while keeping it explicit in typed Abla.
+            statements.append("    xtensaNoOperation()")
+            continue
+        if mnemonic == "excw":
+            # EXCW selects the extended instruction encoding state. It has no
+            # source-level value semantics once the following FP operation is
+            # represented directly in typed IR.
+            continue
+        if mnemonic == "abla.tlsaddress":
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            symbol = operands[1]
+            if not re.fullmatch(r"[.$A-Za-z_][.$A-Za-z0-9_]*", symbol):
+                raise Unsupported("TLS symbol")
+            store(
+                operands[0], f"$xtensa tlsAddress {{{symbol}}}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic == "movsp":
+            if len(operands) != 2 or operands[0] != "a1":
+                raise Unsupported(mnemonic)
+            source = operand(operands[1], assigned)
+            if "r1" not in assigned:
+                raise Unsupported("MOVSP without a materialized stack")
+            statements.append(
+                f"    r1 = u32(nativeStackAllocate(int(r1 - {source})))"
+            )
+            uses_local_frame = True
+            continue
+        if mnemonic in ("call8", "callx8"):
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            if mnemonic == "call8":
+                target = operands[0]
+            else:
+                target_register = register_name(operands[0])
+                target = register_symbols.get(target_register, "")
+                dynamic_target = not target
+                if (not dynamic_target and statements and statements[-1].startswith(
+                        f"    {target_register} = $xtensa address ")):
+                    # The typed call materializes this exact link symbol.  Do
+                    # not retain the recovered MOVI/L32R as a second opaque
+                    # address operation immediately before it.
+                    statements.pop()
+            call_arguments: list[str] = []
+            highest_argument = 9
+            for index in range(10, 16):
+                if f"r{index}" in assigned:
+                    highest_argument = index
+            for index in range(10, highest_argument + 1):
+                register = f"r{index}"
+                call_arguments.append(
+                    register if register in assigned else "u32(0)"
+                )
+            arguments = ", ".join(call_arguments)
+            wide_result = assume_wide_calls or call_secondary_result_used(
+                instructions, instruction_index
+            )
+            mode_suffix = "Wide" if wide_result else ""
+            if mnemonic == "callx8" and dynamic_target:
+                call_arguments_source = (
+                    f", {arguments}" if arguments else ""
+                )
+                native_result = "I64" if wide_result else "I32"
+                native_name = (
+                    f"ablaUnsafeCall{native_result}" +
+                    "I32" * len(call_arguments)
+                )
+                native_arguments = ", ".join(
+                    [f"int({target_register})"] +
+                    [f"int({argument})" for argument in call_arguments]
+                )
+                conversion = "u64" if wide_result else "u32"
+                call_source = (
+                    f"{conversion}({native_name}({native_arguments}))"
+                )
+            else:
+                call_source = (
+                    f"$xtensa call{mode_suffix} {{{target}}}({arguments})"
+                )
+            if wide_result:
+                result_name = f"callResult{instruction_index}"
+                statements.append(f"    val {result_name} = {call_source}")
+                statements.append(f"    r10 = u32({result_name})")
+                statements.append(
+                    f"    r11 = u32({result_name} >>> u64(32))"
+                )
+            else:
+                statements.append(f"    r10 = {call_source}")
+            for index in range(8, 16):
+                assigned.discard(f"r{index}")
+            assigned.add("r10")
+            if wide_result:
+                assigned.add("r11")
+            register_symbols.clear()
+            continue
+        if operands and REGISTER.fullmatch(operands[0]) and mnemonic not in store_width:
+            register_symbols.pop(register_name(operands[0]), None)
+        if mnemonic in ("mov", "mov.n", "movi", "movi.n"):
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            store(operands[0], operand(operands[1], assigned), statements, assigned)
+            if not REGISTER.fullmatch(operands[1]) and immediate(operands[1]) is None:
+                register_symbols[register_name(operands[0])] = operands[1]
+            continue
+        if mnemonic == "l32r":
+            if len(operands) != 2 or operands[1] not in literals:
+                raise Unsupported("unresolved L32R")
+            store(operands[0], symbol_value(literals[operands[1]]), statements, assigned)
+            literal = literals[operands[1]]
+            if immediate(literal) is None and SYMBOL_EXPRESSION.fullmatch(literal):
+                register_symbols[register_name(operands[0])] = literal
+            continue
+        if mnemonic in SPECIAL_READS:
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            store(
+                operands[0], f"$xtensa read {{{mnemonic}}}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic == "rsil":
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            level = immediate(operands[1])
+            if level is None or level < 0 or level > 15:
+                raise Unsupported("RSIL level")
+            store(
+                operands[0], f"$xtensa raiseInterruptLevel {{{level}}}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic == "wsr.scompare1":
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            value = operand(operands[0], assigned)
+            statements.append(f"    compareExchangeExpected = {value}")
+            continue
+        if mnemonic == "s32c1i":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            destination = register_name(operands[0])
+            if destination not in assigned:
+                raise Unsupported("atomic desired value is undefined")
+            address = memory_address(operands[1], operands[2], assigned)
+            desired = destination
+            store(
+                operands[0],
+                f"$xtensa atomicCompareExchange({address}, "
+                f"compareExchangeExpected, {desired})",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in SPECIAL_WRITES:
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            value = operand(operands[0], assigned)
+            statements.append(f"    $xtensa write({value}) {{{mnemonic}}}")
+            continue
+        if mnemonic in ("rsync", "esync"):
+            if operands:
+                raise Unsupported(mnemonic)
+            statements.append("    $xtensa eventSynchronize()")
+            continue
+        if mnemonic == "wfr":
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            destination = float_register_name(operands[0])
+            source = operand(operands[1], assigned)
+            statements.append(f"    {destination} = f32FromBits({source})")
+            assigned.add(destination)
+            continue
+        if mnemonic == "rfr":
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            source = float_operand(operands[1], assigned)
+            store(
+                operands[0], f"f32ToBits({source})", statements, assigned
+            )
+            continue
+        if mnemonic in ("ufloat.s", "float.s"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            scale = immediate(operands[2])
+            if scale is None or scale < 0 or scale > 31:
+                raise Unsupported(f"floating scale: {mnemonic}")
+            source = operand(operands[1], assigned)
+            expression = (
+                f"f32FromU32({source})" if mnemonic == "ufloat.s" else
+                f"f32FromI32(i32({source}))"
+            )
+            if scale:
+                expression = f"{expression} / f32FromU32(u32({1 << scale}))"
+            destination = float_register_name(operands[0])
+            statements.append(f"    {destination} = {expression}")
+            assigned.add(destination)
+            continue
+        if mnemonic in ("utrunc.s", "trunc.s"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            scale = immediate(operands[2])
+            if scale is None or scale < 0 or scale > 31:
+                raise Unsupported(f"floating scale: {mnemonic}")
+            source = float_operand(operands[1], assigned)
+            if scale:
+                source = f"{source} * f32FromU32(u32({1 << scale}))"
+            conversion = "f32ToU32" if mnemonic == "utrunc.s" else "f32ToI32"
+            store(
+                operands[0], f"u32({conversion}({source}))",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("mov.s", "neg.s", "abs.s"):
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            source = float_operand(operands[1], assigned)
+            expression = source
+            if mnemonic == "neg.s": expression = f"-{source}"
+            if mnemonic == "abs.s": expression = (
+                f"if ({source} < f32FromBits(u32(0))) -{source} else {source}"
+            )
+            destination = float_register_name(operands[0])
+            statements.append(f"    {destination} = {expression}")
+            assigned.add(destination)
+            continue
+        if mnemonic in ("add.s", "sub.s", "mul.s", "div.s"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = float_operand(operands[1], assigned)
+            right = float_operand(operands[2], assigned)
+            operation = {
+                "add.s": "+", "sub.s": "-", "mul.s": "*", "div.s": "/",
+            }[mnemonic]
+            destination = float_register_name(operands[0])
+            statements.append(f"    {destination} = {left} {operation} {right}")
+            assigned.add(destination)
+            continue
+        if mnemonic == "madd.s":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            destination = float_register_name(operands[0])
+            if destination not in assigned:
+                raise Unsupported(f"read before definition: {operands[0]}")
+            left = float_operand(operands[1], assigned)
+            right = float_operand(operands[2], assigned)
+            statements.append(
+                f"    {destination} = {destination} + ({left} * {right})"
+            )
+            continue
+        if mnemonic in ("oeq.s", "olt.s", "ole.s"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            destination = bool_register_name(operands[0])
+            left = float_operand(operands[1], assigned)
+            right = float_operand(operands[2], assigned)
+            operation = {"oeq.s": "==", "olt.s": "<", "ole.s": "<="}[mnemonic]
+            statements.append(f"    {destination} = {left} {operation} {right}")
+            assigned.add(destination)
+            continue
+        if mnemonic == "lsi":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            address = memory_address(operands[1], operands[2], assigned)
+            destination = float_register_name(operands[0])
+            statements.append(
+                f"    {destination} = f32FromBits("
+                f"u32(ablaUnsafeLoadU32(nativePointerFromAddress(int({address})))))"
+            )
+            assigned.add(destination)
+            uses_memory = True
+            continue
+        if mnemonic == "ssi":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            source = float_operand(operands[0], assigned)
+            address = memory_address(operands[1], operands[2], assigned)
+            statements.append(
+                f"    ablaUnsafeStoreU32(nativePointerFromAddress(int({address})), "
+                f"int(f32ToBits({source})))"
+            )
+            uses_memory = True
+            continue
+        if mnemonic in binary:
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            right = operand(operands[2], assigned)
+            store(operands[0], f"{left} {binary[mnemonic]} {right}", statements, assigned)
+            continue
+        if mnemonic in ("addi", "addi.n", "addmi"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            amount = immediate(operands[2])
+            if amount is None:
+                raise Unsupported(mnemonic)
+            # Xtensa assemblers and objdump render ADDMI's immediate as the
+            # already-shifted byte displacement (for example, `0x100` means
+            # 256 bytes). Multiplying it again corrupted recovered addresses
+            # and made LLVM materialize needlessly large constants.
+            operation = "+" if amount >= 0 else "-"
+            store(
+                operands[0], f"{left} {operation} u32({abs(amount)})",
+                statements, assigned,
+            )
+            if operands[1] == "a1":
+                uses_local_frame = True
+            continue
+        if mnemonic in scaled:
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            index = operand(operands[1], assigned)
+            base = operand(operands[2], assigned)
+            store(
+                operands[0],
+                f"({index} << u32({scaled[mnemonic]})) + {base}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("subx2", "subx4", "subx8"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            shift = {"subx2": 1, "subx4": 2, "subx8": 3}[mnemonic]
+            scaled_value = operand(operands[1], assigned)
+            subtrahend = operand(operands[2], assigned)
+            store(
+                operands[0],
+                f"({scaled_value} << u32({shift})) - {subtrahend}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("slli", "srli", "srai"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            value = operand(operands[1], assigned)
+            amount = operand(operands[2], assigned)
+            if mnemonic == "slli": expression = f"{value} << {amount}"
+            elif mnemonic == "srli": expression = f"{value} >>> {amount}"
+            else: expression = f"u32({signed(value)} >> int({amount}))"
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic == "extui":
+            if len(operands) != 4:
+                raise Unsupported(mnemonic)
+            value = operand(operands[1], assigned)
+            offset = immediate(operands[2])
+            width = immediate(operands[3])
+            if offset is None or width is None or width < 1 or width > 32:
+                raise Unsupported(mnemonic)
+            mask = 0xFFFFFFFF if width == 32 else (1 << width) - 1
+            store(
+                operands[0],
+                f"({value} >>> u32({offset})) & u32({mask})",
+                statements, assigned,
+            )
+            continue
+        if mnemonic == "sext":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            value = operand(operands[1], assigned)
+            sign_bit = immediate(operands[2])
+            if sign_bit is None or sign_bit < 0 or sign_bit > 31:
+                raise Unsupported("SEXT sign bit")
+            shift = 31 - sign_bit
+            store(
+                operands[0],
+                f"u32(i32({value} << u32({shift})) >> {shift})",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("neg", "abs"):
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            value = operand(operands[1], assigned)
+            expression = (
+                f"u32(0) - {value}" if mnemonic == "neg" else
+                # Integer ABS is a wrapping two's-complement operation on
+                # Xtensa.  Keep the subtraction unsigned so INT_MIN remains
+                # 0x80000000 instead of introducing signed-overflow poison.
+                f"if ({signed(value)} < 0) u32(0) - {value} else {value}"
+            )
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic in scaled:
+            raise Unsupported(mnemonic)
+        if mnemonic in ("ssr", "ssl", "ssai"):
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            value = operand(operands[0], assigned)
+            if mnemonic == "ssl": value = f"u32(32) - ({value} & u32(31))"
+            statements.append(f"    shiftAmount = {value} & u32(31)")
+            continue
+        if mnemonic in ("sll", "srl", "sra"):
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            value = operand(operands[1], assigned)
+            if mnemonic == "sll":
+                # Xtensa stores the complement of a left-shift count in SAR.
+                # SSL/SSAI prepare SAR, while SLL shifts by 32 - SAR.
+                expression = f"{value} << ((u32(32) - shiftAmount) & u32(31))"
+            elif mnemonic == "srl": expression = f"{value} >>> shiftAmount"
+            else: expression = f"u32({signed(value)} >> int(shiftAmount))"
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic == "src":
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            high = operand(operands[1], assigned)
+            low = operand(operands[2], assigned)
+            expression = (
+                f"if (shiftAmount == u32(0)) {low} else "
+                f"(({high} << (u32(32) - shiftAmount)) | "
+                f"({low} >>> shiftAmount))"
+            )
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic in ("ssa8l", "ssa8b"):
+            if len(operands) != 1:
+                raise Unsupported(mnemonic)
+            value = operand(operands[0], assigned)
+            amount = f"({value} & u32(3)) << u32(3)"
+            if mnemonic == "ssa8b": amount = f"u32(32) - ({amount})"
+            statements.append(f"    shiftAmount = ({amount}) & u32(31)")
+            continue
+        if mnemonic == "nsau":
+            if len(operands) != 2:
+                raise Unsupported(mnemonic)
+            store(
+                operands[0],
+                f"ablaCountLeadingZerosU32({operand(operands[1], assigned)})",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("minu", "maxu", "min", "max"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            right = operand(operands[2], assigned)
+            signed_compare = mnemonic in ("min", "max")
+            comparison = "<" if mnemonic in ("minu", "min") else ">"
+            compared_left = signed(left) if signed_compare else left
+            compared_right = signed(right) if signed_compare else right
+            store(
+                operands[0],
+                f"if ({compared_left} {comparison} {compared_right}) {left} else {right}",
+                statements, assigned,
+            )
+            continue
+        if mnemonic in ("muluh", "mulsh"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            right = operand(operands[2], assigned)
+            if mnemonic == "muluh":
+                expression = f"u32((u64({left}) * u64({right})) >>> u64(32))"
+            else:
+                expression = f"u32((i64({signed(left)}) * i64({signed(right)})) >> 32)"
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic in ("mul16u", "mul16s"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            right = operand(operands[2], assigned)
+            if mnemonic == "mul16u":
+                expression = (
+                    f"({left} & u32(65535)) * ({right} & u32(65535))"
+                )
+            else:
+                expression = (
+                    f"u32(i32(i16({left})) * i32(i16({right})))"
+                )
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic in ("quou", "remu", "quos", "rems"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            left = operand(operands[1], assigned)
+            right = operand(operands[2], assigned)
+            operation = "/" if mnemonic in ("quou", "quos") else "%"
+            if mnemonic in ("quos", "rems"):
+                expression = f"u32({signed(left)} {operation} {signed(right)})"
+            else:
+                expression = f"{left} {operation} {right}"
+            store(operands[0], expression, statements, assigned)
+            continue
+        if mnemonic in ("moveqz", "movnez"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            destination = register_name(operands[0])
+            if destination not in assigned:
+                raise Unsupported("conditional move into undefined register")
+            value = operand(operands[1], assigned)
+            condition = operand(operands[2], assigned)
+            comparison = "==" if mnemonic == "moveqz" else "!="
+            statements.append(
+                f"    if ({condition} {comparison} u32(0)) {destination} = {value}"
+            )
+            continue
+        if mnemonic in ("movgez", "movltz"):
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            destination = register_name(operands[0])
+            if destination not in assigned:
+                raise Unsupported("conditional move into undefined register")
+            value = operand(operands[1], assigned)
+            condition = operand(operands[2], assigned)
+            comparison = ">=" if mnemonic == "movgez" else "<"
+            statements.append(
+                f"    if (i32({condition}) {comparison} 0) {destination} = {value}"
+            )
+            continue
+        if mnemonic in load:
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            width, signed_load = load[mnemonic]
+            amount = immediate(operands[2])
+            if operands[1] == "a1" and amount is not None:
+                argument = incoming_stack_load(
+                    width, signed_load, amount, frame_size
+                )
+                if argument is not None:
+                    store(operands[0], argument, statements, assigned)
+                    continue
+                uses_local_frame = True
+            address = memory_address(operands[1], operands[2], assigned)
+            store(
+                operands[0], load_expression(width, address, signed_load),
+                statements, assigned,
+            )
+            uses_memory = True
+            continue
+        if mnemonic in store_width:
+            if len(operands) != 3:
+                raise Unsupported(mnemonic)
+            if operands[1] == "a1":
+                amount = immediate(operands[2])
+                if amount is None:
+                    raise Unsupported("store into incoming stack arguments")
+                width = store_width[mnemonic]
+                location = incoming_stack_location(
+                    amount, frame_size, width
+                )
+                if location is not None:
+                    index, byte_offset = location
+                    value = operand(operands[0], assigned)
+                    target = f"incomingStack{index}"
+                    if width == 32:
+                        statements.append(f"    {target} = {value}")
+                    else:
+                        shift = byte_offset * 8
+                        value_mask = (1 << width) - 1
+                        field_mask = unsigned(~(value_mask << shift))
+                        inserted = f"({value} & u32({value_mask}))"
+                        if shift:
+                            inserted = f"({inserted} << u32({shift}))"
+                        statements.append(
+                            f"    {target} = ({target} & u32({field_mask})) | {inserted}"
+                        )
+                    continue
+                uses_local_frame = True
+            address = memory_address(operands[1], operands[2], assigned)
+            value = operand(operands[0], assigned)
+            intrinsic = {
+                8: "ablaUnsafeStoreU8",
+                16: "ablaUnsafeStoreU16",
+                32: "ablaUnsafeStoreU32",
+            }[store_width[mnemonic]]
+            statements.append(
+                f"    {intrinsic}(nativePointerFromAddress(int({address})), int({value}))"
+            )
+            uses_memory = True
+            continue
+        if mnemonic == "memw":
+            if operands:
+                raise Unsupported(mnemonic)
+            statements.append("    xtensaMemoryBarrier()")
+            continue
+        if mnemonic in ("break", "ill", "ill.n"):
+            statements.append("    ablaRuntimeTrap()")
+            continue
+        raise Unsupported(f"instruction: {mnemonic}")
+
+    if not returned:
+        # Recovered noreturn functions conventionally end in abort, reset,
+        # scheduler dispatch, or a fatal handler call and therefore have no
+        # RETW in the object. Preserve that contract and make an unexpected
+        # return explicitly unreachable.
+        statements.append("    ablaRuntimeTrap()")
+        statements.append("    return r2")
+    materializes_stack_pointer = uses_local_frame or any(
+        re.search(r"\br1\b", statement) for statement in statements
+    )
+    if materializes_stack_pointer:
+        if frame_size <= 0:
+            raise Unsupported("frame access without ENTRY")
+        statements.insert(
+            register_prologue_size,
+            f"    val frameAddress = u32(nativeStackAllocate({frame_size}))"
+        )
+        statements.insert(register_prologue_size + 1, "    var r1 = frameAddress")
+        assigned.add("r1")
+
+    parameters = ",\n    ".join(f"{parameter}: u32" for parameter in parameter_names)
+    source = (
+        f"trusted fun {name}(\n    {parameters}\n): u32 {{\n"
+        + "\n".join(statements)
+        + "\n}"
+    )
+    return Lifted(source, uses_memory or uses_local_frame)
+
+
+BRANCHES = {
+    "beq", "bne", "beqz", "beqz.n", "bnez", "bnez.n",
+    "beqi", "bnei", "blt", "bge", "bltu", "bgeu", "blti",
+    "bgei", "bltui", "bgeui", "bltz", "bgez", "bbci", "bbci.l",
+    "bbsi", "bbsi.l", "bbc", "bbs", "bany", "bnone", "ball",
+    "bnall", "bt", "bf",
+}
+
+
+@dataclass
+class BasicBlock:
+    label: str
+    instructions: list[str]
+    terminator: str
+
+
+def branch_condition(mnemonic: str, arguments: list[str]) -> tuple[str, str]:
+    assigned = {f"r{index}" for index in range(1, 16)}
+    if not arguments:
+        raise Unsupported(f"branch operands: {mnemonic}")
+    target = arguments[-1]
+    values = arguments[:-1]
+    if mnemonic in ("bt", "bf"):
+        if len(values) != 1:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        condition = bool_register_name(values[0])
+        if mnemonic == "bf": condition = f"!{condition}"
+        return condition, target
+    if mnemonic in ("beqz", "beqz.n", "bnez", "bnez.n", "bltz", "bgez"):
+        if len(values) != 1:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        value = operand(values[0], assigned)
+        if mnemonic in ("beqz", "beqz.n"):
+            condition = f"{value} == u32(0)"
+        elif mnemonic in ("bnez", "bnez.n"):
+            condition = f"{value} != u32(0)"
+        elif mnemonic == "bltz":
+            condition = f"i32({value}) < 0"
+        else:
+            condition = f"i32({value}) >= 0"
+        return condition, target
+    if mnemonic in ("beqi", "bnei", "blti", "bgei", "bltui", "bgeui"):
+        if len(values) != 2:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        left = operand(values[0], assigned)
+        right_value = immediate(values[1])
+        if right_value is None:
+            raise Unsupported(f"branch immediate: {mnemonic}")
+        right = f"u32({unsigned(right_value)})"
+        operation = {
+            "beqi": "==", "bnei": "!=", "blti": "<", "bgei": ">=",
+            "bltui": "<", "bgeui": ">=",
+        }[mnemonic]
+        if mnemonic in ("blti", "bgei"):
+            left = f"i32({left})"
+            right = f"i32({right})"
+        return f"{left} {operation} {right}", target
+    if mnemonic in ("beq", "bne", "blt", "bge", "bltu", "bgeu"):
+        if len(values) != 2:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        left = operand(values[0], assigned)
+        right = operand(values[1], assigned)
+        operation = {
+            "beq": "==", "bne": "!=", "blt": "<", "bge": ">=",
+            "bltu": "<", "bgeu": ">=",
+        }[mnemonic]
+        if mnemonic in ("blt", "bge"):
+            left = f"i32({left})"
+            right = f"i32({right})"
+        return f"{left} {operation} {right}", target
+    if mnemonic in ("bbci", "bbci.l", "bbsi", "bbsi.l", "bbc", "bbs"):
+        if len(values) != 2:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        value = operand(values[0], assigned)
+        bit = operand(values[1], assigned)
+        expected = "==" if mnemonic.startswith("bbc") else "!="
+        return (
+            f"(({value} >>> ({bit} & u32(31))) & u32(1)) {expected} u32(0)",
+            target,
+        )
+    if mnemonic in ("bany", "bnone", "ball", "bnall"):
+        if len(values) != 2:
+            raise Unsupported(f"branch operands: {mnemonic}")
+        left = operand(values[0], assigned)
+        right = operand(values[1], assigned)
+        intersection = f"({left} & {right})"
+        if mnemonic == "bany": condition = f"{intersection} != u32(0)"
+        elif mnemonic == "bnone": condition = f"{intersection} == u32(0)"
+        elif mnemonic == "ball": condition = f"{intersection} == {right}"
+        else: condition = f"{intersection} != {right}"
+        return condition, target
+    raise Unsupported(f"branch: {mnemonic}")
+
+
+def control_flow_records(body: str) -> tuple[list[str], list[BasicBlock], int]:
+    literals: list[str] = []
+    records: list[tuple[str, str]] = []
+    frame_size = 0
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(".literal "):
+            literals.append(line)
+            continue
+        if line.startswith((".literal_position", ".align ", ".p2align ")):
+            continue
+        if line in (".byte 0x00", ".byte 0"):
+            # Objdump prints zero fill between branch-separated density-code
+            # blocks. It has no execution semantics and is not an instruction.
+            continue
+        if line.startswith(".") and not LABEL.fullmatch(line):
+            raise Unsupported(f"assembler directive: {line.split()[0]}")
+        if LABEL.fullmatch(line):
+            records.append(("label", line[:-1]))
+            continue
+        mnemonic, operands = parse_instruction(line)
+        if mnemonic == "entry":
+            if len(operands) != 2 or operands[0] != "a1":
+                raise Unsupported("nonstandard ENTRY")
+            value = immediate(operands[1])
+            if value is None or value < 0:
+                raise Unsupported("nonconstant ENTRY frame")
+            frame_size = value
+            continue
+        records.append(("instruction", line))
+
+    blocks: list[BasicBlock] = []
+    label = "__entry"
+    instructions: list[str] = []
+    synthetic = 0
+
+    def finish(terminator: str = "") -> None:
+        nonlocal label, instructions, synthetic
+        if instructions or terminator or not blocks:
+            blocks.append(BasicBlock(label, instructions, terminator))
+        synthetic += 1
+        label = f"__fallthrough_{synthetic}"
+        instructions = []
+
+    previous_kind = ""
+    for kind, record in records:
+        if kind == "label":
+            if previous_kind == "label":
+                # Consecutive assembler labels are aliases for the same
+                # instruction address. Give the first alias an empty Abla
+                # block that falls through to the second so both direct
+                # branch names remain valid in the recovered CFG.
+                blocks.append(BasicBlock(label, [], ""))
+                synthetic += 1
+                label = f"__fallthrough_{synthetic}"
+            if instructions:
+                finish()
+            elif blocks and blocks[-1].terminator == "" and blocks[-1].label.startswith("__fallthrough_"):
+                blocks[-1].label = record
+                label = f"__fallthrough_{synthetic + 1}"
+                previous_kind = kind
+                continue
+            label = record
+            previous_kind = kind
+            continue
+        mnemonic, _ = parse_instruction(record)
+        if (mnemonic in BRANCHES or mnemonic in
+                ("j", "jx", "ret", "ret.n", "retw", "retw.n") or
+                mnemonic.startswith("loop")):
+            finish(record)
+        else:
+            instructions.append(record)
+        previous_kind = kind
+    if instructions:
+        finish()
+    if not blocks:
+        raise Unsupported("empty control-flow body")
+    return literals, blocks, frame_size
+
+
+def lifted_linear_statements(
+    name: str,
+    literals: list[str],
+    instructions: list[str],
+    frame_size: int,
+) -> tuple[list[str], bool]:
+    fake = "\n".join(
+        literals + [f"entry a1, {frame_size}"] + instructions + ["retw.n"]
+    )
+    lifted = lift(
+        name + "Block", fake,
+        assume_all_registers=True,
+        assume_wide_calls=True,
+    )
+    marker = (
+        "    var shiftAmount = u32(0)\n"
+        "    var compareExchangeExpected = u32(0)\n"
+    )
+    begin = lifted.source.find(marker)
+    end = lifted.source.rfind("\n    return r2\n}")
+    if begin < 0 or end < 0:
+        raise Unsupported("cannot extract lifted basic block")
+    body = lifted.source[begin + len(marker):end]
+    statements = body.splitlines() if body else []
+    # The outer function owns one frame allocation and register set. Remove a
+    # block-local stack materialization synthesized by the linear lifter.
+    statements = [
+        statement for statement in statements
+        if not statement.strip().startswith(
+            "val frameAddress = u32(nativeStackAllocate("
+        ) and statement.strip() != "var r1 = frameAddress"
+    ]
+    return statements, lifted.uses_memory
+
+
+def control_flow_materializes_stack(
+    blocks: list[BasicBlock], frame_size: int
+) -> bool:
+    for block in blocks:
+        for line in block.instructions:
+            mnemonic, operands = parse_instruction(line)
+            if "a1" not in operands:
+                continue
+            if (mnemonic in ("l32i", "l32i.n") and len(operands) == 3 and
+                    operands[1] == "a1"):
+                offset = immediate(operands[2])
+                if (offset is not None and offset >= frame_size and
+                        (offset - frame_size) % 4 == 0):
+                    continue
+            return True
+    return False
+
+
+def lift_control_flow(name: str, body: str) -> Lifted:
+    if ".pushsection" in body or ".section" in body or ".reloc" in body:
+        raise Unsupported("nested assembler-owned definitions")
+    internal_jump_table = "ABLA_LIFT_INTERNAL_JUMP_TABLE" in body
+    literals, blocks, frame_size = control_flow_records(body)
+    labels = {block.label: index for index, block in enumerate(blocks)}
+    # A taken branch to LEND exits the hardware loop. Only sequential
+    # fallthrough to LEND performs the implicit back edge. Preserve that
+    # distinction before reducing assembly edges to program-counter numbers.
+    hardware_ends = set()
+    for candidate in blocks:
+        if candidate.terminator:
+            operation, arguments = parse_instruction(candidate.terminator)
+            if operation in ("loop", "loopnez", "loopgtz"):
+                hardware_ends.add(arguments[1])
+    parameters = [f"a{index}" for index in range(2, 8)] + [
+        f"stack{index}" for index in range(10)
+    ]
+    statements = [
+        f"    var r{index} = a{index}" for index in range(2, 8)
+    ]
+    for index in range(8, 16):
+        statements.append(f"    var r{index} = u32(0)")
+    if re.search(r"\ba0\b", body) and frame_size > 0:
+        statements.insert(0, "    var r0 = $xtensa returnAddress()")
+    for index in range(10):
+        statements.append(f"    var incomingStack{index} = stack{index}")
+    uses_float = bool(re.search(r"\b(?:f|b)(?:[0-9]|1[0-5])\b", body))
+    if uses_float:
+        for index in range(16):
+            statements.append(f"    var f{index} = f32FromBits(u32(0))")
+        for index in range(16):
+            statements.append(f"    var b{index} = false")
+    materializes_stack = control_flow_materializes_stack(blocks, frame_size)
+    if materializes_stack:
+        statements.append(
+            f"    val frameAddress = u32(nativeStackAllocate({frame_size}))"
+        )
+        statements.append("    var r1 = frameAddress")
+    else:
+        statements.append("    var r1 = u32(0)")
+    statements.append("    var shiftAmount = u32(0)")
+    statements.append("    var compareExchangeExpected = u32(0)")
+    statements.append("    var programCounter = 0")
+    statements.append("    var loopCounter = u32(0)")
+    statements.append("    var loopStart = 0")
+    statements.append("    var loopEnd = 0")
+    statements.append("    var loopActive = false")
+    statements.append("    while (true) {")
+    statements.append(
+        "        if (loopActive && programCounter == loopEnd) {"
+    )
+    statements.append("            loopCounter = loopCounter - u32(1)")
+    statements.append(
+        "            if (loopCounter != u32(0)) programCounter = loopStart"
+    )
+    statements.append(
+        "            if (loopCounter == u32(0)) loopActive = false"
+    )
+    statements.append("        }")
+    uses_memory = materializes_stack
+
+    statements.append("        when (programCounter) {")
+    for index, block in enumerate(blocks):
+        statements.append(f"            {index} -> {{")
+        lifted_statements, block_memory = lifted_linear_statements(
+            name, literals, block.instructions, frame_size
+        )
+        uses_memory = uses_memory or block_memory
+        for statement in lifted_statements:
+            statements.append("        " + statement)
+        next_index = index + 1
+        if block.terminator:
+            mnemonic, operands = parse_instruction(block.terminator)
+            if mnemonic in ("ret", "ret.n", "retw", "retw.n"):
+                statements.append("            return r2")
+            elif mnemonic == "j":
+                if len(operands) != 1:
+                    raise Unsupported("J operands")
+                target = operands[0]
+                if target in labels:
+                    if target in hardware_ends:
+                        statements.append(
+                            f"            if (loopEnd == {labels[target]}) loopActive = false"
+                        )
+                    statements.append(f"            programCounter = {labels[target]}")
+                else:
+                    statements.append(
+                        f"            return $xtensa call {{{target}}}(r2, r3, r4, r5, r6, r7)"
+                    )
+            elif mnemonic == "jx":
+                if len(operands) != 1:
+                    raise Unsupported("JX operands")
+                target = register_name(operands[0])
+                if internal_jump_table:
+                    statements.append(
+                        f"            programCounter = int({target})"
+                    )
+                else:
+                    statements.append(
+                        "            return u32("
+                        "ablaUnsafeCallI32I32I32I32I32I32I32("
+                        f"int({target}), int(r2), int(r3), int(r4), "
+                        "int(r5), int(r6), int(r7)))"
+                    )
+            elif mnemonic in BRANCHES:
+                condition, target = branch_condition(mnemonic, operands)
+                if target not in labels:
+                    raise Unsupported(f"unknown branch target: {target}")
+                if next_index >= len(blocks):
+                    raise Unsupported("conditional branch without fallthrough")
+                if target in hardware_ends:
+                    statements.append(
+                        f"            if (({condition}) && loopEnd == {labels[target]}) loopActive = false"
+                    )
+                statements.append(
+                    f"            programCounter = if ({condition}) {labels[target]} else {next_index}"
+                )
+            elif mnemonic.startswith("loop"):
+                if len(operands) != 2:
+                    raise Unsupported(f"loop operands: {mnemonic}")
+                count = operand(
+                    operands[0], {f"r{register}" for register in range(1, 16)}
+                )
+                target = operands[1]
+                if target not in labels or next_index >= len(blocks):
+                    raise Unsupported("invalid hardware-loop target")
+                if mnemonic == "loopgtz":
+                    condition = f"i32({count}) > 0"
+                elif mnemonic == "loopnez":
+                    condition = f"{count} != u32(0)"
+                else:
+                    # LOOP always enters its body. A zero count wraps LCOUNT
+                    # and therefore performs 2^32 iterations.
+                    condition = "true"
+                statements.append(f"            loopCounter = {count}")
+                statements.append(f"            loopStart = {next_index}")
+                statements.append(f"            loopEnd = {labels[target]}")
+                statements.append(f"            loopActive = {condition}")
+                statements.append(
+                    f"            programCounter = if ({condition}) {next_index} else {labels[target]}"
+                )
+            else:
+                raise Unsupported(f"terminator: {mnemonic}")
+        elif next_index < len(blocks):
+            statements.append(f"            programCounter = {next_index}")
+        else:
+            statements.append("            ablaRuntimeTrap()")
+            statements.append("            return r2")
+        statements.append("        }")
+    statements.append("            else -> ablaRuntimeTrap()")
+    statements.append("        }")
+    statements.append("    }")
+    statements.append("    r2")
+
+    parameter_source = ",\n    ".join(
+        f"{parameter}: u32" for parameter in parameters
+    )
+    source = (
+        f"trusted fun {name}(\n    {parameter_source}\n): u32 {{\n"
+        + "\n".join(statements)
+        + "\n}"
+    )
+    return Lifted(source, uses_memory)
+
+
+def transform(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]:
+    source = path.read_text()
+    raw_matches = list(BLOCK.finditer(source))
+    raw_bodies = [match.group("body") for match in raw_matches]
+    candidate_symbols: set[str] = set()
+    body_liftable: list[bool] = []
+    for raw_match in raw_matches:
+        candidate_body, _ = extract_function_aliases(raw_match.group("body"))
+        candidate_helpers = extract_liftable_text_helpers(
+            raw_match.group("name"), candidate_body
+        )
+        stripped, symbols = strip_parseable_data_sections(
+            resolve_self_offset_tables(candidate_helpers.body)
+        )
+        candidate_symbols.update(symbols)
+        liftable = False
+        if "@naked\n" in raw_match.group("head"):
+            try:
+                lift(raw_match.group("name"), stripped)
+                liftable = True
+            except Unsupported:
+                pass
+        elif stripped.strip() == "":
+            liftable = True
+        body_liftable.append(liftable)
+    safe_cross_symbols: set[str] = set()
+    for symbol in candidate_symbols:
+        referencing = [
+            index for index, body in enumerate(raw_bodies)
+            if symbol in body
+        ]
+        if referencing and all(body_liftable[index] for index in referencing):
+            safe_cross_symbols.add(symbol)
+    lifted_count = 0
+    reasons: dict[str, int] = {}
+    uses_memory = False
+    uses_internal_function = False
+    data_addresses: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal lifted_count, uses_memory, uses_internal_function
+        head = match.group("head")
+        if "@naked\n" not in head:
+            extracted_data = extract_liftable_data_sections(
+                match.group("body"), raw_bodies, safe_cross_symbols
+            )
+            if (extracted_data.declarations and
+                    extracted_data.body.strip() == ""):
+                data_addresses.update(extracted_data.addresses)
+                uses_memory = True
+                lifted_count += 1
+                return (
+                    "\n\n".join(extracted_data.declarations) + "\n\n" +
+                    f'trusted fun {match.group("name")}(): void {{ return }}'
+                )
+            reasons["not naked"] = reasons.get("not naked", 0) + 1
+            return match.group(0)
+        alias_body, function_aliases = extract_function_aliases(
+            match.group("body")
+        )
+        extracted = extract_liftable_text_helpers(
+            match.group("name"), alias_body
+        )
+        for reason in extracted.reasons:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        prefix = ""
+        if extracted.declarations:
+            prefix = "\n\n".join(extracted.declarations) + "\n\n"
+            lifted_count += extracted.count
+            uses_memory = uses_memory or extracted.uses_memory
+            uses_internal_function = True
+        if function_aliases:
+            alias_declarations: list[str] = []
+            for alias in function_aliases:
+                binding = internal_helper_name(
+                    match.group("name") + "::" + alias
+                ) + "Link"
+                alias_declarations.append(
+                    f'val {binding} = #internalFunction('
+                    f'"{match.group("name")}", "{alias}")'
+                )
+            prefix = "\n".join(alias_declarations) + "\n\n" + prefix
+            uses_internal_function = True
+        recovered_body = resolve_self_offset_tables(extracted.body)
+        extracted_data = extract_liftable_data_sections(
+            recovered_body, raw_bodies, safe_cross_symbols
+        )
+        try:
+            result = lift(match.group("name"), extracted_data.body)
+        except Unsupported as error:
+            reason = str(error)
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if extracted_data.declarations:
+                prefix = (
+                    "\n\n".join(extracted_data.declarations) + "\n\n" +
+                    prefix
+                )
+                data_addresses.update(extracted_data.addresses)
+                uses_memory = True
+                lifted_count += extracted_data.count
+            if not extracted.declarations and not extracted_data.declarations:
+                return match.group(0)
+            return (
+                prefix + head + "$xtensa instructions {\n" +
+                extracted_data.body + "\n}"
+            )
+        if extracted_data.declarations:
+            prefix = (
+                "\n\n".join(extracted_data.declarations) + "\n\n" + prefix
+            )
+            data_addresses.update(extracted_data.addresses)
+            uses_memory = True
+        annotations = head[:head.rfind("trusted fun")]
+        annotations = annotations.replace("@naked\n", "")
+        lifted_count += 1
+        uses_memory = uses_memory or result.uses_memory
+        return prefix + annotations + result.source
+
+    transformed = BLOCK.sub(replace, source)
+    for symbol, address in data_addresses.items():
+        transformed = transformed.replace(
+            f"$xtensa address {{{{{symbol}}}}}", address
+        )
+    if lifted_count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
+        transformed = 'import "abla/unsafe/memory"\n' + transformed
+    if (lifted_count and "ablaRuntimeTrap()" in transformed and
+            'import "abla/runtime/self"' not in transformed):
+        transformed = 'import "abla/runtime/self"\n' + transformed
+    if (uses_internal_function and 'import "abla/build"' not in transformed):
+        transformed = 'import "abla/build"\n' + transformed
+    if (lifted_count and "f32FromBits(" in transformed and
+            'import "abla/float"' not in transformed):
+        transformed = 'import "abla/float"\n' + transformed
+    if write and transformed != source:
+        path.write_text(transformed)
+    return lifted_count, reasons
+
+
+def parameter_names(parameter_source: str) -> list[str]:
+    inside = parameter_source[1:-1].strip()
+    if not inside:
+        return []
+    names: list[str] = []
+    for parameter in split_operands(inside):
+        match = re.fullmatch(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*u32", parameter.strip()
+        )
+        if match is None:
+            raise Unsupported("non-u32 source parameter")
+        names.append(match.group(1))
+    if len(names) > 16:
+        raise Unsupported("more than sixteen source parameters")
+    return names
+
+
+def source_signature_lift(
+    name: str, parameters: str, lifted: Lifted, annotations: str,
+    result_type: str = "u32"
+) -> str:
+    names = parameter_names(parameters)
+    body_begin = lifted.source.find(" {\n")
+    if body_begin < 0 or not lifted.source.endswith("\n}"):
+        raise Unsupported("malformed lifted source")
+    body = lifted.source[body_begin + 3:-2]
+    lines = body.splitlines()
+    for register in range(2, 8):
+        expected = f"    var r{register} = a{register}"
+        if expected not in lines:
+            raise Unsupported("unexpected lifted register prologue")
+        line_index = lines.index(expected)
+        argument_index = register - 2
+        value = (
+            names[argument_index]
+            if argument_index < len(names) else "u32(0)"
+        )
+        lines[line_index] = f"    var r{register} = {value}"
+    for stack_index in range(10):
+        expected = f"    var incomingStack{stack_index} = stack{stack_index}"
+        if expected not in lines:
+            raise Unsupported("unexpected lifted stack prologue")
+        line_index = lines.index(expected)
+        argument_index = 6 + stack_index
+        value = (
+            names[argument_index]
+            if argument_index < len(names) else "u32(0)"
+        )
+        lines[line_index] = f"    var incomingStack{stack_index} = {value}"
+    if result_type == "void":
+        lines = [
+            line[:len(line) - len(line.lstrip())] + "return"
+            if line.strip() in ("return r2", "r2") else line
+            for line in lines
+        ]
+    return (
+        annotations + f"trusted fun {name}{parameters}: {result_type} {{\n" +
+        "\n".join(lines) + "\n}"
+    )
+
+
+def transform_u32(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]:
+    source = path.read_text()
+    matches = list(U32_BLOCK.finditer(source))
+    if not matches:
+        return 0, {}
+    all_raw_bodies = [
+        match.group("body")
+        for expression in (BLOCK, U32_BLOCK)
+        for match in expression.finditer(source)
+    ]
+    candidate_symbols: set[str] = set()
+    liftable: list[bool] = []
+    stripped_bodies: list[str] = []
+    for match in matches:
+        alias_body, _ = extract_function_aliases(match.group("body"))
+        helpers = extract_liftable_text_helpers(match.group("name"), alias_body)
+        stripped, symbols = strip_parseable_data_sections(
+            resolve_self_offset_tables(helpers.body)
+        )
+        candidate_symbols.update(symbols)
+        stripped_bodies.append(stripped)
+        try:
+            parameter_names(match.group("parameters"))
+            lift(match.group("name"), stripped)
+            liftable.append(True)
+        except Unsupported:
+            liftable.append(False)
+    safe_cross_symbols: set[str] = set()
+    for symbol in candidate_symbols:
+        referencing_all = [body for body in all_raw_bodies if symbol in body]
+        referencing_u32 = [
+            index for index, match in enumerate(matches)
+            if symbol in match.group("body")
+        ]
+        if (referencing_all and len(referencing_all) == len(referencing_u32) and
+                referencing_u32 and
+                all(liftable[index] for index in referencing_u32)):
+            safe_cross_symbols.add(symbol)
+
+    lifted_count = 0
+    reasons: dict[str, int] = {}
+    uses_memory = False
+    uses_internal_function = False
+    data_addresses: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal lifted_count, uses_memory, uses_internal_function
+        alias_body, aliases = extract_function_aliases(match.group("body"))
+        helpers = extract_liftable_text_helpers(match.group("name"), alias_body)
+        for reason in helpers.reasons:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        prefix = ""
+        if helpers.declarations:
+            prefix = "\n\n".join(helpers.declarations) + "\n\n"
+            lifted_count += helpers.count
+            uses_memory = uses_memory or helpers.uses_memory
+            uses_internal_function = True
+        if aliases:
+            alias_declarations: list[str] = []
+            for alias in aliases:
+                binding = internal_helper_name(
+                    match.group("name") + "::" + alias
+                ) + "Link"
+                alias_declarations.append(
+                    f'val {binding} = #internalFunction('
+                    f'"{match.group("name")}", "{alias}")'
+                )
+            prefix = "\n".join(alias_declarations) + "\n\n" + prefix
+            uses_internal_function = True
+        recovered_body = resolve_self_offset_tables(helpers.body)
+        data = extract_liftable_data_sections(
+            recovered_body, all_raw_bodies, safe_cross_symbols
+        )
+        try:
+            result = lift(match.group("name"), data.body)
+            annotations = match.group("head")[:
+                match.group("head").rfind("trusted fun")
+            ].replace("@naked\n", "")
+            replacement = source_signature_lift(
+                match.group("name"), match.group("parameters"),
+                result, annotations,
+            )
+        except Unsupported as error:
+            reason = str(error)
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if not helpers.declarations:
+                return match.group(0)
+            return (
+                prefix + match.group("head") +
+                "$xtensa instructionsU32 {\n" + helpers.body + "\n}"
+            )
+        if data.declarations:
+            prefix = "\n\n".join(data.declarations) + "\n\n" + prefix
+            data_addresses.update(data.addresses)
+            uses_memory = True
+        lifted_count += 1
+        uses_memory = uses_memory or result.uses_memory
+        return prefix + replacement
+
+    transformed = U32_BLOCK.sub(replace, source)
+    for symbol, address in data_addresses.items():
+        transformed = transformed.replace(
+            f"$xtensa address {{{{{symbol}}}}}", address
+        )
+    if lifted_count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
+        transformed = 'import "abla/unsafe/memory"\n' + transformed
+    if (lifted_count and "ablaRuntimeTrap()" in transformed and
+            'import "abla/runtime/self"' not in transformed):
+        transformed = 'import "abla/runtime/self"\n' + transformed
+    if uses_internal_function and 'import "abla/build"' not in transformed:
+        transformed = 'import "abla/build"\n' + transformed
+    if (lifted_count and "f32FromBits(" in transformed and
+            'import "abla/float"' not in transformed):
+        transformed = 'import "abla/float"\n' + transformed
+    if write and transformed != source:
+        path.write_text(transformed)
+    return lifted_count, reasons
+
+
+def transform_typed_void(
+    path: pathlib.Path, write: bool
+) -> tuple[int, dict[str, int]]:
+    source = path.read_text()
+    matches = list(TYPED_VOID_BLOCK.finditer(source))
+    if not matches:
+        return 0, {}
+    raw_bodies = [match.group("body") for match in matches]
+    candidate_symbols: set[str] = set()
+    liftable: list[bool] = []
+    for match in matches:
+        alias_body, _ = extract_function_aliases(match.group("body"))
+        helpers = extract_liftable_text_helpers(match.group("name"), alias_body)
+        stripped, symbols = strip_parseable_data_sections(
+            resolve_self_offset_tables(helpers.body)
+        )
+        candidate_symbols.update(symbols)
+        try:
+            parameter_names(match.group("parameters"))
+            lift(match.group("name"), stripped)
+            liftable.append(True)
+        except Unsupported:
+            liftable.append(False)
+    safe_symbols: set[str] = set()
+    for symbol in candidate_symbols:
+        users = [
+            index for index, match in enumerate(matches)
+            if symbol in match.group("body")
+        ]
+        if users and all(liftable[index] for index in users):
+            safe_symbols.add(symbol)
+
+    count = 0
+    reasons: dict[str, int] = {}
+    uses_memory = False
+    data_addresses: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count, uses_memory
+        alias_body, _ = extract_function_aliases(match.group("body"))
+        helpers = extract_liftable_text_helpers(match.group("name"), alias_body)
+        recovered = resolve_self_offset_tables(helpers.body)
+        data = extract_liftable_data_sections(
+            recovered, raw_bodies, safe_symbols
+        )
+        try:
+            result = lift(match.group("name"), data.body)
+            annotations = match.group("head")[:
+                match.group("head").rfind("trusted fun")
+            ].replace("@naked\n", "")
+            replacement = source_signature_lift(
+                match.group("name"), match.group("parameters"), result,
+                annotations, "void",
+            )
+        except Unsupported as error:
+            reason = str(error)
+            reasons[reason] = reasons.get(reason, 0) + 1
+            return match.group(0)
+        prefix = ""
+        if data.declarations:
+            prefix = "\n\n".join(data.declarations) + "\n\n"
+            data_addresses.update(data.addresses)
+            uses_memory = True
+        count += 1
+        uses_memory = uses_memory or result.uses_memory
+        return prefix + replacement
+
+    transformed = TYPED_VOID_BLOCK.sub(replace, source)
+    for symbol, address in data_addresses.items():
+        transformed = transformed.replace(
+            f"$xtensa address {{{{{symbol}}}}}", address
+        )
+    if count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
+        transformed = 'import "abla/unsafe/memory"\n' + transformed
+    if (count and "ablaRuntimeTrap()" in transformed and
+            'import "abla/runtime/self"' not in transformed):
+        transformed = 'import "abla/runtime/self"\n' + transformed
+    if write and transformed != source:
+        path.write_text(transformed)
+    return count, reasons
+
+
+def transform_inline_data(
+    path: pathlib.Path, write: bool
+) -> tuple[int, dict[str, int]]:
+    source = path.read_text()
+    declarations: list[str] = []
+    addresses: dict[str, str] = {}
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        extracted = extract_liftable_data_sections(
+            match.group("body"), [match.group("body")]
+        )
+        if not extracted.declarations or extracted.body.strip() != "":
+            return match.group(0)
+        declarations.extend(extracted.declarations)
+        addresses.update(extracted.addresses)
+        count += 1
+        return match.group("indent") + "// Static data is emitted by Abla above."
+
+    transformed = INLINE_BLOCK.sub(replace, source)
+    if not count:
+        return 0, {}
+    for symbol, address in addresses.items():
+        transformed = transformed.replace(
+            f"$xtensa address {{{{{symbol}}}}}", address
+        )
+        transformed = transformed.replace(
+            f"$xtensa address {{{symbol}}}", address
+        )
+    if 'import "abla/unsafe/memory"' not in transformed:
+        transformed = 'import "abla/unsafe/memory"\n' + transformed
+    insertion = 0
+    for import_match in re.finditer(r'^import "[^\n]+"\n', transformed, re.MULTILINE):
+        if import_match.start() == insertion:
+            insertion = import_match.end()
+    declaration_source = "\n\n".join(declarations) + "\n\n"
+    transformed = (
+        transformed[:insertion] + declaration_source + transformed[insertion:]
+    )
+    if write:
+        path.write_text(transformed)
+    return count, {}
+
+
+def transform_readonly_data(
+    path: pathlib.Path, write: bool
+) -> tuple[int, int]:
+    """Move relocation-free recovered rodata from startup-written BSS.
+
+    The original ELF section was immutable. Once every initializer entry is a
+    literal integer store, its exact little-endian contents can be represented
+    by nativeStaticBytes and placed in flash. Blocks containing symbolic
+    addresses are deliberately left alone until Abla has a typed static
+    relocation primitive.
+    """
+    source = path.read_text()
+    converted_bytes = 0
+    converted_blocks = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal converted_bytes, converted_blocks
+        storage = match.group("storage")
+        if "_rodata" not in storage:
+            return match.group(0)
+        size = int(match.group("size"))
+        if size < 1:
+            return match.group(0)
+        contents = bytearray(size)
+        saw_store = False
+        for raw_line in match.group("body").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("//") or line == storage:
+                continue
+            store = LITERAL_DATA_STORE.fullmatch(raw_line)
+            if store is None or store.group("storage") != storage:
+                return match.group(0)
+            width = int(store.group("bits")) // 8
+            offset = int(store.group("offset"))
+            if offset < 0 or offset + width > size:
+                return match.group(0)
+            value = int(store.group("value")) & ((1 << (width * 8)) - 1)
+            contents[offset:offset + width] = value.to_bytes(
+                width, "little"
+            )
+            saw_store = True
+        if not saw_store:
+            return match.group(0)
+        converted_bytes += size
+        converted_blocks += 1
+        initialized = match.group("initialized")
+        value = match.group("value")
+        return (
+            f"val {storage} = nativeStaticBytes(\n"
+            f"    {abla_byte_string(bytes(contents))}\n"
+            f")\n"
+            f"val {initialized} = {storage}\n"
+            f"val {value} = u32({initialized})\n"
+        )
+
+    transformed = INITIALIZED_DATA.sub(replace, source)
+    if write and transformed != source:
+        path.write_text(transformed)
+    return converted_blocks, converted_bytes
+
+
+def unsafe_semantic_instructions(source: str) -> set[str]:
+    """Find semantic-sensitive opcodes before any `--write` transformation."""
+    found: set[str] = set()
+    seen_bodies: set[tuple[int, int]] = set()
+    for expression in (BLOCK, U32_BLOCK, TYPED_VOID_BLOCK, INLINE_BLOCK):
+        for match in expression.finditer(source):
+            span = match.span("body")
+            if span in seen_bodies:
+                continue
+            seen_bodies.add(span)
+            for raw in match.group("body").splitlines():
+                line = raw.strip()
+                if not line or line.startswith(("#", ".")):
+                    continue
+                mnemonic, _ = parse_instruction(line)
+                if mnemonic in UNSAFE_XTENSA_FP_MNEMONICS:
+                    found.add(mnemonic)
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=pathlib.Path)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    files: list[pathlib.Path] = []
+    for path in arguments.paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.ab")))
+        else:
+            files.append(path)
+    violations: list[tuple[pathlib.Path, list[str]]] = []
+    for path in files:
+        unsafe = sorted(unsafe_semantic_instructions(path.read_text()))
+        if unsafe:
+            violations.append((path, unsafe))
+    if violations:
+        for path, mnemonics in violations:
+            print(
+                f"{path}: refusing lossy Xtensa FP translation: " +
+                ", ".join(mnemonics),
+                file=sys.stderr,
+            )
+        return 1
+    total = 0
+    readonly_blocks = 0
+    readonly_bytes = 0
+    reasons: dict[str, int] = {}
+    for path in files:
+        data_blocks, data_bytes = transform_readonly_data(
+            path, arguments.write
+        )
+        readonly_blocks += data_blocks
+        readonly_bytes += data_bytes
+        count, path_reasons = transform(path, arguments.write)
+        total += count
+        for reason, amount in path_reasons.items():
+            reasons[reason] = reasons.get(reason, 0) + amount
+        u32_count, u32_reasons = transform_u32(path, arguments.write)
+        total += u32_count
+        for reason, amount in u32_reasons.items():
+            reasons[reason] = reasons.get(reason, 0) + amount
+        void_count, void_reasons = transform_typed_void(path, arguments.write)
+        total += void_count
+        for reason, amount in void_reasons.items():
+            reasons[reason] = reasons.get(reason, 0) + amount
+        inline_count, inline_reasons = transform_inline_data(
+            path, arguments.write
+        )
+        total += inline_count
+        for reason, amount in inline_reasons.items():
+            reasons[reason] = reasons.get(reason, 0) + amount
+    action = "lifted" if arguments.write else "liftable"
+    print(f"{total} Xtensa leaf function(s) {action} as ordinary Abla")
+    data_action = "moved" if arguments.write else "movable"
+    print(
+        f"{readonly_blocks} relocation-free rodata block(s) {data_action} "
+        f"to {readonly_bytes} immutable byte(s)"
+    )
+    for reason, amount in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:30]:
+        print(f"{amount:5} not lifted: {reason}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

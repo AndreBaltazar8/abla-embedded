@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Rebase recovered `.text.function+offset` data into one assembly unit."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import subprocess
+import tempfile
+
+
+ABI_SYMBOL = re.compile(r"^// Original ABI symbol: ([^\n]+)$", re.MULTILINE)
+TEXT_TARGET = re.compile(
+    r"\.text\.([.$A-Za-z_][.$A-Za-z0-9_\\]*?)\+0x([0-9A-Fa-f]+)"
+)
+NM_MEMBER = re.compile(r"^(.*\.a):([^:]+):[0-9A-Fa-f]+\s+\S\s+(\S+)$")
+SECTION = re.compile(r"^\s*\[\s*(\d+)\]\s+(\S+)\s+", re.MULTILINE)
+FUNCTION = re.compile(
+    r"^\s*\d+:\s+([0-9A-Fa-f]+)\s+\d+\s+FUNC\s+\S+\s+"
+    r"\S+\s+(\d+)\s+(\S+)$",
+    re.MULTILINE,
+)
+
+
+def run(*command: str, binary: bool = False) -> str | bytes:
+    return subprocess.run(
+        command, check=True, stdout=subprocess.PIPE,
+        text=not binary,
+    ).stdout
+
+
+def archive_symbol_index(
+    archives: list[pathlib.Path], wanted: set[str]
+) -> dict[str, list[tuple[pathlib.Path, str]]]:
+    found: dict[str, list[tuple[pathlib.Path, str]]] = {}
+    for archive in archives:
+        output = run("nm", "-A", "--defined-only", str(archive))
+        assert isinstance(output, str)
+        for line in output.splitlines():
+            match = NM_MEMBER.match(line)
+            if match is None or match.group(3) not in wanted:
+                continue
+            owner = (pathlib.Path(match.group(1)), match.group(2))
+            if owner not in found.setdefault(match.group(3), []):
+                found[match.group(3)].append(owner)
+    return found
+
+
+def member_objects(archive: pathlib.Path, member: str) -> list[bytes]:
+    listing = run("ar", "t", str(archive))
+    assert isinstance(listing, str)
+    instances = sum(line == member for line in listing.splitlines())
+    if instances == 1:
+        content = run("ar", "p", str(archive), member, binary=True)
+        assert isinstance(content, bytes)
+        return [content]
+    objects: list[bytes] = []
+    for instance in range(1, instances + 1):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(
+                ["ar", "xN", str(instance), str(archive), member],
+                check=True, cwd=directory,
+            )
+            objects.append((pathlib.Path(directory) / member).read_bytes())
+    return objects
+
+
+def function_starts(
+    archive: pathlib.Path, member: str
+) -> list[dict[str, tuple[str, int]]]:
+    results: list[dict[str, tuple[str, int]]] = []
+    for contents in member_objects(archive, member):
+        with tempfile.NamedTemporaryFile(suffix=".o") as extracted:
+            extracted.write(contents)
+            extracted.flush()
+            sections_output = run("readelf", "-SW", extracted.name)
+            symbols_output = run("readelf", "-Ws", extracted.name)
+        assert isinstance(sections_output, str)
+        assert isinstance(symbols_output, str)
+        sections = {
+            int(index): name
+            for index, name in SECTION.findall(sections_output)
+        }
+        functions: dict[str, tuple[str, int]] = {}
+        for value, section_index, name in FUNCTION.findall(symbols_output):
+            section = sections.get(int(section_index))
+            if section is not None:
+                functions[name] = (section, int(value, 16))
+        results.append(functions)
+    return results
+
+
+def entry_label(source: str, function: str, label: str) -> str:
+    marker = f"// Original ABI symbol: {function}\n"
+    begin = source.find(marker)
+    if begin < 0:
+        raise ValueError(f"source does not implement {function}")
+    string_begin = source.find('xtensaAssemblyVoid(\n    "', begin)
+    if string_begin < 0:
+        raise ValueError(f"{function} has no recovered assembly body")
+    string_begin += len('xtensaAssemblyVoid(\n    "')
+    string_end = source.find('\",\n    "~{memory}"', string_begin)
+    if string_end < 0:
+        raise ValueError(f"{function} has no bounded assembly string")
+    body = source[string_begin:string_end]
+    entry = body.rfind(r"\nentry")
+    if entry >= 0:
+        insertion = string_begin + entry + 2
+    elif body.startswith("entry"):
+        insertion = string_begin
+    else:
+        raise ValueError(f"cannot find the entry instruction for {function}")
+    definition = f"{label}:\\n"
+    if definition not in source[string_begin:string_end]:
+        source = source[:insertion] + definition + source[insertion:]
+    return source
+
+
+def resolve_source(
+    path: pathlib.Path,
+    index: dict[str, list[tuple[pathlib.Path, str]]],
+) -> int:
+    source = path.read_text()
+    targets = sorted(set(TEXT_TARGET.findall(source)))
+    if not targets:
+        return 0
+    owner_cache: dict[tuple[pathlib.Path, str], list[dict[str, tuple[str, int]]]] = {}
+    starts: dict[str, int] = {}
+    for function, _ in targets:
+        candidates: set[int] = set()
+        for owner in index.get(function, []):
+            if owner not in owner_cache:
+                owner_cache[owner] = function_starts(*owner)
+            for functions in owner_cache[owner]:
+                location = functions.get(function)
+                if location is not None and location[0] == f".text.{function}":
+                    candidates.add(location[1])
+        if len(candidates) != 1:
+            raise ValueError(
+                f"{path}: no unique section start for {function}: "
+                f"{sorted(candidates)}"
+            )
+        starts[function] = next(iter(candidates))
+    resolved = 0
+    for function in starts:
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", function)
+        namespace = re.sub(r"[^A-Za-z0-9_]", "_", path.as_posix())
+        label = f".Labla_recovered_{namespace}_{safe}_section_entry"
+        source = entry_label(source, function, label)
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal resolved
+            if match.group(1) != function:
+                return match.group(0)
+            delta = int(match.group(2), 16) - starts[function]
+            resolved += 1
+            if delta == 0:
+                return label
+            sign = "+" if delta > 0 else "-"
+            return f"{label}{sign}0x{abs(delta):x}"
+
+        source = TEXT_TARGET.sub(replace, source)
+    path.write_text(source)
+    print(f"{path}: rebased {resolved} text-section target(s)")
+    return resolved
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--archives", required=True, type=pathlib.Path)
+    parser.add_argument("sources", nargs="+", type=pathlib.Path)
+    arguments = parser.parse_args()
+    wanted: set[str] = set()
+    for path in arguments.sources:
+        wanted.update(function for function, _ in TEXT_TARGET.findall(
+            path.read_text()
+        ))
+    index = archive_symbol_index(
+        sorted(arguments.archives.rglob("*.a")), wanted
+    )
+    total = 0
+    for path in arguments.sources:
+        total += resolve_source(path, index)
+    print(f"rebased {total} recovered text-section target(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

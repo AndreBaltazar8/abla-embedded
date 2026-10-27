@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Report actual windowed frames from linked ELF + matching objdump stdin.
+
+Use target GNU objdump -d --no-show-raw-insn with retained .xt.prop metadata,
+or Espressif llvm-objdump -d --mcpu=esp32s3 --no-show-raw-insn for entry frames.
+This inventories symbol-entry frames ONLY, not instruction streams/call graphs.
+Linear disassembly can lose alignment in embedded padding/literal pools after
+Xtensa property sections have been stripped. Never infer calls from that.
+ROM calls, nesting, recursion and dynamic stack operations need separate work.
+"""
+import bisect
+import json
+import hashlib
+import re
+import struct
+import sys
+from pathlib import Path
+
+
+def functions(data):
+    if data[:6] != b"\x7fELF\x01\x01" or struct.unpack_from("<H", data, 18)[0] != 94:
+        raise ValueError("expected little-endian ELF32 Xtensa")
+    if struct.unpack_from("<H", data, 16)[0] != 2:
+        raise ValueError("expected linked executable, not relocatable object")
+    table = struct.unpack_from("<I", data, 32)[0]
+    stride, count = struct.unpack_from("<HH", data, 46)
+    if stride != 40:
+        raise ValueError("unsupported section table")
+    sections = [struct.unpack_from("<10I", data, table + n * 40) for n in range(count)]
+    result = {}
+    for section in sections:
+        if section[1] != 2:  # SYMTAB
+            continue
+        if section[9] != 16 or section[6] >= count:
+            raise ValueError("invalid symbol table")
+        strings = sections[section[6]]
+        names = data[strings[4]:strings[4] + strings[5]]
+        for pos in range(section[4], section[4] + section[5], 16):
+            name, address, size, info, _, shndx = struct.unpack_from("<IIIBBH", data, pos)
+            if info & 15 != 2 or not size or shndx == 0:
+                continue
+            label = names[name:].split(b"\0", 1)[0].decode("utf-8")
+            if address in result and result[address]["size"] != size:
+                raise ValueError("function aliases disagree on size")
+            result.setdefault(address, {"names": [], "size": size})["names"].append(label)
+    if not result:
+        raise ValueError("no sized function symbols")
+    return result
+
+
+def inspect(symbols, lines):
+    starts = sorted(symbols)
+    records = {a: {"address": hex(a), "names": symbols[a]["names"], "frame_bytes": None,
+                   "entry_instruction": None} for a in starts}
+    pattern = re.compile(r"^\s*([0-9a-fA-F]+):\s+(.+?)\s*$")
+    for line in lines:
+        match = pattern.match(line)
+        if not match:
+            continue
+        address = int(match[1], 16)
+        index = bisect.bisect_right(starts, address) - 1
+        if index < 0:
+            continue
+        start = starts[index]
+        if address != start:
+            continue  # Only exact ELF function entries are reliable here.
+        record = records[start]
+        instruction = match[2]
+        record["entry_instruction"] = instruction
+        pieces = instruction.split(None, 1)
+        opcode = pieces[0]
+        operands = pieces[1] if len(pieces) > 1 else ""
+        if address == start:
+            entry = re.fullmatch(r"a1,\s*(0x[0-9a-fA-F]+|[0-9]+)", operands)
+            if opcode == "entry" and entry:
+                record["frame_bytes"] = int(entry[1], 0)
+    if any(r["entry_instruction"] is None for r in records.values()):
+        raise ValueError("disassembly does not cover every ELF function")
+    ordered = sorted(records.values(), key=lambda r: -(r["frame_bytes"] or 0))
+    return {"worst_case_stack_proven": False,
+            "scope": "individual function-entry frames only; no call graph or dynamic/interrupt stack proof",
+            "call_graph_analyzed": False,
+            "largest_frame_bytes": max(r["frame_bytes"] or 0 for r in ordered),
+            "functions_without_entry": sum(r["frame_bytes"] is None for r in ordered),
+            "functions": ordered}
+
+
+def call_paths(report, ir, entry):
+    """Correlate optimized IR calls with measured frames, without ROM bounds.
+
+    This is a conservative sum of named ENTRY frames, counting tail calls too.
+    It is not a machine-level stack proof or a ROM/interrupt stack allowance.
+    """
+    graph = {}
+    current = None
+    for number, line in enumerate(ir.splitlines(), 1):
+        match = re.match(r"define\b.*@([A-Za-z0-9_.$]+)\(", line)
+        if match:
+            current = match[1]
+            graph[current] = {"calls": set(), "fixed_addresses": set(), "unresolved": [], "intrinsics": set(), "fixed_values": {}}
+        if line == "}":
+            current = None
+        if current is None:
+            continue
+        node = graph[current]
+        # Only exact constant pointer SELECTs; no guesses about loaded pointers
+        # or phi nodes. Both outcomes contribute to the fixed-call inventory.
+        selected = re.fullmatch(r"\s*(%[A-Za-z0-9_.$]+) = select i1 [^,]+, ptr inttoptr \(i(?:32|64) ([0-9]+) to ptr\), ptr inttoptr \(i(?:32|64) ([0-9]+) to ptr\)\s*", line)
+        if selected:
+            node["fixed_values"][selected[1]] = {int(selected[2]), int(selected[3])}
+        if not re.search(r"\s(?:call|invoke|callbr)\s", line):
+            continue
+        direct = re.search(r"@([A-Za-z0-9_.$]+)\(", line)
+        fixed = re.search(r"inttoptr \(i(?:32|64) ([0-9]+) to ptr\)\(", line)
+        indirect = re.search(r"(%[A-Za-z0-9_.$]+)\(", line)
+        if direct:
+            name = direct[1]
+            node["intrinsics" if name.startswith("llvm.") else "calls"].add(name)
+        elif fixed:
+            node["fixed_addresses"].add(int(fixed[1]))
+        elif indirect and indirect[1] in node["fixed_values"]:
+            node["fixed_addresses"].update(node["fixed_values"][indirect[1]])
+        else:
+            node["unresolved"].append(number)
+    frames = {name: r["frame_bytes"] for r in report["functions"] for name in r["names"]}
+    memo = {}
+    active = set()
+
+    def visit(name):
+        if name in active:
+            raise ValueError("recursive named call path: " + name)
+        if name in memo:
+            return memo[name]
+        if name not in graph or frames.get(name) is None:
+            raise ValueError("missing IR definition/measured ENTRY frame: " + name)
+        active.add(name)
+        children = [visit(child) for child in sorted(graph[name]["calls"])]
+        best = max(children, key=lambda path: path[0]) if children else (0, [])
+        result = (frames[name] + best[0], [name] + best[1])
+        active.remove(name)
+        memo[name] = result
+        return result
+
+    total, path = visit(entry)
+    report["optimized_ir"] = {
+        "sha256": hashlib.sha256(ir.encode()).hexdigest(), "entry": entry,
+        "named_entry_frame_sum_bytes": total, "largest_named_path": path,
+        "reachable_functions": len(memo),
+        "fixed_call_addresses": sorted({hex(a) for name in memo for a in graph[name]["fixed_addresses"]}),
+        "unresolved_call_lines": sorted({n for name in memo for n in graph[name]["unresolved"]}),
+        "intrinsics": sorted({n for name in memo for n in graph[name]["intrinsics"]}),
+        "scope": "optimized IR named calls only; fixed calls, intrinsics, dynamic stack and interrupts excluded",
+    }
+    # Deliberately leave worst_case_stack_proven false, even with no recursion.
+    report["call_graph_analyzed"] = "optimized IR named calls only"
+    return report
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) not in (2, 4):
+            raise ValueError("usage: report-xtensa-stack LINKED.elf [OPTIMIZED.ll ENTRY] < CPU-SPECIFIC-OBJDUMP.txt")
+        report = inspect(functions(Path(sys.argv[1]).read_bytes()), sys.stdin)
+        if len(sys.argv) == 4:
+            report = call_paths(report, Path(sys.argv[2]).read_text(), sys.argv[3])
+        print(json.dumps(report, indent=2))
+    except (ValueError, OSError, struct.error) as error:
+        sys.exit(str(error))

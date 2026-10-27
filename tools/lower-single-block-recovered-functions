@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Lower trivially structured recovered dispatchers to ordinary Abla bodies.
+
+The recovered Xtensa lifter originally represented every function as a
+program-counter loop, including functions with one unconditional basic block.
+This pass removes only that mechanically provable case. Multi-block control
+flow, counter assignments, and blocks without an unconditional terminator are
+left byte-for-byte unchanged for a later CFG structurizer.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import sys
+
+
+DISPATCHER = re.compile(
+    r"(?P<counter>^    var programCounter = 0\n)"
+    r"(?P<loopvars>"
+    r"(?:^    var loopCounter = u32\(0\)\n"
+    r"^    var loopStart = 0\n"
+    r"^    var loopEnd = 0\n)?"
+    r")"
+    r"^    while \(true\) \{\n"
+    r"(?P<loophead>"
+    r"(?:^        if \(loopCounter != u32\(0\) && programCounter == loopEnd\) \{\n"
+    r"^            loopCounter = loopCounter - u32\(1\)\n"
+    r"^            if \(loopCounter != u32\(0\)\) programCounter = loopStart\n"
+    r"^        \}\n)?"
+    r")"
+    r"^        when \(programCounter\) \{\n"
+    r"^            0 -> \{\n"
+    r"(?P<body>.*?)"
+    r"^        \}\n"
+    r"^            else -> ablaRuntimeTrap\(\)\n"
+    r"^        \}\n"
+    r"^    \}\n",
+    re.MULTILINE | re.DOTALL,
+)
+
+ARM = re.compile(r"^            [0-9]+ -> \{", re.MULTILINE)
+STATE_NAMES = re.compile(r"\b(?:programCounter|loopCounter|loopStart|loopEnd)\b")
+TERMINATOR = re.compile(r"^(?:return(?:\s+.+)?|ablaRuntimeTrap\(\))$")
+
+
+def lower_body(body: str) -> str | None:
+    if ARM.search(body) is not None or STATE_NAMES.search(body) is not None:
+        return None
+
+    meaningful = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.lstrip().startswith("//")
+    ]
+    if not meaningful or TERMINATOR.fullmatch(meaningful[-1]) is None:
+        return None
+
+    lowered: list[str] = []
+    for line in body.splitlines(keepends=True):
+        lowered.append(line[8:] if line.startswith("        ") else line)
+    return "".join(lowered)
+
+
+def transform(source: str) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in DISPATCHER.finditer(source):
+        body = lower_body(match.group("body"))
+        if body is not None:
+            replacements.append((match.start(), match.end(), body))
+
+    transformed = source
+    for begin, end, replacement in reversed(replacements):
+        transformed = transformed[:begin] + replacement + transformed[end:]
+    return transformed, len(replacements)
+
+
+def input_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.ab")))
+        elif path.suffix == ".ab":
+            files.append(path)
+    return files
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    arguments = parser.parse_args()
+
+    changed_files = 0
+    lowered_functions = 0
+    for path in input_files(arguments.paths):
+        source = path.read_text()
+        transformed, lowered = transform(source)
+        lowered_functions += lowered
+        if transformed != source:
+            changed_files += 1
+            if arguments.verbose:
+                print(f"{path}: {lowered}")
+            if arguments.write:
+                path.write_text(transformed)
+
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {lowered_functions} single-block function(s) "
+        f"across {changed_files} file(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

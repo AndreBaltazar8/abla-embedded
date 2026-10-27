@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Synchronize recovered Xtensa NOPs after source CFG restructuring.
+
+The reference and target are expected to contain the same mechanically lifted
+functions.  Only gaps bounded by two consecutive, text-identical non-NOP
+lines are touched, so semantic edits and unmatched control-flow regions remain
+unchanged.  Re-running after other mechanical lowering passes converges more
+sites without guessing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+from pathlib import Path
+
+
+NOP = "xtensaNoOperation()"
+
+
+def synchronize(reference: Path, target: Path) -> tuple[str, int, int]:
+    reference_lines = reference.read_text().splitlines()
+    target_lines = target.read_text().splitlines()
+    reference_non = [
+        (line.strip(), index)
+        for index, line in enumerate(reference_lines)
+        if line.strip() != NOP
+    ]
+    target_non = [
+        (line.strip(), index)
+        for index, line in enumerate(target_lines)
+        if line.strip() != NOP
+    ]
+    matcher = difflib.SequenceMatcher(
+        None,
+        [line for line, _ in reference_non],
+        [line for line, _ in target_non],
+        autojunk=False,
+    )
+    matches: dict[int, int] = {}
+    for reference_begin, target_begin, length in matcher.get_matching_blocks():
+        for offset in range(length):
+            matches[reference_begin + offset] = target_begin + offset
+
+    replacements: list[tuple[int, int, list[str]]] = []
+    inserted = 0
+    removed = 0
+    keys = sorted(matches)
+    for left, right in zip(keys, keys[1:]):
+        target_left = matches[left]
+        target_right = matches[right]
+        if right != left + 1 or target_right != target_left + 1:
+            continue
+        reference_begin = reference_non[left][1] + 1
+        reference_end = reference_non[right][1]
+        target_begin = target_non[target_left][1] + 1
+        target_end = target_non[target_right][1]
+        reference_count = sum(
+            line.strip() == NOP
+            for line in reference_lines[reference_begin:reference_end]
+        )
+        target_count = sum(
+            line.strip() == NOP
+            for line in target_lines[target_begin:target_end]
+        )
+        if reference_count == target_count:
+            continue
+        next_line = target_lines[target_non[target_right][1]]
+        previous_line = target_lines[target_non[target_left][1]]
+        anchor = next_line if not next_line.strip().startswith("}") else previous_line
+        indent = anchor[: len(anchor) - len(anchor.lstrip())]
+        replacements.append(
+            (target_begin, target_end, [indent + NOP] * reference_count)
+        )
+        inserted += max(0, reference_count - target_count)
+        removed += max(0, target_count - reference_count)
+
+    transformed = target_lines
+    for begin, end, replacement in reversed(replacements):
+        transformed[begin:end] = replacement
+    suffix = "\n" if target.read_text().endswith("\n") else ""
+    return "\n".join(transformed) + suffix, inserted, removed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("reference", type=Path)
+    parser.add_argument("target", type=Path)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    inserted = 0
+    removed = 0
+    changed = 0
+    reference_files = (
+        sorted(arguments.reference.glob("*.ab"))
+        if arguments.reference.is_dir()
+        else [arguments.reference]
+    )
+    for reference in reference_files:
+        target = (
+            arguments.target / reference.name
+            if arguments.target.is_dir()
+            else arguments.target
+        )
+        if not target.exists():
+            continue
+        source = target.read_text()
+        transformed, added, deleted = synchronize(reference, target)
+        inserted += added
+        removed += deleted
+        if transformed != source:
+            changed += 1
+            if arguments.write:
+                target.write_text(transformed)
+    action = "synchronized" if arguments.write else "would synchronize"
+    print(
+        f"{action} {changed} file(s): add {inserted} NOP(s), "
+        f"remove {removed} misplaced NOP(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

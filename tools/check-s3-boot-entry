@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Check linked boot-entry ABI fixture, not a bootable firmware image."""
+import struct, sys
+from pathlib import Path
+d=Path(sys.argv[1]).read_bytes()
+assert d[:6] == b'\x7fELF\x01\x01' and struct.unpack_from('<H',d,16)[0] == 2
+t=struct.unpack_from('<I',d,32)[0]; stride,count,_=struct.unpack_from('<HHH',d,46)
+assert stride == 40
+hs=[struct.unpack_from('<10I',d,t+i*40) for i in range(count)]
+symbols={}
+for h in hs:
+    if h[1] != 2: continue
+    strings=hs[h[6]]; names=d[strings[4]:strings[4]+strings[5]]
+    for p in range(h[4],h[4]+h[5],16):
+        n,value,size,info,_,section=struct.unpack_from('<IIIBBH',d,p)
+        name=names[n:].split(b'\0',1)[0].decode()
+        if name: symbols[name]=(value,size,section)
+def read(address,size):
+    for h in hs:
+        if h[1] == 1 and h[3] <= address and address+size <= h[3]+h[5]:
+            return d[h[4]+address-h[3]:h[4]+address-h[3]+size]
+    raise AssertionError('read outside loaded segments')
+def ins(words): return b''.join(bytes.fromhex(w)[::-1] for w in words.split())
+entry,size,_=symbols['abla_boot_entry']; main,_,_=symbols['abla_boot_main']
+assert struct.unpack_from('<I',d,24)[0] == entry
+low,_,_=symbols['__abla_boot_stack_low']; top,_,_=symbols['__abla_boot_stack_top']
+assert 0x3FC88000 <= low < top <= 0x3FD00000 and top-low >= 256 and top & 15 == 0
+c=read(entry,size)
+shstr=hs[struct.unpack_from('<H',d,50)[0]]
+section_names=d[shstr[4]:shstr[4]+shstr[5]]
+sections={section_names[h[0]:].split(bytes([0]),1)[0].decode():h for h in hs}
+vectors=sections['.iram1.abla.s3BootVectors'][3]
+assert vectors & 1023 == 0 and sections['.iram1.abla.s3BootVectors'][5] == 1024
+pc=0
+def expect(*encodings):
+    global pc
+    for encoding in encodings:
+        value=ins(encoding)
+        if c[pc:pc+len(value)] == value:
+            pc+=len(value)
+            return
+    raise AssertionError(('unexpected entry opcode',pc,c[pc:pc+3].hex()))
+def literal(register,value):
+    global pc
+    word=int.from_bytes(c[pc:pc+3],'little')
+    assert word & 255 == (register<<4)|1
+    immediate=word>>8
+    if immediate & 0x8000: immediate-=65536
+    target=((entry+pc+3)&~3)+immediate*4
+    assert int.from_bytes(read(target,4),'little') == value
+    pc+=3
+expect('006f00 f00c 13e600 002010 000c 13e400 13e000 134800 002010 100c 134900 002010')
+literal(1,top)
+expect('e0c112')
+expect('000c','00a002')
+for short,wide in (('0109','006102'),('1109','016102'),('2109','026102'),('3109','036102')):
+    expect(short,wide)
+expect('49c100 49d100')
+literal(0,vectors)
+expect('13e700 002010')
+literal(0,0x4002f)
+expect('13e600 002010')
+expect('000c','00a002')
+word=int.from_bytes(c[pc:pc+3],'little'); displacement=word>>6
+if displacement & (1<<17): displacement-=1<<18
+assert word & 63 == 21 and ((entry+pc)&~3)+4+displacement*4 == main
+pc+=3
+expect('006f00 ffff06')
+assert pc == size and int.from_bytes(read(main,3),'little') & 0xfff == 0x136
+def jump(address):
+    word=int.from_bytes(read(address,3),'little')
+    assert word & 63 == 6
+    delta=word>>6
+    if delta & (1<<17): delta-=1<<18
+    return address+4+delta
+window=jump(vectors)
+assert 0x40378000 <= window <= 0x403e0000-384
+for offset in (0,64,128,192,256,320):
+    assert jump(vectors+offset) == window+offset
+fatal=jump(vectors+384)
+assert vectors+387 <= fatal <= vectors+388
+assert read(fatal,3) == ins('006f00') and jump(fatal+3) == fatal
+for offset in range(384,1024,64):
+    if offset != 832: assert jump(vectors+offset) == fatal
+# User exception5 must preserve original a0 in EXCSAVE1 before MOVSP recovery.
+user=vectors+832
+assert read(user,6) == ins('13d100 03e800')
+assert read(user+6,3) == ins('025026') # relaxed BEQI5 over far fatal jump
+assert jump(user+9) == fatal
+assert jump(user+12) == window+80
+print('PASS: entry installs private early vectors before WOE/CALL4; exact window jumps, MOVSP recovery and stackless fatal slots; not hardware proof')

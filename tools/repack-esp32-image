@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Repack an unsigned, unencrypted ESP32 application image; never flash it.
+
+Preserve every non-padding address/byte, header field except segment count,
+entrypoint, XOR checksum and appended SHA256. Signed/trailing data is rejected.
+Use nearest modulo-64KiB alignment even just after crossing a page boundary.
+"""
+import argparse
+import hashlib
+import pathlib
+import struct
+
+PAGE = 65536
+
+def flash(address):
+    return 0x3F400000 <= address < 0x3F800000 or 0x400D0000 <= address < 0x40400000
+
+def xor_bytes(data, checksum=0xEF):
+    for value in data:
+        checksum ^= value
+    return checksum
+
+def parse(data):
+    if len(data) < 64 or data[0] != 0xE9 or not 1 <= data[1] <= 16:
+        raise ValueError('invalid ESP image header')
+    if data[12:14] != b'\0\0' or data[23] != 1:
+        raise ValueError('only ESP32 images with appended SHA256 are supported')
+    cursor, checksum, segments = 24, 0xEF, []
+    for _ in range(data[1]):
+        if cursor + 8 > len(data):
+            raise ValueError('truncated segment header')
+        address, size = struct.unpack_from('<II', data, cursor)
+        cursor += 8
+        if size % 4 or cursor + size > len(data) or address + size > 0x100000000:
+            raise ValueError('invalid segment span')
+        payload = data[cursor:cursor + size]
+        if flash(address) and cursor % PAGE != address % PAGE:
+            raise ValueError('misaligned flash segment')
+        if address == 0 and any(payload):
+            raise ValueError('nonzero padding payload')
+        checksum = xor_bytes(payload, checksum)
+        if address != 0:
+            if not size:
+                raise ValueError('empty load segment')
+            segments.append((address, payload))
+        cursor += size
+    checksum_offset = cursor + (15 - cursor % 16)
+    if len(data) != checksum_offset + 33:
+        raise ValueError('signed, padded, or trailing data is unsupported')
+    if any(data[cursor:checksum_offset]) or data[checksum_offset] != checksum:
+        raise ValueError('invalid XOR footer')
+    if hashlib.sha256(data[:-32]).digest() != data[-32:]:
+        raise ValueError('invalid SHA256 footer')
+    return data[:24], normalize(segments)
+
+def normalize(segments):
+    result = []
+    for address, payload in sorted(segments):
+        if result and result[-1][0] + len(result[-1][1]) > address:
+            raise ValueError('overlapping load segments')
+        if result and result[-1][0] + len(result[-1][1]) == address:
+            old_address, old_payload = result.pop()
+            result.append((old_address, old_payload + payload))
+        else:
+            result.append((address, payload))
+    return result
+
+def repack(data):
+    header, original = parse(data)
+    mapped = [(a, p) for a, p in original if flash(a)]
+    ram = [(a, p) for a, p in original if not flash(a)]
+    output = bytearray(header)
+    checksum, count = 0xEF, 0
+
+    def emit(address, payload):
+        nonlocal checksum, count
+        output.extend(struct.pack('<II', address, len(payload)))
+        output.extend(payload)
+        checksum = xor_bytes(payload, checksum)
+        count += 1
+
+    for address, payload in mapped:
+        while (len(output) + 8) % PAGE != address % PAGE:
+            gap = (address - len(output) - 8) % PAGE
+            padding = (gap - 8) % PAGE
+            if ram and padding > 8:
+                ram_address, ram_payload = ram.pop(0)
+                used = min(len(ram_payload), padding)
+                emit(ram_address, ram_payload[:used])
+                if used < len(ram_payload):
+                    ram.insert(0, (ram_address + used, ram_payload[used:]))
+            else:
+                emit(0, bytes(padding))
+        emit(address, payload)
+    for address, payload in ram:
+        emit(address, payload)
+    if not 1 <= count <= 16:
+        raise ValueError('repacked image exceeds ESP32 segment limit')
+    output[1] = count
+    output.extend(bytes(15 - len(output) % 16))
+    output.append(checksum)
+    output.extend(hashlib.sha256(output).digest())
+    verified_header, verified_segments = parse(output)
+    if verified_header[:1] + verified_header[2:] != header[:1] + header[2:] or verified_segments != original:
+        raise ValueError('repack changed load bytes or header fields')
+    if len(output) > len(data):
+        raise ValueError('repack would enlarge image')
+    return bytes(output)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('input', type=pathlib.Path)
+    parser.add_argument('output', type=pathlib.Path)
+    args = parser.parse_args()
+    data = args.input.read_bytes()
+    output = repack(data)
+    # Never overwrite an original, signed release, or previous comparison.
+    with args.output.open('xb') as destination:
+        destination.write(output)
+    print(f'PASS: {len(data)} -> {len(output)} bytes; identical load addresses/data, valid checksums; not flashed')
+
+if __name__ == '__main__':
+    main()

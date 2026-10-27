@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Offline P4 RAM-console image/ELF equivalence. Never accesses a device.
+
+Checks payload, revision guard and reserved-memory boundaries, not bootability.
+Flash header settings must still match the intended board/bootloader.
+"""
+import hashlib
+import struct
+import sys
+from pathlib import Path
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def insert(memory, address, payload):
+    for offset, value in enumerate(payload):
+        require(address + offset not in memory, "overlapping load segments")
+        memory[address + offset] = value
+
+
+def validate(elf, image, layout):
+    require(layout in (1, 3), "unsupported layout")
+    base = 0x4ff10000 if layout == 1 else 0x4ff80000
+    revision = (0, 299) if layout == 1 else (300, 399)
+    require(elf[:6] == b"\x7fELF\x01\x01" and len(elf) >= 52, "expected ELF32 LE")
+    kind, machine = struct.unpack_from("<HH", elf, 16)
+    require(kind == 2 and machine == 243, "expected RISC-V executable")
+    entry, phoff = struct.unpack_from("<II", elf, 24)
+    stride, count = struct.unpack_from("<HH", elf, 42)
+    require(stride == 32 and 1 <= count <= 16 and phoff + stride * count <= len(elf), "invalid program headers")
+    expected, executable = {}, False
+    spans = []
+    for index in range(count):
+        tag, offset, address, physical, size, reserved, flags, align = struct.unpack_from("<8I", elf, phoff + index * stride)
+        if tag != 1:
+            continue
+        require(address == physical and size <= reserved and offset + size <= len(elf), "invalid ELF load segment")
+        require(base <= address and address + reserved <= base + 0x18000, "ELF load outside selected RAM window")
+        require(not (flags & 1 and flags & 2), "writable executable segment")
+        for start, end in spans:
+            require(not (address < end and start < address + reserved), "overlapping ELF memory reservations")
+        spans.append((address, address + reserved))
+        executable |= bool(flags & 1 and address <= entry < address + size)
+        insert(expected, address, elf[offset:offset + size])
+    require(executable and expected, "entry is not backed by executable bytes")
+    require(len(image) >= 64 and image[0] == 0xe9 and 1 <= image[1] <= 16, "invalid image header")
+    require(struct.unpack_from("<I", image, 4)[0] == entry, "entry mismatch")
+    require(struct.unpack_from("<H", image, 12)[0] == 18, "not a P4 image")
+    require(struct.unpack_from("<HH", image, 15) == revision, "wrong revision guard")
+    require(image[23] == 1, "SHA256 required")
+    actual, cursor, checksum = {}, 24, 0xef
+    for _ in range(image[1]):
+        require(cursor + 8 <= len(image), "truncated image segment")
+        address, size = struct.unpack_from("<II", image, cursor)
+        cursor += 8
+        require(size > 0 and size % 4 == 0 and cursor + size <= len(image), "invalid image segment size")
+        require(base <= address and address + size <= base + 0x18000, "image segment outside selected RAM")
+        payload = image[cursor:cursor + size]
+        insert(actual, address, payload)
+        for value in payload:
+            checksum ^= value
+        cursor += size
+    footer = cursor + (15 - cursor % 16)
+    require(len(image) == footer + 33, "unexpected trailing/signature data")
+    require(not any(image[cursor:footer]) and image[footer] == checksum, "invalid XOR footer")
+    require(hashlib.sha256(image[:-32]).digest() == image[-32:], "invalid SHA256")
+    require(actual == expected, "image bytes differ from ELF load payloads")
+
+
+if __name__ == "__main__":
+    try:
+        require(len(sys.argv) == 4, "usage: check-p4-console-image ELF BIN LAYOUT")
+        validate(Path(sys.argv[1]).read_bytes(), Path(sys.argv[2]).read_bytes(), int(sys.argv[3]))
+    except (ValueError, OSError, struct.error) as error:
+        sys.exit(str(error))
+    print("PASS: P4 image matches ELF payload/entry, RAM layout, revision guard and checksums (not hardware proof)")

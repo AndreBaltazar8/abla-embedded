@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Restore only architecture-required store delay slots from raw Xtensa lifts."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import re
+from pathlib import Path
+
+
+NOP = "xtensaNoOperation()"
+STORE_WIDTH = {
+    "s8i": "U8",
+    "s16i": "U16",
+    "s32i": "U32",
+    "s32i.n": "U32",
+}
+
+
+def delayed_store_patterns(raw_source: str) -> dict[tuple[str, str], int]:
+    patterns: dict[tuple[str, str], int] = {}
+    functions = re.finditer(
+        r"trusted fun\s+(\w+).*?xtensaAssembly(?:Void|ReadU32)\(\n"
+        r"\s*(\"(?:[^\"\\]|\\.)*\")",
+        raw_source,
+        re.S,
+    )
+    for function in functions:
+        name = function.group(1)
+        instructions = ast.literal_eval(function.group(2)).splitlines()
+        for index, instruction in enumerate(instructions):
+            fields = re.split(r"[\s,]+", instruction.strip())
+            if len(fields) < 4 or fields[0] not in STORE_WIDTH:
+                continue
+            cursor = index + 1
+            while cursor < len(instructions):
+                mnemonic = instructions[cursor].strip().split()
+                if not mnemonic or mnemonic[0] not in ("memw", "rsync", "esync"):
+                    break
+                cursor += 1
+            delay = 0
+            while cursor < len(instructions):
+                mnemonic = instructions[cursor].strip().split()
+                if not mnemonic or mnemonic[0] not in ("nop", "nop.n"):
+                    break
+                delay += 1
+                cursor += 1
+            if delay != 4:
+                continue
+            opcode, value, base, offset = fields[:4]
+            value = "r" + value[1:]
+            base = "r" + base[1:]
+            amount = int(offset, 0)
+            address = base if amount == 0 else f"({base} + u32({amount}))"
+            store = (
+                f"ablaUnsafeStore{STORE_WIDTH[opcode]}("
+                f"nativePointerFromAddress(int({address})), int({value}))"
+            )
+            patterns[(name, store)] = delay
+    return patterns
+
+
+def function_extent(source: str, name: str) -> tuple[int, int] | None:
+    header = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", source)
+    if header is None:
+        return None
+    begin = source.find("{", header.end())
+    depth = 0
+    for position in range(begin, len(source)):
+        if source[position] == "{":
+            depth += 1
+        elif source[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return begin, position + 1
+    raise ValueError(f"unterminated function {name}")
+
+
+def restore(raw_source: str, target_source: str) -> tuple[str, int]:
+    had_newline = target_source.endswith("\n")
+    source = "\n".join(
+        line for line in target_source.splitlines() if line.strip() != NOP
+    )
+    sites = 0
+    for (name, store), delay in delayed_store_patterns(raw_source).items():
+        extent = function_extent(source, name)
+        if extent is None:
+            continue
+        begin, end = extent
+        body = source[begin:end]
+        occurrence = re.compile(
+            r"^(?P<indent>[ \t]*)" + re.escape(store) + r"[ \t]*$", re.M
+        )
+
+        def add_delay(match: re.Match[str]) -> str:
+            indent = match.group("indent")
+            delay_lines = "\n".join(indent + NOP for _ in range(delay))
+            return match.group(0) + "\n" + delay_lines
+
+        updated, count = occurrence.subn(add_delay, body)
+        if count:
+            source = source[:begin] + updated + source[end:]
+            sites += count
+    if had_newline:
+        source += "\n"
+    return source, sites
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("raw_directory", type=Path)
+    parser.add_argument("target_directory", type=Path)
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("stems", nargs="+")
+    arguments = parser.parse_args()
+    for stem in arguments.stems:
+        raw = arguments.raw_directory / f"{stem}.ab"
+        target = arguments.target_directory / f"{stem}.ab"
+        transformed, sites = restore(raw.read_text(), target.read_text())
+        if arguments.write:
+            target.write_text(transformed)
+        action = "restored" if arguments.write else "would restore"
+        print(f"{stem}: {action} {sites} store sites, {sites * 4} NOPs")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

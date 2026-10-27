@@ -10,6 +10,7 @@ unit, so the original archive member is no longer an input to the firmware.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import re
 import shlex
 import struct
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 SECTION = re.compile(r"^Disassembly of section (\S+):$")
 SYMBOL = re.compile(r"^([0-9a-f]+) <([^>]+)>:$")
 INSTRUCTION = re.compile(
-    r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2}(?:[0-9a-f]{2}){0,2}\s+)+([^\s].*?)\s*$"
+    r"^\s*([0-9a-f]+):\s+[0-9a-f]{2,6}\s+([^\s].*?)\s*$"
 )
 RELOCATION = re.compile(r"^\s*([0-9a-f]+):?\s+R_XTENSA_(\S+)\s+(.+?)\s*$")
 RELOCATION_SECTION = re.compile(r"^RELOCATION RECORDS FOR \[(\S+)\]:$")
@@ -90,10 +91,16 @@ def section_bytes(output: str) -> dict[str, bytes]:
             chunks.setdefault(active, bytearray())
             continue
         if active:
-            data = re.match(r"^\s*[0-9a-f]+\s+((?:[0-9a-f]{8}\s*)+)", line)
+            # objdump's final group may contain only 1-3 bytes. Requiring
+            # eight hex digits silently lost small globals and table tails.
+            # Stop at the double-space ASCII delimiter (which can itself
+            # contain hex-looking text), not at the end of the line.
+            data = re.match(r"^\s*[0-9a-f]+ +(.+)$", line)
             if data:
-                chunks[active].extend(bytes.fromhex(data.group(1)))
-                continue
+                hex_columns = data.group(1).split("  ", 1)[0]
+                if re.fullmatch(r"[0-9a-f]{2}(?:[0-9a-f]{2}){0,3}(?: [0-9a-f]{2}(?:[0-9a-f]{2}){0,3}){0,3}", hex_columns):
+                    chunks[active].extend(bytes.fromhex(hex_columns))
+                    continue
             if line and not line.startswith(" "):
                 active = ""
     for name, value in chunks.items():
@@ -118,7 +125,77 @@ def object_data_symbols(output: str) -> dict[str, tuple[str, int]]:
     for line in output.splitlines():
         fields = line.split()
         if len(fields) >= 6 and fields[2] == "O":
-            result[fields[5]] = (fields[3], int(fields[4], 16))
+            # BFD inserts an optional visibility token (for example
+            # `.hidden`) before the symbol name.
+            result[fields[-1]] = (fields[3], int(fields[4], 16))
+        elif (len(fields) >= 5 and
+                re.match(r"^\.(?:bss|tbss|tdata|data|dram|rodata)", fields[2]) and
+                re.fullmatch(r"[0-9A-Fa-f]+", fields[3])):
+            # Hand-written and TLS assembly symbols do not always carry
+            # STT_OBJECT even though their nonzero size identifies them.
+            result[fields[4]] = (fields[2], int(fields[3], 16))
+    return result
+
+
+def object_local_data_labels(output: str) -> dict[str, tuple[str, int]]:
+    """Return zero-sized compiler labels within data/literal sections.
+
+    GCC commonly relocates code against labels such as `.LC20`. They are
+    local ELF symbols, not STT_OBJECT values, and therefore cannot keep their
+    original spelling once many recovered members share one assembler unit.
+    Resolve them to their section plus offset before the section itself is
+    namespaced and emitted.
+    """
+    result: dict[str, tuple[str, int]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[1] != "l":
+            continue
+        section = next((field for field in fields[2:-1]
+                        if field.startswith(".")), "")
+        name = fields[-1]
+        if (not section or name == section or
+                not re.fullmatch(r"[0-9A-Fa-f]+", fields[0])):
+            continue
+        if (re.match(r"^\.(?:bss|tbss|tdata|data|dram|rodata)", section) or
+                "literal" in section):
+            result[name] = (section, int(fields[0], 16))
+    return result
+
+
+def resolve_local_data_labels(
+    source: str,
+    directives: list[str],
+    labels: dict[str, tuple[str, int]],
+    explicitly_selected: set[str],
+) -> tuple[str, list[str]]:
+    """Turn member-local data labels into section-relative expressions."""
+    for name in sorted(labels, key=len, reverse=True):
+        if name in explicitly_selected:
+            continue
+        section, offset = labels[name]
+        expression = section + (f"+0x{offset:x}" if offset else "")
+        source = replace_exact_symbol_reference(source, name, expression)
+        directives = [
+            replace_exact_directive_reference(line, name, expression)
+            for line in directives
+        ]
+    return source, directives
+
+
+def object_function_symbols(output: str) -> dict[str, tuple[str, int]]:
+    """Return each ELF function symbol's section and section-relative value.
+
+    BFD disassembly prints only one label when multiple ABI symbols share the
+    same body (common for C aliases and C++ C1/C2 or D1/D2 entry points).  The
+    symbol table retains every spelling, so use it to recover those aliases
+    without teaching the tool any library- or platform-specific names.
+    """
+    result: dict[str, tuple[str, int]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and fields[2] == "F":
+            result[fields[-1]] = (fields[3], int(fields[0], 16))
     return result
 
 
@@ -203,15 +280,23 @@ def clean_symbol(value: str) -> str:
     return value.split(" (")[0].strip()
 
 
+def escape_abla_string(value: str) -> str:
+    """Quote arbitrary assembler text as one non-interpolated Abla string."""
+    # One escaped dollar survives Abla decoding as `$`; LLVM inline assembly
+    # itself requires `$$` for a literal dollar in an assembler symbol.
+    return (value.replace("\\", "\\\\").replace("\n", "\\n")
+            .replace('"', '\\"').replace("$", "\\$\\$"))
+
+
 def data_relocation_expression(
     value: str,
     content: bytes,
     offset: int,
 ) -> str:
-    """Restore REL addends which BFD omits for section-symbol targets."""
+    """Restore an in-place REL addend when BFD omits it from the target."""
     symbol = clean_symbol(value)
     if ("+" not in symbol and "-" not in symbol[1:] and
-            symbol.startswith(".") and offset + 4 <= len(content)):
+            offset + 4 <= len(content)):
         addend = struct.unpack_from("<i", content, offset)[0]
         if addend > 0:
             symbol = f"{symbol}+0x{addend:x}"
@@ -242,6 +327,34 @@ def abla_function_name(name: str) -> str:
     )
 
 
+def abla_alias_function_name(name: str, target: str) -> str:
+    """Keep source names unique when punctuation-only ABI aliases collide."""
+    name_spelling = abla_function_name(name)
+    if name_spelling == abla_function_name(target):
+        return name_spelling + "Alias"
+    return name_spelling
+
+
+def unique_abla_function_names(names: list[str]) -> dict[str, str]:
+    """Disambiguate ABI spellings which normalize to the same Abla name."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        if name not in groups.setdefault(abla_function_name(name), []):
+            groups[abla_function_name(name)].append(name)
+    result: dict[str, str] = {}
+    for base, raw_names in groups.items():
+        if len(raw_names) == 1:
+            result[raw_names[0]] = base
+            continue
+        ordered = sorted(
+            raw_names,
+            key=lambda raw: (not raw.isalnum(), raw),
+        )
+        for index, raw in enumerate(ordered):
+            result[raw] = base if index == 0 else f"{base}Abi{index}"
+    return result
+
+
 def replace_compatibility_reference(
     value: str,
     old: str,
@@ -256,7 +369,8 @@ def replace_compatibility_reference(
     the number of bytes which preceded that instruction in the input section.
     """
     pattern = re.compile(
-        re.escape(old) + r"(?:([+-])0x([0-9A-Fa-f]+))?(?![A-Za-z0-9_.$])"
+        r"(?<![A-Za-z0-9_.$])" + re.escape(old) +
+        r"(?:([+-])0x([0-9A-Fa-f]+))?(?![A-Za-z0-9_.$])"
     )
 
     def replace(match: re.Match[str]) -> str:
@@ -284,11 +398,18 @@ def data_section_directives(
     relocations: dict[int, tuple[str, str]],
     global_symbol: str = "",
     internal_symbol: str = "",
+    weak_symbol: str = "",
 ) -> list[str]:
-    bss = section.startswith(".bss")
+    tls = section.startswith(".tbss") or section.startswith(".tdata")
+    bss = section.startswith(".bss") or section.startswith(".tbss")
+    if not bss and len(content) < size:
+        raise ValueError(
+            f"incomplete initialized section {section}: "
+            f"expected {size} bytes, parsed {len(content)}"
+        )
     writable = bss or section.startswith(".data") or section.startswith(".dram")
     merge_strings = ".str1." in section
-    flags = "aw" if writable else "aMS" if merge_strings else "a"
+    flags = "awT" if tls else "aw" if writable else "aMS" if merge_strings else "a"
     kind = "@nobits" if bss else "@progbits"
     # Preserve the input section family. ESP-IDF's linker fragment places
     # Wi-Fi logging data by names such as `.rodata_wlog_debug.*`; folding all
@@ -306,11 +427,13 @@ def data_section_directives(
     ]
     if alignment > 0:
         lines.append(f".p2align {alignment}")
-    exact_symbol = global_symbol or internal_symbol
+    exact_symbol = global_symbol or internal_symbol or weak_symbol
     if exact_symbol:
         lines.extend([
-            f".global {exact_symbol}" if global_symbol else f".local {exact_symbol}",
-            f".type {exact_symbol}, @object",
+            f".global {exact_symbol}" if global_symbol else
+            f".weak {exact_symbol}" if weak_symbol else
+            f".local {exact_symbol}",
+            f".type {exact_symbol}, " + ("@tls_object" if tls else "@object"),
             f"{exact_symbol}:",
         ])
     else:
@@ -329,7 +452,7 @@ def data_section_directives(
                 )
                 offset += 4
             else:
-                value = content[offset] if offset < len(content) else 0
+                value = content[offset]
                 lines.append(f".byte 0x{value:02x}")
                 offset += 1
     if exact_symbol:
@@ -342,13 +465,155 @@ def replace_directive_reference(line: str, old: str, new: str) -> str:
     """Replace a data reference without renaming its ELF input section."""
     if line.startswith(".pushsection "):
         return line
-    return line.replace(old, new)
+    return replace_exact_symbol_reference(line, old, new)
+
+
+def replace_exact_symbol_reference(source: str, old: str, new: str) -> str:
+    """Rename one assembler symbol without touching longer symbol names."""
+    symbol_character = r"A-Za-z0-9_.$"
+    return re.sub(
+        rf"(?<![{symbol_character}]){re.escape(old)}(?![{symbol_character}])",
+        lambda _: new,
+        source,
+    )
+
+
+def replace_exact_directive_reference(line: str, old: str, new: str) -> str:
+    if line.startswith(".pushsection "):
+        return line
+    return replace_exact_symbol_reference(line, old, new)
+
+
+def namespace_assembler_locals(
+    source: str,
+    directives: list[str],
+    namespace: str,
+) -> tuple[str, list[str]]:
+    """Restore ELF object-local scope inside the monolithic assembler unit."""
+    names: set[str] = set()
+    for line in source.splitlines() + directives:
+        match = re.fullmatch(r"\.local\s+(\S+)", line.strip())
+        if match:
+            names.add(match.group(1))
+    for name in sorted(names, key=len, reverse=True):
+        # local_function_directives already assigns a collision-free recovered
+        # name. Do not namespace that generated name a second time when its
+        # directives are folded into the selected monolithic anchor.
+        if name.startswith(".Labla_recovered_"):
+            continue
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        replacement = f".Labla_recovered_{namespace}_local_{safe}"
+        if name == replacement:
+            continue
+        source = replace_exact_symbol_reference(source, name, replacement)
+        directives = [
+            replace_exact_directive_reference(line, name, replacement)
+            for line in directives
+        ]
+    return source, directives
+
+
+def normalize_symbolic_literal_addends(
+    source: str,
+    directives: list[str],
+) -> tuple[str, list[str]]:
+    """Keep Xtensa text-streamer literals to a single symbol expression."""
+    joined = source + "\n" + "\n".join(directives)
+    literals: dict[str, tuple[str, int]] = {}
+    pattern = re.compile(
+        r"(?m)^\.literal\s+(\S+),\s*"
+        r"([.$A-Za-z_][.$A-Za-z0-9_]*)\+0x([0-9A-Fa-f]+)$"
+    )
+    for match in pattern.finditer(joined):
+        literals[match.group(1)] = (
+            match.group(2), int(match.group(3), 16)
+        )
+    for label, (symbol, addend) in literals.items():
+        old = re.compile(
+            rf"(?m)^\.literal\s+{re.escape(label)},\s*"
+            rf"{re.escape(symbol)}\+0x[0-9A-Fa-f]+$"
+        )
+        source = old.sub(f".literal {label}, {symbol}", source)
+        directives = [old.sub(f".literal {label}, {symbol}", line)
+                      for line in directives]
+
+        high = ((addend + 128) // 256) * 256
+        low = addend - high
+        if high < -32768 or high > 32512 or low < -128 or low > 127:
+            raise ValueError(
+                f"literal addend is outside Xtensa immediates: {symbol}+0x{addend:x}"
+            )
+        load = re.compile(
+            rf"(?m)^l32r[\t ]+(a(?:[0-9]|1[0-5])),[\t ]*"
+            rf"{re.escape(label)}$"
+        )
+
+        def expand(match: re.Match[str]) -> str:
+            register = match.group(1)
+            lines = [match.group(0)]
+            if high:
+                lines.append(f"addmi {register}, {register}, {high}")
+            if low:
+                lines.append(f"addi {register}, {register}, {low}")
+            return "\n".join(lines)
+
+        source = load.sub(expand, source)
+        directives = [load.sub(expand, line) for line in directives]
+    return source, directives
+
+
+BRANCH_INVERSE = {
+    "ball": "bnall", "bnall": "ball",
+    "bany": "bnone", "bnone": "bany",
+    "bbc": "bbs", "bbs": "bbc",
+    "bbci": "bbsi", "bbsi": "bbci",
+    "beq": "bne", "bne": "beq",
+    "beqi": "bnei", "bnei": "beqi",
+    "beqz": "bnez", "bnez": "beqz",
+    "beqz.n": "bnez.n", "bnez.n": "beqz.n",
+    "bf": "bt", "bt": "bf",
+    "bge": "blt", "blt": "bge",
+    "bgei": "blti", "blti": "bgei",
+    "bgeu": "bltu", "bltu": "bgeu",
+    "bgeui": "bltui", "bltui": "bgeui",
+    "bgez": "bltz", "bltz": "bgez",
+}
+
+
+def normalize_cross_section_branches(source: str, namespace: str) -> str:
+    """Turn conditional cross-section branches into inverse-branch + jump."""
+    result: list[str] = []
+    count = 0
+    local_symbols = set(re.findall(r"(?m)^\.local\s+(\S+)$", source))
+    pattern = re.compile(r"^(\S+)\s+(.+,\s*)([^,\s]+)$")
+    for line in source.splitlines():
+        match = pattern.fullmatch(line)
+        if match and match.group(1) in BRANCH_INVERSE:
+            target = match.group(3)
+            target_base = re.sub(
+                r"[+-](?:0x[0-9A-Fa-f]+|[0-9]+)$", "", target
+            )
+            cross_local = target_base in local_symbols
+            external_target = not target.startswith(".Labla_recovered_")
+            if cross_local or external_target:
+                label = f".Labla_recovered_{namespace}_far_branch_{count}"
+                count += 1
+                result.extend([
+                    f"{BRANCH_INVERSE[match.group(1)]} "
+                    f"{match.group(2)}{label}",
+                    f"j {target}",
+                    f"{label}:",
+                ])
+                continue
+        result.append(line)
+    return "\n".join(result)
 
 
 def recovered_data_prefix(
     source: str,
     global_names: list[str],
     internal_names: list[str],
+    weak_names: list[str],
     local_names: list[str],
     content: dict[str, bytes],
     relocations: dict[str, dict[int, tuple[str, str]]],
@@ -356,6 +621,8 @@ def recovered_data_prefix(
     symbols: dict[str, tuple[str, int]],
     compatibility_starts: dict[str, int],
     additional_directives: list[str] | None = None,
+    reuse_recovered_data: bool = False,
+    reused_data_labels: dict[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     replacements: dict[str, str] = {}
     directives: list[str] = list(additional_directives or [])
@@ -375,9 +642,35 @@ def recovered_data_prefix(
             raise ValueError(f"internal data symbol is missing: {name}")
         section, symbol_size = symbols[name]
         size, alignment = metadata.get(section, (symbol_size, 2))
+        # ELF local/internal symbols only have object-file scope.  Recovered
+        # members share one LLVM assembler unit, so preserving the original
+        # spelling can collide with an equally named local in another member.
+        # Give internal data the same reconstruction namespace as explicit
+        # local data and rewrite every reference before combining the unit.
+        label = data_label(section + "_" + name)
+        directives = [
+            replace_exact_symbol_reference(line, name, label)
+            for line in directives
+        ]
+        directives.extend(data_section_directives(
+            section, label, size, alignment, content.get(section, b""),
+            relocations.get(section, {})
+        ))
+        source = replace_exact_symbol_reference(source, name, label)
+        source = replace_exact_symbol_reference(source, section, label)
+        directives = [
+            replace_exact_directive_reference(line, section, label)
+            for line in directives
+        ]
+        global_sections.add(section)
+    for name in weak_names:
+        if name not in symbols:
+            raise ValueError(f"weak data symbol is missing: {name}")
+        section, symbol_size = symbols[name]
+        size, alignment = metadata.get(section, (symbol_size, 2))
         directives.extend(data_section_directives(
             section, name, size, alignment, content.get(section, b""),
-            relocations.get(section, {}), internal_symbol=name
+            relocations.get(section, {}), weak_symbol=name
         ))
         global_sections.add(section)
     for name in local_names:
@@ -387,40 +680,56 @@ def recovered_data_prefix(
         size, alignment = metadata.get(section, (symbol_size, 2))
         label = data_label(section + "_" + name)
         directives = [
-            replace_directive_reference(line, name, label)
+            replace_exact_symbol_reference(line, name, label)
             for line in directives
         ]
         directives.extend(data_section_directives(
             section, label, size, alignment, content.get(section, b""),
             relocations.get(section, {})
         ))
-        source = source.replace(name, label)
+        source = replace_exact_symbol_reference(source, name, label)
+        source = replace_exact_symbol_reference(source, section, label)
+        directives = [
+            replace_exact_directive_reference(line, section, label)
+            for line in directives
+        ]
         global_sections.add(section)
     # Named data can itself relocate against an otherwise anonymous local
     # section. Discover those references after named directives have been
     # materialized so the dependency is emitted as well.
     reference_source = source + "\n" + "\n".join(directives)
-    local_sections = sorted(set(re.findall(
-        r"\.(?:bss|data|dram|rodata)[A-Za-z0-9_.$]*", reference_source
-    )))
+    local_sections = sorted(
+        section for section in metadata
+        if (re.match(r"^\.(?:bss|tbss|tdata|data|dram|rodata)", section) or
+            "literal" in section) and
+        any(re.search(
+            r"(?<![A-Za-z0-9_.$])" + re.escape(candidate) +
+            r"(?![A-Za-z0-9_.$])", reference_source,
+        ) for candidate in (section, escape_abla_string(section)))
+    )
     for section in local_sections:
         if section in global_sections:
             continue
         if section not in metadata:
             continue
-        label = data_label(section)
+        reused_label = (reused_data_labels or {}).get(section)
+        label = reused_label or data_label(section)
         replacements[section] = label
+        escaped_section = escape_abla_string(section)
+        if escaped_section != section:
+            replacements[escaped_section] = label
         size, alignment = metadata[section]
-        directives.extend(data_section_directives(
-            section, label, size, alignment, content.get(section, b""),
-            relocations.get(section, {})
-        ))
+        if not reuse_recovered_data and reused_label is None:
+            directives.extend(data_section_directives(
+                section, label, size, alignment, content.get(section, b""),
+                relocations.get(section, {})
+            ))
     # A base section such as `.rodata` is a prefix of generated sections such
     # as `.rodata.__func__$0`. Rewrite the longest names first so a short
     # section cannot corrupt a more specific relocation target.
     for old in sorted(replacements, key=len, reverse=True):
         new = replacements[old]
-        source = source.replace(old, new)
+        source = replace_exact_symbol_reference(source, old, new)
         directives = [
             replace_directive_reference(line, old, new)
             for line in directives
@@ -445,7 +754,11 @@ def literal_expression(
 ) -> str:
     relocation = relocations.get(section, {}).get(offset)
     if relocation and relocation[0] == "32":
-        return clean_symbol(relocation[1])
+        return data_relocation_expression(
+            relocation[1], data.get(section, b""), offset
+        )
+    if relocation and relocation[0] == "TLS_TPOFF":
+        return "@abla-tpoff:" + clean_symbol(relocation[1])
     content = data.get(section, b"")
     if offset + 4 > len(content):
         raise ValueError(f"literal {section}+0x{offset:x} is outside section")
@@ -474,6 +787,30 @@ def normalize_xtensa_assembler_immediate(text: str) -> str:
     return f"addmi\t{registers}, {value}"
 
 
+def symbolic_address_load(register: str, expression: str) -> str:
+    """Load a symbol plus addend without a binary literal expression.
+
+    Espressif LLVM's Xtensa text streamer crashes when inline assembly asks it
+    to materialize `symbol+addend` directly.  Load the relocatable base and add
+    the constant with ordinary Xtensa instructions instead.
+    """
+    match = re.fullmatch(r"([.$A-Za-z_][.$A-Za-z0-9_]*)\+0x([0-9A-Fa-f]+)",
+                         expression)
+    if not match:
+        return f"movi {register}, {expression}"
+    addend = int(match.group(2), 16)
+    high = ((addend + 128) // 256) * 256
+    low = addend - high
+    if high < -32768 or high > 32512 or low < -128 or low > 127:
+        raise ValueError(f"symbol addend is outside Xtensa immediates: {expression}")
+    lines = [f"movi {register}, {match.group(1)}"]
+    if high:
+        lines.append(f"addmi {register}, {register}, {high}")
+    if low:
+        lines.append(f"addi {register}, {register}, {low}")
+    return "\n".join(lines)
+
+
 def recover_instruction(
     function: str,
     section: str,
@@ -496,15 +833,64 @@ def recover_instruction(
         register = operands.split(",", 1)[0]
         if expansion:
             return f"movi {register}, {expansion}"
+        # Hand-written Xtensa assembly commonly keeps literals in a shared
+        # `.literal` section. BFD prints the resolved PC-relative address as
+        # a wrapped text offset, while the relocation records the real input
+        # section (and optional addend). Follow that relocation instead of
+        # treating the displayed address as an offset into the function.
+        literal_slot = next(
+            (clean_symbol(value) for kind, value in instruction.relocations
+             if kind.startswith("SLOT")),
+            "",
+        )
+        literal_target = re.fullmatch(
+            r"(\.[A-Za-z0-9_.$]+)(?:\+0x([0-9A-Fa-f]+))?",
+            literal_slot,
+        )
+        if literal_target and literal_target.group(1) in data:
+            literal_section = literal_target.group(1)
+            literal_offset = int(literal_target.group(2) or "0", 16)
+            expression = literal_expression(
+                literal_section, literal_offset, data, relocations
+            )
+            if expression.startswith("@abla-tpoff:"):
+                symbol = expression.removeprefix("@abla-tpoff:")
+                label = local_label(function + "_tpoff", instruction.offset)
+                return (
+                    f".type {symbol}, @tls_object\n"
+                    f".literal {label}, 0\n"
+                    f".reloc {label}, R_XTENSA_TLS_TPOFF, {symbol}\n"
+                    f"l32r {register}, {label}"
+                )
+            return symbolic_address_load(register, expression)
         target = TARGET.search(operands)
         if not target:
             raise ValueError(f"cannot recover literal load: {text}")
         expression = literal_expression(
             section, int(target.group(1), 16), data, relocations
         )
-        return f"movi {register}, {expression}"
+        if expression.startswith("@abla-tpoff:"):
+            symbol = expression.removeprefix("@abla-tpoff:")
+            label = local_label(function + "_tpoff", instruction.offset)
+            return (
+                f".type {symbol}, @tls_object\n"
+                f".literal {label}, 0\n"
+                f".reloc {label}, R_XTENSA_TLS_TPOFF, {symbol}\n"
+                f"l32r {register}, {label}"
+            )
+        return symbolic_address_load(register, expression)
     if mnemonic == ".byte":
         return f".byte 0x{int(operands, 16):02x}"
+    if mnemonic == "ssa8b":
+        # Espressif LLVM 21 does not expose this ESP32 ISA mnemonic through
+        # its integrated assembler, although the core executes it. Preserve
+        # the documented three-byte RRR encoding instead of requiring a
+        # compiler-specific opcode hook.
+        register = re.fullmatch(r"a([0-9]|1[0-5])", operands.strip())
+        if not register:
+            raise ValueError(f"invalid ssa8b register: {operands}")
+        encoded = 0x30 + int(register.group(1))
+        return f".byte 0x00\n.byte 0x{encoded:02x}\n.byte 0x40"
 
     slot = next(
         (clean_symbol(value) for kind, value in instruction.relocations
@@ -540,6 +926,25 @@ def recovered_function_body(
             description = match.group(2)
             if description == name or description.startswith(name + "+"):
                 targets.add(int(match.group(1), 16))
+    # Relocation-backed jump tables live in data sections and therefore do
+    # not appear as branch operands in objdump's function body. Label every
+    # table destination too, so section-plus-offset relocations can become
+    # direct references within the reconstructed monolithic unit.
+    for relocation_section, section_relocations in relocations.items():
+        for relocation_offset, (_, value) in section_relocations.items():
+            expression = data_relocation_expression(
+                value, data.get(relocation_section, b""), relocation_offset
+            )
+            section_target = re.fullmatch(
+                re.escape(section) + r"\+0x([0-9A-Fa-f]+)", expression
+            )
+            function_target = re.fullmatch(
+                re.escape(name) + r"\+0x([0-9A-Fa-f]+)", expression
+            )
+            if section_target:
+                targets.add(int(section_target.group(1), 16))
+            if function_target:
+                targets.add(start + int(function_target.group(1), 16))
     body: list[str] = []
     for instruction in instructions:
         if instruction.offset in targets:
@@ -608,6 +1013,7 @@ def emit_function(
     data: dict[str, bytes],
     relocations: dict[str, dict[int, tuple[str, str]]],
     prefix: list[str] | None = None,
+    emitted_name: str = "",
 ) -> str:
     body = recovered_function_body(
         name, section, start, instructions, data, relocations
@@ -615,11 +1021,8 @@ def emit_function(
     body = deduplicate_symbol_literals(body, name)
     if prefix:
         body = prefix + body
-    escaped = "\\n".join(
-        line.replace("\\", "\\\\").replace('"', '\\"')
-        for line in body
-    )
-    abla_name = abla_function_name(name)
+    assembly = "\n".join(body)
+    abla_name = emitted_name or abla_function_name(name)
     # Most recovered functions use an ordinary `.text.*` input section and
     # should let LLVM choose the final text subsection.  Named executable
     # sections such as IRAM/RTC memory, however, are part of the function's
@@ -627,13 +1030,42 @@ def emit_function(
     # general LLVM boundary rather than a target-specific annotation.
     section_annotation = ""
     if not section.startswith(".text"):
-        escaped_section = section.replace("\\", "\\\\").replace('"', '\\"')
+        # GCC's numbered sections are only object-local identities. Reusing
+        # `.iram1.4` from many recovered members in one LLVM object coalesces
+        # unrelated functions and makes section-symbol relocations ambiguous.
+        # Retain the linker-placement family but give every function a stable,
+        # source-level subsection.
+        recovered_section = f"{section}.abla.{abla_name}"
+        escaped_section = escape_abla_string(recovered_section)
         section_annotation = f'@section("{escaped_section}")\n'
     return (
         f"// Original ABI symbol: {name}\n"
         f"@naked\n{section_annotation}"
-        f"trusted fun {abla_name}(): void = xtensaAssemblyVoid(\n"
-        f"    \"{escaped}\",\n    \"~{{memory}}\"\n)\n"
+        f"trusted fun {abla_name}(): void = $xtensa instructions {{\n"
+        f"{assembly}\n}}\n"
+    )
+
+
+def emit_alias_function(name: str, target: str, emitted_name: str = "") -> str:
+    """Emit a source-owned tail alias without duplicating the target body."""
+    target_symbol = compatibility_symbol(target)
+    return (
+        f"// Original ABI alias: {name} -> {target}\n"
+        f"@naked\ntrusted fun "
+        f"{emitted_name or abla_alias_function_name(name, target)}(): void = "
+        "$xtensa instructions {\n"
+        f"movi a8, {target_symbol}\njx a8\n}}\n"
+    )
+
+
+def emit_synthetic_anchor(name: str, emitted_name: str = "") -> str:
+    """Provide a prunable internal owner for source-recovered data-only objects."""
+    return (
+        f"// Internal data-only object anchor: {name}\n"
+        f"@naked\ntrusted fun "
+        f"{emitted_name or abla_function_name(name)}(): void = "
+        "$xtensa instructions {\n"
+        "entry a1, 32\nretw.n\n}\n"
     )
 
 
@@ -659,9 +1091,12 @@ def local_function_directives(
                 break
     symbol = emitted_name or name
     safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
-    lines = [
-        f'.pushsection .text.abla_ioctl_local_{safe},"ax",@progbits',
-    ]
+    recovered_section = (
+        f".text.abla_ioctl_local_{safe}"
+        if section.startswith(".text")
+        else f"{section}.abla.{safe}"
+    )
+    lines = [f'.pushsection {recovered_section},"ax",@progbits']
     if alignment > 0:
         lines.append(f".p2align {alignment}")
     lines.extend([
@@ -680,41 +1115,239 @@ def local_function_directives(
     return lines
 
 
+def emit_standalone_local_function(
+    name: str,
+    section: str,
+    start: int,
+    instructions: list[Instruction],
+    data: dict[str, bytes],
+    relocations: dict[str, dict[int, tuple[str, str]]],
+    emitted_name: str,
+    linker_name: str,
+) -> str:
+    """Recover a section-only helper as a prunable LLVM function.
+
+    The original ELF section label includes its literal pool before `entry`.
+    Skip that pool just as the directive form does, but let internalFunction
+    provide the exact local linker spelling. This lets a monolithic build keep
+    each helper only when reachable instead of pinning a large directive blob
+    to an unrelated anchor function.
+    """
+    if name.startswith(".text."):
+        for index, instruction in enumerate(instructions):
+            if instruction.text.strip().startswith("entry"):
+                start = instruction.offset
+                instructions = instructions[index:]
+                break
+    body = recovered_function_body(
+        name, section, start, instructions, data, relocations, linker_name
+    )
+    body = deduplicate_symbol_literals(body, linker_name)
+    assembly = "\n".join(body)
+    section_annotation = ""
+    if not section.startswith(".text"):
+        recovered_section = f"{section}.abla.{emitted_name}"
+        section_annotation = (
+            f'@section("{escape_abla_string(recovered_section)}")\n'
+        )
+    return (
+        f"// Original section-local ABI symbol: {name}\n"
+        f"@naked\n{section_annotation}"
+        f"trusted fun {emitted_name}(): void = $xtensa instructions {{\n"
+        f"{assembly}\n}}\n"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("object")
-    parser.add_argument("symbols", nargs="+")
+    parser.add_argument("symbols", nargs="*")
     parser.add_argument("--objdump", default="xtensa-esp32-elf-objdump")
     parser.add_argument("--global-data", action="append", default=[])
     parser.add_argument("--internal-data", action="append", default=[])
+    parser.add_argument("--weak-data", action="append", default=[])
     parser.add_argument("--local-data", action="append", default=[])
     parser.add_argument("--local-function", action="append", default=[])
+    parser.add_argument(
+        "--standalone-local-function", action="append", default=[],
+        help=("recover a section-only helper as its own prunable Abla/LLVM "
+              "function instead of folding it into another function"),
+    )
+    parser.add_argument(
+        "--reuse-recovered-data", action="store_true",
+        help=("reference data already reconstructed from the same input "
+              "object instead of emitting duplicate sections"),
+    )
+    parser.add_argument(
+        "--reuse-data-from", action="append", default=[], metavar="SOURCE.ab",
+        help=("reuse sections already emitted by another reconstruction of "
+              "the same input object, emitting only missing dependencies"),
+    )
     parser.add_argument("--link-output")
     parser.add_argument("--export-function", action="append", default=[])
+    parser.add_argument(
+        "--alias-function", action="append", default=[], metavar="ALIAS=TARGET",
+        help="emit a generic tail alias while recovering TARGET only once",
+    )
+    parser.add_argument(
+        "--weak-symbol-alias", action="append", default=[],
+        metavar="ALIAS=TARGET",
+        help="emit a zero-byte weak assembler alias for a selected target",
+    )
+    parser.add_argument(
+        "--global-symbol-alias", action="append", default=[],
+        metavar="ALIAS=TARGET",
+        help="emit a zero-byte global assembler alias for a selected target",
+    )
+    parser.add_argument(
+        "--synthetic-anchor", default="", metavar="NAME",
+        help="add a prunable internal function anchor for a data-only object",
+    )
     parser.add_argument("--unselected-function", action="append", default=[])
     parser.add_argument("--output")
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--namespace", default="ioctl")
     parser.add_argument("--link-selector", default="linkRecoveredOpaqueCallers")
     arguments = parser.parse_args()
+    aliases: list[tuple[str, str]] = []
+    for value in arguments.alias_function:
+        if "=" not in value:
+            parser.error("--alias-function requires ALIAS=TARGET")
+        alias, target = value.split("=", 1)
+        if not alias or not target:
+            parser.error("--alias-function requires non-empty ALIAS and TARGET")
+        aliases.append((alias, target))
+    weak_symbol_aliases: list[tuple[str, str]] = []
+    for value in arguments.weak_symbol_alias:
+        if "=" not in value:
+            parser.error("--weak-symbol-alias requires ALIAS=TARGET")
+        alias, target = value.split("=", 1)
+        if not alias or not target:
+            parser.error(
+                "--weak-symbol-alias requires non-empty ALIAS and TARGET"
+            )
+        weak_symbol_aliases.append((alias, target))
+    global_symbol_aliases: list[tuple[str, str]] = []
+    for value in arguments.global_symbol_alias:
+        if "=" not in value:
+            parser.error("--global-symbol-alias requires ALIAS=TARGET")
+        alias, target = value.split("=", 1)
+        if not alias or not target:
+            parser.error(
+                "--global-symbol-alias requires non-empty ALIAS and TARGET"
+            )
+        global_symbol_aliases.append((alias, target))
+    if not arguments.symbols and not arguments.synthetic_anchor:
+        parser.error("select at least one function or provide --synthetic-anchor")
     namespace = re.sub(r"[^A-Za-z0-9_]", "_", arguments.namespace)
+    reused_data_labels: dict[str, str] = {}
+    for reused_path in arguments.reuse_data_from:
+        reused_source = pathlib.Path(reused_path).read_text()
+        for block in re.finditer(
+            r"\.pushsection\s+((?:[^,\\\s]|\\\$\\\$)+).*?\\n"
+            r"(?P<body>.*?)\.popsection(?:\\n|\")",
+            reused_source, re.DOTALL,
+        ):
+            label = re.search(
+                r"(?:^|\\n)([.$A-Za-z_][.$A-Za-z0-9_\\\$]*):\\n",
+                block.group("body"),
+            )
+            if label is not None:
+                section = block.group(1).replace(r"\$\$", "$")
+                owner = label.group(1).replace(r"\$\$", "$")
+                previous = reused_data_labels.get(section)
+                if previous is not None and previous != owner:
+                    raise ValueError(
+                        f"conflicting reused data owner for {section}: "
+                        f"{previous} and {owner}"
+                    )
+                reused_data_labels[section] = owner
+    emitted_names = unique_abla_function_names(
+        list(arguments.symbols) + [alias for alias, _ in aliases] +
+        ([arguments.synthetic_anchor] if arguments.synthetic_anchor else [])
+    )
     unselected = set(arguments.unselected_function)
+    standalone_local_functions = set(arguments.standalone_local_function)
     local_symbols = {
         name: ".Labla_recovered_" + namespace + "_local_" +
         re.sub(r"[^A-Za-z0-9_]", "_", name)
-        for name in arguments.local_function
+        for name in arguments.local_function +
+        arguments.standalone_local_function
     }
     output = run_objdump(arguments.objdump, arguments.object)
     data = section_bytes(output)
     metadata = section_metadata(output)
     functions, relocations = parse(output)
-    symbol_table = object_data_symbols(run_symbol_table(
+    symbol_table_output = run_symbol_table(
         arguments.objdump, arguments.object
-    ))
+    )
+    function_symbols = object_function_symbols(symbol_table_output)
+    explicit_alias_names = {alias for alias, _ in aliases}
+    local_aliases: list[tuple[str, str]] = []
+    for name in arguments.symbols:
+        if name in functions or name in explicit_alias_names:
+            continue
+        location = function_symbols.get(name)
+        if location is None:
+            continue
+        candidates = [
+            target for target in arguments.symbols
+            if target != name and target in functions and
+            function_symbols.get(target) == location
+        ]
+        if len(candidates) == 1:
+            target = candidates[0]
+            if target in local_symbols:
+                local_aliases.append((name, target))
+            else:
+                aliases.append((name, target))
+    alias_names = {alias for alias, _ in aliases}
+    alias_names.update(alias for alias, _ in local_aliases)
+    for alias in alias_names:
+        local_symbols.pop(alias, None)
+    section_functions: dict[str, list[tuple[str, int]]] = {}
+    for name in arguments.symbols:
+        recovered = functions.get(name)
+        if recovered is None or name in local_symbols:
+            continue
+        section_functions.setdefault(recovered[0], []).append((
+            name, recovered[1]
+        ))
+    # Compiler-generated section symbols do not always repeat the ABI name.
+    # For example, a function `foo` may live in `.text.optimizedFoo`, and REL
+    # relocations then refer to the section plus the function-entry addend.
+    # Derive that relationship from the symbol table so reconstruction stays
+    # generic and every reference is rebased to the selected Abla function.
+    section_aliases = {
+        section: entries[0]
+        for section, entries in section_functions.items()
+        if section.startswith(".") and len(entries) == 1
+    }
+    local_section_aliases: dict[str, tuple[str, int]] = {}
+    for name, emitted_name in local_symbols.items():
+        recovered = functions.get(name)
+        if recovered is None or not recovered[0].startswith("."):
+            continue
+        section, start, instructions = recovered
+        # Section-local compiler helpers commonly have a literal pool before
+        # their first `entry`. Their reconstructed Abla function starts at the
+        # entry instruction, so section-symbol relocations must be rebased for
+        # every object just like named function-symbol relocations are.
+        if name.startswith(".text."):
+            start = next(
+                (instruction.offset for instruction in instructions
+                 if instruction.text.strip().startswith("entry")),
+                start,
+            )
+        local_section_aliases[section] = (emitted_name, start)
+    symbol_table = object_data_symbols(symbol_table_output)
+    local_data_labels = object_local_data_labels(symbol_table_output)
     recovered_functions: list[tuple[str, str]] = []
     local_directives: list[str] = []
     failures = 0
     for name in arguments.symbols:
+        if name in alias_names:
+            continue
         recovered = functions.get(name)
         if recovered is None:
             print(f"missing function: {name}", file=sys.stderr)
@@ -727,19 +1360,107 @@ def main() -> int:
                     name, *recovered, data, relocations,
                     metadata.get(section, (0, 2))[1], local_symbols[name]
                 ))
-            else:
+            elif name in standalone_local_functions:
                 recovered_functions.append((
-                    name, emit_function(name, *recovered, data, relocations)
+                    name,
+                    emit_standalone_local_function(
+                        name, *recovered, data, relocations,
+                        emitted_names[name], local_symbols[name]
+                    ),
+                ))
+            else:
+                symbol_alias_prefix: list[str] = []
+                for alias, target in weak_symbol_aliases:
+                    if target == name:
+                        symbol_alias_prefix.extend([
+                            f".weak {alias}",
+                            f".set {alias}, {compatibility_symbol(target)}",
+                        ])
+                for alias, target in global_symbol_aliases:
+                    if target == name:
+                        symbol_alias_prefix.extend([
+                            f".global {alias}",
+                            f".set {alias}, {compatibility_symbol(target)}",
+                        ])
+                recovered_functions.append((
+                    name, emit_function(
+                    name, *recovered, data, relocations,
+                    prefix=symbol_alias_prefix,
+                    emitted_name=emitted_names[name],
+                    )
                 ))
         except ValueError as error:
             print(f"{name}: {error}", file=sys.stderr)
             failures += 1
+    for alias, target in local_aliases:
+        local_directives.extend([
+            f".local {alias}",
+            f".set {alias}, {local_symbols[target]}",
+        ])
+    if not failures and arguments.synthetic_anchor:
+        recovered_functions.append((
+            arguments.synthetic_anchor,
+            emit_synthetic_anchor(
+                arguments.synthetic_anchor,
+                emitted_names[arguments.synthetic_anchor],
+            ),
+        ))
+    if not failures:
+        selected_names = {name for name, _ in recovered_functions}
+        for alias, target in weak_symbol_aliases:
+            if alias in selected_names:
+                print(f"duplicate weak symbol alias: {alias}", file=sys.stderr)
+                failures += 1
+        for alias, target in global_symbol_aliases:
+            if alias in selected_names:
+                print(f"duplicate global symbol alias: {alias}", file=sys.stderr)
+                failures += 1
+            elif target not in selected_names:
+                print(
+                    f"global symbol alias target is not selected: "
+                    f"{alias}={target}",
+                    file=sys.stderr,
+                )
+                failures += 1
+            elif target not in selected_names:
+                print(
+                    f"weak symbol alias target is not selected: "
+                    f"{alias}={target}",
+                    file=sys.stderr,
+                )
+                failures += 1
+        for alias, target in aliases:
+            if alias in selected_names:
+                print(f"duplicate alias function: {alias}", file=sys.stderr)
+                failures += 1
+            elif target not in selected_names:
+                print(
+                    f"alias target is not selected: {alias}={target}",
+                    file=sys.stderr,
+                )
+                failures += 1
+            else:
+                recovered_functions.append((
+                    alias, emit_alias_function(
+                        alias, target, emitted_names[alias]
+                    )
+                ))
+                selected_names.add(alias)
     if not failures:
         combined = "\n".join(source for _, source in recovered_functions)
         try:
+            combined, local_directives = resolve_local_data_labels(
+                combined,
+                local_directives,
+                local_data_labels,
+                set(arguments.global_data) |
+                set(arguments.internal_data) |
+                set(arguments.weak_data) |
+                set(arguments.local_data),
+            )
             combined, prefix = recovered_data_prefix(
                 combined, arguments.global_data, arguments.internal_data,
-                arguments.local_data,
+                arguments.weak_data, arguments.local_data,
                 data, relocations,
                 metadata, symbol_table,
                 {
@@ -747,8 +1468,17 @@ def main() -> int:
                     for name, recovered in functions.items()
                     if name in COMPATIBILITY_SYMBOLS
                 },
-                local_directives
+                local_directives,
+                arguments.reuse_recovered_data,
+                reused_data_labels,
             )
+            combined, prefix = namespace_assembler_locals(
+                combined, prefix, namespace
+            )
+            combined, prefix = normalize_symbolic_literal_addends(
+                combined, prefix
+            )
+            combined = normalize_cross_section_branches(combined, namespace)
             # Rename after data recovery as well: data tables can contain
             # relocations to section-local functions, not only code calls.
             for old, new in local_symbols.items():
@@ -766,13 +1496,28 @@ def main() -> int:
                     replace_compatibility_reference(line, old, new, start)
                     for line in prefix
                 ]
+            for old in sorted(section_aliases, key=len, reverse=True):
+                new, start = section_aliases[old]
+                combined = replace_compatibility_reference(
+                    combined, old, new, start
+                )
+                prefix = [
+                    replace_compatibility_reference(line, old, new, start)
+                    for line in prefix
+                ]
+            for old in sorted(local_section_aliases, key=len, reverse=True):
+                new, start = local_section_aliases[old]
+                combined = replace_compatibility_reference(
+                    combined, old, new, start
+                )
+                prefix = [
+                    replace_compatibility_reference(line, old, new, start)
+                    for line in prefix
+                ]
             # All section definitions are assembled with the first selected
             # function, avoiding a synthetic exported data anchor.
-            escaped_prefix = "\\n".join(
-                line.replace("\\", "\\\\").replace('"', '\\"')
-                for line in prefix
-            )
-            if escaped_prefix:
+            recovered_prefix = "\n".join(prefix)
+            if recovered_prefix:
                 anchor = next(
                     (name for name, _ in recovered_functions
                      if name not in unselected),
@@ -785,14 +1530,14 @@ def main() -> int:
                     )
                 marker = (
                     f"trusted fun {abla_function_name(anchor)}(): void = "
-                    "xtensaAssemblyVoid(\n    \""
+                    "$xtensa instructions {\n"
                 )
                 if marker not in combined:
                     raise ValueError(
                         f"cannot find selected function anchor: {anchor}"
                     )
                 combined = combined.replace(
-                    marker, marker + escaped_prefix + "\\n", 1
+                    marker, marker + recovered_prefix + "\n", 1
                 )
             if namespace != "ioctl":
                 combined = combined.replace(
@@ -802,7 +1547,14 @@ def main() -> int:
                     ".abla_ioctl_", f".abla_{namespace}_"
                 )
             if arguments.header:
-                combined = "\n".join(arguments.header) + "\n\n" + combined
+                header = "\n".join(
+                    "\n".join(
+                        line if line.startswith("//") else f"// {line}"
+                        for line in value.splitlines()
+                    )
+                    for value in arguments.header
+                )
+                combined = header + "\n\n" + combined
             if arguments.output:
                 with open(arguments.output, "w", encoding="utf-8") as file:
                     file.write(combined)
@@ -823,14 +1575,19 @@ def main() -> int:
                 for name, _ in recovered_functions:
                     if name in unselected:
                         continue
+                    if name in standalone_local_functions:
+                        selections.append(
+                            f"    // Original section-local symbol: {name}"
+                        )
                     selector = (
                         "exportFunction" if name in exported
                         else "internalFunction"
                     )
                     selections.append(
                         "    if (!" + selector + "(\"" +
-                        abla_function_name(name) + "\", \"" +
-                        compatibility_symbol(name) +
+                        emitted_names.get(name, abla_function_name(name)) +
+                        "\", \"" +
+                        local_symbols.get(name, compatibility_symbol(name)) +
                         "\")) return false"
                     )
                 selections.extend(["    true", "}", ""])

@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Replace recovered Xtensa code-address tables with pure Abla `when` flow."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib.util
+import importlib.machinery
+import pathlib
+import re
+import subprocess
+import struct
+import sys
+import tempfile
+
+
+@dataclasses.dataclass(frozen=True)
+class Dispatch:
+    source: str
+    archive: str
+    member: str
+    abi_function: str
+    abla_function: str
+    table: str
+    first_entry: int = 0
+    entry_count: int = -1
+    site_limit: int = -1
+
+
+DISPATCHES = (
+    Dispatch("src/esp32/wifi/supplicant_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_supplicant.o", "wifi_set_rx_policy",
+             "esp32RecoveredWifiSetRxPolicy",
+             "esp32Data_Labla_recovered_supplicant_data_rodata_wifi_set_rx_policy_314dab6f80"),
+    Dispatch("src/esp32/wifi/connection_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "wl_cnx.o", "cnx_auth_done", "esp32RecoveredCnxAuthDone",
+             "esp32Data_Labla_recovered_connection_data_rodata_cnx_auth_done_87d5f54330"),
+    Dispatch("src/esp32/wifi/nvs_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_nvs.o", "wifi_nvs_set", "esp32RecoveredWifiNvsSet",
+             "esp32Data_Labla_recovered_nvs_data_rodata_wifi_nvs_set_55734b77ce"),
+    Dispatch("src/esp32/wifi/api_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_api.o", "esp_wifi_set_protocol",
+             "esp32RecoveredEspWifiSetProtocol",
+             "esp32Data_Labla_recovered_api_data_rodata_esp_wifi_set_protocol_701db45d59"),
+    Dispatch("src/esp32/wifi/api_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_api.o", "wifi_get_user_ie",
+             "esp32RecoveredWifiGetUserIe",
+             "esp32Data_Labla_recovered_api_data_rodata_wifi_get_user_ie_61681d3d8b"),
+    Dispatch("src/esp32/wifi/output_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_output.o", "esp_wifi_mesh_tx",
+             "esp32RecoveredEspWifiMeshTx",
+             "esp32Data_Labla_recovered_output_data_rodata_esp_wifi_mesh_tx_98622b0806"),
+    Dispatch("src/esp32/wifi/input_esp32.ab", "esp_wifi/lib/esp32/libnet80211.a",
+             "ieee80211_input.o", "ieee80211_parse_beacon",
+             "esp32RecoveredIeee80211ParseBeacon",
+             "esp32Data_Labla_recovered_input_data_rodata_ieee80211_parse_beacon_c9884bb590"),
+    Dispatch("src/esp32/radio/low_mac_esp32.ab", "esp_wifi/lib/esp32/libpp.a", "lmac.o",
+             "lmacProcessTxComplete", "esp32RecoveredLmacProcessTxComplete",
+             "esp32Data_Labla_recovered_low_mac_data_rodata_f423e20895"),
+    Dispatch("src/esp32/radio/esf_buf_esp32.ab", "esp_wifi/lib/esp32/libpp.a", "esf_buf.o",
+             "esf_buf_alloc", "esp32RecoveredEsfBufAlloc",
+             "esp32Data_Labla_recovered_esf_buf_data_rodata_ae7decf86a",
+             0, 9),
+    Dispatch("src/esp32/radio/esf_buf_esp32.ab", "esp_wifi/lib/esp32/libpp.a", "esf_buf.o",
+             "esf_buf_recycle", "esp32RecoveredEsfBufRecycle",
+             "esp32Data_Labla_recovered_esf_buf_data_rodata_ae7decf86a",
+             9, 9),
+    Dispatch("src/esp32/radio/packet_processing_esp32.ab", "esp_wifi/lib/esp32/libpp.a", "pp.o",
+             "ppTask", "esp32RecoveredPpTask",
+             "esp32Data_Labla_recovered_packet_processing_data_rodata_265b823495"),
+    Dispatch("src/esp32/radio/phy_chip_v7_cal_esp32.ab",
+             "esp_phy/lib/esp32/libphy.a", "phy_chip_v7_cal.o",
+             "get_rate_fcc_index", "esp32RecoveredGetRateFccIndex",
+             "esp32Data_Labla_recovered_phy_chip_v7_cal_data_rodata_91220204e0",
+             0, 9, 1),
+    Dispatch("src/esp32/radio/phy_chip_v7_cal_esp32.ab",
+             "esp_phy/lib/esp32/libphy.a", "phy_chip_v7_cal.o",
+             "get_rate_fcc_index", "esp32RecoveredGetRateFccIndex",
+             "esp32Data_Labla_recovered_phy_chip_v7_cal_data_rodata_91220204e0",
+             9, 9, 1),
+)
+
+PHY_TABLE = (
+    "esp32Data_Labla_recovered_phy_chip_v7_cal_data_rodata_91220204e0"
+)
+
+INITIALIZED = re.compile(
+    r"(?ms)^val\s+(?P<storage>esp32Data_[A-Za-z0-9_]+Storage)\s*=\s*"
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)\n"
+    r"trusted\s+fun\s+(?P<initialize>esp32Data_[A-Za-z0-9_]+Initialize)"
+    r"\(\):\s*int\s*\{\n(?P<body>.*?)^\}\n"
+    r"val\s+(?P<initialized>esp32Data_[A-Za-z0-9_]+Initialized)\s*=.*?\n"
+    r"val\s+(?P<value>esp32Data_[A-Za-z0-9_]+)\s*=[^\n]*\n?"
+)
+STORE = re.compile(
+    r"ablaUnsafeStoreU32\([^\n]*Storage \+ (?P<offset>[0-9]+)\),\s*"
+    r"int\((?P<expression>.*?)\)\)\s*$"
+)
+ADDRESS = re.compile(
+    r"^\(?\$xtensa\s+address\s+\{\{?\s*(?P<symbol>[^{}\s]+)\s*\}\}?"
+    r"(?:\s*\+\s*u32\((?P<addend>[0-9]+)\))?\)?$"
+)
+
+
+def load_lifter(tools: pathlib.Path):
+    path = tools / "lift-xtensa-leaves-to-abla"
+    loader = importlib.machinery.SourceFileLoader(
+        "abla_jump_lifter", str(path)
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load Xtensa lifter")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def function_span(source: str, name: str) -> tuple[int, int]:
+    match = re.search(rf"(?m)^trusted fun {re.escape(name)}\(", source)
+    if match is None:
+        raise ValueError(f"missing Abla function {name}")
+    opening = source.find("{", match.end())
+    depth = 0
+    quoted = False
+    escaped = False
+    for index in range(opening, len(source)):
+        character = source[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return match.start(), index + 1
+    raise ValueError(f"unterminated Abla function {name}")
+
+
+def table_entries(source: str, table: str) -> tuple[re.Match[str], list[tuple[str, int]]]:
+    block = next((match for match in INITIALIZED.finditer(source)
+                  if match.group("value") == table), None)
+    if block is None:
+        raise ValueError(f"missing recovered table {table}")
+    entries: list[tuple[str, int]] = []
+    for line in block.group("body").splitlines():
+        store = STORE.search(line.strip())
+        if store is None:
+            continue
+        address = ADDRESS.fullmatch(store.group("expression").strip())
+        if address is None:
+            raise ValueError(f"non-address entry in {table}: {line.strip()}")
+        entries.append((address.group("symbol"), int(address.group("addend") or 0)))
+    expected = int(block.group("size")) // 4
+    if table != PHY_TABLE and len(entries) != expected:
+        raise ValueError(f"{table}: recovered {len(entries)} of {expected} entries")
+    return block, entries
+
+
+def object_function_start(object_path: pathlib.Path, symbol: str) -> int:
+    output = subprocess.check_output(
+        ["nm", "--defined-only", str(object_path)], text=True
+    )
+    match = re.search(
+        rf"(?m)^([0-9A-Fa-f]+)\s+[Tt]\s+{re.escape(symbol)}$", output
+    )
+    if match is None:
+        raise ValueError(f"missing {symbol} in {object_path.name}")
+    return int(match.group(1), 16)
+
+
+def elf_section(object_path: pathlib.Path, wanted: str) -> bytes:
+    elf = object_path.read_bytes()
+    if elf[:6] != b"\x7fELF\x01\x01":
+        raise ValueError(f"{object_path.name} is not little-endian ELF32")
+    section_offset = struct.unpack_from("<I", elf, 32)[0]
+    entry_size = struct.unpack_from("<H", elf, 46)[0]
+    count = struct.unpack_from("<H", elf, 48)[0]
+    names_index = struct.unpack_from("<H", elf, 50)[0]
+
+    def header(index: int) -> tuple[int, int, int]:
+        offset = section_offset + index * entry_size
+        return (
+            struct.unpack_from("<I", elf, offset)[0],
+            struct.unpack_from("<I", elf, offset + 16)[0],
+            struct.unpack_from("<I", elf, offset + 20)[0],
+        )
+
+    _, names_offset, names_size = header(names_index)
+    names = elf[names_offset:names_offset + names_size]
+    for index in range(count):
+        name_offset, data_offset, data_size = header(index)
+        end = names.find(b"\0", name_offset)
+        if names[name_offset:end].decode() == wanted:
+            return elf[data_offset:data_offset + data_size]
+    raise ValueError(f"{object_path.name} has no {wanted} section")
+
+
+def abla_bytes(value: bytes) -> str:
+    chunks = [
+        '"' + "".join(f"\\x{byte:02x}" for byte in value[offset:offset + 32]) + '"'
+        for offset in range(0, len(value), 32)
+    ]
+    return "\n        ".join(
+        chunk + (" +" if index + 1 < len(chunks) else "")
+        for index, chunk in enumerate(chunks)
+    )
+
+
+def block_map(
+    root: pathlib.Path,
+    tools: pathlib.Path,
+    lifter,
+    objdump: str,
+    object_path: pathlib.Path,
+    dispatch: Dispatch,
+    temporary: pathlib.Path,
+) -> tuple[int, dict[int, int]]:
+    raw = temporary / f"{dispatch.abi_function}.ab"
+    subprocess.run([
+        str(tools / "reconstruct-xtensa-object"),
+        "--objdump", objdump,
+        "--output", str(raw),
+        "--namespace", "jump_table_map",
+        str(object_path), dispatch.abi_function,
+    ], check=True)
+    recovered = raw.read_text()
+    match = lifter.BLOCK.search(recovered)
+    if match is None:
+        raise ValueError(f"cannot parse reconstructed {dispatch.abi_function}")
+    executable = lifter.NESTED_SECTION.sub("", match.group("body"))
+    executable = lifter.normalize_encoded_instructions(executable)
+    _, blocks, _ = lifter.control_flow_records(executable)
+    start = object_function_start(object_path, dispatch.abi_function)
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", dispatch.abi_function)
+    result = {start: 0}
+    label = re.compile(rf"\.Labla_recovered_{re.escape(safe)}_([0-9A-Fa-f]+)")
+    for index, block in enumerate(blocks):
+        found = label.fullmatch(block.label)
+        if found:
+            result[int(found.group(1), 16)] = index
+    return start, result
+
+
+def target_offset(symbol: str, addend: int, function: str, start: int) -> int:
+    local = re.fullmatch(
+        rf"\.Labla_recovered_{re.escape(re.sub(r'[^A-Za-z0-9_]', '_', function))}_"
+        r"([0-9A-Fa-f]+)", symbol
+    )
+    if local:
+        return int(local.group(1), 16) + addend
+    if symbol == function or symbol.endswith("_section_entry"):
+        return start + addend
+    if symbol.startswith("."):
+        return addend
+    raise ValueError(f"unsupported jump-table target {symbol}+{addend}")
+
+
+def lower_dispatch(
+    function: str, table: str, mapping: list[int], site_limit: int
+) -> tuple[str, int]:
+    lines = function.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    replaced = 0
+    while index < len(lines):
+        assignment = None if (site_limit >= 0 and replaced >= site_limit) else re.fullmatch(
+            rf"(?P<indent>\s*)(?P<base>r[0-9]+) = {re.escape(table)}\n?",
+            lines[index],
+        )
+        if assignment is None or index + 3 >= len(lines):
+            output.append(lines[index])
+            index += 1
+            continue
+        shift = re.fullmatch(
+            rf"{re.escape(assignment.group('indent'))}(?P<target>r[0-9]+) = "
+            rf"\((?P<selector>r[0-9]+) << u32\(2\)\) \+ "
+            rf"{assignment.group('base')}\n?",
+            lines[index + 1],
+        )
+        if shift is None:
+            output.append(lines[index])
+            index += 1
+            continue
+        address_register = shift.group("target")
+        load = re.fullmatch(
+            rf"(?P<jump>r[0-9]+) = u32\(ablaUnsafeLoadU32\(.*"
+            rf"int\({address_register}\).*\)\)\)",
+            lines[index + 2].strip(),
+        )
+        if load is None:
+            output.append(lines[index])
+            index += 1
+            continue
+        jump_register = load.group("jump")
+        call_index = index + 3
+        while (call_index < min(len(lines), index + 11) and
+               not lines[call_index].strip().startswith(
+                   "return u32(ablaUnsafeCall"
+               )):
+            call_index += 1
+        if (call_index >= min(len(lines), index + 11) or
+                f"int({jump_register})" not in lines[call_index]):
+            output.append(lines[index])
+            index += 1
+            continue
+        indent = assignment.group("indent")
+        output.extend(lines[index + 3:call_index])
+        output.append(
+            f"{indent}programCounter = when ({shift.group('selector')}) {{\n"
+        )
+        for selector, state in enumerate(mapping):
+            output.append(f"{indent}    {selector} -> {state}\n")
+        output.append(f"{indent}    else -> -1\n{indent}}}\n")
+        index = call_index + 1
+        replaced += 1
+    return "".join(output), replaced
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--archive-root", required=True, type=pathlib.Path)
+    parser.add_argument("--objdump", required=True)
+    parser.add_argument("root", type=pathlib.Path)
+    arguments = parser.parse_args()
+    root = arguments.root.resolve()
+    tools = root / "tools"
+    lifter = load_lifter(tools)
+    changed: dict[pathlib.Path, str] = {}
+    table_blocks: dict[tuple[pathlib.Path, str], re.Match[str]] = {}
+    total_dispatches = 0
+
+    with tempfile.TemporaryDirectory(prefix=".abla-jump-map.", dir=root) as name:
+        temporary = pathlib.Path(name)
+        objects: dict[tuple[str, str], pathlib.Path] = {}
+        for dispatch in DISPATCHES:
+            source_path = root / dispatch.source
+            source = changed.get(source_path, source_path.read_text())
+            if not re.search(rf"\b{re.escape(dispatch.table)}\b", source):
+                print(
+                    f"{dispatch.source}: {dispatch.abi_function} already lowered"
+                )
+                continue
+            block, entries = table_entries(source, dispatch.table)
+            table_blocks[(source_path, dispatch.table)] = block
+            key = (dispatch.archive, dispatch.member)
+            if key not in objects:
+                object_path = temporary / dispatch.member
+                object_path.write_bytes(subprocess.check_output([
+                    "ar", "p", str(arguments.archive_root / dispatch.archive),
+                    dispatch.member,
+                ]))
+                objects[key] = object_path
+            start, states = block_map(
+                root, tools, lifter, arguments.objdump, objects[key],
+                dispatch, temporary,
+            )
+            count = dispatch.entry_count
+            selected = entries[dispatch.first_entry:]
+            if count >= 0:
+                selected = selected[:count]
+            mapping = []
+            for symbol, addend in selected:
+                target = target_offset(
+                    symbol, addend, dispatch.abi_function, start
+                )
+                if target not in states:
+                    raise ValueError(
+                        f"{dispatch.abi_function}: no Abla state for "
+                        f"{symbol}+{addend} (0x{target:x})"
+                    )
+                mapping.append(states[target])
+            begin, end = function_span(source, dispatch.abla_function)
+            lowered, replacements = lower_dispatch(
+                source[begin:end], dispatch.table, mapping,
+                dispatch.site_limit,
+            )
+            if replacements == 0:
+                raise ValueError(
+                    f"{dispatch.abla_function}: no computed jump using "
+                    f"{dispatch.table}"
+                )
+            changed[source_path] = source[:begin] + lowered + source[end:]
+            total_dispatches += replacements
+            print(
+                f"{dispatch.source}: {dispatch.abi_function} -> "
+                f"{len(mapping)}-arm Abla when ({replacements} site(s))"
+            )
+        phy_constant_tail = elf_section(
+            objects[("esp_phy/lib/esp32/libphy.a", "phy_chip_v7_cal.o")],
+            ".rodata",
+        )[72:]
+
+    phy_path = root / "src/esp32/radio/phy_chip_v7_cal_esp32.ab"
+    phy_source = changed[phy_path]
+    phy_block, _ = table_entries(phy_source, PHY_TABLE)
+    phy_declaration = (
+        "// Immutable calibration lookup data following the two lowered "
+        "switch tables.\n"
+        f"val {PHY_TABLE} = u32(nativeStaticBytes(\n"
+        f"        {abla_bytes(phy_constant_tail)}\n"
+        "))\n"
+    )
+    phy_source = (
+        phy_source[:phy_block.start()] + phy_declaration +
+        phy_source[phy_block.end():]
+    )
+    first = phy_source.find(f"r11 = {PHY_TABLE}")
+    second = phy_source.find(f"r11 = {PHY_TABLE}", first + 1)
+    if first < 0 or second < 0:
+        raise ValueError("missing calibration constant-table users")
+    insertion = second + len(f"r11 = {PHY_TABLE}")
+    phy_source = phy_source[:insertion] + " + u32(20)" + phy_source[insertion:]
+    changed[phy_path] = phy_source
+
+    for (path, table), _ in table_blocks.items():
+        if table == PHY_TABLE:
+            continue
+        source = changed[path]
+        block, _ = table_entries(source, table)
+        outside = source[:block.start()] + source[block.end():]
+        if re.search(rf"\b{re.escape(table)}\b", outside):
+            raise ValueError(f"{table} remains in use after dispatch lowering")
+        changed[path] = outside
+
+    action = "lowered" if arguments.write else "would lower"
+    print(f"{action} {total_dispatches} computed jumps in {len(changed)} files")
+    if arguments.write:
+        for path, source in changed.items():
+            path.write_text(source)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

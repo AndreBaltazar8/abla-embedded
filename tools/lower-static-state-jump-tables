@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Lower recovered static u32 state tables to pure Abla `when` flow."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import struct
+
+
+STATIC_BYTES = re.compile(
+    r"val (?P<base>esp32Data_[A-Za-z0-9_]+)Storage = nativeStaticBytes\("
+    r"(?P<body>.*?)\n\)\n"
+    r"val (?P=base)Initialized =",
+    re.DOTALL,
+)
+BASE = re.compile(r"^(?P<indent>\s*)(?P<base>r[0-9]+) = (?P<table>esp32Data_[A-Za-z0-9_]+)$")
+INDEX = re.compile(
+    r"^(?P<indent>\s*)(?P<address>r[0-9]+) = "
+    r"\((?P<selector>r[0-9]+) << u32\(2\)\) \+ (?P<base>r[0-9]+)$"
+)
+LOAD = re.compile(
+    r"^(?P<indent>\s*)(?P<target>r[0-9]+) = u32\(ablaUnsafeLoadU32\("
+    r"nativePointerFromAddress\(int\((?P<address>r[0-9]+)\)\)\)\)$"
+)
+JUMP = re.compile(r"^(?P<indent>\s*)programCounter = int\((?P<target>r[0-9]+)\)$")
+
+
+def tables(source: str) -> dict[str, tuple[int, ...]]:
+    result: dict[str, tuple[int, ...]] = {}
+    for match in STATIC_BYTES.finditer(source):
+        data = bytes(
+            int(value, 16)
+            for value in re.findall(r"\\x([0-9A-Fa-f]{2})", match.group("body"))
+        )
+        values = tuple(
+            struct.unpack_from("<I", data, offset)[0]
+            for offset in range(0, len(data) - 3, 4)
+        )
+        # Some object sections place an unrelated string immediately after the
+        # state table. Reconstructed state identifiers are small integers; the
+        # first non-state word therefore marks the exact table boundary.
+        boundary = next(
+            (index for index, value in enumerate(values) if value >= 4096),
+            len(values),
+        )
+        if boundary:
+            result[match.group("base")] = values[:boundary]
+    return result
+
+
+def transform(source: str) -> tuple[str, int]:
+    available = tables(source)
+    lines = source.splitlines(keepends=True)
+    output: list[str] = []
+    lowered = 0
+    index = 0
+    while index < len(lines):
+        first = BASE.fullmatch(lines[index].rstrip("\n"))
+        if first is None or first.group("table") not in available or index + 3 >= len(lines):
+            output.append(lines[index])
+            index += 1
+            continue
+        second = INDEX.fullmatch(lines[index + 1].rstrip("\n"))
+        third = LOAD.fullmatch(lines[index + 2].rstrip("\n"))
+        fourth = JUMP.fullmatch(lines[index + 3].rstrip("\n"))
+        if (
+            second is None or third is None or fourth is None
+            or second.group("indent") != first.group("indent")
+            or third.group("indent") != first.group("indent")
+            or fourth.group("indent") != first.group("indent")
+            or second.group("base") != first.group("base")
+            or third.group("address") != second.group("address")
+            or fourth.group("target") != third.group("target")
+        ):
+            output.append(lines[index])
+            index += 1
+            continue
+        indent = first.group("indent")
+        output.append(f"{indent}programCounter = when ({second.group('selector')}) {{\n")
+        for selector, target in enumerate(available[first.group("table")]):
+            output.append(f"{indent}    {selector} -> {target}\n")
+        output.append(f"{indent}    else -> -1\n{indent}}}\n")
+        lowered += 1
+        index += 4
+    return "".join(output), lowered
+
+
+def files(paths: list[Path]) -> list[Path]:
+    result: list[Path] = []
+    for path in paths:
+        result.extend(sorted(path.rglob("*.ab")) if path.is_dir() else [path])
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    count = 0
+    changed = 0
+    for path in files(arguments.paths):
+        source = path.read_text()
+        transformed, lowered = transform(source)
+        if lowered:
+            print(f"{path}: {lowered}")
+            count += lowered
+            changed += 1
+            if arguments.write:
+                path.write_text(transformed)
+    print(f"{'lowered' if arguments.write else 'would lower'} {count} table jump(s) across {changed} file(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

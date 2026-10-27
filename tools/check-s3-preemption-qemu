@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Execute existing RAM ELF on Espressif S3 QEMU; no device access or build."""
+import os, pathlib, re, shutil, socket, subprocess, sys, tempfile, time
+
+root = pathlib.Path(__file__).resolve().parent.parent
+home = pathlib.Path.home()
+qemu = os.environ.get('ABLA_S3_QEMU', str(home / '.cache/abla-embedded/qemu-20250817/qemu/bin/qemu-system-xtensa'))
+gdb = os.environ.get('ABLA_S3_GDB', str(home / '.espressif/tools/xtensa-esp-elf-gdb/17.1_20260402/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb'))
+elf = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else root / 'build/tests/esp32s3-boot-runtime.link.elf').resolve()
+runner = ['steam-run'] if shutil.which('steam-run') else []
+qemu_runner = runner[:]
+if os.environ.get('ABLA_QEMU_LIBRARY_PATH'):
+    qemu_runner += ['env', 'LD_LIBRARY_PATH=' + os.environ['ABLA_QEMU_LIBRARY_PATH']]
+with socket.socket() as probe:
+    probe.bind(('127.0.0.1', 0))
+    port = probe.getsockname()[1]
+
+def debug(*commands):
+    args = runner + [gdb, '-q', '-nx', '-batch', str(elf), '-ex', f'target remote 127.0.0.1:{port}']
+    for command in commands:
+        args += ['-ex', command]
+    return subprocess.run(args, capture_output=True, text=True, timeout=5, check=True).stdout
+
+with tempfile.TemporaryFile(mode='w+') as log:
+    process = subprocess.Popen(qemu_runner + [qemu, '-M', 'esp32s3', '-display', 'none', '-serial', 'none',
+        '-monitor', 'none', '-nic', 'none', '-device', f'loader,file={elf},cpu-num=0',
+        '-S', '-gdb', f'tcp:127.0.0.1:{port}'], stdout=log, stderr=log, cwd=root)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            if process.poll() is not None:
+                log.seek(0)
+                raise RuntimeError(log.read())
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=.1):
+                    break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError('QEMU GDB listener')
+                time.sleep(.05)
+        # Generic ELF loader preserves hardware ROM; -kernel does not. No
+        # debugger register/memory writes: initialization must come from Abla.
+        print(debug('info registers pc atomctl', 'detach'), end='')
+        while time.monotonic() < deadline:
+            time.sleep(.1)
+            result = debug('info registers pc atomctl', 'x/4wx &__abla_preemption_state', 'detach')
+            state = re.search(r'^0x[0-9a-f]+:\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)', result, re.M)
+            values = [int(value, 16) for value in state.groups()] if state else []
+            if values and values[2] == 0x50524531:
+                if min(values[:2]) < 8 or not re.search(r'^atomctl\s+0x15\b', result, re.M):
+                    raise RuntimeError('Pass marker contradicts counters/atomic setup:\n' + result)
+                print(result, end='')
+                print('PASS: S3 QEMU executed timer-driven two-task preemption; not physical hardware proof')
+                break
+            if '0xbad0000' in result:
+                details = debug('info registers cpenable exccause epc1',
+                    'x/4wx &__abla_current_tasks', 'x/16wx &__abla_task_cp3', 'x/16wx &__abla_second_cp3',
+                    'x/32wx (char *)&__abla_task_cp3+112', 'x/32wx (char *)&__abla_second_cp3+112',
+                    'x/32wx (char *)&__abla_simd_witness+288', 'x/32wx (char *)&__abla_simd_witness+704', 'detach')
+                raise RuntimeError(result + details)
+        else:
+            raise TimeoutError(result)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()

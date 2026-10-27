@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Model linked kernel/double fatal capture instructions; not hardware proof."""
+import os, re, shutil, struct, subprocess, sys
+from pathlib import Path
+data=Path(sys.argv[1]).read_bytes()
+assert data[:6] == b'\x7fELF\x01\x01' and struct.unpack_from('<H',data,16)[0] == 2
+table=struct.unpack_from('<I',data,32)[0]
+stride,count,ni=struct.unpack_from('<HHH',data,46)
+assert stride == 40
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+n=headers[ni]; names=data[n[4]:n[4]+n[5]]
+sections={names[h[0]:].split(b'\0',1)[0].decode():h for h in headers}
+vecbase=sections['.iram1.abla.s3WindowVectors'][3]
+records=sections['.dram1.abla.s3FatalRecords']
+assert records[5] == 256 and records[3] & 15 == 0
+selected=['.iram1.abla.s3KernelVector','.iram1.abla.s3DoubleVector','.iram1.abla.s3FatalEntry']
+profiles=[(1,selected[0],0x300),(2,selected[1],0x3c0)]
+for level in range(4,8):
+    name=f'.iram1.abla.s3Level{level}Vector'
+    selected.append(name); profiles.append((level,name,0x200+(level-4)*64))
+for name,offset in zip(selected,(0x300,0x3c0)):
+    assert sections[name][3] == vecbase+offset and sections[name][5] == 64
+for _,name,offset in profiles:
+    assert sections[name][3] == vecbase+offset and sections[name][5] == 64
+objdump=os.environ.get('ABLA_ESP_S3_OBJDUMP') or shutil.which('xtensa-esp32s3-elf-objdump') or str(Path.home()/'.platformio/packages/toolchain-xtensa-esp32s3/xtensa-esp32s3-elf/bin/objdump')
+runner=['steam-run'] if shutil.which('steam-run') else []
+listing=subprocess.check_output(runner+[objdump,'-d']+sum((['-j',s] for s in selected),[])+[sys.argv[1]],text=True)
+code={}
+for line in listing.splitlines():
+    m=re.match(r'\s*([0-9a-f]+):\s+([0-9a-f]{4,6})\s+([a-z][a-z0-9.]*)\s*(.*)',line)
+    if m:
+        args=m[4].split('<')[0].strip().replace(' ','')
+        code[int(m[1],16)]=(len(m[2])//2,m[3].removesuffix('.n'),args.split(',') if args else [])
+def literal(address):
+    for h in headers:
+        if h[1] == 1 and h[3] <= address and address+4 <= h[3]+h[5]:
+            return struct.unpack_from('<I',data,h[4]+address-h[3])[0]
+    raise AssertionError('literal outside linked image')
+fields={'epc1':8,'ps':12,'exccause':16,'excvaddr':20,'sar':88,'lbeg':92,'lend':96,'lcount':100,'excsave1':104,'cpenable':108,'depc':112}
+for seed in range(64):
+  for core in range(2):
+    for reason,name,_ in profiles:
+      regs=[0xA0000000+seed*256+i for i in range(16)]
+      original=regs[:]
+      special={key:0x12340000+seed*32+i for i,key in enumerate(fields)}
+      special.update({f'epc{level}':0x42004000+seed*128+level*4 for level in range(4,8)})
+      special.update({f'eps{level}':0x40000+seed*128+level for level in range(4,8)})
+      special['debugcause']=seed+64
+      special['prid']=core<<13; saved=special.copy()
+      base=records[3]+core*128; memory={}; writes=[]; fences=0
+      pc=sections[name][3]
+      for step in range(120):
+        if pc not in code:
+            # GNU linear disassembly can consume branch-alignment zero padding
+            # as the prefix of the next instruction. Decode at the actual
+            # reached branch destination, not the padding's guessed boundary.
+            one=subprocess.check_output(runner+[objdump,'-d',f'--start-address={pc}',f'--stop-address={pc+3}',sys.argv[1]],text=True)
+            m=re.search(r'^\s*'+format(pc,'x')+r':\s+([0-9a-f]{4,6})\s+([a-z][a-z0-9.]*)\s*(.*)',one,re.M)
+            assert m, ('cannot decode reached instruction',hex(pc))
+            args=m[3].split('<')[0].strip().replace(' ','')
+            code[pc]=(len(m[1])//2,m[2].removesuffix('.n'),args.split(',') if args else [])
+        width,op,args=code[pc]; following=pc+width
+        def r(a): return regs[int(a[1:])]
+        def put(a,v): regs[int(a[1:])]=v & 0xffffffff
+        if op.startswith('wsr.'): special[op[4:]]=r(args[0])
+        elif op.startswith('rsr.'): put(args[0],special[op[4:]])
+        elif op == 'movi': put(args[0],int(args[1],0))
+        elif op == 'l32r': put(args[0],literal(int(args[1],16)))
+        elif op == 'extui': put(args[0],(r(args[1])>>int(args[2])) & ((1<<int(args[3]))-1))
+        elif op == 'slli': put(args[0],r(args[1])<<int(args[2]))
+        elif op == 'addi': put(args[0],r(args[1])+int(args[2],0))
+        elif op == 'add': put(args[0],r(args[1])+r(args[2]))
+        elif op == 'sub': put(args[0],r(args[1])-r(args[2]))
+        elif op == 's32i':
+            address=r(args[1])+int(args[2],0)
+            assert base <= address < base+128 and address & 3 == 0, 'write outside own record/uses interrupted stack'
+            memory[address]=r(args[0]); writes.append(address)
+            if r(args[0]) == 1178686513: assert address == base and fences == 1
+        elif op == 'rsil': put(args[0],special['ps']); special['ps']=(special['ps'] & ~15)|int(args[1])
+        elif op == 'memw': fences+=1
+        elif op == 'l32i': put(args[0],memory[r(args[1])+int(args[2],0)])
+        elif op == 'bnei':
+            if r(args[0]) != int(args[1],0): following=int(args[2],16)
+        elif op == 'j':
+            following=int(args[0],16)
+            if following == pc: break
+        else: raise AssertionError(('unexpected instruction',pc,op,args))
+        pc=following
+      else: raise AssertionError('did not halt')
+      assert writes[0] == base and writes[-1] == base and fences == 2
+      assert memory[base] == 1178686513 and memory[base+4] == reason
+      assert (special['ps'] & 15) == 15 and regs[2:] == original[2:]
+      for i,value in enumerate(original): assert memory[base+24+i*4] == value
+      for key,offset in fields.items(): assert memory[base+offset] == saved[key], key
+      assert memory[base+116] == saved['epc1' if reason == 1 else 'depc' if reason == 2 else f'epc{reason}']
+      assert memory[base+120] == saved['ps' if reason < 4 else f'eps{reason}']
+      assert memory[base+124] == saved['debugcause']
+print('PASS:768 linked fatal vector profiles, visible registers, correct EPC/EPS/DEPC, own-core record, publish-last, stackless halt; not hardware proof')

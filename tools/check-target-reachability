@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Require direct-call reachability to named Abla sources in optimized LLVM.
+
+This supplements symbol-closure checks; it is not execution/hardware proof.
+Pass optimized .bc or .ll, exported entry, then required abla.source names.
+An inlined-away required boundary fails deliberately: review the new IR before
+changing the check, rather than silently weakening retained-path evidence.
+"""
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def inspect(ir, entry, required):
+    attributes = dict(re.findall(r'^attributes #(\d+) = .*?"abla.source"="([^"]+)"', ir, re.M))
+    functions = {}
+    sources = {}
+    aliases = dict(re.findall(r'^@([\w.$]+) = [^\n]*\balias\b[^\n]*ptr @([\w.$]+)\s*$', ir, re.M))
+    for match in re.finditer(r'^define\b[^\n]*@([\w.$]+)\([^\n]*\)[^\n]*\{\n(.*?)^}', ir, re.M | re.S):
+        name, body = match.group(1, 2)
+        header = match.group(0).splitlines()[0]
+        group = re.search(r'#(\d+)\s*\{', header)
+        sources[name] = attributes.get(group.group(1), name) if group else name
+        functions[name] = re.findall(r'\b(?:call|invoke)\b[^\n]*?@([\w.$]+)\(', body)
+    for name, target in aliases.items():
+        functions[name] = [target]
+        sources[name] = name
+    if entry not in functions:
+        raise ValueError(f"missing defined entry: {entry}")
+    paths = {entry: [entry]}
+    queue = [entry]
+    for caller in queue:
+        for callee in functions[caller]:
+            if callee in functions and callee not in paths:
+                paths[callee] = paths[caller] + [callee]
+                queue.append(callee)
+    result = []
+    for source in required:
+        matches = [name for name in paths if sources[name] == source]
+        if not matches:
+            raise ValueError(f"{entry} cannot reach retained source: {source}")
+        result.append(" -> ".join(sources[name] for name in paths[matches[0]]))
+    return result
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        sys.exit("usage: check-target-reachability optimized.bc entry required-source [...]")
+    path, entry, *required = sys.argv[1:]
+    try:
+        ir = pathlib.Path(path).read_text() if path.endswith('.ll') else subprocess.check_output(
+            ['llvm-dis', path, '-o', '-'], text=True)
+        for chain in inspect(ir, entry, required):
+            print('PASS retained path: ' + chain)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

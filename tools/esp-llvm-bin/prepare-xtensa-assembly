@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Prepare one LLVM Xtensa assembly stream for the external assembler.
+
+LLVM emits temporary `.literal` directives at their use sites. With text
+section literals the assembler otherwise inserts a branch and pool at the
+callable symbol, before Xtensa's windowed `entry` instruction. Hoist only
+LLVM-owned temporary literals ahead of the function symbol. Literals written
+inside Abla's parsed `$xtensa` blocks keep their explicit structural layout.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+
+
+FUNCTION_TYPE = re.compile(
+    r"^[ \t]*\.type[ \t]+(?P<name>[^,]+),[ \t]*@function[ \t]*$"
+)
+GENERATED_LITERAL = re.compile(
+    r"^[ \t]*\.literal[ \t]+(?:\.Ltmp[0-9]+|\.LCPI[0-9]+_[0-9]+),"
+)
+ISLAND_JUMP = re.compile(r"^[ \t]*j[ \t]+(?P<label>\.LBB[0-9]+_[0-9]+)[ \t]*$")
+ENTRY = re.compile(r"^[ \t]*entry(?:[ \t]|$)")
+CFI = re.compile(r"^[ \t]*\.cfi_")
+WINDOW_VECTOR_SECTION = re.compile(
+    r'^[ \t]*\.section[ \t]+\.WindowVectors\.text,'
+    r'"axR",@progbits,unique,[0-9]+[ \t]*$'
+)
+MARKERS = {
+    "# ABLA_XTENSA_LITERAL_POSITION": "\t.literal_position\n",
+    "# ABLA_XTENSA_BEGIN_NO_TRANSFORM": "\t.begin no-transform\n",
+    "# ABLA_XTENSA_END_NO_TRANSFORM": "\t.end no-transform\n",
+}
+
+STACK_ADJUST = re.compile(r"^\s*addi(?:\.n)?\s+(a\d+),\s*a1,\s*(-?\d+)\s*$")
+
+SECTION = re.compile(r'^(\s*\.section\s+)([^,\s]+)(.*)$')
+
+
+def place_iram_companion_data(lines: list[str]) -> list[str]:
+    """Keep LLVM per-function constant/jump tables accessible with cache off.
+
+    Xtensa codegen emits .rodata.<function> even for explicitly IRAM functions.
+    IDF's .dram1.* mapping loads these constants into internal RAM. Match exact
+    function ownership; never move unrelated data or user inline assembly.
+    """
+    iram_functions = set()
+    section = ""
+    inline = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "#APP":
+            inline = True
+        if stripped == "#NO_APP":
+            inline = False
+            continue
+        if inline:
+            continue
+        match = SECTION.match(line.rstrip("\n"))
+        if match:
+            section = match[2]
+        elif stripped in (".text", ".data", ".bss"):
+            section = stripped
+        function = FUNCTION_TYPE.match(line.rstrip("\n"))
+        if function and (section == ".iram1" or section.startswith(".iram1.")):
+            iram_functions.add(function["name"].strip())
+    output = []
+    inline = False
+    table_symbol = None
+    merge_restore = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "#APP":
+            inline = True
+        if stripped == "#NO_APP":
+            inline = False
+        match = SECTION.match(line.rstrip("\n")) if not inline else None
+        typed_table = re.match(r"\s*\.type\s+(\.Lswitch\.table\.([^,\s]+)),\s*@object", line) if not inline else None
+        if typed_table:
+            table_symbol = typed_table[1] if typed_table[2] in iram_functions else None
+        if match and match[2].startswith(".rodata.cst") and table_symbol:
+            merge_restore = line
+            line = f"{match[1]}.dram1.abla.rodata.{table_symbol}{match[3]}" + ("\n" if line.endswith("\n") else "")
+            output.append(line)
+            continue
+        owner = match[2][8:] if match and match[2].startswith(".rodata.") else None
+        if owner and owner.startswith(".Lswitch.table."):
+            owner = owner[len(".Lswitch.table."):]
+        if owner in iram_functions:
+            line = f"{match[1]}.dram1.abla{match[2]}{match[3]}" + ("\n" if line.endswith("\n") else "")
+        output.append(line)
+        if table_symbol and re.match(r"\s*\.size\s+" + re.escape(table_symbol) + r"\s*,", line):
+            if merge_restore:
+                output.append(merge_restore)
+            merge_restore = None
+            table_symbol = None
+    return output
+
+
+def align_outgoing_call_frames(lines: list[str]) -> list[str]:
+    """Prove outgoing-frame balance over generated control flow before padding.
+
+    State is (outstanding byte count, has called, pending MOVSP sites). Every
+    predecessor must agree, including zero-frame predecessors. Inline assembly
+    is opaque and untouched; it may never be crossed with an outstanding frame.
+    """
+    result = list(lines)
+    # LLVM jump tables live after .size. Their entries are additional CFG
+    # roots with no outgoing frame; every generated indirect jump is checked
+    # below to prohibit crossing it with an outstanding adjustment.
+    jump_targets = set()
+    for line in lines:
+        target = re.fullmatch(r"\s*\.word\s+(\.LBB\d+_\d+)\s*", line)
+        if target:
+            jump_targets.add(target[1])
+    index = 0
+    while index < len(lines):
+        span = function_span(lines, index)
+        if span is None:
+            index += 1
+            continue
+        begin, end = span
+        text = {}
+        labels = {}
+        opaque = set()
+        inline = False
+        pairs = {}
+        for pos in range(begin, end):
+            raw = lines[pos].strip()
+            if raw == "#APP":
+                inline = True
+            if inline:
+                opaque.add(pos)
+            if raw == "#NO_APP":
+                inline = False
+            code = raw.split("#", 1)[0].strip()
+            text[pos] = code
+            if code.endswith(":") and pos not in opaque:
+                labels[code[:-1]] = pos
+        for pos in range(begin, end - 1):
+            match = STACK_ADJUST.match(text[pos]) if pos not in opaque else None
+            if not match or not int(match[2]) % 16:
+                continue
+            # Machine scheduling can put the ADDI before an unconditional
+            # edge and MOVSP in its successors. Prove bounded paths
+            # with neither source/destination clobbers nor observations
+            # of A1; the CFG state below also validates all incoming edges.
+            cursors = [pos + 1]
+            seen = set()
+            moves = set()
+            valid = True
+            while cursors and valid:
+                cursor = cursors.pop()
+                if cursor in seen:
+                    continue
+                if cursor >= end or len(seen) >= 32:
+                    valid = False
+                    break
+                seen.add(cursor)
+                code = text[cursor]
+                if cursor in opaque:
+                    valid = False
+                    break
+                if re.fullmatch(rf"movsp\s+a1,\s*{match[1]}", code):
+                    moves.add(cursor)
+                    continue
+                jump = re.fullmatch(r"(j(?:\.n)?|b\w*(?:\.\w+)?)\s+.*?(\.LBB\d+_\d+)", code)
+                if jump and jump[2] in labels:
+                    cursors.append(labels[jump[2]])
+                    if jump[1] not in ("j", "j.n"):
+                        cursors.append(cursor + 1)
+                    continue
+                if code and not code.startswith(".") and not code.endswith(":"):
+                    if (re.search(r"\ba1\b", code) or
+                        re.match(rf"\w+(?:\.\w+)?\s+{match[1]}(?:,|$)", code) or
+                        re.match(r"(?:b\w*|j\w*|call\w*|ret\w*|loop\w*|ill\w*)\b", code)):
+                        valid = False
+                        break
+                cursors.append(cursor + 1)
+            if valid and moves:
+                if (abs(int(match[2])) + 15) & -16 > 127:
+                    raise ValueError(f"outgoing adjustment encoding overflow at line {pos + 1}")
+                pairs[pos] = (match[1], int(match[2]), frozenset(moves))
+        if not pairs:
+            index = end
+            continue
+        states = {}
+        work = [(begin, (0, False, None))]
+        work.extend((labels[label], (0, False, None)) for label in jump_targets if label in labels)
+        visited_pairs = set()
+        while work:
+            pos, state = work.pop()
+            if pos >= end:
+                if state[0] or state[2] is not None:
+                    raise ValueError(f"unbalanced frame at function end line {end}")
+                continue
+            if pos in states:
+                if states[pos] != state:
+                    raise ValueError(f"inconsistent call-frame join at line {pos + 1}: {states[pos]} vs {state}")
+                continue
+            states[pos] = state
+            size, called, pending = state
+            code = text[pos]
+            next_pos = pos + 1
+            if pos in pairs:
+                register, amount, move_pos = pairs[pos]
+                if pending is not None:
+                    raise ValueError(f"overlapping stack adjustment at line {pos + 1}")
+                if amount < 0:
+                    if size:
+                        raise ValueError(f"nested outgoing frame at line {pos + 1}")
+                    state = (-amount, False, move_pos)
+                else:
+                    if size != amount or not called:
+                        raise ValueError(f"unmatched outgoing restore at line {pos + 1}")
+                    state = (0, False, move_pos)
+                rounded = (abs(amount) + 15) & -16
+                result[pos] = f"\taddi\t{register}, a1, {rounded if amount > 0 else -rounded}\n"
+                visited_pairs.add(pos)
+                work.append((pos + 1, state))
+                continue
+            if pending is not None and pos in pending:
+                work.append((next_pos, (size, called, None)))
+                continue
+            if size:
+                if pos in opaque:
+                    raise ValueError(f"inline assembly in outgoing frame at line {pos + 1}")
+                if re.match(r"(?:movsp|entry)\b|\w+(?:\.\w+)?\s+a1,", code):
+                    raise ValueError(f"SP mutation in outgoing frame at line {pos + 1}")
+                access = re.fullmatch(r"[ls](8|16|32)\w*(?:\.n)?\s+a\d+,\s*a1,\s*(-?\d+)", code)
+                if access and not (0 <= int(access[2]) and int(access[2]) + int(access[1]) // 8 <= size):
+                    raise ValueError(f"non-argument stack access at line {pos + 1}")
+                if re.search(r"\ba1\b", code) and not access:
+                    address = STACK_ADJUST.match(code)
+                    start_address = re.fullmatch(r"mov(?:\.n)?\s+a\d+,\s*a1", code)
+                    if not start_address and not (address and 0 <= int(address[2]) <= size):
+                        raise ValueError(f"unproven outgoing stack address at line {pos + 1}: {code}")
+                if re.match(r"call(?:x)?8\s", code):
+                    state = (size, True, pending)
+                elif re.match(r"call", code):
+                    raise ValueError(f"unknown call ABI in outgoing frame at line {pos + 1}")
+            if pos in opaque or not code or code.startswith(".") or code.endswith(":"):
+                work.append((next_pos, state))
+                continue
+            op = code.split()[0]
+            if op.startswith("loop"):
+                raise ValueError(f"implicit hardware-loop edge requires separate proof at line {pos + 1}")
+            if op.startswith(("ret", "ill")):
+                if state[0] or state[2] is not None:
+                    raise ValueError(f"outstanding frame at terminal line {pos + 1}")
+                continue
+            if op in ("j", "j.n") or op.startswith("b") or op.startswith("loop"):
+                target = re.split(r"[\s,]+", code)[-1]
+                if target not in labels:
+                    raise ValueError(f"unknown control edge at line {pos + 1}: {code}")
+                work.append((labels[target], state))
+                if op not in ("j", "j.n"):
+                    work.append((next_pos, state))
+                continue
+            if op in ("jx", "jx.n"):
+                if state[0]:
+                    raise ValueError(f"indirect edge in outgoing frame at line {pos + 1}")
+                continue
+            work.append((next_pos, state))
+        if visited_pairs != set(pairs):
+            missing = min(set(pairs) - visited_pairs)
+            raise ValueError(f"unreachable or unproven outgoing adjustment at line {missing + 1}")
+        index = end
+    return result
+
+
+def normalized_line(line: str) -> str | None:
+    if CFI.match(line):
+        return None
+    if WINDOW_VECTOR_SECTION.match(line.rstrip("\n")):
+        # Xtensa's six window vectors and the alloca entry are one fixed-offset
+        # architectural table. LLVM uses unique fragments for functions that
+        # share an explicit section; merge only this table before assembly.
+        return '\t.section\t.WindowVectors.text,"axR",@progbits\n'
+    marker = line.strip()
+    if marker in MARKERS:
+        return MARKERS[marker]
+    return line
+
+
+def ignorable_comment(line: str) -> bool:
+    stripped = line.strip()
+    return (
+        stripped == "" or stripped.startswith("#") or
+        CFI.match(line) is not None
+    )
+
+
+def strip_leading_constant_island(
+    block: list[str], label_index: int
+) -> list[str]:
+    """Remove LLVM's branch-around-pool prologue after hoisting its pool."""
+    jump_index = label_index + 1
+    while jump_index < len(block) and ignorable_comment(block[jump_index]):
+        jump_index += 1
+    if jump_index == len(block):
+        return block
+    jump = ISLAND_JUMP.match(block[jump_index].rstrip("\n"))
+    if jump is None:
+        return block
+
+    target_text = jump.group("label") + ":"
+    target_index = jump_index + 1
+    allowed = True
+    while target_index < len(block):
+        stripped = block[target_index].strip()
+        if stripped.startswith(target_text):
+            break
+        if not (
+            ignorable_comment(block[target_index]) or
+            stripped.startswith(".p2align") or
+            stripped == ".literal_position" or
+            GENERATED_LITERAL.match(block[target_index]) is not None
+        ):
+            allowed = False
+            break
+        target_index += 1
+    if not allowed or target_index == len(block):
+        return block
+
+    entry_index = target_index + 1
+    while entry_index < len(block) and ignorable_comment(block[entry_index]):
+        entry_index += 1
+    if entry_index == len(block) or ENTRY.match(block[entry_index]) is None:
+        return block
+    return block[:jump_index] + block[target_index + 1:]
+
+
+def function_span(
+    lines: list[str], index: int
+) -> tuple[int, int] | None:
+    function = FUNCTION_TYPE.match(lines[index].rstrip("\n"))
+    if function is None:
+        return None
+    name = function.group("name").strip()
+    label = re.compile(rf"^[ \t]*{re.escape(name)}:[ \t]*(?:#.*)?$")
+    body = index + 1
+    while body < len(lines) and label.match(
+        lines[body].rstrip("\n")
+    ) is None:
+        stripped = lines[body].lstrip()
+        if (stripped.startswith(".type") or
+            stripped.startswith(".section") or
+            stripped.startswith(f".set\t{name},") or
+            stripped.startswith(f".set {name},")):
+            return None
+        body += 1
+    if body == len(lines):
+        return None
+
+    size = re.compile(rf"^[ \t]*\.size[ \t]+{re.escape(name)},")
+    end = body + 1
+    while end < len(lines) and size.match(lines[end]) is None:
+        end += 1
+    if end == len(lines):
+        raise ValueError(f"function {name} has no matching .size")
+    return body, end + 1
+
+
+def prepare_function(block: list[str], label_index: int) -> list[str]:
+    """Prepare a function without stealing literals from nested helpers."""
+    # LLVM's first literal island precedes the mandatory windowed `entry`.
+    # Hoist only that island ahead of the callable symbol. Later islands are
+    # range-extension pools deliberately placed inside very large functions;
+    # moving them all to the front makes Xtensa's signed 18-bit L32R reach
+    # overflow in a monolithic firmware initializer.
+    entry_index = len(block)
+    entry_cursor = label_index + 1
+    while entry_cursor < len(block):
+        if ENTRY.match(block[entry_cursor]) is not None:
+            entry_index = entry_cursor
+            break
+        entry_cursor += 1
+    children: list[tuple[int, int, int]] = []
+    cursor = label_index + 1
+    while cursor < len(block) - 1:
+        span = function_span(block, cursor)
+        if span is None:
+            cursor += 1
+            continue
+        child_label, child_end = span
+        children.append((cursor, child_end, child_label))
+        cursor = child_end
+
+    literals: list[str] = []
+    rebuilt: list[str] = []
+    cursor = 0
+    for child_begin, child_end, child_label in children:
+        line_index = cursor
+        while line_index < child_begin:
+            line = block[line_index]
+            if line_index < entry_index and GENERATED_LITERAL.match(line):
+                literals.append(line)
+            else:
+                rebuilt.append(line)
+            line_index += 1
+        rebuilt.extend(prepare_function(
+            block[child_begin:child_end], child_label - child_begin
+        ))
+        cursor = child_end
+    line_index = cursor
+    while line_index < len(block):
+        line = block[line_index]
+        if line_index < entry_index and GENERATED_LITERAL.match(line):
+            literals.append(line)
+        else:
+            rebuilt.append(line)
+        line_index += 1
+
+    function = FUNCTION_TYPE.match(rebuilt[0].rstrip("\n"))
+    if function is None:
+        raise ValueError("prepared function lost its type record")
+    name = function.group("name").strip()
+    label = re.compile(rf"^[ \t]*{re.escape(name)}:[ \t]*(?:#.*)?$")
+    prepared_label = next(
+        index for index, line in enumerate(rebuilt)
+        if label.match(line.rstrip("\n")) is not None
+    )
+    rebuilt = strip_leading_constant_island(rebuilt, prepared_label)
+    if literals:
+        return literals + ["\t.literal_position\n"] + rebuilt
+    return rebuilt
+
+
+def prepare(lines: list[str]) -> list[str]:
+    lines = place_iram_companion_data(lines)
+    lines = align_outgoing_call_frames(lines)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        function = FUNCTION_TYPE.match(lines[index].rstrip("\n"))
+        if function is None:
+            line = normalized_line(lines[index])
+            if line is not None:
+                output.append(line)
+            index += 1
+            continue
+
+        span = function_span(lines, index)
+        if span is None:
+            # LLVM also emits `.type alias,@function` followed by `.set` for
+            # aliases. They have no body or `.size` and require no pooling.
+            normalized = normalized_line(lines[index])
+            if normalized is not None:
+                output.append(normalized)
+            index += 1
+            continue
+
+        body, end = span
+        block = prepare_function(lines[index:end], body - index)
+        for line in block:
+            normalized = normalized_line(line)
+            if normalized is not None:
+                output.append(normalized)
+        index = end
+    return output
+
+
+def main() -> int:
+    sys.stdout.writelines(prepare(sys.stdin.readlines()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

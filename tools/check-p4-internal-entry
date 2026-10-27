@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Check linked RV32 startup/trap instructions. Not execution/hardware proof."""
+import struct
+import sys
+from pathlib import Path
+
+
+def validate(data):
+    assert data[:6] == b"\x7fELF\x01\x01"
+    table = struct.unpack_from("<I", data, 32)[0]
+    stride, count, _ = struct.unpack_from("<HHH", data, 46)
+    assert stride == 40
+    sections = [struct.unpack_from("<10I", data, table + i * 40) for i in range(count)]
+    symbols = {}
+    for section in sections:
+        if section[1] != 2:
+            continue
+        strings = sections[section[6]]
+        names = data[strings[4]:strings[4] + strings[5]]
+        for pos in range(section[4], section[4] + section[5], 16):
+            name, address, size, info, _, index = struct.unpack_from("<IIIBBH", data, pos)
+            symbols[names[name:].split(b"\0", 1)[0].decode()] = (address, info, index)
+
+    def address(name):
+        return symbols[name][0]
+
+    def read(start, size):
+        for section in sections:
+            if section[1] == 1 and section[3] <= start and start + size <= section[3] + section[5]:
+                pos = section[4] + start - section[3]
+                return data[pos:pos + size]
+        raise AssertionError("instruction/data outside loaded sections")
+
+    def words(start, expected):
+        assert read(start, len(expected) * 4) == struct.pack("<" + "I" * len(expected), *expected)
+
+    def pair(start, reg, target, call=False):
+        hi, lo = struct.unpack("<II", read(start, 8))
+        assert hi & 0xfff == (reg << 7) | 0x17
+        assert lo & 0xfffff == (reg << 15) | (reg << 7) | (0x67 if call else 0x13)
+        immediate = lo >> 20
+        if immediate & 0x800:
+            immediate -= 0x1000
+        assert (start + (hi & 0xfffff000) + immediate) & 0xffffffff == target
+
+    entry = address("abla_p4_application_entry")
+    fault = address("abla_p4_early_fault_entry")
+    record = address("abla_p4_early_fault_record")
+    assert struct.unpack_from("<I", data, 24)[0] == entry
+    assert entry % 64 == fault % 64 == 0 and fault == entry + 128
+    assert symbols["abla_p4_early_fault_entry"][1] >> 4 == 0
+    assert symbols["abla_p4_early_fault_record"][1] >> 4 == 0
+    assert read(record, 32) == bytes(32)
+    # Secondary-core and failed MTVEC readback branches go directly to park.
+    words(entry, [0x30047073, 0xf14022f3, 0x04029a63])
+    pair(entry + 12, 5, fault)
+    words(entry + 20, [0x0032e293, 0x30529073, 0x30502373, 0x02629e63])
+    for offset, reg, name in ((36, 3, "__abla_gp"), (44, 2, "__abla_stack_top"),
+                              (52, 5, "__abla_bss_start"), (60, 6, "__abla_bss_end")):
+        pair(entry + offset, reg, address(name))
+    assert address("__abla_stack_top") % 16 == 0
+    assert address("__abla_bss_start") % 4 == address("__abla_bss_end") % 4 == 0
+    words(entry + 68, [0x0062f863, 0x0002a023, 0x00428293, 0xff5ff06f])
+    pair(entry + 84, 1, address("abla_p4_application_main"), call=True)
+    words(entry + 92, [0x30047073, 0x10500073, 0xff9ff06f])
+    words(fault, [0x30047073])
+    pair(fault + 4, 5, record)
+    # No stack loads/calls; CSR evidence then SP/RA, fences and magic last.
+    words(fault + 12, [0x0002a023, 0xf1402373, 0x0062a223, 0x34202373,
+                      0x0062a423, 0x34102373, 0x0062a623, 0x34302373,
+                      0x0062a823, 0x30002373, 0x0062aa23, 0x0022ac23,
+                      0x0012ae23, 0x0330000f, 0x50345337, 0x45230313,
+                      0x0062a023, 0x0330000f, 0x10500073, 0xffdff06f])
+
+
+if __name__ == "__main__":
+    validate(Path(sys.argv[1]).read_bytes())
+    print("PASS: P4 entry, core guard, trap vector/readback, GP/SP/BSS, call and private fault record instructions (not hardware proof)")

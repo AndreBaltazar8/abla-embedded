@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Execute startup/refusal on an existing RAM ELF. No physical device access.
+
+Poison BSS in the paused emulator to verify Abla clears it. Default proof is
+zero; optional proof1 tests refusal of the actual reset clock/peer snapshot.
+This does NOT emulate analog PSRAM calibration or certify a board image.
+"""
+import argparse, os, pathlib, shutil, socket, struct, subprocess, tempfile, time
+
+root = pathlib.Path(__file__).resolve().parent.parent
+home = pathlib.Path.home()
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('elf',nargs='?',default=str(root/'build/tests/esp32s3-psram-entry.link.elf'))
+parser.add_argument('--admission-refusal',action='store_true',help='supply proof in emulator only; verify actual reset clock/peer state is refused')
+parser.add_argument('--invalid-request',action='store_true',help='proof3 with invalid memory arguments must be refused before clock preparation')
+options=parser.parse_args()
+if options.admission_refusal and options.invalid_request: parser.error('select one refusal scenario')
+elf=pathlib.Path(options.elf).resolve()
+data=elf.read_bytes()
+assert data[:6] == b'\x7fELF\x01\x01'
+table=struct.unpack_from('<I',data,32)[0]
+stride,count=struct.unpack_from('<HH',data,46)
+assert stride == 40
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+sh=headers[struct.unpack_from('<H',data,50)[0]];section_names=data[sh[4]:sh[4]+sh[5]]
+vectors=[h[3] for h in headers if section_names[h[0]:].split(b'\0',1)[0] == b'.iram1.abla.s3BootVectors']
+assert len(vectors) == 1 and vectors[0] & 1023 == 0
+symbols={}
+for h in headers:
+    if h[1] != 2: continue
+    sh=headers[h[6]];strings=data[sh[4]:sh[4]+sh[5]]
+    for p in range(h[4],h[4]+h[5],16):
+        n,value,size,_,_,section=struct.unpack_from('<IIIBBH',data,p)
+        name=strings[n:].split(b'\0',1)[0].decode()
+        if name and section: symbols[name]=(value,size)
+entry,size=symbols['abla_boot_entry'];halt=entry+size-3
+assert struct.unpack_from('<I',data,24)[0] == entry
+bss=symbols['__abla_bss_low'][0];end=symbols['__abla_bss_top'][0]
+result=symbols['__abla_psram_result'][0];request=symbols['__abla_psram_request'][0]
+stack_low=symbols['__abla_boot_stack_low'][0];stack_top=symbols['__abla_boot_stack_top'][0]
+assert 0x3fc88000 <= bss < end <= stack_low < stack_top <= 0x3fcc9000
+runner=['steam-run'] if shutil.which('steam-run') else []
+qemu=os.environ.get('ABLA_S3_QEMU',str(home/'.cache/abla-embedded/qemu-20250817/qemu/bin/qemu-system-xtensa'))
+gdb=os.environ.get('ABLA_S3_GDB',str(home/'.espressif/tools/xtensa-esp-elf-gdb/17.1_20260402/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb'))
+qrunner=runner[:]
+if os.environ.get('ABLA_QEMU_LIBRARY_PATH'): qrunner+=['env','LD_LIBRARY_PATH='+os.environ['ABLA_QEMU_LIBRARY_PATH']]
+with socket.socket() as probe:
+    probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
+with tempfile.TemporaryFile(mode='w+') as log:
+    process=subprocess.Popen(qrunner+[qemu,'-M','esp32s3','-display','none','-serial','none','-monitor','none','-nic','none',
+        '-device',f'loader,file={elf},cpu-num=0','-S','-gdb',f'tcp:127.0.0.1:{port}'],stdout=log,stderr=log,cwd=root)
+    try:
+        deadline=time.monotonic()+10
+        while True:
+            if process.poll() is not None:
+                log.seek(0);raise RuntimeError(log.read())
+            try:
+                with socket.create_connection(('127.0.0.1',port),timeout=.1): break
+            except OSError:
+                if time.monotonic()>deadline: raise TimeoutError('QEMU listener')
+                time.sleep(.05)
+        addresses=[0x60002000,0x60003000,0x60002014,0x60003014,0x60003050,0x600030ec,0x600c4000,0x600c4060,0x600c0060,0x600c0010,0x60008000,0x6000807c]
+        commands=[f'target remote 127.0.0.1:{port}',
+            f'python inferior=gdb.selected_inferior(); inferior.write_memory({bss}, bytes([165])*{end-bss})',
+            'python expected_status=2',
+            *([f'python inferior.write_memory({request+4},(3).to_bytes(4,"little")); inferior.write_memory({request+48},(1800).to_bytes(4,"little"))'] if options.invalid_request else []),
+            *([f'python inferior.write_memory({request+4},(1).to_bytes(4,"little")); inferior.write_memory({request+48},(1800).to_bytes(4,"little"))',
+                f'python inferior.write_memory({request+8},b"".join(v.to_bytes(4,"little") for v in [0x3c100000,65536,4194304,80,0,0,5,1,0,0]))',
+                'python rd=lambda a:int.from_bytes(inferior.read_memory(a,4),"little"); sysclk=rd(0x600c0060); cpu=rd(0x600c0010); power=rd(0x60008000); peer=rd(0x600c0000)',
+                'python mismatch=(4 if ((sysclk>>10)&3)!=1 or not(cpu&4) or (cpu&3)==3 or power&0x540 else 0)|(8 if not(peer&4) else 0); assert mismatch != 0; expected_status=0x40000|mismatch'] if options.admission_refusal else []),
+            f'python addresses={addresses!r}; before=[bytes(inferior.read_memory(a,4)) for a in addresses]; req=bytes(inferior.read_memory({request},52))',
+            f'hbreak *{halt}', 'continue',
+            f'python assert int(gdb.parse_and_eval("$pc")) == {halt}',
+            f'python actual=bytes(inferior.read_memory({bss},{end-bss})); expected=bytearray({end-bss}); expected[{result-bss}:{result-bss+4}]=expected_status.to_bytes(4,"little"); assert actual == bytes(expected)',
+            f'python assert bytes(inferior.read_memory({request},52)) == req',
+            'python assert before == [bytes(inferior.read_memory(a,4)) for a in addresses]',
+            f'python assert {stack_low} <= int(gdb.parse_and_eval("$a1")) < {stack_top}',
+            f'python assert int(gdb.parse_and_eval("$vecbase")) == {vectors[0]} and int(gdb.parse_and_eval("$cpenable")) == 0',
+            'python assert int(gdb.parse_and_eval("$intenable")) == 0 and (int(gdb.parse_and_eval("$ps")) & 15) == 15',
+            'info registers pc vecbase ps a1',
+            'python print("S3_STARTUP_REFUSAL_PASS")', 'disconnect']
+        args=runner+[gdb,'-q','-nx','-batch',str(elf)]
+        for command in commands: args+=['-ex',command]
+        completed=subprocess.run(args,capture_output=True,text=True,timeout=10)
+        if completed.returncode or 'S3_STARTUP_REFUSAL_PASS' not in completed.stdout or 'Traceback' in completed.stderr:
+            raise RuntimeError(completed.stdout+completed.stderr)
+        print(completed.stdout,end='')
+        reason='clock/peer admission' if options.admission_refusal else 'invalid-memory-request' if options.invalid_request else 'missing-contract'
+        print('PASS: S3 emulator executed entry, BSS clearing and '+reason+' refusal without clock/supply/MSPI/cache mutation; not PSRAM/hardware proof')
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try: process.wait(timeout=3)
+            except subprocess.TimeoutExpired: process.kill();process.wait()

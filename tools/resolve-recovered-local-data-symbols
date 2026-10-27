@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Resolve object-local .LC data symbols in monolithic recovered Abla source."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import subprocess
+import tempfile
+
+
+ABI_SYMBOL = re.compile(r"^// Original ABI symbol: ([^\n]+)$", re.MULTILINE)
+LOCAL_DATA = re.compile(r"(?<![A-Za-z0-9_])\.LC[A-Za-z0-9_.$]*")
+NM_MEMBER = re.compile(r"^(.*\.a):([^:]+):[0-9A-Fa-f]+\s+\S\s+(\S+)$")
+SECTION = re.compile(r"^\s*\[\s*(\d+)\]\s+(\S+)\s+", re.MULTILINE)
+SYMBOL = re.compile(
+    r"^\s*\d+:\s+([0-9A-Fa-f]+)\s+\d+\s+\S+\s+LOCAL\s+"
+    r"\S+\s+(\d+)\s+(\.LC[A-Za-z0-9_.$]*)$",
+    re.MULTILINE,
+)
+
+
+def run(*command: str, binary: bool = False) -> str | bytes:
+    return subprocess.run(
+        command, check=True, stdout=subprocess.PIPE,
+        text=not binary,
+    ).stdout
+
+
+def archive_symbol_index(
+    archives: list[pathlib.Path], wanted: set[str]
+) -> dict[str, list[tuple[pathlib.Path, str]]]:
+    found: dict[str, list[tuple[pathlib.Path, str]]] = {}
+    for archive in archives:
+        output = run("nm", "-A", "--defined-only", str(archive))
+        assert isinstance(output, str)
+        for line in output.splitlines():
+            match = NM_MEMBER.match(line)
+            if match is None or match.group(3) not in wanted:
+                continue
+            found.setdefault(match.group(3), []).append((
+                pathlib.Path(match.group(1)), match.group(2)
+            ))
+    return found
+
+
+def owning_members(
+    source: str,
+    index: dict[str, list[tuple[pathlib.Path, str]]],
+) -> list[tuple[pathlib.Path, str]]:
+    owners: list[tuple[pathlib.Path, str]] = []
+    for symbol in ABI_SYMBOL.findall(source):
+        for candidate in index.get(symbol, []):
+            if candidate not in owners:
+                owners.append(candidate)
+    if not owners:
+        raise ValueError("no archive member owns a recovered ABI symbol")
+    return owners
+
+
+def local_data_locations(
+    archive: pathlib.Path, member: str
+) -> list[dict[str, tuple[str, int]]]:
+    members_output = run("ar", "t", str(archive))
+    assert isinstance(members_output, str)
+    instances = sum(
+        line == member for line in members_output.splitlines()
+    )
+    objects: list[bytes] = []
+    if instances == 1:
+        contents = run("ar", "p", str(archive), member, binary=True)
+        assert isinstance(contents, bytes)
+        objects.append(contents)
+    else:
+        # GNU archives may contain target-generic and chip-specific objects
+        # with the same basename. `ar p` silently returns only the first;
+        # extract each numbered instance so the monolithic source can recover
+        # constants from both.
+        for instance in range(1, instances + 1):
+            with tempfile.TemporaryDirectory() as directory:
+                subprocess.run(
+                    ["ar", "xN", str(instance), str(archive), member],
+                    check=True, cwd=directory,
+                )
+                objects.append((pathlib.Path(directory) / member).read_bytes())
+    results: list[dict[str, tuple[str, int]]] = []
+    for contents in objects:
+        with tempfile.NamedTemporaryFile(suffix=".o") as extracted:
+            extracted.write(contents)
+            extracted.flush()
+            sections_output = run("readelf", "-SW", extracted.name)
+            symbols_output = run("readelf", "-Ws", extracted.name)
+        assert isinstance(sections_output, str)
+        assert isinstance(symbols_output, str)
+        sections = {
+            int(index): name
+            for index, name in SECTION.findall(sections_output)
+        }
+        locations: dict[str, tuple[str, int]] = {}
+        for value, section_index, name in SYMBOL.findall(symbols_output):
+            section = sections.get(int(section_index))
+            if section is not None:
+                locations[name] = (section, int(value, 16))
+        results.append(locations)
+    return results
+
+
+def section_start_label(source: str, section: str) -> str:
+    block = re.search(
+        rf"\.pushsection {re.escape(section)}(?:,.*?)?\\n"
+        rf"(?P<body>.*?)\.popsection",
+        source,
+    )
+    if block is None:
+        raise ValueError(f"recovered source does not own section {section}")
+    label = re.search(
+        r"(?:^|\\n)([.$A-Za-z_][.$A-Za-z0-9_\\$]*):\\n",
+        block.group("body"),
+    )
+    if label is None:
+        raise ValueError(f"recovered section {section} has no start label")
+    return label.group(1)
+
+
+def resolve_source(
+    path: pathlib.Path,
+    index: dict[str, list[tuple[pathlib.Path, str]]],
+) -> int:
+    source = path.read_text()
+    referenced = set(LOCAL_DATA.findall(source))
+    defined = set(re.findall(
+        r"(?<![A-Za-z0-9_])(\.LC[A-Za-z0-9_.$]*):", source
+    ))
+    unresolved = sorted(referenced - defined)
+    if not unresolved:
+        return 0
+    owners = owning_members(source, index)
+    locations = {
+        owner: local_data_locations(*owner) for owner in owners
+    }
+    replacements: dict[str, str] = {}
+    for name in unresolved:
+        candidates: list[tuple[str, pathlib.Path, str]] = []
+        for archive, member in owners:
+            for instance_locations in locations[(archive, member)]:
+                location = instance_locations.get(name)
+                if location is None:
+                    continue
+                section, offset = location
+                try:
+                    label = section_start_label(source, section)
+                except ValueError:
+                    continue
+                target = label if offset == 0 else f"{label}+0x{offset:x}"
+                candidate = (target, archive, member)
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        targets = {candidate[0] for candidate in candidates}
+        if len(targets) != 1:
+            owners_text = ", ".join(
+                f"{archive}({member}) -> {target}"
+                for target, archive, member in candidates
+            ) or "none"
+            raise ValueError(
+                f"{path}: {name} has no unique recovered owner: {owners_text}"
+            )
+        replacements[name] = next(iter(targets))
+    for name in sorted(replacements, key=len, reverse=True):
+        source = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_.$])",
+            replacements[name], source,
+        )
+    path.write_text(source)
+    print(f"{path}: resolved {len(replacements)} local data symbol(s)")
+    return len(replacements)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--archives", required=True, type=pathlib.Path)
+    parser.add_argument("sources", nargs="+", type=pathlib.Path)
+    arguments = parser.parse_args()
+    archives = sorted(arguments.archives.rglob("*.a"))
+    wanted: set[str] = set()
+    for path in arguments.sources:
+        wanted.update(ABI_SYMBOL.findall(path.read_text()))
+    index = archive_symbol_index(archives, wanted)
+    resolved = 0
+    for path in arguments.sources:
+        resolved += resolve_source(path, index)
+    print(f"resolved {resolved} object-local data symbol(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

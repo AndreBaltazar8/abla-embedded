@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Replace same-module Xtensa symbol addresses with Abla-owned addresses.
+
+Recovered modules retain exact ABI symbol comments and deterministic names for
+their static data. When an address use and its owner are in the same module,
+there is no linker boundary: nativeFunctionAddress or the static allocation's
+ordinary Abla value is both more precise and more optimizable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pathlib
+import re
+
+
+# Reconstructed f-string sources historically used doubled braces while
+# hand-written target modules use the subparser's ordinary single braces.
+ADDRESS = re.compile(
+    r"\$xtensa\s+address\s+\{\{?\s*([^{}\s]+)\s*\}\}?"
+)
+FUNCTION = re.compile(
+    r"// Original ABI symbol:\s*([^\n]+)\n"
+    r"(?:\s*//[^\n]*\n|\s*@[A-Za-z_][^\n]*\n)*"
+    r"\s*(?:trusted\s+)?fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.MULTILINE,
+)
+SECTION_FUNCTION = re.compile(
+    r"// Original section-local ABI symbol:\s*([^\n]+)\n"
+    r"(?:\s*//[^\n]*\n|\s*@[A-Za-z_][^\n]*\n)*"
+    r"\s*(?:trusted\s+)?fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.MULTILINE,
+)
+INTERNAL = re.compile(
+    r'#?(?:internal|export)Function\(\s*'
+    r'"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"([^"]+)"\s*\)',
+    re.DOTALL,
+)
+DECLARATION = re.compile(
+    r"(?m)^(?:@[A-Za-z_][^\n]*\n)*\s*(?:trusted\s+)?fun\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+IMPORT = re.compile(r'(?m)^import\s+"([^"]+)"\s*$')
+
+
+def data_identifier(symbol: str) -> str:
+    readable = re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
+    if not readable or readable[0].isdigit():
+        readable = "data_" + readable
+    digest = hashlib.sha1(symbol.encode()).hexdigest()[:10]
+    return f"esp32Data_{readable}_{digest}"
+
+
+def recovered_local_key(symbol: str) -> str:
+    value = symbol
+    if value.startswith(".text."):
+        value = value[len(".text."):]
+    value = value.replace("$part$", "_part_")
+    return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
+
+
+def ensure_imports(source: str, imports: set[str]) -> str:
+    statements = [f'import "{name}"' for name in sorted(imports)]
+    existing = set(source.splitlines())
+    statements = [statement for statement in statements if statement not in existing]
+    if not statements:
+        return source
+    lines = source.splitlines(keepends=True)
+    insertion = 0
+    while insertion < len(lines) and lines[insertion].startswith("import "):
+        insertion += 1
+    lines[insertion:insertion] = [statement + "\n" for statement in statements]
+    return "".join(lines)
+
+
+def lower_source(source: str) -> tuple[str, int, int]:
+    functions = {symbol.strip(): name for symbol, name in FUNCTION.findall(source)}
+    functions.update(
+        {symbol.strip(): name for symbol, name in SECTION_FUNCTION.findall(source)}
+    )
+    for function, symbol in INTERNAL.findall(source):
+        functions[symbol] = function
+    # Section-local object symbols and their collision-proof reconstructed
+    # bindings use different prefixes but retain the same normalized suffix.
+    # Infer aliases only within one module and only when the match is unique.
+    for symbol in set(ADDRESS.findall(source)):
+        if symbol in functions:
+            continue
+        key = recovered_local_key(symbol)
+        candidates = {
+            function for bound, function in INTERNAL.findall(source)
+            if any(recovered_local_key(bound).endswith(prefix + key)
+                   for prefix in ("local_", "local_text_"))
+        }
+        if len(candidates) == 1:
+            functions[symbol] = candidates.pop()
+    data: dict[str, str] = {}
+    identifiers = set(re.findall(
+        r"(?m)^val\s+(esp32Data_[A-Za-z0-9_]+)\s*=", source
+    ))
+    identifiers = {
+        identifier for identifier in identifiers
+        if not identifier.endswith(("Storage", "Initialized"))
+    }
+    for symbol in set(ADDRESS.findall(source)):
+        identifier = data_identifier(symbol)
+        if re.search(rf"(?m)^val\s+{re.escape(identifier)}\s*=", source):
+            data[symbol] = identifier
+            continue
+        # Data emitted from a renamed section records the original alias twice
+        # in its readable identifier. That repeated exact key is unambiguous
+        # and lets the source use the Abla allocation rather than an ELF lookup.
+        key = recovered_local_key(symbol)
+        repeated = re.compile(rf"(?:^|_){re.escape(key)}_{re.escape(key)}(?:_|$)")
+        candidates = {identifier for identifier in identifiers if repeated.search(identifier.lower())}
+        if len(candidates) == 1:
+            data[symbol] = candidates.pop()
+
+    function_count = 0
+    data_count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal function_count, data_count
+        symbol = match.group(1)
+        function = functions.get(symbol)
+        if function is not None:
+            function_count += 1
+            return f"u32(nativeFunctionAddress({function}))"
+        value = data.get(symbol)
+        if value is not None:
+            data_count += 1
+            return value
+        return match.group(0)
+
+    lowered = ADDRESS.sub(replace, source)
+    if function_count:
+        lowered = ensure_imports(lowered, {"abla/unsafe/native"})
+    return lowered, function_count, data_count
+
+
+def relative_import(caller: pathlib.Path, owner: pathlib.Path) -> str:
+    value = os.path.relpath(owner, caller.parent)
+    if not value.startswith("."):
+        value = "./" + value
+    return pathlib.PurePath(value).as_posix()
+
+
+def import_graph(paths: list[pathlib.Path]) -> dict[pathlib.Path, set[pathlib.Path]]:
+    known = {path.resolve(): path for path in paths}
+    graph = {path: set() for path in paths}
+    for path in paths:
+        for imported in IMPORT.findall(path.read_text()):
+            if not imported.endswith(".ab"):
+                continue
+            resolved = (path.parent / imported).resolve()
+            owner = known.get(resolved)
+            if owner is not None:
+                graph[path].add(owner)
+    return graph
+
+
+def reaches(
+    graph: dict[pathlib.Path, set[pathlib.Path]],
+    start: pathlib.Path,
+    wanted: pathlib.Path,
+) -> bool:
+    pending = [start]
+    seen: set[pathlib.Path] = set()
+    while pending:
+        current = pending.pop()
+        if current == wanted:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(graph.get(current, ()))
+    return False
+
+
+def lower_cross_module_functions(
+    paths: list[pathlib.Path], write: bool
+) -> tuple[int, int, int]:
+    definitions: dict[str, pathlib.Path] = {}
+    ambiguous_names: set[str] = set()
+    sources = {path: path.read_text() for path in paths}
+    for path, source in sources.items():
+        for name in DECLARATION.findall(source):
+            previous = definitions.get(name)
+            if previous is not None and previous != path:
+                ambiguous_names.add(name)
+            else:
+                definitions[name] = path
+    for name in ambiguous_names:
+        definitions.pop(name, None)
+
+    symbols: dict[str, tuple[str, pathlib.Path]] = {}
+    ambiguous_symbols: set[str] = set()
+    for path, source in sources.items():
+        candidates = [(symbol.strip(), name) for symbol, name in FUNCTION.findall(source)]
+        candidates.extend(
+            (symbol.strip(), name)
+            for symbol, name in SECTION_FUNCTION.findall(source)
+        )
+        candidates.extend((symbol, name) for name, symbol in INTERNAL.findall(source))
+        for symbol, name in candidates:
+            owner = definitions.get(name)
+            if owner is None:
+                continue
+            value = (name, owner)
+            previous = symbols.get(symbol)
+            if previous is not None and previous != value:
+                ambiguous_symbols.add(symbol)
+            else:
+                symbols[symbol] = value
+    for symbol in ambiguous_symbols:
+        symbols.pop(symbol, None)
+
+    # Apply the same exact-suffix rule used within a module to references to
+    # section-local callbacks owned by another imported Abla module.
+    all_bindings: list[tuple[str, str, pathlib.Path]] = []
+    for source in sources.values():
+        for name, bound in INTERNAL.findall(source):
+            owner = definitions.get(name)
+            if owner is not None:
+                all_bindings.append((bound, name, owner))
+        for bound, name in SECTION_FUNCTION.findall(source):
+            owner = definitions.get(name)
+            if owner is not None:
+                all_bindings.append((bound.strip(), name, owner))
+    for source in sources.values():
+        for symbol in ADDRESS.findall(source):
+            if symbol in symbols:
+                continue
+            key = recovered_local_key(symbol)
+            candidates = {
+                (name, owner) for bound, name, owner in all_bindings
+                if any(recovered_local_key(bound).endswith(prefix + key)
+                       for prefix in ("local_", "local_text_"))
+            }
+            if len(candidates) == 1:
+                symbols[symbol] = candidates.pop()
+
+    graph = import_graph(paths)
+    lowered_count = cycle_count = link_owner_count = 0
+    changed_files = 0
+    for path in paths:
+        source = sources[path]
+        imports: set[str] = set()
+        needs_native = False
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal lowered_count, cycle_count, link_owner_count, needs_native
+            symbol = match.group(1)
+            mapped = symbols.get(symbol)
+            if mapped is None:
+                return match.group(0)
+            function, owner = mapped
+            if owner == path:
+                lowered_count += 1
+                needs_native = True
+                return f"u32(nativeFunctionAddress({function}))"
+            # Importing a compatibility link-selector would retain precisely
+            # the public ABI root this conversion is intended to eliminate.
+            if "_link" in owner.stem:
+                link_owner_count += 1
+                return match.group(0)
+            if reaches(graph, owner, path):
+                cycle_count += 1
+                return match.group(0)
+            graph[path].add(owner)
+            imports.add(relative_import(path, owner))
+            lowered_count += 1
+            needs_native = True
+            return f"u32(nativeFunctionAddress({function}))"
+
+        lowered = ADDRESS.sub(replace, source)
+        if needs_native:
+            imports.add("abla/unsafe/native")
+            lowered = ensure_imports(lowered, imports)
+        if lowered != source:
+            changed_files += 1
+            if write:
+                path.write_text(lowered)
+    return lowered_count, cycle_count, link_owner_count
+
+
+def lower_cross_module_data(
+    paths: list[pathlib.Path], write: bool
+) -> tuple[int, int]:
+    sources = {path: path.read_text() for path in paths}
+    declarations: dict[str, pathlib.Path] = {}
+    ambiguous: set[str] = set()
+    for path, source in sources.items():
+        for identifier in re.findall(
+            r"(?m)^val\s+(esp32Data_[A-Za-z0-9_]+)\s*=", source
+        ):
+            previous = declarations.get(identifier)
+            if previous is not None and previous != path:
+                ambiguous.add(identifier)
+            else:
+                declarations[identifier] = path
+    for identifier in ambiguous:
+        declarations.pop(identifier, None)
+
+    symbols: dict[str, tuple[str, pathlib.Path]] = {}
+    for source in sources.values():
+        for symbol in ADDRESS.findall(source):
+            identifier = data_identifier(symbol)
+            owner = declarations.get(identifier)
+            if owner is not None:
+                symbols[symbol] = (identifier, owner)
+
+    graph = import_graph(paths)
+    lowered_count = cycle_count = 0
+    for path in paths:
+        source = sources[path]
+        imports: set[str] = set()
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal lowered_count, cycle_count
+            mapped = symbols.get(match.group(1))
+            if mapped is None:
+                return match.group(0)
+            identifier, owner = mapped
+            if owner != path:
+                # An already imported owner adds no dependency edge. This is
+                # especially important for mutually recursive recovered PHY
+                # modules that already compile as one monolithic Abla unit.
+                if owner not in graph[path] and reaches(graph, owner, path):
+                    cycle_count += 1
+                    return match.group(0)
+                graph[path].add(owner)
+                imports.add(relative_import(path, owner))
+            lowered_count += 1
+            return identifier
+
+        lowered = ADDRESS.sub(replace, source)
+        if imports:
+            lowered = ensure_imports(lowered, imports)
+        if lowered != source and write:
+            path.write_text(lowered)
+    return lowered_count, cycle_count
+
+
+def source_paths(arguments: list[pathlib.Path]) -> list[pathlib.Path]:
+    paths: list[pathlib.Path] = []
+    for argument in arguments:
+        if argument.is_dir():
+            paths.extend(sorted(argument.rglob("*.ab")))
+        elif argument.suffix == ".ab":
+            paths.append(argument)
+    return list(dict.fromkeys(paths))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--cross-module-functions", action="store_true")
+    parser.add_argument("--cross-module-data", action="store_true")
+    parser.add_argument("paths", nargs="+", type=pathlib.Path)
+    arguments = parser.parse_args()
+    functions = data = changed = 0
+    for path in source_paths(arguments.paths):
+        original = path.read_text()
+        lowered, function_count, data_count = lower_source(original)
+        if lowered == original:
+            continue
+        changed += 1
+        functions += function_count
+        data += data_count
+        if arguments.write:
+            path.write_text(lowered)
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {functions} function and {data} data addresses "
+        f"in {changed} files"
+    )
+    if arguments.cross_module_functions:
+        cross, cycles, link_owners = lower_cross_module_functions(
+            source_paths(arguments.paths), arguments.write
+        )
+        print(
+            f"{action} {cross} cross-module function addresses; "
+            f"skipped cycles={cycles}, link-selector owners={link_owners}"
+        )
+    if arguments.cross_module_data:
+        data_cross, data_cycles = lower_cross_module_data(
+            source_paths(arguments.paths), arguments.write
+        )
+        print(
+            f"{action} {data_cross} cross-module data addresses; "
+            f"skipped cycles={data_cycles}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

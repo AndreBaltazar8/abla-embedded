@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Regression check for nested recovered-call conversion."""
+
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+tool = Path(__file__).with_name("direct-recovered-xtensa-calls")
+parameters = ", ".join(
+    [f"a{index}: u32" for index in range(2, 8)]
+    + [f"stack{index}: u32" for index in range(10)]
+)
+
+with tempfile.TemporaryDirectory(prefix="abla-direct-call-check-") as directory:
+    root = Path(directory)
+    source = root / "nested.ab"
+    source.write_text(
+        f'''val innerLink = #internalFunction("inner", "inner_symbol")
+val outerLink = #internalFunction("outer", "outer_symbol")
+
+trusted fun inner({parameters}): u32 {{ a2 }}
+trusted fun outer({parameters}): u32 {{ a2 + a3 }}
+
+trusted fun caller({parameters}): u32 {{
+    var r10 = a2
+    var r11 = a3
+    r10 = $xtensa call {{outer_symbol}}(
+        $xtensa call {{inner_symbol}}(r10),
+        r11
+    )
+    r10
+}}
+'''
+    )
+    subprocess.run([str(tool), str(root), "--write"], check=True)
+    rewritten = source.read_text()
+
+expected_inner = "inner(r10, u32(0), u32(0), u32(0), u32(0), u32(0)"
+expected_outer = "r10 = outer(inner(r10, u32(0)"
+if expected_inner not in rewritten or expected_outer not in rewritten:
+    raise SystemExit(f"nested calls were not converted intact:\n{rewritten}")
+if "$xtensa call" in rewritten:
+    raise SystemExit(f"nested target call remained after conversion:\n{rewritten}")
+
+print("Nested recovered Xtensa call conversion passed")
+
+with tempfile.TemporaryDirectory(prefix="abla-wide-call-check-") as directory:
+    root = Path(directory)
+    source = root / "wide.ab"
+    source.write_text('''trusted fun caller(a2:u32):u32 {
+    var r10 = a2
+    var r11 = u32(0)
+    val unsignedResult = $xtensa callWide {__floatunsidf}(r10)
+    r10 = u32(unsignedResult)
+    r11 = u32(unsignedResult >>> u64(32))
+    val signedResult = $xtensa callWide {__floatsidf}(r10)
+    r10 = u32(signedResult)
+    r11 = u32(signedResult >>> u64(32))
+    val timerResult = $xtensa callWide {esp_timer_get_time}()
+    r10 = u32(timerResult)
+    r11 = u32(timerResult >>> u64(32))
+    val tlsTimeResult = $xtensa callWide {esp_tls_get_platform_time}()
+    r10 = u32(tlsTimeResult)
+    r11 = u32(tlsTimeResult >>> u64(32))
+    r11
+}
+''')
+    subprocess.run([str(tool), str(root), "--write"], check=True)
+    rewritten = source.read_text()
+    for name, expression in [
+        ("unsignedResult", "esp32Unsigned32ToBinary64(r10)"),
+        ("signedResult", "esp32Signed32ToBinary64(i32(r10))"),
+        ("timerResult", "esp32TimerTimeMicroseconds()"),
+        ("tlsTimeResult", "esp32TimerTimeMicroseconds()"),
+    ]:
+        assert f"val {name} = {expression}" in rewritten, rewritten
+        assert f"r11 = u32({name} >>> u64(32))" in rewritten, rewritten
+    assert "$xtensa callWide" not in rewritten, rewritten
+
+print("Binary64 conversion and timestamps preserve both return words")

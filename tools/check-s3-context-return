@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Validate complete emitted level1..3 return tails and shared context restore.
+
+ELF32 relocatable or final linked ELF; not exception/hardware execution proof.
+"""
+import struct
+import sys
+from pathlib import Path
+
+data=Path(sys.argv[1]).read_bytes()
+assert data[:6] == b'\x7fELF\x01\x01'
+table=struct.unpack_from('<I',data,32)[0]
+stride,count,names_index=struct.unpack_from('<HHH',data,46)
+assert stride == 40 and names_index < count
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+n= headers[names_index]
+names=data[n[4]:n[4]+n[5]]
+index=next(i for i,s in enumerate(headers) if names[s[0]:].split(b'\0',1)[0] == b'.iram1.abla.s3ContextReturns')
+section=headers[index]
+code=data[section[4]:section[4]+section[5]]
+functions=[]
+for s in headers:
+    if s[1] != 2: continue
+    assert s[9] == 16
+    for offset in range(s[4],s[4]+s[5],16):
+        _,value,size,info,_,shndx=struct.unpack_from('<IIIBBH',data,offset)
+        if shndx == index and info & 15 == 2:
+            functions.append((value-section[3],size))
+assert len(functions) == 1
+base,size=functions[0]
+for level in (1,2,3):
+    pc=base+(level-1)*64
+    # CALL0 is expanded by the target assembly adapter to L32R/CALLX0.
+    if code[pc] == 1:
+        assert code[pc+3:pc+6] == bytes.fromhex('c00000')
+        immediate=int.from_bytes(code[pc+1:pc+3],'little',signed=True)
+        literal=((pc+3) & ~3)+immediate*4
+        assert 0 <= literal <= len(code)-4
+        assert struct.unpack_from('<I',code,literal)[0] == section[3]+base+192
+    else:
+        # Link relaxation preserves slot size: OR a1,a1,a1 then direct CALL0.
+        assert code[pc:pc+3] == bytes.fromhex('101120')
+        instruction=int.from_bytes(code[pc+3:pc+6],'little')
+        assert instruction & 63 == 5
+        displacement=instruction>>6
+        if displacement & (1<<17): displacement-=1<<18
+        assert ((pc+3) & ~3)+4+displacement*4 == base+192
+    expected=bytes.fromhex('0821')
+    expected+=bytes((0,0xE6 if level == 1 else 0xC0+level,0x13))
+    expected+=bytes.fromhex('0811')+bytes((0,0xB0+level,0x13))
+    expected+=bytes.fromhex('0831 1841 102000')
+    expected+=bytes.fromhex('003000') if level == 1 else bytes((0x10,0x30+level,0))
+    assert code[pc+6:pc+6+len(expected)] == expected, 'incorrect PS/PC/A0/SP return order'
+    assert not any(code[pc+6+len(expected):base+level*64]), 'unexpected instructions in slot padding'
+
+# Independent S3 frame layout and register encodings for shared restore.
+expected=bytearray()
+for i,reg in enumerate((None,16,17,4,12,32,33,34,35)):
+    expected+=bytes((0x32,0x21,28+i)) # L32I a3,a1,112+4*i
+    expected+=bytes.fromhex('30e7f3') if reg is None else bytes((0x30,reg,0x13))
+for slot,reg in ((22,0),(23,1),(24,2),(19,3)):
+    expected+=bytes((0x32,0x21,slot,0x30,reg,0x13))
+for reg in range(2,16):
+    slot=3+reg
+    expected+=bytes(((reg<<4)|8,(slot<<4)|1)) if slot < 16 else bytes(((reg<<4)|2,0x21,slot))
+expected+=bytes.fromhex('102000 0df0')
+assert code[base+192:] == expected and size == 192+len(expected)
+print('PASS: three return paths reach shared restore, exact frame/register/return encodings; not hardware proof')

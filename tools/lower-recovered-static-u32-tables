@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Lower startup-written recovered rodata word tables to nativeStaticU32s.
+
+Only exact 32-bit tables in recovered `_data_rodata_` storage are accepted.
+Sparse layouts are filled with the zeroes supplied by the original static
+allocation. Mutable data, mixed-width stores, and expressions containing
+run-time calls are deliberately left unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+
+
+STORAGE = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage = "
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)$"
+)
+INITIALIZER = re.compile(
+    r"^trusted fun (?P<base>[A-Za-z_][A-Za-z0-9_]*)Initialize\(\): int \{$"
+)
+STORE = re.compile(
+    r"^    ablaUnsafeStoreU32\(nativePointerFromAddress\("
+    r"(?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage \+ (?P<offset>[0-9]+)\), "
+    r"(?P<value>.+)\)$"
+)
+RETURN = re.compile(
+    r"^    (?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage$"
+)
+INITIALIZED = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*)Initialized = "
+    r"(?P=base)Initialize\(\)$"
+)
+ADDRESS = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*) = "
+    r"u32\((?P=base)Initialized\)$"
+)
+CALL = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+CONSTANT_CALLS = {
+    "int",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "nativeFunctionAddress",
+}
+
+
+def constant_expression(value: str) -> bool:
+    if any(character in value for character in "[]{}?:&|*/%<>=!\"'"):
+        return False
+    return all(call in CONSTANT_CALLS for call in CALL.findall(value))
+
+
+def lower_source(source: str) -> tuple[str, int, int]:
+    lines = source.splitlines()
+    output: list[str] = []
+    tables = words = 0
+    index = 0
+    while index < len(lines):
+        storage = STORAGE.match(lines[index])
+        if not storage or "_data_rodata_" not in storage.group("base"):
+            output.append(lines[index])
+            index += 1
+            continue
+
+        base = storage.group("base")
+        size = int(storage.group("size"))
+        cursor = index + 1
+        if cursor >= len(lines):
+            output.append(lines[index])
+            index += 1
+            continue
+        initializer = INITIALIZER.match(lines[cursor])
+        if not initializer or initializer.group("base") != base:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        cursor += 1
+        stored_values: dict[int, str] = {}
+        duplicate_offset = False
+        while cursor < len(lines):
+            store = STORE.match(lines[cursor])
+            if not store or store.group("base") != base:
+                break
+            offset = int(store.group("offset"))
+            if offset in stored_values:
+                duplicate_offset = True
+            stored_values[offset] = store.group("value")
+            cursor += 1
+
+        offsets = list(stored_values)
+        valid = (
+            size > 0
+            and size % 4 == 0
+            and bool(stored_values)
+            and not duplicate_offset
+            and all(offset % 4 == 0 and offset < size for offset in offsets)
+            and all(constant_expression(value) for value in stored_values.values())
+            and cursor + 4 < len(lines)
+            and bool(RETURN.match(lines[cursor]))
+            and RETURN.match(lines[cursor]).group("base") == base
+            and lines[cursor + 1] == "}"
+            and bool(INITIALIZED.match(lines[cursor + 2]))
+            and INITIALIZED.match(lines[cursor + 2]).group("base") == base
+            and bool(ADDRESS.match(lines[cursor + 3]))
+            and ADDRESS.match(lines[cursor + 3]).group("base") == base
+        )
+        if not valid:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        values = [stored_values.get(offset, "0") for offset in range(0, size, 4)]
+        output.append(f"val {base}Storage = nativeStaticU32s([")
+        for value_index, value in enumerate(values):
+            suffix = "," if value_index + 1 < len(values) else ""
+            output.append(f"    {value}{suffix}")
+        output.append("])")
+        output.append(f"val {base}Initialized = {base}Storage")
+        output.append(f"val {base} = u32({base}Initialized)")
+        tables += 1
+        words += len(values)
+        index = cursor + 4
+
+    trailing = "\n" if source.endswith("\n") else ""
+    return "\n".join(output) + trailing, tables, words
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=pathlib.Path)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+
+    files: list[pathlib.Path] = []
+    for path in arguments.paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.ab")))
+        elif path.suffix == ".ab":
+            files.append(path)
+
+    changed_files = tables = words = 0
+    for path in files:
+        original = path.read_text()
+        lowered, file_tables, file_words = lower_source(original)
+        if lowered == original:
+            continue
+        changed_files += 1
+        tables += file_tables
+        words += file_words
+        if arguments.write:
+            path.write_text(lowered)
+
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {tables} recovered rodata u32 table(s) with "
+        f"{words} link-time word(s) in {changed_files} file(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

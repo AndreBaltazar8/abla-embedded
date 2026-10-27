@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Place the transitive relocation closure of IRAM/DRAM roots in internal sections.
+
+Post-codegen placement only: no instruction, data, symbol or linkage changes.
+Preserves monolithic LLVM optimization. Does NOT prove computed pointers,
+stack placement, final linker addresses/capacity, or hardware correctness.
+Xtensa literal pools stay in IRAM for l32r reach, not remote DRAM.
+"""
+import argparse
+import struct
+import subprocess
+from pathlib import Path
+
+
+def internal(name):
+    return name in ('.iram1', '.dram1') or name.startswith(('.iram1.', '.dram1.'))
+
+
+def plan(sections, edges):
+    # Sections: (name, flags, size); edges include code, data and function tables.
+    roots = [i for i, (name, flags, _) in enumerate(sections) if internal(name) and flags & 2]
+    if not roots:
+        raise ValueError('no allocated internal roots')
+    pending = roots[:]
+    seen = set()
+    while pending:
+        index = pending.pop()
+        if index in seen:
+            continue
+        if index < 0 or index >= len(sections) or not sections[index][1] & 2:
+            raise ValueError('internal closure references unresolved or non-allocated storage')
+        seen.add(index)
+        pending.extend(edges.get(index, ()))
+    renames = []
+    for index in sorted(seen):
+        name, flags, _ = sections[index]
+        if internal(name):
+            continue
+        if not name or any(c in name for c in '=,\n\r'):
+            raise ValueError('unsupported section name')
+        code = flags & 4 or name == '.literal' or name.startswith('.literal.')
+        renamed = ('.iram1.' if code else '.dram1.') + 'abla.closure' + name
+        if renamed in {s[0] for s in sections}:
+            raise ValueError('placement name collision')
+        renames.append((name, renamed))
+    return renames
+
+
+def inspect(data, linker_symbols=()):
+    if data[:6] != b'\x7fELF\x01\x01' or len(data) < 52:
+        raise ValueError('expected little-endian ELF32')
+    offset = struct.unpack_from('<I', data, 32)[0]
+    stride, count, names_index = struct.unpack_from('<HHH', data, 46)
+    if stride != 40 or not count or names_index >= count or offset+count*40 > len(data):
+        raise ValueError('invalid section table')
+    raw = [struct.unpack_from('<10I', data, offset+i*40) for i in range(count)]
+    def payload(section):
+        if section[4]+section[5] > len(data):
+            raise ValueError('truncated section')
+        return data[section[4]:section[4]+section[5]]
+    names = payload(raw[names_index])
+    sections = []
+    for section in raw:
+        end = names.find(b'\0', section[0])
+        if end < 0:
+            raise ValueError('invalid section name')
+        sections.append((names[section[0]:end].decode('ascii'), section[2], section[5]))
+    if len({s[0] for s in sections}) != len(sections):
+        raise ValueError('ambiguous duplicate section names')
+    edges = {}
+    for section in raw:
+        if section[1] not in (4, 9):
+            continue
+        if section[7] >= count or section[6] >= count:
+            raise ValueError('invalid relocation links')
+        symbols = raw[section[6]]
+        width = 12 if section[1] == 4 else 8
+        if section[9] != width or symbols[9] != 16 or section[5] % width:
+            raise ValueError('invalid relocation/symbol stride')
+        table = payload(symbols)
+        relocs = payload(section)
+        for pos in range(0, len(relocs), width):
+            info = struct.unpack_from('<I', relocs, pos+4)[0]
+            if info & 255 == 0:
+                continue
+            symbol = info >> 8
+            if (symbol+1)*16 > len(table):
+                raise ValueError('invalid relocation symbol')
+            target = struct.unpack_from('<H', table, symbol*16+14)[0]
+            if target == 0 and linker_symbols:
+                if symbols[6] >= count:
+                    raise ValueError('invalid symbol string table')
+                strings = payload(raw[symbols[6]])
+                name_offset = struct.unpack_from('<I', table, symbol*16)[0]
+                end = strings.find(b'\0', name_offset)
+                if end < 0:
+                    raise ValueError('invalid symbol name')
+                if strings[name_offset:end].decode('ascii') in linker_symbols:
+                    continue  # Exact caller-declared boundary; final link must resolve it.
+            if target == 0xfff1:  # absolute ROM/hardware boundary
+                continue
+            edges.setdefault(section[7], set()).add(target)
+    return sections, edges
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('source', type=Path)
+    parser.add_argument('output', type=Path)
+    parser.add_argument('--objcopy', default='llvm-objcopy')
+    parser.add_argument('--linker-symbol', action='append', default=[], help='exact linker-owned boundary; requires final no-undefined/address checks')
+    args = parser.parse_args()
+    if args.source.resolve() == args.output.resolve():
+        raise ValueError('preserve the input object; use a distinct output')
+    original = args.source.read_bytes()
+    sections, edges = inspect(original, args.linker_symbol)
+    renames = plan(sections, edges)
+    command = [args.objcopy]
+    for old, new in renames:
+        command.extend(['--rename-section', old+'='+new])
+    subprocess.run(command+[str(args.source), str(args.output)], check=True)
+    output = args.output.read_bytes()
+    placed, placed_edges = inspect(output, args.linker_symbol)
+    if plan(placed, placed_edges):
+        raise ValueError('internal closure remains incomplete')
+    def contents(data, labels):
+        offset = struct.unpack_from('<I', data, 32)[0]
+        result = {}
+        for index, (name, flags, size) in enumerate(labels):
+            if not flags & 2:
+                continue
+            section = struct.unpack_from('<10I', data, offset+index*40)
+            payload = None if section[1] == 8 else data[section[4]:section[4]+size]
+            result[name] = (section[1], flags, size, payload)
+        return result
+    mapping = dict(renames)
+    expected = {mapping.get(name, name): value for name, value in contents(original, sections).items()}
+    if expected != contents(output, placed):
+        raise ValueError('placement changed allocated bytes, flags, sizes or section types')
+    print(f'PASS: placed {len(renames)} sections; original monolithic object preserved; not final-link/hardware proof')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, struct.error, subprocess.CalledProcessError) as error:
+        raise SystemExit(str(error))

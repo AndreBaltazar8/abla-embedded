@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Check emitted IRQ shell ABI/order. Not nested hardware execution proof."""
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+data=Path(sys.argv[1]).read_bytes()
+assert data[:6] == b'\x7fELF\x01\x01'
+table=struct.unpack_from('<I',data,32)[0]
+stride,count,names_index=struct.unpack_from('<HHH',data,46)
+assert stride == 40 and names_index < count
+headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
+n=headers[names_index]; names=data[n[4]:n[4]+n[5]]
+sections={names[s[0]:].split(b'\0',1)[0].decode():s for s in headers}
+section=sections['.iram1.abla.s3IrqEntries']
+code=data[section[4]:section[4]+section[5]]
+config=sections['.dram1.abla.s3IrqConfig']
+assert config[5] == 64 and not any(data[config[4]:config[4]+64])
+objdump=os.environ.get('ABLA_ESP_S3_OBJDUMP') or shutil.which('xtensa-esp32s3-elf-objdump') or str(Path.home()/'.platformio/packages/toolchain-xtensa-esp32s3/xtensa-esp32s3-elf/bin/objdump')
+runner=['steam-run'] if shutil.which('steam-run') else []
+listing=subprocess.check_output(runner+[objdump,'-d','-j','.iram1.abla.s3IrqEntries',sys.argv[1]],text=True)
+instructions=[]
+for line in listing.splitlines():
+    match=re.match(r'\s*([0-9a-f]+):\s+[0-9a-f]{4,6}\s+([a-z][a-z0-9.]*)\s*(.*)',line)
+    if match:
+        instructions.append((int(match[1],16),match[2].removesuffix('.n'),match[3].split('<')[0].strip().replace(' ','')))
+base=next(pc for pc,op,_ in instructions if op == 'wsr.excsave1')
+for level in (1,2,3):
+    block=[(pc,op,args) for pc,op,args in instructions if base+(level-1)*512 <= pc < base+level*512]
+    assert block[0][1:] == (f'wsr.excsave{level}','a0')
+    end=next(i for i,(_,op,_) in enumerate(block) if op in ('rfe','rfi'))
+    block=block[:end+1]
+    pairs=[(op,args) for _,op,args in block]
+    def at(op,args): return pairs.index((op,args))
+    call_indices=[i for i,(_,op,_) in enumerate(block) if op in ('callx0','call0')]
+    assert len(call_indices) == 2 and pairs.count(('callx4','a4')) == 1
+    assert at('s32i','a12,a1,60') < call_indices[0]
+    assert at('s32i','a13,a1,64') < call_indices[0]
+    assert not any(op in ('entry','callx8','callx12','retw') for op,_ in pairs)
+    calls=[]
+    for i,(pc,op,args) in enumerate(block):
+        if op == 'call0':
+            calls.append(int(args,16))
+        elif op == 'callx0':
+            assert args == 'a0'
+            previous=block[i-1]
+            assert previous[1] == 'l32r' and previous[2].startswith('a0,')
+            literal=int(previous[2].split(',')[1],16)-section[3]
+            calls.append(struct.unpack_from('<I',code,literal)[0])
+    assert calls == [base+1536,base+1792]
+    assert ('slli','a0,a8,5') in pairs  # 32-byte per-core config
+    assert at('s32i','a0,a1,148') < at('wsr.cpenable','a0') < at('callx4','a4')
+    assert at('s32i','a13,a1,0') < at('callx4','a4') and at('s32i','a12,a1,4') < at('callx4','a4')
+    assert ('movi',f'a7,{level}') in pairs and ('extui','a8,a8,13,1') in pairs
+    assert at('rsil','a0,15') > at('callx4','a4')
+    assert pairs[at('s32i','a0,a1,156')-1] == ('movi','a0,0')
+    assert pairs[at('s32i','a0,a1,152')-1] == ('movi',f'a0,{level}')
+    selected=at('addi','a0,a0,-1')
+    selection=pairs[selected:selected+8]
+    assert selection[1] == ('s32i','a0,a12,4')
+    assert selection[2][0] == 'bnez' and selection[2][1].startswith('a0,')
+    assert selection[3] == ('l32i','a0,a13,156')
+    assert selection[4][0] == 'beqz' and selection[4][1] == selection[2][1]
+    assert selection[5] == ('mov','a1,a0')
+    assert selection[6] == ('j',format(base+1408,'x'))
+    assert selection[7] == ('mov','a1,a13')
+    assert pairs[-8:] == [('l32i','a0,a1,8'),('wsr.ps' if level == 1 else f'wsr.eps{level}','a0'),('l32i','a0,a1,4'),(f'wsr.epc{level}','a0'),('l32i','a0,a1,12'),('l32i','a1,a1,16'),('rsync',''),('rfe','') if level == 1 else ('rfi',str(level))]
+selected=[(pc,op,args) for pc,op,args in instructions if base+1408 <= pc < base+1536]
+end=next(i for i,(_,op,_) in enumerate(selected) if op == 'rfe')
+selected=selected[:end+1]
+pairs=[(op,args) for _,op,args in selected]
+assert pairs[:2] == [('l32i','a0,a1,148'),('wsr.cpenable','a0')]
+i=next(i for i,(_,op,_) in enumerate(selected) if op in ('callx0','call0'))
+if selected[i][1] == 'call0':
+    assert int(selected[i][2],16) == base+1792
+else:
+    assert selected[i][2] == 'a0' and selected[i-1][1] == 'l32r'
+    literal=int(selected[i-1][2].split(',')[1],16)-section[3]
+    assert struct.unpack_from('<I',code,literal)[0] == base+1792
+assert pairs[-8:] == [('l32i','a0,a1,8'),('wsr.ps','a0'),('l32i','a0,a1,4'),('wsr.epc1','a0'),('l32i','a0,a1,12'),('l32i','a1,a1,16'),('rsync',''),('rfe','')]
+print('PASS: three IRQ shells, nested-safe selected-frame routing, shared restore/RFE and original RFIn paths; not hardware proof')

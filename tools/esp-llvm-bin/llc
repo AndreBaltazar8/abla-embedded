@@ -4,6 +4,7 @@ set -euo pipefail
 cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
 toolchain_root="${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}"
 cpu="${ABLA_ESP_CPU:-esp32}"
+script_root=$(cd -- "$(dirname -- "$0")" && pwd -P)
 runner=()
 if command -v steam-run >/dev/null 2>&1; then
     runner=(steam-run)
@@ -11,6 +12,7 @@ fi
 arguments=()
 output=""
 expect_output=false
+filetype=""
 for argument in "$@"; do
     if $expect_output; then
         output="$argument"
@@ -20,19 +22,69 @@ for argument in "$@"; do
     elif [[ "$argument" == -o=* ]]; then
         output="${argument#-o=}"
     fi
+    if [[ "$argument" == -filetype=* ]]; then
+        filetype="${argument#-filetype=}"
+    fi
     if [[ "$argument" != "--threads=1" && "$argument" != "-relocation-model=pic" ]]; then
         arguments+=("$argument")
     fi
 done
-"${runner[@]}" "$toolchain_root/bin/llc" -mcpu="$cpu" \
-    -relocation-model=static --function-sections --data-sections \
-    "${arguments[@]}"
+
+# Espressif LLVM's Xtensa code generator understands TLS and emits the right
+# target expressions, but its integrated assembler does not register Xtensa
+# relocation names for `.reloc` inside inline assembly.  Emit one assembly
+# stream for the whole optimized LLVM module and feed that stream to the
+# toolchain's Xtensa assembler.  The result remains one monolithic object; no
+# component boundary is introduced and LLVM has already optimized/pruned the
+# complete program before this final encoding step.
+if [[ $filetype == obj && -n $output ]]; then
+    if [[ ${ABLA_KEEP_XTENSA_INPUT:-0} == 1 ]]; then
+        for argument in "${arguments[@]}"; do
+            if [[ $argument == *.bc && -f $argument ]]; then
+                cp -- "$argument" "$output.abla-input.bc"
+            fi
+        done
+    fi
+    output_directory=$(cd -- "$(dirname -- "$output")" && pwd -P)
+    temporary_assembly=$(mktemp \
+        "$output_directory/.abla-xtensa.XXXXXX.s")
+    if [[ ${ABLA_KEEP_XTENSA_ASSEMBLY:-0} != 1 ]]; then
+        trap 'status=$?; if (( status == 0 )); then rm -f -- "$temporary_assembly"; fi; exit "$status"' EXIT
+    fi
+    assembly_arguments=()
+    skip_output=false
+    for argument in "${arguments[@]}"; do
+        if $skip_output; then
+            skip_output=false
+        elif [[ $argument == -o ]]; then
+            skip_output=true
+        elif [[ $argument == -o=* ]]; then
+            :
+        elif [[ $argument == -filetype=obj ]]; then
+            assembly_arguments+=("-filetype=asm")
+        else
+            assembly_arguments+=("$argument")
+        fi
+    done
+    "${runner[@]}" "$toolchain_root/bin/llc" -mcpu="$cpu" \
+        -relocation-model=static --mtext-section-literals \
+        --function-sections --data-sections \
+        "${assembly_arguments[@]}" -o "$temporary_assembly"
+    "$script_root/prepare-xtensa-assembly" < "$temporary_assembly" | \
+    "${runner[@]}" "$toolchain_root/bin/xtensa-${cpu}-elf-clang-as" \
+        --text-section-literals -o "$output" -c -
+else
+    "${runner[@]}" "$toolchain_root/bin/llc" -mcpu="$cpu" \
+        -relocation-model=static --mtext-section-literals \
+        --function-sections --data-sections \
+        "${arguments[@]}"
+fi
 
 # Abla's MCU panic boundary traps and never unwinds, and Arduino/ESP-IDF MCU
 # builds disable C++ exceptions. Removing call-frame unwind metadata saves
 # flash without changing executable instructions. Set ABLA_ESP_KEEP_UNWIND=1
 # for integrations that intentionally unwind through Abla frames.
-if [[ -n "$output" && -f "$output" &&
+if [[ $filetype == obj && -n "$output" && -f "$output" &&
       "${ABLA_ESP_KEEP_UNWIND:-0}" != "1" ]]; then
     temporary="$output.abla-no-eh"
     "${runner[@]}" "$toolchain_root/bin/llvm-objcopy" \

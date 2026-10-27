@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+"""Turn reducible recovered program-counter graphs into structured Abla.
+
+Each eligible dispatcher must have only constant edges, conditional constant
+edges, or unconditional exits. Immediate post-dominators identify branch joins,
+and single-entry strongly-connected regions identify natural loops. Nested loop
+regions are lowered recursively, allowing the pass to emit ordinary sequences,
+if/else regions, and while loops without retaining a state variable. Anything
+outside that proof boundary is left unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, replace
+from pathlib import Path
+import re
+import sys
+
+
+DISPATCHER = re.compile(
+    r"^    var programCounter = 0\n"
+    r"(?P<loopvars>"
+    r"(?:^    var loopCounter = u32\(0\)\n"
+    r"^    var loopStart = 0\n"
+    r"^    var loopEnd = 0\n"
+    r"^    var loopActive = false\n)?"
+    r")"
+    r"^    while \(true\) \{\n"
+    r"(?P<loophead>"
+    r"(?:^        if \(loopActive && programCounter == loopEnd\) \{\n"
+    r"^            loopCounter = loopCounter - u32\(1\)\n"
+    r"^            if \(loopCounter != u32\(0\)\) programCounter = loopStart\n"
+    r"^            if \(loopCounter == u32\(0\)\) loopActive = false\n"
+    r"^        \}\n)?"
+    r")"
+    r"^        when \(programCounter\) \{\n"
+    r"(?P<arms>"
+    r"(?:^            [0-9]+ -> \{\n.*?^        \}\n)+"
+    r")"
+    r"^            else -> ablaRuntimeTrap\(\)\n"
+    r"^        \}\n"
+    r"^    \}\n"
+    r"(?:^    (?:r2|return)\n)?",
+    re.MULTILINE | re.DOTALL,
+)
+
+ARM = re.compile(
+    r"^            (?P<number>[0-9]+) -> \{\n"
+    r"(?P<body>.*?)"
+    r"^        \}\n",
+    re.MULTILINE | re.DOTALL,
+)
+BRANCH = re.compile(
+    r"^            programCounter = if \((?P<condition>.*)\) "
+    r"(?P<yes>[0-9]+) else (?P<no>[0-9]+)$"
+)
+JUMP = re.compile(r"^            programCounter = (?P<target>[0-9]+)$")
+SWITCH = re.compile(
+    r"^            programCounter = when \((?P<selector>[^\n]+)\) \{\n"
+    r"(?P<arms>(?:^                (?:-?[0-9]+|else) -> -?[0-9]+\n)+)"
+    r"^            \}$",
+    re.MULTILINE,
+)
+SWITCH_ARM = re.compile(
+    r"^                (?P<value>-?[0-9]+|else) -> (?P<target>-?[0-9]+)$",
+    re.MULTILINE,
+)
+STATE_NAMES = re.compile(
+    r"\b(?:programCounter|loopCounter|loopStart|loopEnd|loopActive)\b"
+)
+# In particular, never strip a lifter-generated loopActive cancellation from
+# an explicit branch to LEND. Such edges are not equivalent to fallthrough:
+# leave their correct dispatcher intact until edge provenance is modeled here.
+HARDWARE_LOOP = re.compile(
+    r"^            loopCounter = (?P<count>[^\n]+)\n"
+    r"^            loopStart = (?P<start>[0-9]+)\n"
+    r"^            loopEnd = (?P<end>[0-9]+)\n"
+    r"^            loopActive = (?P<active>[^\n]+)\n"
+    r"^            programCounter = if \((?P<condition>[^\n]+)\) "
+    r"(?P<yes>[0-9]+) else (?P<no>[0-9]+)$",
+    re.MULTILINE,
+)
+EXIT = -1
+
+
+@dataclass(frozen=True)
+class Block:
+    statements: tuple[str, ...]
+    kind: str
+    condition: str = ""
+    targets: tuple[int, ...] = ()
+    count: str = ""
+    loop_start: int = -1
+    loop_end: int = -1
+    case_values: tuple[str, ...] = ()
+
+
+def parse_block(body: str) -> Block | None:
+    hardware_loop = HARDWARE_LOOP.search(body)
+    if hardware_loop is not None and hardware_loop.end() == len(body.rstrip()):
+        start = int(hardware_loop.group("start"))
+        end = int(hardware_loop.group("end"))
+        yes = int(hardware_loop.group("yes"))
+        no = int(hardware_loop.group("no"))
+        if yes != start or no != end or start >= end:
+            return None
+        if hardware_loop.group("active") != hardware_loop.group("condition"):
+            return None
+        statements = tuple(body[:hardware_loop.start()].splitlines())
+        return Block(
+            statements, "hardware_loop", hardware_loop.group("condition"),
+            (start, end), hardware_loop.group("count"), start, end,
+        )
+    lines = body.splitlines()
+    meaningful = [index for index, line in enumerate(lines) if line.strip()]
+    if not meaningful:
+        return None
+    last = meaningful[-1]
+    switch = SWITCH.search(body.rstrip())
+    if switch is not None and switch.end() == len(body.rstrip()):
+        arms = tuple(SWITCH_ARM.finditer(switch.group("arms")))
+        if not arms or arms[-1].group("value") != "else":
+            return None
+        targets = tuple(
+            EXIT if arm.group("target") == "-1" else int(arm.group("target"))
+            for arm in arms
+        )
+        statements = tuple(body[:switch.start()].splitlines())
+        if STATE_NAMES.search("\n".join(statements)) is not None:
+            return None
+        return Block(
+            statements, "switch", switch.group("selector"), targets,
+            case_values=tuple(arm.group("value") for arm in arms),
+        )
+    branch = BRANCH.fullmatch(lines[last])
+    jump = JUMP.fullmatch(lines[last])
+    if branch is not None:
+        statements = tuple(lines[:last] + lines[last + 1:])
+        if STATE_NAMES.search("\n".join(statements)) is not None:
+            return None
+        if any("ablaRuntimeTrap()" in line for line in statements):
+            return Block(statements, "exit", targets=(EXIT,))
+        return Block(
+            statements,
+            "branch",
+            branch.group("condition"),
+            (int(branch.group("yes")), int(branch.group("no"))),
+        )
+    if jump is not None:
+        statements = tuple(lines[:last] + lines[last + 1:])
+        if STATE_NAMES.search("\n".join(statements)) is not None:
+            return None
+        if any("ablaRuntimeTrap()" in line for line in statements):
+            return Block(statements, "exit", targets=(EXIT,))
+        return Block(statements, "jump", targets=(int(jump.group("target")),))
+
+    last_text = lines[last].strip()
+    if last_text.startswith("return") or last_text == "ablaRuntimeTrap()":
+        if STATE_NAMES.search(body) is not None:
+            return None
+        return Block(tuple(lines), "exit", targets=(EXIT,))
+    multiline_return = list(re.finditer(r"^            return\b", body, re.MULTILINE))
+    if multiline_return and STATE_NAMES.search(body[multiline_return[-1].start():]) is None:
+        return Block(tuple(lines), "exit", targets=(EXIT,))
+    return None
+
+
+def reachable(blocks: dict[int, Block]) -> set[int] | None:
+    if 0 not in blocks:
+        return None
+    result: set[int] = set()
+    def visit(number: int) -> bool:
+        if number == EXIT:
+            return True
+        if number not in blocks:
+            return False
+        if number in result:
+            return True
+        result.add(number)
+        for target in blocks[number].targets:
+            if not visit(target):
+                return False
+        return True
+
+    return result if visit(0) else None
+
+
+def strongly_connected_components(
+    blocks: dict[int, Block], nodes: set[int], cut: int | None = None,
+) -> list[set[int]]:
+    indices: dict[int, int] = {}
+    low: dict[int, int] = {}
+    stack: list[int] = []
+    active: set[int] = set()
+    output: list[set[int]] = []
+    sequence = 0
+
+    def visit(node: int) -> None:
+        nonlocal sequence
+        indices[node] = sequence
+        low[node] = sequence
+        sequence += 1
+        stack.append(node)
+        active.add(node)
+        for target in blocks[node].targets:
+            if target == EXIT or target not in nodes or target == cut:
+                continue
+            if target not in indices:
+                visit(target)
+                low[node] = min(low[node], low[target])
+            elif target in active:
+                low[node] = min(low[node], indices[target])
+        if low[node] != indices[node]:
+            return
+        component: set[int] = set()
+        while True:
+            current = stack.pop()
+            active.remove(current)
+            component.add(current)
+            if current == node:
+                break
+        output.append(component)
+
+    for node in nodes:
+        if node not in indices:
+            visit(node)
+    return output
+
+
+def cyclic_component(component: set[int], blocks: dict[int, Block]) -> bool:
+    return len(component) > 1 or any(
+        node in blocks[node].targets for node in component
+    )
+
+
+def reducible_loop_regions(
+    blocks: dict[int, Block], nodes: set[int],
+) -> dict[int, set[int]] | None:
+    regions: dict[int, set[int]] = {}
+    for component in strongly_connected_components(blocks, nodes):
+        if not cyclic_component(component, blocks):
+            continue
+        entries = {
+            target
+            for source, block in blocks.items()
+            if source in nodes and source not in component
+            for target in block.targets if target in component
+        }
+        if 0 in component:
+            entries.add(0)
+        if len(entries) != 1:
+            return None
+        header = next(iter(entries))
+        regions[header] = component
+    return regions
+
+
+def clone_small_multi_entry_regions(
+    blocks: dict[int, Block], nodes: set[int], maximum_new_nodes: int = 96,
+) -> tuple[dict[int, Block], set[int]] | None:
+    """Split small irreducible SCC entries by cloning their loop bodies.
+
+    This is the standard node-splitting reduction. It is deliberately bounded:
+    large switch-fed regions are left for a compact local-selector lowering
+    rather than expanded into excessive source and machine code.
+    """
+    result = dict(blocks)
+    added = 0
+    while reducible_loop_regions(result, nodes) is None:
+        candidate: tuple[set[int], list[int]] | None = None
+        for component in strongly_connected_components(result, nodes):
+            if not cyclic_component(component, result):
+                continue
+            entries = {
+                target
+                for source, block in result.items()
+                if source in nodes and source not in component
+                for target in block.targets if target in component
+            }
+            if 0 in component:
+                entries.add(0)
+            if len(entries) > 1:
+                ordered = sorted(entries)
+                cost = len(component) * (len(ordered) - 1)
+                if added + cost <= maximum_new_nodes:
+                    candidate = component, ordered
+                    break
+        if candidate is None:
+            return None
+
+        component, entries = candidate
+        next_number = max(result) + 1
+        outside = [number for number in result if number not in component]
+        for entry in entries[1:]:
+            mapping = {
+                number: next_number + offset
+                for offset, number in enumerate(sorted(component))
+            }
+            next_number += len(component)
+            for number in sorted(component):
+                block = result[number]
+                result[mapping[number]] = replace(
+                    block,
+                    targets=tuple(
+                        mapping.get(target, target) for target in block.targets
+                    ),
+                )
+            for source in outside:
+                block = result[source]
+                if entry in block.targets:
+                    result[source] = replace(
+                        block,
+                        targets=tuple(
+                            mapping[entry] if target == entry else target
+                            for target in block.targets
+                        ),
+                    )
+            added += len(component)
+        nodes = reachable(result) or set()
+        if not nodes:
+            return None
+    return result, nodes
+
+
+def clone_small_nested_multi_entry_regions(
+    blocks: dict[int, Block], nodes: set[int], maximum_new_nodes: int = 96,
+) -> tuple[dict[int, Block], set[int]] | None:
+    """Node-split irreducible loops revealed only after an outer header cut."""
+    result = dict(blocks)
+    added = 0
+
+    def find(
+        region: set[int], cut: int | None, entry_hint: int | None,
+    ) -> tuple[set[int], list[int]] | None:
+        for component in strongly_connected_components(result, region, cut):
+            cyclic = len(component) > 1 or any(
+                number != cut and number in result[number].targets
+                for number in component
+            )
+            if not cyclic:
+                continue
+            entries = {
+                target
+                for source in region - component
+                for target in result[source].targets if target in component
+            }
+            if entry_hint is not None and entry_hint in component:
+                entries.add(entry_hint)
+            if len(entries) > 1:
+                return component, sorted(entries)
+            if len(entries) == 1:
+                header = next(iter(entries))
+                nested = find(component, header, header)
+                if nested is not None:
+                    return nested
+        return None
+
+    while True:
+        candidate = find(nodes, None, 0)
+        if candidate is None:
+            return result, nodes
+        component, entries = candidate
+        if any(result[number].kind == "hardware_loop" for number in component):
+            return None
+        cost = len(component) * (len(entries) - 1)
+        if added + cost > maximum_new_nodes:
+            return None
+        next_number = max(result) + 1
+        outside = [number for number in result if number not in component]
+        for entry in entries[1:]:
+            mapping = {
+                number: next_number + offset
+                for offset, number in enumerate(sorted(component))
+            }
+            next_number += len(component)
+            for number in sorted(component):
+                block = result[number]
+                result[mapping[number]] = replace(
+                    block,
+                    targets=tuple(
+                        mapping.get(target, target) for target in block.targets
+                    ),
+                )
+            for source in outside:
+                block = result[source]
+                if entry in block.targets:
+                    result[source] = replace(
+                        block,
+                        targets=tuple(
+                            mapping[entry] if target == entry else target
+                            for target in block.targets
+                        ),
+                    )
+            added += len(component)
+        nodes = reachable(result) or set()
+        if not nodes:
+            return None
+
+
+def postdominators(
+    blocks: dict[int, Block], nodes: set[int]
+) -> tuple[dict[int, set[int]], dict[int, int]]:
+    universe = set(nodes)
+    universe.add(EXIT)
+    postdom: dict[int, set[int]] = {EXIT: {EXIT}}
+    for node in nodes:
+        postdom[node] = set(universe)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            successors = blocks[node].targets
+            common = set(universe)
+            for successor in successors:
+                common &= postdom[successor]
+            updated = {node} | common
+            if updated != postdom[node]:
+                postdom[node] = updated
+                changed = True
+
+    immediate: dict[int, int] = {}
+    for node in nodes:
+        candidates = postdom[node] - {node}
+        if candidates:
+            immediate[node] = max(candidates, key=lambda item: len(postdom[item]))
+    return postdom, immediate
+
+
+def normalized_statements(lines: tuple[str, ...], indent: str) -> list[str]:
+    output: list[str] = []
+    for line in lines:
+        text = line[12:] if line.startswith("            ") else line.lstrip()
+        output.append(f"{indent}{text}" if text else "")
+    return output
+
+
+def emit_graph(blocks: dict[int, Block], nodes: set[int]) -> str | None:
+    loop_regions = reducible_loop_regions(blocks, nodes)
+    if loop_regions is None:
+        return None
+    emitted_steps = 0
+    maximum_steps = len(nodes) * 32 + 32
+    loop_sequence = 0
+
+    # A recovered error path commonly jumps through one or more tiny cleanup
+    # blocks and then returns. Treat such unconditional tails as early exits so
+    # the successful continuation is emitted once instead of copied into every
+    # error branch.
+    terminal_nodes = {
+        number for number in nodes
+        if (
+            blocks[number].kind == "exit"
+            or blocks[number].targets == (number,)
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for number in nodes - terminal_nodes:
+            block = blocks[number]
+            if (
+                block.kind == "jump"
+                and block.targets[0] in terminal_nodes
+            ):
+                terminal_nodes.add(number)
+                changed = True
+        for header, region in loop_regions.items():
+            exits = {
+                target
+                for number in region
+                for target in blocks[number].targets
+                if target != EXIT and target not in region
+            }
+            if header not in terminal_nodes and (
+                not exits or all(target in terminal_nodes for target in exits)
+            ):
+                terminal_nodes.add(header)
+                changed = True
+    # Once a terminal arm is emitted as an early return, it no longer
+    # participates in the fallthrough graph. Compute joins from that normalized
+    # view so shared successful tails remain shared instead of being duplicated
+    # into every error-check arm.
+    structural_blocks: dict[int, Block] = {}
+    for number, block in blocks.items():
+        targets = block.targets
+        if block.kind in ("branch", "switch"):
+            live = tuple(target for target in targets if target not in terminal_nodes)
+            if live:
+                targets = live
+        structural_blocks[number] = replace(block, targets=targets)
+    postdom, immediate = postdominators(structural_blocks, nodes)
+
+    def common_postdominator(starts: set[int]) -> int:
+        if not starts:
+            return EXIT
+        common: set[int] | None = None
+        for start in starts:
+            values = postdom[start]
+            common = set(values) if common is None else common & values
+        if not common:
+            return EXIT
+        return max(common, key=lambda item: len(postdom[item]))
+
+    def loop_boundaries(loop_nodes: set[int], natural: int) -> set[int]:
+        result = {natural}
+        for number in loop_nodes:
+            for target in blocks[number].targets:
+                if target != EXIT and target not in loop_nodes:
+                    result.add(target)
+        return result
+
+    def hardware_loop_nodes(start: int, end: int) -> set[int] | None:
+        candidates = {
+            number for number in nodes if start <= number < end
+        }
+        if start not in candidates:
+            return None
+        result: set[int] = set()
+        pending = [start]
+        while pending:
+            number = pending.pop()
+            if number in result:
+                continue
+            result.add(number)
+            pending.extend(
+                target for target in blocks[number].targets
+                if target in candidates and target not in result
+            )
+        return result
+
+    def emit_loop_iteration(
+        start: int, loop_nodes: set[int], natural: int,
+        destination: str, indent: str, continue_target: int | None = None,
+        ancestor_loops: set[int] | None = None,
+    ) -> list[str] | None:
+        # Collapse every edge leaving this one-iteration graph to a virtual exit
+        # for postdominator purposes, while retaining the exact destination in
+        # emitted Abla. Nested ordinary and fixed-count loops recurse here.
+        view: dict[int, Block] = {}
+        for number in loop_nodes:
+            block = blocks[number]
+            targets = tuple(
+                target if target in loop_nodes and target != continue_target else EXIT
+                for target in block.targets
+            )
+            view[number] = Block(
+                block.statements, block.kind, block.condition, targets,
+                block.count, block.loop_start, block.loop_end,
+                block.case_values,
+            )
+        view_nodes = set(loop_nodes)
+        active_loops = set(ancestor_loops or ()) | loop_nodes
+        structural_view: dict[int, Block] = {}
+        for number, block in view.items():
+            targets = block.targets
+            original = blocks[number]
+            if block.kind in ("branch", "switch"):
+                live = tuple(
+                    mapped
+                    for actual, mapped in zip(
+                        original.targets, block.targets, strict=True,
+                    )
+                    if actual not in terminal_nodes or actual in loop_nodes
+                )
+                if live:
+                    targets = live
+            structural_view[number] = replace(block, targets=targets)
+        view_postdom, view_immediate = postdominators(
+            structural_view, view_nodes
+        )
+        nested_regions = reducible_loop_regions(view, view_nodes)
+        if nested_regions is None:
+            return None
+        steps = 0
+
+        def common_view_postdominator(starts: set[int]) -> int:
+            if not starts:
+                return EXIT
+            common: set[int] | None = None
+            for start_node in starts:
+                values = view_postdom[start_node]
+                common = set(values) if common is None else common & values
+            if not common:
+                return EXIT
+            return max(common, key=lambda item: len(view_postdom[item]))
+
+        def boundary(target: int, level: str) -> list[str]:
+            if target == natural:
+                return []
+            if target == EXIT:
+                return []
+            return [f"{level}{destination} = {target}"]
+
+        def emit(start_node: int, stop: int, level: str) -> list[str] | None:
+            nonlocal steps, loop_sequence
+            output: list[str] = []
+            node = start_node
+            path: set[int] = set()
+            while node != stop and node != EXIT:
+                steps += 1
+                if steps > len(loop_nodes) * 16 + 16 or node in path:
+                    return None
+                path.add(node)
+                original = blocks[node]
+                block = view[node]
+
+                if node in nested_regions:
+                    nested_nodes = nested_regions[node]
+                    actual_exits = {
+                        target
+                        for number in nested_nodes
+                        for target in blocks[number].targets
+                        if target == continue_target or target not in nested_nodes
+                    }
+                    loop_sequence += 1
+                    nested_destination = (
+                        f"recoveredLoopDestination{loop_sequence}"
+                    )
+                    if actual_exits:
+                        output.append(
+                            f"{level}var {nested_destination} = {node}"
+                        )
+                        output.append(
+                            f"{level}while ({nested_destination} == {node}) {{"
+                        )
+                    else:
+                        output.append(f"{level}while (true) {{")
+                    nested_body = emit_loop_iteration(
+                        node, nested_nodes, node, nested_destination,
+                        level + "    ", continue_target=node,
+                        ancestor_loops=active_loops,
+                    )
+                    if nested_body is None:
+                        return None
+                    output.extend(nested_body)
+                    output.append(f"{level}}}")
+                    if not actual_exits:
+                        node = EXIT
+                        continue
+
+                    mapped_exits = {
+                        target
+                        if target in loop_nodes and target != continue_target
+                        else EXIT
+                        for target in actual_exits
+                    }
+                    join = common_view_postdominator(mapped_exits)
+                    ordered = sorted(actual_exits)
+
+                    def nested_choice(
+                        index: int, choice_level: str,
+                    ) -> list[str] | None:
+                        target = ordered[index]
+                        nested_level = choice_level + (
+                            "    " if index + 1 < len(ordered) else ""
+                        )
+                        if target in loop_nodes and target != continue_target:
+                            lines = emit(target, join, nested_level)
+                        else:
+                            lines = boundary(target, nested_level)
+                        if lines is None:
+                            return None
+                        if index + 1 == len(ordered):
+                            return lines
+                        tail = nested_choice(index + 1, choice_level + "    ")
+                        if tail is None:
+                            return None
+                        selected = [
+                            f"{choice_level}if ({nested_destination} == {target}) {{"
+                        ]
+                        selected.extend(lines)
+                        selected.append(f"{choice_level}}} else {{")
+                        selected.extend(tail)
+                        selected.append(f"{choice_level}}}")
+                        return selected
+
+                    selected = nested_choice(0, level)
+                    if selected is None:
+                        return None
+                    output.extend(selected)
+                    node = join
+                    continue
+
+                output.extend(normalized_statements(block.statements, level))
+                if block.kind == "hardware_loop":
+                    hardware_nodes = hardware_loop_nodes(
+                        block.loop_start, block.loop_end
+                    )
+                    if (
+                        hardware_nodes is None
+                        or not hardware_nodes <= loop_nodes
+                        or node in hardware_nodes
+                    ):
+                        return None
+                    boundaries = loop_boundaries(hardware_nodes, block.loop_end)
+                    early = sorted(boundaries - {block.loop_end})
+                    loop_sequence += 1
+                    remaining = f"recoveredLoopRemaining{loop_sequence}"
+                    hardware_destination = (
+                        f"recoveredLoopDestination{loop_sequence}"
+                    )
+                    output.append(f"{level}var {remaining} = {block.count}")
+                    if early:
+                        output.append(
+                            f"{level}var {hardware_destination} = {block.loop_end}"
+                        )
+                    condition = block.condition.replace(block.count, remaining)
+                    plain_loop = block.condition == "true"
+                    output.append(
+                        f"{level}while ({'true' if plain_loop else condition}) {{"
+                    )
+                    body = emit_loop_iteration(
+                        block.loop_start, hardware_nodes, block.loop_end,
+                        hardware_destination, level + "    ",
+                        ancestor_loops=active_loops,
+                    )
+                    if body is None:
+                        return None
+                    output.extend(body)
+                    if early:
+                        output.append(
+                            f"{level}    if ({hardware_destination} == {block.loop_end}) {{"
+                        )
+                        output.append(
+                            f"{level}        {remaining} = {remaining} - u32(1)"
+                        )
+                        output.append(f"{level}    }} else {{")
+                        output.append(f"{level}        {remaining} = u32(0)")
+                        output.append(f"{level}    }}")
+                    else:
+                        output.append(
+                            f"{level}    {remaining} = {remaining} - u32(1)"
+                        )
+                    if plain_loop:
+                        output.append(
+                            f"{level}    if ({remaining} == u32(0)) break"
+                        )
+                    output.append(f"{level}}}")
+                    if not early:
+                        node = block.loop_end
+                        continue
+
+                    continuations = set(early) | {block.loop_end}
+                    mapped = {
+                        target
+                        if target in loop_nodes and target != continue_target
+                        else EXIT
+                        for target in continuations
+                    }
+                    join = common_view_postdominator(mapped)
+                    ordered = sorted(continuations)
+
+                    def hardware_choice(
+                        index: int, choice_level: str,
+                    ) -> list[str] | None:
+                        target = ordered[index]
+                        nested_level = choice_level + (
+                            "    " if index + 1 < len(ordered) else ""
+                        )
+                        if target in loop_nodes and target != continue_target:
+                            lines = emit(target, join, nested_level)
+                        else:
+                            lines = boundary(target, nested_level)
+                        if lines is None:
+                            return None
+                        if index + 1 == len(ordered):
+                            return lines
+                        tail = hardware_choice(index + 1, choice_level + "    ")
+                        if tail is None:
+                            return None
+                        selected = [
+                            f"{choice_level}if ({hardware_destination} == {target}) {{"
+                        ]
+                        selected.extend(lines)
+                        selected.append(f"{choice_level}}} else {{")
+                        selected.extend(tail)
+                        selected.append(f"{choice_level}}}")
+                        return selected
+
+                    selected = hardware_choice(0, level)
+                    if selected is None:
+                        return None
+                    output.extend(selected)
+                    node = join
+                    continue
+
+                if block.kind == "exit":
+                    node = EXIT
+                    continue
+                if block.kind == "jump":
+                    actual = original.targets[0]
+                    if actual not in loop_nodes or actual == continue_target:
+                        output.extend(boundary(actual, level))
+                        node = EXIT
+                    else:
+                        node = actual
+                    continue
+                if block.kind == "switch":
+                    join = view_immediate.get(node, EXIT)
+                    arms: list[list[str]] = []
+                    for value, actual in zip(
+                        block.case_values, original.targets, strict=True,
+                    ):
+                        if actual not in loop_nodes or actual == continue_target:
+                            emitted = boundary(actual, level + "        ")
+                        else:
+                            emitted = emit(actual, join, level + "        ")
+                            if emitted is None:
+                                return None
+                        if value == "else" and actual == EXIT:
+                            emitted.append(f"{level}        ablaRuntimeTrap()")
+                        arms.append(emitted)
+                    output.append(f"{level}when ({block.condition}) {{")
+                    for value, emitted in zip(
+                        block.case_values, arms, strict=True,
+                    ):
+                        output.append(f"{level}    {value} -> {{")
+                        output.extend(emitted)
+                        output.append(f"{level}    }}")
+                    output.append(f"{level}}}")
+                    node = join
+                    continue
+
+                yes_actual, no_actual = original.targets
+                yes_terminal = (
+                    yes_actual in terminal_nodes and
+                    yes_actual not in active_loops
+                )
+                no_terminal = (
+                    no_actual in terminal_nodes and
+                    no_actual not in active_loops
+                )
+                if yes_terminal or no_terminal:
+                    if yes_terminal and no_terminal:
+                        yes_lines = emit_region(
+                            yes_actual, EXIT, level + "    ", active_loops
+                        )
+                        no_lines = emit_region(
+                            no_actual, EXIT, level + "    ", active_loops
+                        )
+                        if yes_lines is None or no_lines is None:
+                            return None
+                        output.append(f"{level}if ({block.condition}) {{")
+                        output.extend(yes_lines)
+                        output.append(f"{level}}} else {{")
+                        output.extend(no_lines)
+                        output.append(f"{level}}}")
+                        node = EXIT
+                        continue
+
+                    terminal = yes_actual if yes_terminal else no_actual
+                    continuation = no_actual if yes_terminal else yes_actual
+                    terminal_lines = emit_region(
+                        terminal, EXIT, level + "    ", active_loops
+                    )
+                    if terminal_lines is None:
+                        return None
+                    condition = (
+                        block.condition
+                        if yes_terminal else f"!({block.condition})"
+                    )
+                    output.append(f"{level}if ({condition}) {{")
+                    output.extend(terminal_lines)
+                    output.append(f"{level}}}")
+                    if (
+                        continuation in loop_nodes
+                        and continuation != continue_target
+                    ):
+                        node = continuation
+                    else:
+                        output.extend(boundary(continuation, level))
+                        node = EXIT
+                    continue
+
+                join = view_immediate.get(node, EXIT)
+                arms: list[list[str]] = []
+                for actual in original.targets:
+                    if actual not in loop_nodes or actual == continue_target:
+                        arms.append(boundary(actual, level + "    "))
+                    else:
+                        emitted = emit(actual, join, level + "    ")
+                        if emitted is None:
+                            return None
+                        arms.append(emitted)
+                yes_lines, no_lines = arms
+                if yes_lines and no_lines:
+                    output.append(f"{level}if ({block.condition}) {{")
+                    output.extend(yes_lines)
+                    output.append(f"{level}}} else {{")
+                    output.extend(no_lines)
+                    output.append(f"{level}}}")
+                elif yes_lines:
+                    output.append(f"{level}if ({block.condition}) {{")
+                    output.extend(yes_lines)
+                    output.append(f"{level}}}")
+                elif no_lines:
+                    output.append(f"{level}if (!({block.condition})) {{")
+                    output.extend(no_lines)
+                    output.append(f"{level}}}")
+                node = join
+            return output
+
+        return emit(start, EXIT, indent)
+
+    def emit_region(
+        start: int, stop: int, indent: str,
+        ancestor_loops: set[int] | None = None,
+    ) -> list[str] | None:
+        nonlocal emitted_steps, loop_sequence
+        active_loops = set(ancestor_loops or ())
+        output: list[str] = []
+        node = start
+        local_path: set[int] = set()
+        while node != stop and node != EXIT:
+            emitted_steps += 1
+            if emitted_steps > maximum_steps or node in local_path:
+                return None
+            local_path.add(node)
+            block = blocks[node]
+
+            if node in loop_regions:
+                loop_nodes = loop_regions[node]
+                exits = {
+                    target for number in loop_nodes
+                    for target in blocks[number].targets
+                    if target != EXIT and target not in loop_nodes
+                }
+                loop_sequence += 1
+                destination = f"recoveredLoopDestination{loop_sequence}"
+                if exits:
+                    output.append(f"{indent}var {destination} = {node}")
+                    output.append(f"{indent}while ({destination} == {node}) {{")
+                else:
+                    output.append(f"{indent}while (true) {{")
+                body = emit_loop_iteration(
+                    node, loop_nodes, node, destination,
+                    indent + "    ", continue_target=node,
+                    ancestor_loops=active_loops,
+                )
+                if body is None:
+                    return None
+                output.extend(body)
+                output.append(f"{indent}}}")
+                if not exits:
+                    node = EXIT
+                    continue
+
+                terminal_exits = sorted(exits & terminal_nodes)
+                for target in terminal_exits:
+                    lines = emit_region(
+                        target, EXIT, indent + "    ", active_loops
+                    )
+                    if lines is None:
+                        return None
+                    output.append(f"{indent}if ({destination} == {target}) {{")
+                    output.extend(lines)
+                    output.append(f"{indent}}}")
+
+                remaining_exits = exits - terminal_nodes
+                if not remaining_exits:
+                    node = EXIT
+                    continue
+                if len(remaining_exits) == 1:
+                    node = next(iter(remaining_exits))
+                    continue
+
+                join = common_postdominator(remaining_exits)
+                ordered = sorted(remaining_exits)
+
+                def loop_choice(index: int, level: str) -> list[str] | None:
+                    target = ordered[index]
+                    lines = emit_region(
+                        target, join,
+                        level + ("    " if index + 1 < len(ordered) else ""),
+                        active_loops,
+                    )
+                    if lines is None:
+                        return None
+                    if index + 1 == len(ordered):
+                        return lines
+                    tail = loop_choice(index + 1, level + "    ")
+                    if tail is None:
+                        return None
+                    selected = [f"{level}if ({destination} == {target}) {{"]
+                    selected.extend(lines)
+                    selected.append(f"{level}}} else {{")
+                    selected.extend(tail)
+                    selected.append(f"{level}}}")
+                    return selected
+
+                selected = loop_choice(0, indent)
+                if selected is None:
+                    return None
+                output.extend(selected)
+                node = join
+                continue
+
+            output.extend(normalized_statements(block.statements, indent))
+
+            if block.kind == "hardware_loop":
+                loop_nodes = hardware_loop_nodes(
+                    block.loop_start, block.loop_end
+                )
+                if loop_nodes is None or node in loop_nodes:
+                    return None
+                boundaries = loop_boundaries(loop_nodes, block.loop_end)
+                early = sorted(boundaries - {block.loop_end})
+                loop_sequence += 1
+                remaining = f"recoveredLoopRemaining{loop_sequence}"
+                destination = f"recoveredLoopDestination{loop_sequence}"
+                output.append(f"{indent}var {remaining} = {block.count}")
+                if early:
+                    output.append(f"{indent}var {destination} = {block.loop_end}")
+                condition = block.condition.replace(block.count, remaining)
+                plain_loop = block.condition == "true"
+                output.append(
+                    f"{indent}while ({'true' if plain_loop else condition}) {{"
+                )
+                body = emit_loop_iteration(
+                    block.loop_start, loop_nodes, block.loop_end,
+                    destination, indent + "    ",
+                    ancestor_loops=active_loops,
+                )
+                if body is None:
+                    return None
+                output.extend(body)
+                if early:
+                    output.append(f"{indent}    if ({destination} == {block.loop_end}) {{")
+                    output.append(f"{indent}        {remaining} = {remaining} - u32(1)")
+                    output.append(f"{indent}    }} else {{")
+                    output.append(f"{indent}        {remaining} = u32(0)")
+                    output.append(f"{indent}    }}")
+                else:
+                    output.append(f"{indent}    {remaining} = {remaining} - u32(1)")
+                if plain_loop:
+                    output.append(
+                        f"{indent}    if ({remaining} == u32(0)) break"
+                    )
+                output.append(f"{indent}}}")
+
+                if not early:
+                    node = block.loop_end
+                    continue
+                continuations = set(early) | {block.loop_end}
+                join = common_postdominator(continuations)
+
+                def choice(index: int, level: str) -> list[str] | None:
+                    target = early[index] if index < len(early) else block.loop_end
+                    lines = emit_region(
+                        target, join,
+                        level + ("    " if index < len(early) else ""),
+                        active_loops,
+                    )
+                    if lines is None:
+                        return None
+                    if index == len(early):
+                        return lines
+                    tail = choice(index + 1, level + "    ")
+                    if tail is None:
+                        return None
+                    selected = [f"{level}if ({destination} == {target}) {{"]
+                    selected.extend(lines)
+                    selected.append(f"{level}}} else {{")
+                    selected.extend(tail)
+                    selected.append(f"{level}}}")
+                    return selected
+
+                selected = choice(0, indent)
+                if selected is None:
+                    return None
+                output.extend(selected)
+                node = join
+                continue
+
+            if block.kind == "exit":
+                node = EXIT
+                continue
+            if block.kind == "jump":
+                node = block.targets[0]
+                continue
+
+            if block.kind == "switch":
+                join = immediate.get(node, EXIT)
+                output.append(f"{indent}when ({block.condition}) {{")
+                for value, target in zip(
+                    block.case_values, block.targets, strict=True,
+                ):
+                    lines = emit_region(
+                        target, join, indent + "        ", active_loops
+                    )
+                    if lines is None:
+                        return None
+                    output.append(f"{indent}    {value} -> {{")
+                    output.extend(lines)
+                    if value == "else" and target == EXIT:
+                        output.append(f"{indent}        ablaRuntimeTrap()")
+                    output.append(f"{indent}    }}")
+                output.append(f"{indent}}}")
+                node = join
+                continue
+
+            yes, no = block.targets
+            yes_terminal = yes in terminal_nodes and yes not in active_loops
+            no_terminal = no in terminal_nodes and no not in active_loops
+            if yes_terminal and no_terminal:
+                yes_lines = emit_region(yes, EXIT, indent + "    ", active_loops)
+                no_lines = emit_region(no, EXIT, indent + "    ", active_loops)
+                if yes_lines is None or no_lines is None:
+                    return None
+                output.append(f"{indent}if ({block.condition}) {{")
+                output.extend(yes_lines)
+                output.append(f"{indent}}} else {{")
+                output.extend(no_lines)
+                output.append(f"{indent}}}")
+                node = EXIT
+                continue
+            if yes_terminal != no_terminal:
+                terminal = yes if yes_terminal else no
+                continuation = no if yes_terminal else yes
+                lines = emit_region(
+                    terminal, EXIT, indent + "    ", active_loops
+                )
+                if lines is None:
+                    return None
+                condition = block.condition if yes_terminal else f"!({block.condition})"
+                output.append(f"{indent}if ({condition}) {{")
+                output.extend(lines)
+                output.append(f"{indent}}}")
+                node = continuation
+                continue
+
+            join = immediate.get(node, EXIT)
+            yes_lines = emit_region(
+                yes, join, indent + "    ", active_loops
+            )
+            no_lines = emit_region(
+                no, join, indent + "    ", active_loops
+            )
+            if yes_lines is None or no_lines is None:
+                return None
+            if yes_lines and no_lines:
+                output.append(f"{indent}if ({block.condition}) {{")
+                output.extend(yes_lines)
+                output.append(f"{indent}}} else {{")
+                output.extend(no_lines)
+                output.append(f"{indent}}}")
+            elif yes_lines:
+                output.append(f"{indent}if ({block.condition}) {{")
+                output.extend(yes_lines)
+                output.append(f"{indent}}}")
+            elif no_lines:
+                output.append(f"{indent}if (!({block.condition})) {{")
+                output.extend(no_lines)
+                output.append(f"{indent}}}")
+            node = join
+        return output
+
+    lines = emit_region(0, EXIT, "    ")
+    if lines is None:
+        return None
+    return "\n".join(lines) + "\n"
+
+
+def lower_dispatcher(match: re.Match[str]) -> str | None:
+    blocks: dict[int, Block] = {}
+    for arm in ARM.finditer(match.group("arms")):
+        number = int(arm.group("number"))
+        block = parse_block(arm.group("body"))
+        if block is None or number in blocks:
+            return None
+        blocks[number] = block
+    if not blocks:
+        return None
+
+    nodes = reachable(blocks)
+    if nodes is None:
+        return None
+    nested_split = clone_small_nested_multi_entry_regions(blocks, nodes)
+    if nested_split is None:
+        return None
+    blocks, nodes = nested_split
+    if reducible_loop_regions(blocks, nodes) is None:
+        split = clone_small_multi_entry_regions(blocks, nodes)
+        if split is None:
+            return None
+        blocks, nodes = split
+    return emit_graph(blocks, nodes)
+
+
+def transform(
+    source: str, allowed_functions: set[str] | None = None,
+) -> tuple[str, int]:
+    replacements: list[tuple[int, int, str]] = []
+    for match in DISPATCHER.finditer(source):
+        if allowed_functions is not None:
+            declarations = list(re.finditer(
+                r"^(?:trusted )?fun ([^(]+)", source[:match.start()],
+                re.MULTILINE,
+            ))
+            if not declarations or declarations[-1].group(1) not in allowed_functions:
+                continue
+        lowered = lower_dispatcher(match)
+        if lowered is not None:
+            replacements.append((match.start(), match.end(), lowered))
+    transformed = source
+    for begin, end, replacement in reversed(replacements):
+        transformed = transformed[:begin] + replacement + transformed[end:]
+    return transformed, len(replacements)
+
+
+def input_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.ab")))
+        elif path.suffix == ".ab":
+            files.append(path)
+    return files
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--function", action="append", default=[])
+    arguments = parser.parse_args()
+
+    changed_files = 0
+    lowered_functions = 0
+    for path in input_files(arguments.paths):
+        source = path.read_text()
+        allowed = set(arguments.function) if arguments.function else None
+        transformed, lowered = transform(source, allowed)
+        lowered_functions += lowered
+        if transformed != source:
+            changed_files += 1
+            if arguments.verbose:
+                print(f"{path}: {lowered}")
+            if arguments.write:
+                path.write_text(transformed)
+
+    action = "structured" if arguments.write else "would structure"
+    print(
+        f"{action} {lowered_functions} acyclic function(s) "
+        f"across {changed_files} file(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

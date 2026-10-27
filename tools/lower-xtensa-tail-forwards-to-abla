@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Replace naked Xtensa forwarding shims with typed Abla calls.
+
+The recovered interface-control table originally used tiny tail-jump objects.
+Once both the table and target implementations live in the same Abla module,
+the exact register forwarding can be represented by ordinary scalar function
+parameters. This pass also repairs recovered call sites that previously called
+a void naked shim and then synthesized a zero return value.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+
+
+FORWARDS: dict[str, tuple[int, str]] = {
+    "esp32InterfaceFreeReceiveBuffer": (1, "esp32RecoveredPpRecycleRxPkt"),
+    "esp32InterfaceBeaconMonitorConfigure": (1, "esp32RecoveredPmBeaconMonitorConfigure"),
+    "esp32InterfaceCreateWifiTask": (0, "esp32RecoveredPpCreateTask"),
+    "esp32InterfaceDeleteWifiTask": (0, "esp32RecoveredPpDeleteTask"),
+    "esp32InterfacePacketBufferAllocate": (3, "esp32RecoveredEsfBufAlloc"),
+    "esp32InterfacePacketBufferRecycleReceive": (1, "esp32RecoveredPpRecycleRxPkt"),
+    "esp32InterfacePacketBufferRecycleTransmit": (1, "esp32RecoveredEsfBufRecycle"),
+    "esp32InterfaceGetSixMegabitSchedule": (0, "esp32RecoveredRcGetG6MSched"),
+    "esp32InterfaceGetFixedRate": (3, "esp32RecoveredRcGetFixRate"),
+    "esp32InterfaceGetKeepAliveTime": (0, "esp32RecoveredPmGetKeepAliveTime"),
+    "esp32InterfaceGetNextBeaconOffset": (0, "esp32RecoveredWDevGetNextBcnOffset"),
+    "esp32InterfaceGetNextTbtt": (0, "esp32RecoveredWDevGetNextTBTT"),
+    "esp32InterfaceGetPacketTaskHandle": (0, "esp32RecoveredPpGetTaskHdl"),
+    "esp32InterfaceResetTbtt": (0, "esp32RecoveredWDevResetTBTT"),
+    "esp32InterfaceSetBeaconInterval": (1, "esp32RecoveredWDevSetBeaconInt"),
+    "esp32InterfaceSetKeepAliveTime": (1, "esp32RecoveredPmSetKeepAliveTime"),
+    "esp32InterfaceSetMinimumActiveTime": (1, "esp32RecoveredPmSetSleepMinActiveTime"),
+    "esp32InterfaceSetBroadcastWaitTime": (1, "esp32RecoveredPmSetSleepWaitBroadcastDataTime"),
+    "esp32InterfaceStopHardwareTransmitQueue": (0, "esp32RecoveredLmacStopHwTxq"),
+    "esp32InterfaceSetPerPacketRate": (2, "esp32RecoveredTrcSetPerPktRate"),
+    "esp32InterfaceUpdatePhysicalMode": (2, "esp32RecoveredTrcUpdateIfxPhyMode"),
+    "esp32InterfaceTransmitQueueEmpty": (0, "esp32RecoveredPpTxqEmpty"),
+    "esp32InterfaceUpdateLightSleepDefaults": (2, "esp32RecoveredPmUpdateLightSleepDefaultParams"),
+    "esp32InterfaceUpdateModemSleepDefaults": (0, "esp32RecoveredPmUpdateModemSleepDefaultParams"),
+}
+
+IMPORTS = (
+    'import "./packet_processing_esp32.ab"\n'
+    'import "./esf_buf_esp32.ab"\n'
+    'import "./transmit_rate_control_esp32.ab"\n'
+    'import "./power_management_esp32.ab"\n'
+    'import "./wifi_device_esp32.ab"\n'
+    'import "./low_mac_esp32.ab"\n'
+)
+
+
+def matching_parenthesis(source: str, opening: int) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(opening, len(source)):
+        character = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError(f"unterminated call at byte {opening}")
+
+
+def split_arguments(source: str) -> list[str]:
+    if not source.strip():
+        return []
+    result: list[str] = []
+    start = 0
+    depths = [0, 0, 0]
+    quote = ""
+    escaped = False
+    for index, character in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "(": depths[0] += 1
+        elif character == ")": depths[0] -= 1
+        elif character == "[": depths[1] += 1
+        elif character == "]": depths[1] -= 1
+        elif character == "{": depths[2] += 1
+        elif character == "}": depths[2] -= 1
+        elif character == "," and depths == [0, 0, 0]:
+            result.append(source[start:index].strip())
+            start = index + 1
+    result.append(source[start:].strip())
+    return result
+
+
+def target_arguments(parameters: list[str]) -> str:
+    return ", ".join(parameters + ["u32(0)"] * (16 - len(parameters)))
+
+
+def lower_definitions(source: str) -> tuple[str, int]:
+    changed = 0
+    for name, (arity, target) in FORWARDS.items():
+        pattern = re.compile(
+            rf"@naked\s*\ntrusted fun {re.escape(name)}\(.*?\)"
+            rf"\s*:\s*void\s*=\s*\n\s*\$xtensa tail{arity} \{{[^}}]+\}}",
+            re.DOTALL,
+        )
+        parameters = [f"a{index}: u32" for index in range(2, 2 + arity)]
+        names = [f"a{index}" for index in range(2, 2 + arity)]
+        declaration = ", ".join(parameters)
+        replacement = (
+            f"trusted fun {name}({declaration}): u32 =\n"
+            f"    {target}({target_arguments(names)})"
+        )
+        source, count = pattern.subn(replacement, source, count=1)
+        if count != 1:
+            raise ValueError(f"did not find one tail definition for {name}")
+        changed += count
+    if IMPORTS.splitlines()[0] not in source:
+        lines = source.splitlines(keepends=True)
+        insertion = 0
+        while insertion < len(lines) and lines[insertion].startswith("import "):
+            insertion += 1
+        lines.insert(insertion, IMPORTS)
+        source = "".join(lines)
+    return source, changed
+
+
+def lower_calls(source: str) -> tuple[str, int, int]:
+    calls = zero_returns = 0
+    for name, (arity, _target) in FORWARDS.items():
+        cursor = 0
+        output: list[str] = []
+        while True:
+            match = re.search(rf"\b{re.escape(name)}\s*\(", source[cursor:])
+            if match is None:
+                output.append(source[cursor:])
+                break
+            start = cursor + match.start()
+            opening = cursor + match.end() - 1
+            closing = matching_parenthesis(source, opening)
+            arguments = split_arguments(source[opening + 1:closing])
+            if len(arguments) >= arity:
+                forwarded = arguments[:arity]
+            elif not arguments:
+                forwarded = [f"r{index}" for index in range(10, 10 + arity)]
+            else:
+                raise ValueError(
+                    f"{name} has {len(arguments)} arguments, expected {arity}"
+                )
+
+            line_start = source.rfind("\n", 0, start) + 1
+            prefix = source[line_start:start]
+            plain_statement = prefix.strip() == ""
+            replacement = f"{name}({', '.join(forwarded)})"
+            if plain_statement and not arguments:
+                replacement = "r10 = " + replacement
+
+            end = closing + 1
+            if plain_statement and not arguments:
+                following = re.match(
+                    r"\s*\n([ \t]*)r10\s*=\s*u32\(0\)", source[end:]
+                )
+                if following is not None:
+                    end += following.end()
+                    zero_returns += 1
+
+            output.append(source[cursor:start])
+            output.append(replacement)
+            cursor = end
+            calls += 1
+        source = "".join(output)
+    return source, calls, zero_returns
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("root", type=pathlib.Path)
+    arguments = parser.parse_args()
+    forward = arguments.root / "esp32/radio/interface_control_forward_esp32.ab"
+    original = forward.read_text()
+    lowered, definitions = lower_definitions(original)
+    files_changed = 1
+    calls = zero_returns = 0
+    changes: dict[pathlib.Path, str] = {forward: lowered}
+    for path in sorted(arguments.root.rglob("*.ab")):
+        if path == forward:
+            continue
+        source = path.read_text()
+        updated, file_calls, file_zero_returns = lower_calls(source)
+        if updated == source:
+            continue
+        changes[path] = updated
+        files_changed += 1
+        calls += file_calls
+        zero_returns += file_zero_returns
+    if arguments.write:
+        for path, source in changes.items():
+            path.write_text(source)
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {definitions} definitions and {calls} calls in "
+        f"{files_changed} files; removed {zero_returns} synthetic zero returns"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

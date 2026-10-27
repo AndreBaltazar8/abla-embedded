@@ -1,4 +1,4 @@
-# Link one prebuilt Abla object into an ESP-IDF component without a C shim.
+# Add one prebuilt Abla object to an ESP-IDF component without a C shim.
 # The including component sets ABLA_OBJECT before including this file.
 if(NOT DEFINED ABLA_OBJECT)
     message(FATAL_ERROR "ABLA_OBJECT must name an Abla-produced object")
@@ -12,7 +12,15 @@ set_property(
     TARGET abla_application_object
     PROPERTY IMPORTED_OBJECTS "${ABLA_OBJECT}"
 )
-target_sources(
-    ${COMPONENT_LIB}
-    INTERFACE $<TARGET_OBJECTS:abla_application_object>
-)
+get_target_property(ABLA_COMPONENT_TYPE ${COMPONENT_LIB} TYPE)
+if(ABLA_COMPONENT_TYPE STREQUAL "INTERFACE_LIBRARY")
+    target_sources(
+        ${COMPONENT_LIB}
+        INTERFACE $<TARGET_OBJECTS:abla_application_object>
+    )
+else()
+    target_sources(
+        ${COMPONENT_LIB}
+        PRIVATE $<TARGET_OBJECTS:abla_application_object>
+    )
+endif()

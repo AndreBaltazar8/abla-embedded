@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Run inside the compiler's pinned Nix shell. Link-only: never flashes/resets.
+compiler_root=${ABLA_SYSROOT:-../ablac}
+llvm_root=${ABLA_ESP_LLVM_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/abla-embedded/esp-clang-21.1.3}
+export ABLA_SYSROOT="$compiler_root" ABLA_ESP_CPU=esp32s3
+export PATH="$PWD/tools/esp-llvm-bin:$PATH"
+runner=()
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+mkdir -p build/tests
+fixtures=(boot-entry boot-runtime)
+if [[ ${ABLA_S3_SIMD:-0} == 1 ]]; then fixtures+=(boot-simd); fi
+for fixture in "${fixtures[@]}"; do
+    output="build/tests/esp32s3-$fixture"
+    "$compiler_root/build/ablac" build "tests/esp32s3-$fixture-target.ab" -o "$output.o" \
+        --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
+    bash tools/optimize-embedded-size "$output.o.ll" "$output.bc"
+    llc -filetype=obj -O2 -mtriple=xtensa-esp-unknown-elf "$output.bc" -o "$output.opt.o"
+    python3 tools/check-cache-internal-object "$output.opt.o"
+    definitions=$(nm -g --defined-only "$output.opt.o" | awk '{print $NF}' | sort)
+    test "$definitions" = $'abla_boot_entry\nabla_boot_main'
+    script="tests/s3-$fixture.ld"
+    if [[ $fixture == boot-simd ]]; then script=tests/s3-boot-runtime.ld; fi
+    "${runner[@]}" "$llvm_root/bin/xtensa-esp32s3-elf-clang-ld" \
+        -T "$script" --no-undefined -o "$output.link.elf" "$output.opt.o"
+    test -z "$(nm -u "$output.link.elf")"
+    python3 tools/check-s3-boot-entry "$output.link.elf"
+    if [[ $fixture != boot-entry ]]; then
+        python3 tools/check-s3-irq-entries "$output.opt.o"
+        python3 tools/check-s3-fatal-vectors "$output.link.elf"
+        python3 tools/check-s3-medium-vectors "$output.link.elf"
+        python3 tools/check-window-vectors "$output.link.elf"
+        python3 tools/check-s3-coprocessor-context "$output.opt.o"
+        python3 tools/check-s3-context-return "$output.link.elf"
+        python3 tools/check-s3-task-launch "$output.link.elf"
+    fi
+done
+echo 'PASS: S3 entry and composed boot/runtime link gates; no hardware/bootability claim'

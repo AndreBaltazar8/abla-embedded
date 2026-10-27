@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Lower numeric startup store layouts to exact mutable byte globals."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+
+
+STORAGE = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage = "
+    r"nativeStaticAllocate\((?P<size>[0-9]+)\)$"
+)
+INITIALIZER = re.compile(
+    r"^trusted fun (?P<base>[A-Za-z_][A-Za-z0-9_]*)Initialize\(\): int \{$"
+)
+STORE = re.compile(
+    r"^    ablaUnsafeStoreU(?P<width>8|16|32|64)"
+    r"\(nativePointerFromAddress\("
+    r"(?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage \+ (?P<offset>[0-9]+)\), "
+    r"(?P<value>-?[0-9]+)\)$"
+)
+RETURN = re.compile(r"^    (?P<base>[A-Za-z_][A-Za-z0-9_]*)Storage$")
+INITIALIZED = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*)Initialized = "
+    r"(?P=base)Initialize\(\)$"
+)
+ADDRESS = re.compile(
+    r"^val (?P<base>[A-Za-z_][A-Za-z0-9_]*) = "
+    r"u32\((?P=base)Initialized\)$"
+)
+
+
+def byte_expression(contents: bytes) -> list[str]:
+    chunks = [contents[index:index + 32] for index in range(0, len(contents), 32)]
+    literals = [
+        '"' + "".join(f"\\x{value:02x}" for value in chunk) + '"'
+        for chunk in chunks
+    ]
+    if len(literals) == 1:
+        return [f"nativeStaticMutableBytes({literals[0]})"]
+    result = ["nativeStaticMutableBytes(", "    ("]
+    for index, literal in enumerate(literals):
+        suffix = " +" if index + 1 < len(literals) else ""
+        result.append(f"        {literal}{suffix}")
+    result.extend(["    )", ")"])
+    return result
+
+
+def lower_source(source: str) -> tuple[str, int, int]:
+    lines = source.splitlines()
+    output: list[str] = []
+    layouts = total_bytes = 0
+    index = 0
+    while index < len(lines):
+        storage = STORAGE.match(lines[index])
+        if not storage:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        base = storage.group("base")
+        size = int(storage.group("size"))
+        cursor = index + 1
+        initializer = INITIALIZER.match(lines[cursor]) if cursor < len(lines) else None
+        if not initializer or initializer.group("base") != base:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        cursor += 1
+        stores: list[tuple[int, int, int]] = []
+        while cursor < len(lines):
+            store = STORE.match(lines[cursor])
+            if not store or store.group("base") != base:
+                break
+            stores.append((
+                int(store.group("width")),
+                int(store.group("offset")),
+                int(store.group("value")),
+            ))
+            cursor += 1
+
+        occupied: set[int] = set()
+        valid = size > 0 and bool(stores)
+        for width, offset, _ in stores:
+            width_bytes = width // 8
+            cells = set(range(offset, offset + width_bytes))
+            valid = (
+                valid
+                and offset >= 0
+                and offset % width_bytes == 0
+                and offset + width_bytes <= size
+                and not bool(cells & occupied)
+            )
+            occupied.update(cells)
+        valid = (
+            valid
+            and cursor + 4 < len(lines)
+            and bool(RETURN.match(lines[cursor]))
+            and RETURN.match(lines[cursor]).group("base") == base
+            and lines[cursor + 1] == "}"
+            and bool(INITIALIZED.match(lines[cursor + 2]))
+            and INITIALIZED.match(lines[cursor + 2]).group("base") == base
+            and bool(ADDRESS.match(lines[cursor + 3]))
+            and ADDRESS.match(lines[cursor + 3]).group("base") == base
+        )
+        if not valid:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        contents = bytearray(size)
+        for width, offset, value in stores:
+            width_bytes = width // 8
+            encoded = (value % (1 << width)).to_bytes(width_bytes, "little")
+            contents[offset:offset + width_bytes] = encoded
+
+        expression = byte_expression(bytes(contents))
+        output.append(f"val {base}Storage = {expression[0]}")
+        output.extend(expression[1:])
+        output.append(f"val {base}Initialized = {base}Storage")
+        output.append(f"val {base} = u32({base}Initialized)")
+        layouts += 1
+        total_bytes += size
+        index = cursor + 4
+
+    trailing = "\n" if source.endswith("\n") else ""
+    return "\n".join(output) + trailing, layouts, total_bytes
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("paths", nargs="+", type=pathlib.Path)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+
+    files: list[pathlib.Path] = []
+    for path in arguments.paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.ab")))
+        elif path.suffix == ".ab":
+            files.append(path)
+
+    changed_files = layouts = total_bytes = 0
+    for path in files:
+        original = path.read_text()
+        lowered, file_layouts, file_bytes = lower_source(original)
+        if lowered == original:
+            continue
+        changed_files += 1
+        layouts += file_layouts
+        total_bytes += file_bytes
+        if arguments.write:
+            path.write_text(lowered)
+
+    action = "lowered" if arguments.write else "would lower"
+    print(
+        f"{action} {layouts} mutable byte layout(s) with "
+        f"{total_bytes} link-time byte(s) in {changed_files} file(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

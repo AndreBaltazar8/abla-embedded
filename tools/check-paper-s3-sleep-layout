@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Check linked S3 placement and actual L32R targets; not boot or stack-depth proof."""
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+
+def validate(path):
+    data = path.read_bytes()
+    if data[:6] != b'\x7fELF\x01\x01':
+        raise ValueError('expected little-endian ELF32')
+    offset = struct.unpack_from('<I', data, 32)[0]
+    stride, count, ni = struct.unpack_from('<HHH', data, 46)
+    if stride != 40 or ni >= count:
+        raise ValueError('invalid section table')
+    raw = [struct.unpack_from('<10I', data, offset+i*40) for i in range(count)]
+    names = data[raw[ni][4]:raw[ni][4]+raw[ni][5]]
+    labels = [names[s[0]:].split(b'\0', 1)[0].decode() for s in raw]
+    if '.xt.prop' not in labels or raw[labels.index('.xt.prop')][5] == 0:
+        raise ValueError('Xtensa instruction/padding metadata required for exact disassembly')
+    windows = {'.iram1': (0x40378400, 0x40388000), '.dram1': (0x3fc98000, 0x3fca8000),
+               '.bss': (0x3fc98000, 0x3fca8000), '.sleep_storage': (0x3fc98000, 0x3fca8000),
+               '.sleep_stack': (0x3fc98000, 0x3fca8000), '.flash_text': (0x42000020, 0x42100020),
+               '.flash_rodata': (0x3c000020, 0x3c100020)}
+    allocated = []
+    for name, s in zip(labels, raw):
+        if not s[2] & 2 or not s[5]:
+            continue
+        if name not in windows:
+            raise ValueError('unexpected allocated section '+name)
+        low, high = windows[name]
+        if not low <= s[3] < s[3]+s[5] <= high:
+            raise ValueError('section outside reserved window '+name)
+        allocated.append((s[3], s[3]+s[5], name, s[1]))
+    for index, (low, high, name, _) in enumerate(allocated):
+        for other_low, other_high, other, _ in allocated[index+1:]:
+            if low < other_high and other_low < high:
+                raise ValueError('overlapping allocated sections '+name+'/'+other)
+    functions = []
+    for s in raw:
+        if s[1] != 2:
+            continue
+        if s[9] != 16:
+            raise ValueError('invalid symbol stride')
+        for pos in range(s[4], s[4]+s[5], 16):
+            _, address, size, info, _, target = struct.unpack_from('<IIIBBH', data, pos)
+            if info & 15 == 2 and size and target < count:
+                functions.append((address, address+size))
+    objdump = os.environ.get('ABLA_ESP_S3_OBJDUMP') or shutil.which('xtensa-esp32s3-elf-objdump') or str(Path.home()/'.platformio/packages/toolchain-xtensa-esp32s3/xtensa-esp32s3-elf/bin/objdump')
+    runner = ['steam-run'] if shutil.which('steam-run') else []
+    listing = subprocess.check_output(runner+[objdump, '-d', str(path)], text=True)
+    loads = 0
+    for line in listing.splitlines():
+        match = re.match(r'\s*([0-9a-f]+):\s+([0-9a-f]{6})\s+l32r\s+a\d+,\s*([0-9a-f]+)', line)
+        if not match:
+            continue
+        pc, word, target = (int(x, 16) for x in match.groups())
+        if not any(low <= pc < high for low, high in functions):
+            continue  # literal-pool bytes disassembled as instructions
+        expected = ((pc+3)&~3)+((word>>8)<<2)-0x40000
+        if target != expected or target & 3:
+            raise ValueError(f'invalid resolved L32R at {pc:x}')
+        storage = next((name for low, high, name, kind in allocated if kind != 8 and low <= target and target+4 <= high), None)
+        if storage is None or (0x40378400 <= pc < 0x40388000 and storage != '.iram1'):
+            raise ValueError(f'L32R at {pc:x} reaches unavailable literal {target:x}')
+        loads += 1
+    if not functions or loads == 0:
+        raise ValueError('no linked function/literal evidence')
+    print(f'PASS: {len(allocated)} allocated sections in reserved windows; {loads} resolved L32R targets checked; not stack-depth/hardware proof')
+
+
+if __name__ == '__main__':
+    try:
+        validate(Path(sys.argv[1]))
+    except (IndexError, OSError, ValueError, struct.error, subprocess.CalledProcessError) as error:
+        raise SystemExit(str(error))

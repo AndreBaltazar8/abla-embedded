@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""Replace safe recovered Xtensa symbol calls with ordinary Abla calls.
+
+The recovered windowed-ABI functions have a uniform six-register plus ten
+stack-word signature.  When an Abla-owned callee never reads its stack words,
+an outgoing symbolic `$xtensa call` can call that function directly: supplied
+register arguments retain their order and all absent ABI positions are zero.
+This exposes the edge to normal semantic analysis, inlining, and dead-code
+elimination.  Calls with stack-dependent callees, wide/void results, indirect
+targets, or symbols without an Abla internal mapping remain target operations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import sys
+from dataclasses import dataclass
+
+
+INTERNAL = re.compile(
+    r'(?<![A-Za-z0-9_])#?(?:internal|export)Function\(\s*'
+    r'"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*'
+    r'"([^"]+)"\s*\)',
+    re.DOTALL,
+)
+FUNCTION = re.compile(
+    r'(?m)^(?:@[A-Za-z_][^\n]*\n)*'
+    r'(?:trusted\s+)?fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*'
+    r'\(([^{}=]*?)\)\s*:\s*'
+    r'(u64|u32|i32|u16|i16|u8|i8|int|bool|void)\s*(\{|=)',
+    re.DOTALL,
+)
+DIRECT_CALL = re.compile(r'\$xtensa call \{([^}]+)\}\(')
+WIDE_CALL = re.compile(
+    r'(?m)^([ \t]*)val\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+    r'\$xtensa callWide \{([^}]+)\}\('
+)
+VOID_CALL = re.compile(r'\$xtensa callVoid \{([^}]+)\}\(')
+STACK_NAME = re.compile(r'\b(?:incomingStack|stack)(?:[0-9])\b')
+INCOMING_STACK_INITIALIZER = re.compile(
+    r'^\s*var\s+incomingStack([0-9])\s*=\s*stack\1\s*$',
+    re.MULTILINE,
+)
+
+SOURCE_CALLS: dict[str, tuple[int, object, str]] = {
+    "memcpy": (3, lambda a: f"freestandingCopy({a[0]}, {a[1]}, {a[2]})", "runtime/freestanding_memory.ab"),
+    "memmove": (3, lambda a: f"freestandingMove({a[0]}, {a[1]}, {a[2]})", "runtime/freestanding_memory.ab"),
+    "memset": (3, lambda a: f"freestandingSet({a[0]}, i32({a[1]}), {a[2]})", "runtime/freestanding_memory.ab"),
+    "memcmp": (3, lambda a: f"u32(freestandingCompare({a[0]}, {a[1]}, {a[2]}))", "runtime/freestanding_memory.ab"),
+    "strlen": (1, lambda a: f"freestandingStringLength({a[0]})", "runtime/freestanding_memory.ab"),
+    "strnlen": (2, lambda a: f"freestandingStringLengthBounded({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "strcmp": (2, lambda a: f"u32(freestandingStringCompare({a[0]}, {a[1]}))", "runtime/freestanding_memory.ab"),
+    "strncmp": (3, lambda a: f"u32(freestandingStringCompareBounded({a[0]}, {a[1]}, {a[2]}))", "runtime/freestanding_memory.ab"),
+    "strcpy": (2, lambda a: f"freestandingStringCopy({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "strncpy": (3, lambda a: f"freestandingStringCopyBounded({a[0]}, {a[1]}, {a[2]})", "runtime/freestanding_memory.ab"),
+    "strcat": (2, lambda a: f"freestandingStringAppend({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "strchr": (2, lambda a: f"freestandingStringFind({a[0]}, i32({a[1]}))", "runtime/freestanding_memory.ab"),
+    "strrchr": (2, lambda a: f"freestandingStringFindLast({a[0]}, i32({a[1]}))", "runtime/freestanding_memory.ab"),
+    "strstr": (2, lambda a: f"freestandingStringFindString({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "__bswapsi2": (1, lambda a: f"freestandingByteSwap32({a[0]})", "runtime/freestanding_integer.ab"),
+    "__popcountsi2": (1, lambda a: f"u32(freestandingPopulationCount32({a[0]}))", "runtime/freestanding_integer.ab"),
+    "lwip_htonl": (1, lambda a: f"freestandingByteSwap32({a[0]})", "runtime/freestanding_integer.ab"),
+    "lwip_htons": (1, lambda a: f"u32(freestandingByteSwap16(u16({a[0]})))", "runtime/freestanding_integer.ab"),
+    "abort": (0, lambda a: "freestandingAbortValue()", "runtime/freestanding_integer.ab"),
+    "__assert_func": (4, lambda a: f"esp32AssertFailed({a[0]}, {a[1]}, {a[2]}, {a[3]})", "esp32/system/assert_esp32.ab"),
+    "esp_dport_access_reg_read": (1, lambda a: f"esp32DportRead({a[0]})", "esp32/dport_esp32.ab"),
+    "xPortEnterCriticalTimeout": (2, lambda a: f"esp32RecoveredXPortEnterCriticalTimeout({a[0]}, {a[1]})", "esp32/freertos/port_esp32.ab"),
+    "vPortExitCritical": (1, lambda a: f"esp32RecoveredVPortExitCriticalValue({a[0]})", "esp32/freertos/port_esp32.ab"),
+    "xPortInIsrContext": (0, lambda a: "esp32RecoveredXPortInIsrContext()", "esp32/freertos/port_esp32.ab"),
+    "malloc": (1, lambda a: f"esp32LibcMalloc({a[0]})", "esp32/runtime/libc_heap_esp32.ab"),
+    "calloc": (2, lambda a: f"esp32LibcCalloc({a[0]}, {a[1]})", "esp32/runtime/libc_heap_esp32.ab"),
+    "free": (1, lambda a: f"esp32LibcFreeValue({a[0]})", "esp32/runtime/libc_heap_esp32.ab"),
+    "heap_caps_malloc": (2, lambda a: f"esp32HeapCapsMalloc({a[0]}, {a[1]})", "esp32/heap/capabilities_policy_esp32.ab"),
+    "heap_caps_calloc": (3, lambda a: f"esp32HeapCapsCallocate({a[0]}, {a[1]}, {a[2]})", "esp32/heap/capabilities_policy_esp32.ab"),
+    "heap_caps_free": (1, lambda a: f"esp32HeapCapsFreeValue({a[0]})", "esp32/heap/capabilities_base_esp32.ab"),
+    "pbuf_free": (1, lambda a: f"esp32LwipPbufFree({a[0]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_alloc": (3, lambda a: f"esp32LwipPbufAllocate({a[0]}, {a[1]}, {a[2]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "mbedtls_platform_zeroize": (2, lambda a: f"freestandingSecureZero({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "mbedtls_to_psa_error": (1, lambda a: f"u32(esp32MbedtlsToPsaError(i32({a[0]})))", "esp32/security/crypto/psa_status_esp32.ab"),
+    "ets_delay_us": (1, lambda a: f"esp32EtsDelayUsValue({a[0]})", "esp32/rom/system_esp32.ab"),
+    "esp_rom_delay_us": (1, lambda a: f"esp32RomDelayUsValue({a[0]})", "esp32/rom/system_esp32.ab"),
+    "esp_crosscore_int_send_yield": (1, lambda a: f"esp32RecoveredEspCrosscoreIntSendYieldValue({a[0]})", "esp32/system/crosscore_interrupt_esp32.ab"),
+    "err_to_errno": (1, lambda a: f"u32(esp32RecoveredErrToErrno(i32({a[0]})))", "network/lwip/error_esp32.ab"),
+    "sys_arch_protect": (0, lambda a: "esp32RecoveredSysArchProtect()", "network/lwip/freertos_arch_esp32.ab"),
+    "memp_malloc": (1, lambda a: f"esp32RecoveredMempMalloc({a[0]})", "network/lwip/memory_pools_esp32.ab"),
+    "pbuf_add_header": (2, lambda a: f"esp32LwipPbufAddHeader({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_add_header_force": (2, lambda a: f"esp32LwipPbufAddHeaderForce({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_remove_header": (2, lambda a: f"esp32LwipPbufRemoveHeader({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_copy_partial": (4, lambda a: f"esp32LwipPbufCopyPartial({a[0]}, {a[1]}, {a[2]}, {a[3]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "panic_print_str": (1, lambda a: f"esp32RecoveredPanicPrintStrValue({a[0]})", "esp32/system/panic_esp32.ab"),
+    "panic_print_hex": (1, lambda a: f"esp32RecoveredPanicPrintHexValue({a[0]})", "esp32/system/panic_esp32.ab"),
+    "panic_print_dec": (1, lambda a: f"esp32RecoveredPanicPrintDecValue({a[0]})", "esp32/system/panic_esp32.ab"),
+    "esp_rom_gpio_connect_in_signal": (3, lambda a: f"esp32RomGpioConnectInSignalValue({a[0]}, {a[1]}, {a[2]})", "esp32/rom/gpio_esp32.ab"),
+    "esp_rom_gpio_connect_out_signal": (4, lambda a: f"esp32RomGpioConnectOutSignalValue({a[0]}, {a[1]}, {a[2]}, {a[3]})", "esp32/rom/gpio_esp32.ab"),
+    "wdt_hal_write_protect_disable": (1, lambda a: f"esp32WdtHalWriteProtectDisableValue({a[0]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "wdt_hal_write_protect_enable": (1, lambda a: f"esp32WdtHalWriteProtectEnableValue({a[0]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "wdt_hal_config_stage": (4, lambda a: f"esp32WdtHalConfigStageValue({a[0]}, {a[1]}, {a[2]}, {a[3]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "bzero": (2, lambda a: f"freestandingZeroValue({a[0]}, {a[1]})", "runtime/freestanding_memory.ab"),
+    "mem_free": (1, lambda a: f"esp32LwipMemFreeValue({a[0]})", "network/lwip/memory_esp32.ab"),
+    "pbuf_realloc": (2, lambda a: f"esp32LwipPbufReallocateValue({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_clen": (1, lambda a: f"esp32LwipPbufChainLength({a[0]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_cat": (2, lambda a: f"esp32LwipPbufConcatenateValue({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_try_get_at": (2, lambda a: f"u32(esp32LwipPbufTryGetAt({a[0]}, {a[1]}))", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_copy": (2, lambda a: f"esp32LwipPbufCopy({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_clone": (3, lambda a: f"esp32LwipPbufClone({a[0]}, {a[1]}, {a[2]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_header": (2, lambda a: f"esp32LwipPbufHeader({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_header_force": (2, lambda a: f"esp32LwipPbufHeaderForce({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "pbuf_free_header": (2, lambda a: f"esp32LwipPbufFreeHeader({a[0]}, {a[1]})", "network/lwip/pbuf_basic_esp32.ab"),
+    "roundup2": (2, lambda a: f"esp32Roundup2({a[0]}, {a[1]})", "esp32/idf6_legacy_link.ab"),
+    "esp_ptr_executable": (1, lambda a: f"esp32RecoveredEspPtrExecutable({a[0]})", "esp32/memory/address_esp32.ab"),
+    "esp_rom_crc32_le": (3, lambda a: f"esp32RomCrc32Le({a[0]}, {a[1]}, {a[2]})", "esp32/rom/basic_system_esp32.ab"),
+    "crc32_le": (3, lambda a: f"esp32RomCrc32Le({a[0]}, {a[1]}, {a[2]})", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_get_reset_reason": (1, lambda a: f"esp32RomGetResetReason({a[0]})", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_software_reset_system": (0, lambda a: "esp32RomSoftwareResetSystemValue()", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_software_reset_cpu": (1, lambda a: f"esp32RomSoftwareResetCpuValue({a[0]})", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_output_set_as_console": (1, lambda a: f"esp32RomOutputSetAsConsoleValue({a[0]})", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_install_uart_printf": (0, lambda a: "esp32RomInstallUartPrintfValue()", "esp32/rom/basic_system_esp32.ab"),
+    "esp_rom_route_intr_matrix": (3, lambda a: f"esp32RomRouteInterruptMatrixValue({a[0]}, {a[1]}, {a[2]})", "esp32/rom/system_esp32.ab"),
+    "ets_set_appcpu_boot_addr": (1, lambda a: f"esp32RomSetAppCpuBootAddressValue({a[0]})", "esp32/rom/system_esp32.ab"),
+    "esp_rom_output_tx_wait_idle": (1, lambda a: f"esp32RomOutputTxWaitIdleValue({a[0]})", "esp32/rom/serial_output_esp32.ab"),
+    "esp_rom_spiflash_wait_idle": (0, lambda a: "esp32RomSpiflashWaitIdleValue()", "esp32/rom/spiflash_clock_esp32.ab"),
+    "esp_dport_access_sequence_reg_read": (1, lambda a: f"esp32DportSequenceReadShared({a[0]})", "esp32/dport_esp32.ab"),
+    "Cache_Flush_rom": (1, lambda a: f"esp32RomCacheFlushValue({a[0]})", "esp32/rom/cache_control_esp32.ab"),
+    "Cache_Read_Enable_rom": (1, lambda a: f"esp32RomCacheReadEnableValue({a[0]})", "esp32/rom/cache_control_esp32.ab"),
+    "Cache_Read_Disable_rom": (1, lambda a: f"esp32RomCacheReadDisableValue({a[0]})", "esp32/rom/cache_control_esp32.ab"),
+    "wdt_hal_enable": (1, lambda a: f"esp32WdtHalEnableValue({a[0]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "wdt_hal_disable": (1, lambda a: f"esp32WdtHalDisableValue({a[0]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "wdt_hal_feed": (1, lambda a: f"esp32WdtHalFeedValue({a[0]})", "esp32/power/wdt_hal_typed_esp32.ab"),
+    "esp_rom_gpio_pad_select_gpio": (1, lambda a: f"esp32RomGpioPadSelectGpioValue({a[0]})", "esp32/gpio/hal_esp32.ab"),
+    "esp_rom_gpio_pad_pullup_only": (1, lambda a: f"esp32RomGpioPadPullupOnlyValue({a[0]})", "esp32/gpio/hal_esp32.ab"),
+    "esp_rom_spiflash_read_user_cmd": (2, lambda a: f"esp32RomSpiflashReadUserCommand({a[0]}, {a[1]})", "esp32/rom/spiflash_clock_esp32.ab"),
+    "esp_rom_output_tx_one_char": (1, lambda a: f"esp32RomOutputTxOneCharValue({a[0]})", "esp32/rom/serial_output_esp32.ab"),
+    "esp_rom_cvt": (6, lambda a: f"esp32RomCvt({a[0]}, {a[1]}, {a[2]}, {a[3]}, {a[4]}, {a[5]})", "esp32/rom/cvt_esp32.ab"),
+    "esp_rom_spiflash_write_encrypted_enable": (0, lambda a: "esp32RomSpiflashEncryptedEnableValue()", "esp32/rom/spiflash_typed_esp32.ab"),
+    "esp_rom_spiflash_prepare_encrypted_data": (2, lambda a: f"esp32RomSpiflashPrepareEncryptedDataValue({a[0]}, {a[1]})", "esp32/rom/spiflash_typed_esp32.ab"),
+    "esp_rom_spiflash_write_encrypted_disable": (0, lambda a: "esp32RomSpiflashEncryptedDisableValue()", "esp32/rom/spiflash_typed_esp32.ab"),
+    "esp_rom_spiflash_config_param": (6, lambda a: f"esp32RomSpiflashConfigParam({a[0]}, {a[1]}, {a[2]}, {a[3]}, {a[4]}, {a[5]})", "esp32/rom/spiflash_typed_esp32.ab"),
+    "esp_partition_verify": (1, lambda a: f"esp32PartitionVerify({a[0]})", "esp32/storage/partition_operations_esp32.ab"),
+    "esp_partition_copy": (5, lambda a: f"esp32PartitionCopy({a[0]}, {a[1]}, {a[2]}, {a[3]}, {a[4]})", "esp32/storage/partition_operations_esp32.ab"),
+    "esp_log_util_set_cache_enabled_cb": (1, lambda a: f"esp32LogSetCacheEnabledCallback({a[0]})", "esp32/log/util_typed_esp32.ab"),
+    "tlsf_check_hook": (3, lambda a: f"esp32TlsfCheckHook({a[0]}, {a[1]}, {a[2]})", "esp32/heap/tlsf_esp32.ab"),
+    "efuse_hal_get_mac": (1, lambda a: f"esp32EfuseGetMacValue({a[0]})", "esp32/hal/efuse_identity_esp32.ab"),
+    "efuse_hal_get_chip_ver_pkg": (0, lambda a: "esp32EfuseGetChipVersionPackage()", "esp32/hal/efuse_identity_esp32.ab"),
+    "spi_bus_lock_get_by_id": (1, lambda a: f"esp32SpiBusLockGetById({a[0]})", "esp32/spi/bus_context_esp32.ab"),
+    "cache_flash_mmu_set_rom": (6, lambda a: f"esp32CacheFlashMmuSet({a[0]}, {a[1]}, {a[2]}, {a[3]}, {a[4]}, {a[5]})", "esp32/rom/cache_mmu_esp32.ab"),
+    "bootloader_ana_clock_glitch_reset_config": (2, lambda a: f"esp32BootloaderAnalogClockGlitchResetConfig({a[0]}, {a[1]})", "esp32/rom/cache_mmu_esp32.ab"),
+    "__lshrdi3": (3, lambda a: f"u32((u64({a[0]}) | (u64({a[1]}) << u64(32))) >> u64({a[2]} & u32(63)))", "runtime/freestanding_integer.ab"),
+    "__ashrdi3": (3, lambda a: f"u32(i64(u64({a[0]}) | (u64({a[1]}) << u64(32))) >> i64({a[2]} & u32(63)))", "runtime/freestanding_integer.ab"),
+}
+
+WIDE_SOURCE_CALLS: dict[str, tuple[int, object, str]] = {
+    "esp_timer_get_time": (
+        0,
+        lambda a: "esp32TimerTimeMicroseconds()",
+        "esp32/timer/lac_esp32.ab",
+    ),
+    "esp_tls_get_platform_time": (
+        0,
+        lambda a: "esp32TimerTimeMicroseconds()",
+        "esp32/timer/lac_esp32.ab",
+    ),
+    "__divdi3": (
+        4,
+        lambda a: f"u64(esp32SignedDivide64(i64(u64({a[0]}) | (u64({a[1]}) << u64(32))), i64(u64({a[2]}) | (u64({a[3]}) << u64(32)))))",
+        "esp32/runtime/libgcc_divdi3_esp32.ab",
+    ),
+    "__moddi3": (
+        4,
+        lambda a: f"u64(esp32SignedRemainder64(i64(u64({a[0]}) | (u64({a[1]}) << u64(32))), i64(u64({a[2]}) | (u64({a[3]}) << u64(32)))))",
+        "esp32/runtime/libgcc_moddi3_esp32.ab",
+    ),
+    "__extendsfdf2": (
+        1,
+        lambda a: f"esp32Binary32BitsToBinary64({a[0]})",
+        "esp32/runtime/libgcc_extendsfdf2_esp32.ab",
+    ),
+    "__udivdi3": (
+        4,
+        lambda a: f"esp32UnsignedDivide64(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_udivdi3_esp32.ab",
+    ),
+    "__umoddi3": (
+        4,
+        lambda a: f"esp32UnsignedRemainder64(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_umoddi3_esp32.ab",
+    ),
+    "__floatunsidf": (
+        1,
+        lambda a: f"esp32Unsigned32ToBinary64({a[0]})",
+        "esp32/runtime/libgcc_floatsidf_esp32.ab",
+    ),
+    "__floatsidf": (
+        1,
+        lambda a: f"esp32Signed32ToBinary64(i32({a[0]}))",
+        "esp32/runtime/libgcc_floatsidf_esp32.ab",
+    ),
+    "__ashrdi3": (
+        3,
+        lambda a: f"u64(i64(u64({a[0]}) | (u64({a[1]}) << u64(32))) >> i64({a[2]} & u32(63)))",
+        "runtime/freestanding_integer.ab",
+    ),
+    "__bswapdi2": (
+        2,
+        lambda a: f"freestandingByteSwap64(u64({a[0]}) | (u64({a[1]}) << u64(32)))",
+        "runtime/freestanding_integer.ab",
+    ),
+    "__ashldi3": (
+        3,
+        lambda a: f"(u64({a[0]}) | (u64({a[1]}) << u64(32))) << u64({a[2]} & u32(63))",
+        "runtime/freestanding_integer.ab",
+    ),
+    "__lshrdi3": (
+        3,
+        lambda a: f"(u64({a[0]}) | (u64({a[1]}) << u64(32))) >> u64({a[2]} & u32(63))",
+        "runtime/freestanding_integer.ab",
+    ),
+    "__muldf3": (
+        4,
+        lambda a: f"esp32Binary64Multiply(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_muldf3_esp32.ab",
+    ),
+    "__adddf3": (
+        4,
+        lambda a: f"esp32RecoveredAdddf3(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_addsubdf3_esp32.ab",
+    ),
+    "__subdf3": (
+        4,
+        lambda a: f"esp32RecoveredSubdf3(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_addsubdf3_esp32.ab",
+    ),
+    "__divdf3": (
+        4,
+        lambda a: f"esp32Binary64Divide(u64({a[0]}) | (u64({a[1]}) << u64(32)), u64({a[2]}) | (u64({a[3]}) << u64(32)))",
+        "esp32/runtime/libgcc_divdf3_esp32.ab",
+    ),
+}
+
+# A recovered caller with no synthetic outgoing frame cannot have emitted
+# overflow argument stores. These two variadic facades therefore receive only
+# their six register words at such sites; their absent overflow words are zero.
+FRAMELESS_ZERO_STACK_SYMBOLS = {"wifi_log", "esp_rom_printf"}
+
+
+def recovered_local_key(symbol: str) -> str:
+    """Return the stable source name shared by local ELF symbol spellings."""
+    value = symbol
+    if value.startswith(".text."):
+        value = value[len(".text."):]
+    value = value.replace("$part$", "_part_")
+    return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
+
+
+@dataclass(frozen=True)
+class Function:
+    name: str
+    result: str
+    parameters: str
+    body: str
+    path: pathlib.Path
+    begin: int
+    end: int
+
+    def recovered_parameters(self) -> bool:
+        names = re.findall(
+            r'\b([A-Za-z_][A-Za-z0-9_]*)\s*:', self.parameters
+        )
+        expected = [f"a{index}" for index in range(2, 8)]
+        expected += [f"stack{index}" for index in range(10)]
+        return names == expected
+
+    def recovered_abi(self) -> bool:
+        return self.recovered_parameters() and self.result == "u32"
+
+    def simple_u32_arity(self) -> int | None:
+        if self.parameters.strip() == "":
+            return 0
+        parameters = split_arguments(self.parameters)
+        if not all(re.fullmatch(
+            r'[A-Za-z_][A-Za-z0-9_]*\s*:\s*u32', parameter.strip()
+        ) for parameter in parameters):
+            return None
+        return len(parameters)
+
+    def simple_scalar_types(self) -> list[str] | None:
+        if self.parameters.strip() == "":
+            return []
+        result: list[str] = []
+        for parameter in split_arguments(self.parameters):
+            match = re.fullmatch(
+                r'[A-Za-z_][A-Za-z0-9_]*\s*:\s*'
+                r'(u32|i32|u16|i16|u8|i8|int|bool)',
+                parameter.strip(),
+            )
+            if match is None:
+                return None
+            result.append(match.group(1))
+        return result
+
+    def recovered_register_only(self) -> bool:
+        if not self.recovered_abi():
+            return False
+        remaining = INCOMING_STACK_INITIALIZER.sub("", self.body)
+        return STACK_NAME.search(remaining) is None
+
+
+def matching_delimiter(text: str, opening: int, left: str, right: str) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = opening
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and following == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and following == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in ('"', "'"):
+            quote = char
+            index += 1
+            continue
+        if char == left:
+            depth += 1
+        elif char == right:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise ValueError(f"unterminated {left}{right} group at byte {opening}")
+
+
+def split_arguments(source: str) -> list[str]:
+    if source.strip() == "":
+        return []
+    arguments: list[str] = []
+    start = 0
+    round_depth = square_depth = brace_depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(source):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in ('"', "'"):
+            quote = char
+        elif char == "(":
+            round_depth += 1
+        elif char == ")":
+            round_depth -= 1
+        elif char == "[":
+            square_depth += 1
+        elif char == "]":
+            square_depth -= 1
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth -= 1
+        elif (char == "," and round_depth == 0 and square_depth == 0 and
+              brace_depth == 0):
+            arguments.append(source[start:index].strip())
+            start = index + 1
+    arguments.append(source[start:].strip())
+    if any(argument == "" for argument in arguments):
+        raise ValueError("empty recovered call argument")
+    return arguments
+
+
+def functions_in(path: pathlib.Path, text: str) -> list[Function]:
+    result: list[Function] = []
+    for match in FUNCTION.finditer(text):
+        if match.group(4) == "{":
+            closing = matching_delimiter(text, match.end() - 1, "{", "}")
+            body = text[match.end():closing]
+            end = closing + 1
+        else:
+            closing = text.find("\n", match.end())
+            if closing < 0:
+                closing = len(text)
+            body = text[match.end():closing]
+            end = closing
+        result.append(Function(
+            match.group(1), match.group(3), match.group(2),
+            body, path, match.start(), end,
+        ))
+    return result
+
+
+def rewrite_calls(
+    path: pathlib.Path,
+    root: pathlib.Path,
+    text: str,
+    mappings: dict[str, str],
+    functions: dict[str, Function],
+) -> tuple[str, int, int, set[str]]:
+    # Objdump names section-local functions as `.text.foo$part$0`, while the
+    # reconstructed internal binding deliberately gives the same function a
+    # collision-proof `.Labla_recovered_<owner>_local_foo_part_0` name. Resolve
+    # that spelling difference inside the owning module only. A unique suffix
+    # is proof of identity; offset entries such as `foo+0x20` intentionally do
+    # not match and remain target operations.
+    mappings = dict(mappings)
+    local_bindings = [(symbol, function) for function, symbol in INTERNAL.findall(text)]
+    call_symbols = set(DIRECT_CALL.findall(text))
+    call_symbols.update(match[2] for match in WIDE_CALL.findall(text))
+    call_symbols.update(VOID_CALL.findall(text))
+    for symbol in call_symbols:
+        if symbol in mappings:
+            continue
+        key = recovered_local_key(symbol)
+        candidates = {
+            function for bound, function in local_bindings
+            if any(recovered_local_key(bound).endswith(prefix + key)
+                   for prefix in ("local_", "local_text_"))
+        }
+        if len(candidates) == 1:
+            mappings[symbol] = candidates.pop()
+
+    replacements: list[tuple[int, int, str]] = []
+    converted_symbols: set[str] = set()
+    standard_count = 0
+    source_modules: set[str] = set()
+    caller_functions = functions_in(path, text)
+
+    def caller_outgoing_stack(
+        position: int,
+    ) -> tuple[list[str], str] | None:
+        for caller in caller_functions:
+            if caller.begin <= position < caller.end:
+                has_frame = re.search(
+                    r'\bval\s+frameAddress\s*=\s*u32\(nativeStackAllocate\('
+                    r'[^\n]+\)\)\s*\n\s*var\s+r1\s*=\s*frameAddress\b',
+                    caller.body,
+                ) is not None
+                if has_frame:
+                    return ([
+                        f"freestandingLoadWord(r1 + u32({offset}))"
+                        for offset in range(0, 40, 4)
+                    ], "runtime/freestanding_memory.ab")
+                if caller.recovered_parameters():
+                    return ([f"stack{index}" for index in range(10)], "")
+                return None
+        return None
+
+    def direct_replacement(
+        symbol: str,
+        arguments: list[str],
+        position: int,
+        allow_void: bool = False,
+    ) -> tuple[str, str, bool] | None:
+        standard = SOURCE_CALLS.get(symbol)
+        if (standard is not None and len(arguments) >= standard[0] and
+                len(arguments) <= 7):
+            return (
+                standard[1](arguments[:standard[0]]), standard[2], True
+            )
+        target = mappings.get(symbol, "")
+        function = functions.get(target)
+        if function is None:
+            return None
+        scalar_types = function.simple_scalar_types()
+        scalar_values: list[str] | None = None
+        if scalar_types is not None and len(arguments) <= 7:
+            if len(scalar_types) <= 6 and len(arguments) >= len(scalar_types):
+                scalar_values = arguments[:len(scalar_types)]
+            elif len(scalar_types) > 6 and len(arguments) >= 6:
+                outgoing = caller_outgoing_stack(position)
+                if outgoing is not None and len(scalar_types) <= 16:
+                    scalar_values = arguments[:6] + outgoing[0][
+                        :len(scalar_types) - 6
+                    ]
+        if scalar_types is not None and scalar_values is not None:
+            converted_arguments: list[str] = []
+            for value, kind in zip(scalar_values, scalar_types):
+                if kind == "u32":
+                    converted_arguments.append(value)
+                elif kind == "bool":
+                    converted_arguments.append(f"({value} != u32(0))")
+                else:
+                    converted_arguments.append(f"{kind}({value})")
+            expression = f"{target}({', '.join(converted_arguments)})"
+            if function.result == "u32":
+                return expression, "", False
+            if function.result in {"i32", "u16", "i16", "u8", "i8", "int"}:
+                return f"u32({expression})", "", False
+            if function.result == "bool":
+                return f"if ({expression}) u32(1) else u32(0)", "", False
+            if allow_void and function.result == "void":
+                return expression, "", False
+        if not function.recovered_abi():
+            return None
+        if len(arguments) > 16:
+            return None
+        if len(arguments) > 6:
+            direct_arguments = arguments + ["u32(0)"] * (
+                16 - len(arguments)
+            )
+            return f"{target}({', '.join(direct_arguments)})", "", False
+        direct_arguments = arguments + ["u32(0)"] * (6 - len(arguments))
+        module = ""
+        if function.recovered_register_only():
+            direct_arguments += ["u32(0)"] * 10
+        else:
+            outgoing = caller_outgoing_stack(position)
+            if outgoing is not None:
+                direct_arguments += outgoing[0]
+                module = outgoing[1]
+            elif symbol in FRAMELESS_ZERO_STACK_SYMBOLS:
+                direct_arguments += ["u32(0)"] * 10
+            else:
+                return None
+        return f"{target}({', '.join(direct_arguments)})", module, False
+
+    def simple_void_replacement(
+        symbol: str,
+        arguments: list[str],
+        position: int,
+    ) -> str | None:
+        target = mappings.get(symbol, "")
+        function = functions.get(target)
+        if function is None or function.result != "void":
+            return None
+        scalar_types = function.simple_scalar_types()
+        if scalar_types is None or len(arguments) > 7:
+            return None
+        scalar_values: list[str] | None = None
+        if len(scalar_types) <= 6 and len(arguments) >= len(scalar_types):
+            scalar_values = arguments[:len(scalar_types)]
+        elif len(scalar_types) > 6 and len(arguments) >= 6:
+            outgoing = caller_outgoing_stack(position)
+            if outgoing is not None and len(scalar_types) <= 16:
+                scalar_values = arguments[:6] + outgoing[0][
+                    :len(scalar_types) - 6
+                ]
+        if scalar_values is None:
+            return None
+        converted_arguments: list[str] = []
+        for value, kind in zip(scalar_values, scalar_types):
+            if kind == "u32":
+                converted_arguments.append(value)
+            elif kind == "bool":
+                converted_arguments.append(f"({value} != u32(0))")
+            else:
+                converted_arguments.append(f"{kind}({value})")
+        return f"{target}({', '.join(converted_arguments)})"
+
+    for match in DIRECT_CALL.finditer(text):
+        symbol = match.group(1)
+        closing = matching_delimiter(text, match.end() - 1, "(", ")")
+        arguments = split_arguments(text[match.end():closing])
+        direct = direct_replacement(symbol, arguments, match.start())
+        if direct is None:
+            void_replacement = simple_void_replacement(
+                symbol, arguments, match.start()
+            )
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            assignment = re.fullmatch(
+                r'([ \t]*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*',
+                text[line_start:match.start()],
+            )
+            if void_replacement is None or assignment is None:
+                continue
+            indent, result_variable = assignment.groups()
+            replacements.append((
+                line_start,
+                closing + 1,
+                f"{indent}{void_replacement}\n"
+                f"{indent}{result_variable} = u32(0)",
+            ))
+            converted_symbols.add(symbol)
+            continue
+        replacement, module, standard = direct
+        replacements.append((match.start(), closing + 1, replacement))
+        converted_symbols.add(symbol)
+        if standard:
+            standard_count += 1
+        if module:
+            source_modules.add(module)
+
+    # The lifter represents every two-register call result uniformly even when
+    # the linked Abla function has a proven 32-bit return.  Replace that exact
+    # three-line form with the ordinary call and a defined zero high word.
+    for match in WIDE_CALL.finditer(text):
+        indent, result_name, symbol = match.groups()
+        closing = matching_delimiter(text, match.end() - 1, "(", ")")
+        arguments = split_arguments(text[match.end():closing])
+        suffix = re.match(
+            rf'\n{re.escape(indent)}r10 = u32\({re.escape(result_name)}\)'
+            rf'\n{re.escape(indent)}r11 = u32\({re.escape(result_name)}'
+            rf' >>> u64\(32\)\)',
+            text[closing + 1:],
+        )
+        if suffix is None:
+            continue
+        wide = WIDE_SOURCE_CALLS.get(symbol)
+        if wide is not None and len(arguments) >= wide[0] and len(arguments) <= 7:
+            expression = wide[1](arguments[:wide[0]])
+            replacements.append((
+                match.start(), closing + 1 + suffix.end(),
+                f"{indent}val {result_name} = {expression}\n"
+                f"{indent}r10 = u32({result_name})\n"
+                f"{indent}r11 = u32({result_name} >>> u64(32))",
+            ))
+            converted_symbols.add(symbol)
+            standard_count += 1
+            source_modules.add(wide[2])
+            continue
+        direct = direct_replacement(symbol, arguments, match.start())
+        if direct is None:
+            void_replacement = simple_void_replacement(
+                symbol, arguments, match.start()
+            )
+            if void_replacement is None:
+                continue
+            replacements.append((
+                match.start(), closing + 1 + suffix.end(),
+                f"{indent}{void_replacement}\n"
+                f"{indent}r10 = u32(0)\n{indent}r11 = u32(0)",
+            ))
+            converted_symbols.add(symbol)
+            continue
+        replacement, module, standard = direct
+        replacements.append((
+            match.start(), closing + 1 + suffix.end(),
+            f"{indent}r10 = {replacement}\n{indent}r11 = u32(0)",
+        ))
+        converted_symbols.add(symbol)
+        if standard:
+            standard_count += 1
+        if module:
+            source_modules.add(module)
+
+    for match in VOID_CALL.finditer(text):
+        symbol = match.group(1)
+        closing = matching_delimiter(text, match.end() - 1, "(", ")")
+        arguments = split_arguments(text[match.end():closing])
+        direct = direct_replacement(
+            symbol, arguments, match.start(), allow_void=True
+        )
+        if direct is None:
+            continue
+        replacement, module, standard = direct
+        replacements.append((match.start(), closing + 1, replacement))
+        converted_symbols.add(symbol)
+        if standard:
+            standard_count += 1
+        if module:
+            source_modules.add(module)
+    # Calls can be nested in another recovered call's argument list. Applying
+    # both edits with offsets from the original source corrupts the outer edit
+    # after the inner edit changes its byte range. Select only the innermost
+    # non-overlapping ranges in this pass; main() repeats until every newly
+    # exposed outer call has been lowered.
+    selected: list[tuple[int, int, str]] = []
+    for candidate in sorted(
+        replacements, key=lambda item: (item[1] - item[0], item[0])
+    ):
+        begin, end, _ = candidate
+        if any(begin < kept_end and kept_begin < end
+               for kept_begin, kept_end, _ in selected):
+            continue
+        selected.append(candidate)
+    for begin, end, replacement in sorted(
+        selected, key=lambda item: item[0], reverse=True
+    ):
+        text = text[:begin] + replacement + text[end:]
+    for module in sorted(source_modules):
+        implementation = root / module
+        relative = os.path.relpath(implementation, path.parent)
+        import_line = f'import "{pathlib.PurePath(relative).as_posix()}"'
+        if import_line not in text:
+            text = import_line + "\n" + text
+    return text, len(selected), standard_count, converted_symbols
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", default="src")
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    root = pathlib.Path(arguments.root).resolve()
+    paths = sorted(root.rglob("*.ab"))
+    texts = {path: path.read_text() for path in paths}
+
+    mappings: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for text in texts.values():
+        for match in INTERNAL.finditer(text):
+            function, symbol = match.groups()
+            previous = mappings.get(symbol)
+            if previous is not None and previous != function:
+                ambiguous.add(symbol)
+            else:
+                mappings[symbol] = function
+    for symbol in ambiguous:
+        mappings.pop(symbol, None)
+
+    functions: dict[str, Function] = {}
+    duplicate_functions: set[str] = set()
+    for path, text in texts.items():
+        for function in functions_in(path, text):
+            if function.name in functions:
+                duplicate_functions.add(function.name)
+            else:
+                functions[function.name] = function
+    for name in duplicate_functions:
+        functions.pop(name, None)
+
+    changed_files = converted = standard_converted = 0
+    converted_symbols: set[str] = set()
+    for path, original in texts.items():
+        rewritten = original
+        file_count = 0
+        file_standard_count = 0
+        file_symbols: set[str] = set()
+        while True:
+            next_text, count, standard_count, symbols = rewrite_calls(
+                path, root, rewritten, mappings, functions
+            )
+            if count == 0:
+                break
+            rewritten = next_text
+            file_count += count
+            file_standard_count += standard_count
+            file_symbols.update(symbols)
+        if file_count == 0:
+            continue
+        changed_files += 1
+        converted += file_count
+        standard_converted += file_standard_count
+        converted_symbols.update(file_symbols)
+        if arguments.write:
+            path.write_text(rewritten)
+
+    action = "rewrote" if arguments.write else "would rewrite"
+    print(
+        f"{action} {changed_files} file(s), {converted} call(s), "
+        f"{len(converted_symbols)} symbol(s), "
+        f"{standard_converted} standard call(s); "
+        f"skipped {len(ambiguous)} ambiguous mapping(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
