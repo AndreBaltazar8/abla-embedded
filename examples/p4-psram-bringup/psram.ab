@@ -1,0 +1,103 @@
+import "../../src/esp32/psram/startup_esp32p4.ab"
+import "../../src/esp32/psram/memory_esp32p4.ab"
+import "../../src/esp32/psram/cold_sweep_esp32p4.ab"
+import "../../src/esp32/cache_cold_esp32p4.ab"
+import "../../src/esp32/revision_esp32p4.ab"
+import "../../src/esp32/serial_esp32p4.ab"
+import "../../src/esp32/boot/internal_entry_esp32p4.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// OFFLINE bring-up image, not a verified Tab5 firmware or automatic flash task.
+// Prerequisites: AP-compatible x16 PSRAM powered at its rated voltage and
+// settled in POWER-ON mode (register read dummy8), XTAL40 and analog160MHz
+// upstream stable, calibrated ROM delay/command transport, UART0 configured.
+// Cold PSRAM clocks/MPLL not in use; valid inherited cache tags/backing memory,
+// no inherited live PSRAM users, DMA/peers/preload/locked lines excluded.
+// Does NOT power/reset the chip, disable watchdogs, assume failed tests passed,
+// or restore autoload into changed mappings. Full entry fault capture remains.
+// Reserves physical pages0..28 and virtual48000000..481d0000 (1900544B),
+// enough for720x1280RGB565 plus owned page padding. Destructive38patterns per
+// page AND whole-range alias check at the selected80/200MHz AFTER lower-lane read
+// sweep selects DQS/data delays. Commands stay20MHz; no untested high-speed
+// promotion or automatic low-speed fallback after failed full-width writes.
+// Output twelve hexwords: phase,startupError,coldPhase,coldError,memoryPhase,
+// memoryError,failedPage,pattern,expected,actual,sweepLow,sweepHigh.
+// Phase4 ONLY=full mapped range test passed at the selected speed in this run.
+// Success retains active verified memory and owners until watchdog/user reset.
+// Cold phases14/15 deliberately block generic cold close while range owned.
+val startupStorage=nativeStaticAllocate(16)
+val coldStorage=nativeStaticAllocate(48)
+val memoryStorage=nativeStaticAllocate(88)
+val commandScratch=nativeStaticAllocate(64)
+val commandWork=nativeStaticAllocate(100)
+val trainingStorage=nativeStaticAllocate(32)
+trusted fun p4PsramBringup(): int = p4PsramBringupAt(80)
+// The combined Tab5 video probe uses200MHz per M5GFX's bandwidth requirement;
+// standalone80MHz remains a separate memory probe, not a display-ready claim.
+trusted fun p4PsramBringupAt(mhz: int): int {
+    if (mhz != 80 && mhz != 200) return 0
+    val layout=esp32P4ChipRegisterLayout()
+    if (layout != 1 && layout != 3) return 0
+    val base=if (layout == 1) 0x4ff10000 else 0x4ff80000
+    // Linker's complete code/data/stack reservation, not just used data.
+    val liveBytes=0x18000
+    val entry=nativeFunctionAddress(p4InternalApplicationEntry)
+    if (entry < base || entry >= base+0x10000 || startupStorage < base+0x10000 || commandWork+100 > base+0x14000 || trainingStorage < base+0x10000 || trainingStorage+32 > base+0x14000) return 0
+    if (!p4CacheSramSpanSafe(layout,524288,base,liveBytes)) return 0
+    val startup=nativeBufferAt(startupStorage,16)
+    val cold=nativeBufferAt(coldStorage,48)
+    val memory=nativeBufferAt(memoryStorage,88)
+    if (!p4PsramStartupInitializeOwned(startup) || !p4PsramColdInitializeOwned(cold) || !p4PsramMemoryInitializeOwned(memory)) return 1
+    val started=p4PsramStartupColdOwned(startup,cold,mhz,true,8,nativeBufferAt(commandScratch,64),nativeBufferAt(commandWork,100),100000)
+    if (started != 1) return 2
+    // This report is produced now by this exact cold owner; never reuse a
+    // previous boot's candidate. Sweep also checks all scratch/report aliases.
+    val trained=p4PsramColdReadSweepOwned(cold,0,nativeBufferAt(commandScratch,64),nativeBufferAt(commandWork,100),nativeBufferAt(trainingStorage,32),100000)
+    if (trained != 1) return 3
+    val identity=P4PsramIdentity(cold.loadU32(24)|(cold.loadU32(28)<<32))
+    if (!identity.matchesProfile(mhz,true) || identity.physicalBytes() < 1900544 || cold.loadU32(4) != 8) return 3
+    // Check the whole target MMU range before destructive cache resize.
+    var index=0
+    while (index < 29) {
+        val prior=p4PsramMmuReadOwned(0x48000000+(index<<16),100000)
+        if (prior != 1) { cold.storeU32(36,if ((prior&255) == 1) 6 else prior&255); cold.storeU32(40,index); return 3 }
+        index=index+1
+    }
+    cold.storeU32(4,14)
+    val cache=p4CacheL2InitializeColdOwned(layout,524288,128,base,liveBytes,100000)
+    if (cache != 1) { cold.storeU32(36,cache); return 3 }
+    // Cold profile80 uses MPLL320; profile200 uses MPLL400, both corediv1.
+    // Selected delays remain installed; commands remain20MHz. AXI closed.
+    val speed=p4PsramSweepSpeed(if (mhz == 80) 4 else 2,if (mhz == 80) 16 else 20,100000)
+    if (speed != 1) { cold.storeU32(36,speed); return 3 }
+    val opened=p4PsramMemoryOpenOwned(memory,0x48000000,0,29,identity.physicalBytes(),128,p4PsramProfileReadDummy(mhz),p4PsramProfileWriteDummy(mhz),true,100000)
+    if (opened != 1) return 3
+    val verified=p4PsramMemoryVerifyOwned(memory,100000)
+    if (verified == 1) cold.storeU32(4,15)
+    return if (verified == 1) 4 else 3
+}
+trusted fun p4PsramPrintWord(value: int): bool {
+    val port=serial(0)
+    var word=value&4294967295
+    var remaining=8
+    while (remaining > 0) {
+        val digit=(word>>>28)&15
+        if (!port.tryWriteByte(if (digit < 10) 48+digit else 87+digit,100000)) return false
+        word=(word<<4)&4294967295
+        remaining=remaining-1
+    }
+    return port.tryWriteByte(32,100000)
+}
+trusted fun p4PsramPrintReport(phase: int): void {
+    if (!p4PsramPrintWord(phase)) return
+    if (!p4PsramPrintWord(nativeBufferAt(startupStorage,16).loadU32(12))) return
+    val cold=nativeBufferAt(coldStorage,48); val memory=nativeBufferAt(memoryStorage,88)
+    if (!p4PsramPrintWord(cold.loadU32(4)) || !p4PsramPrintWord(cold.loadU32(36))) return
+    if (!p4PsramPrintWord(memory.loadU32(4)) || !p4PsramPrintWord(memory.loadU32(20))) return
+    if (!p4PsramPrintWord(memory.loadU32(64)) || !p4PsramPrintWord(memory.loadU32(72))) return
+    if (!p4PsramPrintWord(memory.loadU32(80)) || !p4PsramPrintWord(memory.loadU32(84))) return
+    val training=nativeBufferAt(trainingStorage,32)
+    if (!p4PsramPrintWord(training.loadU32(0)) || !p4PsramPrintWord(training.loadU32(4))) return
+    val port=serial(0)
+    port.tryWriteByte(10,100000); port.tryFlush(100000); return
+}

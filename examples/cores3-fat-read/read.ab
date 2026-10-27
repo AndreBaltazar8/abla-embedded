@@ -1,0 +1,59 @@
+import "../../src/esp32/gpio_esp32s3.ab"
+import "../../src/esp32/peripheral_delay_esp32s3.ab"
+import "../../src/m5stack/cores3_spi.ab"
+import "../../src/sd/software_register.ab"
+import "../../src/storage/fat_software_sd.ab"
+import "../../src/storage/fat_mount.ab"
+import "../../src/storage/fat_path.ab"
+import "../../src/storage/fat_file_read.ab"
+import "../../src/storage/fat_path_read_utf16.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// Callable, NOT a boot image. Same settled power/ROM delay and exclusive
+// CoreS3 SPI pads3,4,35,36,37 requirements as cores3-sd-read. Caller owns a
+// canonical initialized gate, workspace2087 for ASCII or2607 for UTF16,
+// destination512 and immutable path, all disjoint. No card writes.
+// Explicit MBR slot0..3 or -1 superfloppy. Initializes card, mounts, finds a
+// nested file, reads one chunk at offset. Result bytes1..512,0EOF;
+// budget bounds each path component and the read separately; max32components.
+// errors -1input,-100-pin,-200-init,-300-CSD,-400capacity,-401descriptor,
+// -500-mount,-600-lookup,-700-read. Destination unchanged until successful
+// file read; workspace untrusted on failure. Pins remain configured.
+trusted fun cores3FatReadExampleMode(gateAddress: u32,workspaceAddress: u32,pathAddress: u32,pathLength: int,destinationAddress: u32,partition: int,offset: int,budget: int,wide: bool): int {
+    val gate=peripheralGateAt(int(gateAddress))
+    val workspaceSize=if (wide) 2607 else 2087
+    val pathBytes=if (wide) pathLength*2 else pathLength
+    val workspace=nativeBufferAt(int(workspaceAddress),workspaceSize)
+    val path=nativeBufferAt(int(pathAddress),pathBytes)
+    val destination=nativeBufferAt(int(destinationAddress),512)
+    if (pathLength < 1 || pathLength > (if (wide) 4096 else 255) || partition < -1 || partition > 3 || offset < 0 || budget < 1 || budget > 1000000 ||
+        !gate.bufferDisjoint(workspace,workspaceSize) || !gate.bufferDisjoint(path,pathBytes) || !gate.bufferDisjoint(destination,512) ||
+        fatBuffersOverlap(workspace,workspaceSize,path,pathBytes) || fatBuffersOverlap(workspace,workspaceSize,destination,512) || fatBuffersOverlap(path,pathBytes,destination,512)) return -1
+    val reader=nativeBufferAt(workspace.addressValue(),28)
+    val boot=nativeBufferAt(workspace.addressValue()+28,512)
+    val work=nativeBufferAt(workspace.addressValue()+540,if (wide) 2067 else 1536)
+    val sector=nativeBufferAt(work.addressValue()+1024,512)
+    val name=nativeBufferAt(workspace.addressValue()+2076,11)
+    val pins=m5BoardStackCoreS3.configureCoreS3SpiPins(gate,u32(7))
+    if (!pins.valid()) return -100-pins.status()
+    val card=softwareSdInitialize(gate,u32(7),Pin(36),Pin(37),Pin(35),Pin(4),sector)
+    if (!card.valid()) return -200-card.status()
+    val csd=softwareSdReadRegister(gate,u32(7),Pin(36),Pin(37),Pin(35),Pin(4),card,9,sector)
+    if (!csd.valid()) return -300-csd.status()
+    val capacity=sdCsdBlockCount(sector)
+    if (capacity == 0) return -400
+    if (!fatSoftwareSdReaderInitialize(reader,gate,u32(7),Pin(36),Pin(37),Pin(35),Pin(4),card,capacity)) return -401
+    val mounted=fatMountReadOwned(reader,capacity,partition,boot,sector)
+    if (!mounted.valid()) return -500-mounted.status()
+    if (wide) {
+        val result=fatReadPathUtf16Owned(reader,boot,mounted.firstSector(),mounted.sectors(),path,pathLength,offset,512,budget,destination,work)
+        // Preserve established lookup/read error families.
+        return if (result <= -100) result-500 else result
+    }
+    val file=fatLookupPathOwned(reader,boot,mounted.firstSector(),mounted.sectors(),path,pathLength,budget,name,work)
+    if (!file.isFile()) return -600-file.status()
+    val read=fatFileReadAtOwned(reader,boot,mounted.firstSector(),mounted.sectors(),file,offset,512,budget,destination,work)
+    if (read.status() == 2) return 0
+    if (read.status() != 1) return -700-read.status()
+    return read.bytesRead()
+}

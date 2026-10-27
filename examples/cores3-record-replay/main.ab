@@ -1,0 +1,59 @@
+import "../../src/esp32/i2c_esp32s3.ab"
+import "../../src/m5stack/cores3_capture.ab"
+import "../../src/m5stack/cores3_playback.ab"
+import "../../src/m5stack/cores3_audio_power.ab"
+import "./owned_sequence.ab"
+import "../../src/runtime/memory32.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+#requiredInternalFunction("freestandingMemorySet32", "memset")
+
+// Callable, finite 1.005-second stereo16/16k record-and-replay example.
+// NOT a boot image. Caller supplies settled I2C, open PMIC/expander/codec
+// handles, stable PLL160M, calibrated ROM delay, exclusive stopped I2S1,
+// both directions of GDMA channel2, pins0/13/14/33/34 and writable storage.
+// Configures board-wide power/AW9523 and quiets both codecs before capture.
+// Requires exclusive board initialization ownership (not a live resume).
+// Leaves configured power rails on and backlight off. No allocation,
+// implicit resource acquisition, retries after failure, or handle closing.
+//
+// descriptors:72 bytes; ring:5760 bytes; recording:64320 bytes; staging:960.
+// All ranges must be disjoint; staging/descriptors/ring aligned to4 bytes.
+// The DMA ring must lie in internal SRAM (validated by the called routines).
+//
+// Bit61 marks power-setup failure (low bits:CoreS3AudioPowerResult).
+// Bit60 marks a capture-phase failure; otherwise CoreS3PlaybackResult layout.
+// On capture failure, low60 bits retain the complete CoreS3CaptureResult.
+// No playback/reuse occurs unless capture reports success AND safe shutdown.
+// On ANY failure inspect the DMA/codec cleanup fields before reusing memory.
+// Success is a software completion result, not acoustic verification.
+trusted fun cores3RecordReplayWithDevices(power: u32, microphone: u32, amplifier: u32,
+    expander: u32, descriptors: u32, ring: u32, recording: u32,
+    staging: u32, owner: u32): int {
+    val source = nativeBufferAt(int(recording), 64320)
+    val scratch = nativeBufferAt(int(staging), 960)
+    if (!Axp2101(int(power)).valid() || !Es7210(int(microphone)).valid() ||
+        !Aw88298(int(amplifier)).valid() || !Aw9523(int(expander)).valid() ||
+        owner == u32(0) || !source.hasAddressRange(0, 64320) ||
+        !esp32s3GdmaRingLayoutValid(int(descriptors), 6, int(ring), 960, 960) ||
+        !scratch.hasAddressRange(0, 960) || (int(staging) & 3) != 0 ||
+        coreS3PlaybackSpansOverlap(int(recording), 64320, int(descriptors), 72) ||
+        coreS3PlaybackSpansOverlap(int(recording), 64320, int(ring), 5760) ||
+        coreS3PlaybackSpansOverlap(int(staging), 960, int(recording), 64320) ||
+        coreS3PlaybackSpansOverlap(int(staging), 960, int(descriptors), 72) ||
+        coreS3PlaybackSpansOverlap(int(staging), 960, int(ring), 5760)) return 2
+    val initialized = cores3InitializeAudioPower(Axp2101(int(power)),
+        Aw9523(int(expander)), Aw88298(int(amplifier)), Es7210(int(microphone)))
+    if (!initialized.valid()) return (1 << 61) | (initialized & 536870911)
+    val captured = cores3CaptureBlocks(Es7210(int(microphone)), 2,
+        int(descriptors), int(ring), source, 67, owner, 1000)
+    if (captured.status() != 1 || captured.bytes() != 64320 ||
+        captured.dmaStatus() != 1 || captured.codecStatus() != 1)
+        return (1 << 60) | (captured & 1152921504606846975)
+    val played = cores3PlaybackBlocks(Aw88298(int(amplifier)),
+        Aw9523(int(expander)), 2, int(descriptors), int(ring), source, 67,
+        scratch, owner, 1000)
+    played & 1152921504606846975
+}
+
+#exportFunction("cores3RecordReplayExample", "abla_cores3_record_replay_example")

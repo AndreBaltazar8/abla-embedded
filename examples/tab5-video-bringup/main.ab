@@ -1,0 +1,76 @@
+import "../p4-psram-bringup/psram.ab"
+import "./bars.ab"
+import "../tab5-panel-bringup/panel.ab"
+import "../../src/m5stack/tab5_psram_video_esp32p4.ab"
+import "../../src/esp32/dw_gdma_controller_esp32p4.ab"
+import "../../src/m5stack/tab5_backlight_esp32p4.ab"
+import "../../src/m5stack/tab5_pwm_esp32p4.ab"
+// OFFLINE ONLY. All PSRAM+panel prerequisites, plus stable DSI PLL240MHz
+// and exclusive initially unclocked DMA group/channel0. Controller ownership
+// is opened explicitly; preexisting groups are never reset/adopted. No IRQ
+// install or watchdog feeding. Partial controller leases persist until reset.
+// Eight RGB565 bars; three observed DMA rearms then checked shutdown.
+// Requires exclusive initially unclocked LEDC and stable XTAL40 for GPIO22 PWM.
+// On successive rearms, request quarter/half/full duty, then stop/detach before
+// video shutdown. These brief steps are not a physical brightness acceptance test.
+// DMA progress does NOT prove visible pixels. Never release a failed loan.
+val videoDescriptorStorage=nativeStaticAllocate(127)
+val videoGateStorage=nativeStaticAllocate(4)
+var videoDmaOwner=Esp32P4DwDmaController(0)
+var backlightClock=Esp32P4IomuxClockOwner(0)
+var videoBacklight=Tab5PwmBacklight(0)
+@export("abla_p4_application_main")
+@noinline
+trusted fun tab5VideoApplicationMain(): void {
+    val layout=esp32P4ChipRegisterLayout()
+    backlightClock=esp32P4IomuxClockOpenOwned(layout)
+    if (!backlightClock.ready()) { p4PsramPrintWord(backlightClock|0); return }
+    val dark=tab5BacklightConfigureOffOwned(layout)
+    if (dark != 1) { p4PsramPrintWord(dark); return }
+    val psram=p4PsramBringupAt(200); p4PsramPrintReport(psram)
+    if (psram != 4) return
+    val panelResult=tab5PanelBringup(); tab5PanelPrintReport(panelResult)
+    if (panelResult != 9) return
+    val memory=nativeBufferAt(memoryStorage,88)
+    val frame=nativeBufferAt(memory.loadU32(8),1843200)
+    if (memory.loadU32(4) != 4 || !tab5VideoFillBars(frame)) return
+    val descriptor=nativeBufferAt((videoDescriptorStorage+63)&4294967232,64)
+    val panel=tab5DsiOwnerAt(nativeBufferAt(panelStorage,40))
+    nativeBufferAt(videoGateStorage,4).storeU32(0,0)
+    videoDmaOwner=esp32P4DwDmaControllerOpenOwned(100000)
+    if (videoDmaOwner.status() != 1) {
+        p4PsramPrintWord(videoDmaOwner|0)
+        val failedPort=serial(0); failedPort.tryWriteByte(10,100000); failedPort.tryFlush(100000); return
+    }
+    val started=panel.startPsramVideoOwned(memory,0,descriptor,100000)
+    var refreshed=0; var remaining=1000000; var last=0; var light=1
+    if ((started&15) == 1) {
+        while (remaining > 0 && refreshed < 3) {
+            last=esp32P4DsiServiceRefresh(serviceGateAt(videoGateStorage),u32(1),0,descriptor,frame,1843200,128,100000)
+            val status=last&255
+            if (status == 1) {
+                refreshed=refreshed+1
+                if (refreshed == 1) {
+                    videoBacklight=tab5PwmBacklightOpenOwned(layout,100000)
+                    light=videoBacklight.status()
+                    if (!videoBacklight.ready()) break
+                }
+                videoBacklight=videoBacklight.setDutyOwned(if (refreshed == 1) 64 else if (refreshed == 2) 128 else 256,100000)
+                light=videoBacklight.status()
+                if (light != 1) break
+            }
+            else if (status != 0 && status != 3) break
+            remaining=remaining-1
+        }
+    }
+    videoBacklight=videoBacklight.closeOwned(100000)
+    val darkened=videoBacklight.bits()
+    val stopped=if (memory.loadU32(4) == 8) panel.stopPsramVideoOwned(memory,videoGateStorage,100000) else 2
+    // No IRQ/callback was installed. Only a confirmed stopped channel returns
+    // its group lease; timeout/partial stop must leave group clocks pinned.
+    if ((stopped&255) == 1 && (stopped&32768) != 0) videoDmaOwner=videoDmaOwner.closeOwned(100000)
+    p4PsramPrintWord(started); p4PsramPrintWord(refreshed); p4PsramPrintWord(last); p4PsramPrintWord(stopped)
+    p4PsramPrintWord(videoDmaOwner|0)
+    p4PsramPrintWord(light); p4PsramPrintWord(darkened)
+    val port=serial(0); port.tryWriteByte(10,100000); port.tryFlush(100000); return
+}

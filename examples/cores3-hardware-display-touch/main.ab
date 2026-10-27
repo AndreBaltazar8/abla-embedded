@@ -1,0 +1,93 @@
+import "../../src/esp32/i2c_esp32s3.ab"
+import "../../src/esp32/gpio_esp32s3.ab"
+import "../../src/esp32/peripheral_delay_esp32s3.ab"
+import "../../src/m5stack/cores3_display_hardware_init.ab"
+import "../../src/m5stack/cores3_touch.ab"
+import "../../src/input/touch_ft5x06_frame.ab"
+import "../../src/esp32/timer_esp32s3.ab"
+import "abla/runtime/scalar"
+import "../../src/runtime/memory32.ab"
+import "../../src/runtime/unsigned_division64.ab"
+import "abla/build"
+#requiredInternalFunction("freestandingMemorySet32", "memset")
+
+val demoSpiGate = nativeStaticMutableU32s([0])
+val demoTouchStorage = nativeStaticMutableU32s([0,0,0,0,0,0,0,0])
+val demoTouchFrame = nativeStaticAllocate(40)
+val demoTouchTracker = nativeStaticAllocate(184)
+
+// CoreS3/SE only, NOT Atom Echo. Callable example entry, not a bootloader.
+// Startup must supply stable PLL80M plus actual stable XTAL/CPU clocks,
+// stopped GPSPI2, and exclusively hand over
+// SYSTIMER unit0 snapshot access with its actual running frequency timerHz,
+// I2C1/GPIO11,12,21,3,4,35,36,37 and board power for this entire call.
+// No concurrent invocation or pre-existing I2C users. External5V is not enabled
+// by this demo; existing external power state is preserved. No flash writes.
+// Runs bounded touch samples, draws white dots (green while held), then turns the backlight off
+// and closes the owned bus/devices. SPI pins remain in inactive configured state.
+// Low16 result:0 success,1 arguments,2 I2C setup,3 handles,4 touch init,
+// 5 touch read,6 report,7 drawing,8 rotation,9 timer; 256+stage for display initialization failure.
+// Bits16/17 independently report backlight-off / bus-close failure.
+@export("abla_cores3_hardware_display_touch_demo")
+trusted fun cores3HardwareDisplayTouchDemo(xtalHz: u32, cpuHz: u32, samples: i32, rotation: int, timerHz: u32): int {
+    if (samples < i32(0) || samples > i32(1000) || rotation < 0 || rotation > 7 || xtalHz == u32(0) || cpuHz == u32(0) || timerHz == u32(0)) return 1
+    val initialTicks = esp32S3TimerTicks()
+    if (initialTicks < 0) return 9
+    val bus = i2cMaster(1, 12, 11, xtalHz, cpuHz)
+    if (!bus.valid()) {
+        // Partial I2C setup is explicitly recoverable; do not silently retry it.
+        return 2 | (if (i2cAbortSetup(1)) 0 else 131072)
+    }
+    val power = axp2101(bus)
+    val expander = aw9523(bus)
+    val touch = ft5x06(bus, 56, 100000)
+    val board = m5BoardStackCoreS3
+    val gate = peripheralGateAt(demoSpiGate)
+    val snapshot = nativeBufferAt(demoTouchStorage, 29)
+    val frame = nativeBufferAt(demoTouchFrame, 40)
+    val tracker = touchTrackerAt(demoTouchTracker)
+    var result = 0
+    if (!power.valid() || !expander.valid() || !touch.valid()) result = 3
+    if (result == 0) {
+        val initialized = board.initializeCoreS3HardwareDisplay(power, expander, touch, gate, u32(7), false, 80)
+        if (!initialized.valid()) result = 256 + initialized.status()
+    }
+    if (result == 0 && (!cores3ConfigureTouchInterrupt() || !touch.begin())) result = 4
+    var sample = i32(0)
+    val display = board.spiDisplay()
+    val view = board.displayGeometry().view(rotation)
+    if (result == 0 && !display.setRotation(gate,u32(7),board.displayGeometry(),rotation).valid()) result = 8
+    while (result == 0 && sample < samples) {
+        val count = cores3ReadTouch(touch, expander, snapshot)
+        if (count < 0) result = 5
+        val ticks = esp32S3TimerTicks()
+        if (ticks < 0) result = 9
+        if (result == 0) {
+            // Includes I/O time and wraps at the hardware52-bit counter.
+            // Multiplication by1000 fits62bits; pure-Abla division avoids
+            // an implicit compiler-runtime dependency on this32-bit target.
+            val elapsed = (ticks - initialTicks) & 4503599627370495
+            val now = int(unsignedDivide64(
+                u64(elapsed) * u64(1000),u64(timerHz))) & 4294967295
+            if (tracker.updateFt5x06Snapshot(snapshot,frame,count,now,320,240,rotation) < 0) result = 6
+        }
+        var contact = 0
+        while (result == 0 && contact < touchMaximumPoints) {
+            val detail = tracker.detail(contact)
+            val point = detail.point()
+            if (detail.isPressed()) {
+                val drawn = display.fillRect(gate, u32(7), view,
+                    point.x() - 2, point.y() - 2, 5, 5,
+                    if (detail.isHolding()) rgb565Green else rgb565White)
+                if (!drawn.valid()) result = 7
+            }
+            contact = contact + 1
+        }
+        sample = sample + i32(1)
+        if (result == 0 && sample < samples) peripheralDelayMilliseconds(16)
+    }
+    if (power.valid() && !cores3DisplaySetBrightness(power, 0)) result = result | 65536
+    // Bus.close revokes all device slots, so no redundant per-device closes.
+    if (!bus.close()) result = result | 131072
+    result
+}

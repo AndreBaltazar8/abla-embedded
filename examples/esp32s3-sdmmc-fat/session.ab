@@ -1,0 +1,124 @@
+import "../../src/sd/mmc_startup_s3_sequence.ab"
+import "../../src/sd/mmc_shutdown_s3_sequence.ab"
+import "../../src/sd/mmc_transfer_clock_s3_sequence.ab"
+import "../../src/storage/fat_sdmmc.ab"
+import "../../src/storage/fat_mount.ab"
+import "../../src/storage/fat_path.ab"
+import "../../src/storage/fat_file_read.ab"
+// Caller-owned zero-initialized2304bytes, DMA descriptor16 and bounce512.
+// Startup128@0, FATsession52@128,reader28@180,BPB512@208,scratch1536@720,
+// shortName11@2256,descriptorPointer32@2280,bouncePointer32@2284,stage32@2288.
+// Stage0fresh,1starting,2ready,3failed,4closing,5closed,6close-update-failed,
+// 7pad-failed,8SCR,9width,10transfer-clock (all before FAT binding).
+// All storage/pads/power/clock leases remain pinned on failure. Close releases
+// the startup RCC lease only; caller restores pads/power/source afterwards.
+// Caller supplies powered/settled card, exclusively routed SDMMC pads,
+// both CIU clocks disabled, stable XTAL40/PLL160 and16MHz SYSTIMER unit0.
+// This generic wiring example does NOT claim any board's SPI socket is SDMMC.
+trusted fun sdMmcFatExampleBegin(workspace: NativeBuffer,descriptor: NativeBuffer,bounce: NativeBuffer,slot: int,pll160: bool,nowMs: u32,prepared: bool): int {
+    if (!prepared || !workspace.hasAddressRange(0,2304) || workspace.loadU32(2288) != 0 ||
+        !sdMmcDmaRegionsValid(descriptor,bounce,512) || fatBuffersOverlap(workspace,2304,descriptor,16) || fatBuffersOverlap(workspace,2304,bounce,512)) return -1
+    val started=sdMmcStartupBeginOwned(nativeBufferAt(workspace.addressValue(),128),slot,pll160,nowMs,2000,true)
+    if (started != 2) return -100-started
+    workspace.storeU32(2280,descriptor.addressValue()); workspace.storeU32(2284,bounce.addressValue()); workspace.storeU32(2288,1)
+    return 0
+}
+trusted fun sdMmcFatExamplePoll(workspace: NativeBuffer,nowMs: u32,nowUs: u32): int {
+    if (!workspace.hasAddressRange(0,2304)) return -1
+    val stage=workspace.loadU32(2288)
+    if (stage == 10) return sdMmcFatSpeedPoll(workspace,nowMs,nowUs)
+    if (stage == 4) {
+        val closed=sdMmcStartupClosePollOwned(nativeBufferAt(workspace.addressValue(),128))
+        if (closed == 1) { workspace.storeU32(2288,5); return 1 }
+        if (closed == 5) workspace.storeU32(2288,6)
+        return if (closed == 2) 0 else -600-closed
+    }
+    if (stage == 5) return 1
+    if (stage == 2) return 1
+    if (stage != 1) return -1
+    val startup=nativeBufferAt(workspace.addressValue(),128)
+    val status=sdMmcStartupPollOwned(startup,nowMs,nowUs)
+    if (status == 2) return 0
+    if (status != 1) { workspace.storeU32(2288,3); return -100-status }
+    return sdMmcFatSpeedBegin(workspace,nowMs)
+}
+// Reuse the unbound FAT session/reader bytes128..191. Both bus widths pass
+// this stage before FAT admission. 25MHz ceiling, default SDR only; actual
+// clock is divider-limited. Explicit600ms hardware /1000ms software timeout.
+trusted fun sdMmcFatSpeedBegin(workspace: NativeBuffer,nowMs: u32): int {
+    if (!workspace.hasAddressRange(0,2304) || (workspace.loadU32(2288) != 1 && workspace.loadU32(2288) != 9)) return -1
+    val startup=nativeBufferAt(workspace.addressValue(),128)
+    val status=sdMmcTransferClockBeginOwned(nativeBufferAt(workspace.addressValue()+128,64),sdMmcStartupCard(startup),startup.load(6) != 0,25000000,600,nowMs,1000,true)
+    if (status != 2) { workspace.storeU32(2288,3); return -1100-status }
+    workspace.storeU32(2288,10)
+    return 0
+}
+trusted fun sdMmcFatSpeedPoll(workspace: NativeBuffer,nowMs: u32,nowUs: u32): int {
+    if (!workspace.hasAddressRange(0,2304) || workspace.loadU32(2288) != 10) return -1
+    val context=nativeBufferAt(workspace.addressValue()+128,64)
+    val status=sdMmcTransferClockPollOwned(context,nowMs,nowUs)
+    if (status == 2) return 0
+    if (status != 1) { workspace.storeU32(2288,3); return -1100-status }
+    // Publish effective clock metadata before binding overwrites the context.
+    workspace.store(7,context.load(7)); workspace.storeU32(8,context.loadU32(8)); workspace.storeU32(40,context.loadU32(12))
+    return sdMmcFatExampleBindReady(workspace)
+}
+trusted fun sdMmcFatExampleBindReady(workspace: NativeBuffer): int {
+    if (!workspace.hasAddressRange(0,2304)) return -1
+    val startup=nativeBufferAt(workspace.addressValue(),128)
+    if (sdMmcStartupStatus(startup) != 1) return -1
+    val initialized=fatSdMmcReaderInitialize(nativeBufferAt(workspace.addressValue()+180,28),sdMmcStartupCard(startup),
+        nativeBufferAt(workspace.addressValue()+128,52),nativeBufferAt(workspace.loadU32(2280),16),nativeBufferAt(workspace.loadU32(2284),512),1000,100000,true)
+    if (!initialized) { workspace.storeU32(2288,3); return -200 }
+    workspace.storeU32(2288,2)
+    return 1
+}
+trusted fun sdMmcFatExampleRead(workspace: NativeBuffer,path: NativeBuffer,pathLength: int,destination: NativeBuffer,partition: int,offset: int,budget: int): int {
+    if (!workspace.hasAddressRange(0,2304) || workspace.loadU32(2288) != 2 || pathLength < 1 || pathLength > 255 ||
+        !path.hasAddressRange(0,pathLength) || !destination.hasAddressRange(0,512) || partition < -1 || partition > 3 || offset < 0 || budget < 1 || budget > 1000000 ||
+        fatBuffersOverlap(workspace,2304,path,pathLength) || fatBuffersOverlap(workspace,2304,destination,512) || fatBuffersOverlap(path,pathLength,destination,512)) return -1
+    val descriptor=nativeBufferAt(workspace.loadU32(2280),16)
+    val bounce=nativeBufferAt(workspace.loadU32(2284),512)
+    if (fatBuffersOverlap(path,pathLength,descriptor,16) || fatBuffersOverlap(path,pathLength,bounce,512) ||
+        fatBuffersOverlap(destination,512,descriptor,16) || fatBuffersOverlap(destination,512,bounce,512)) return -1
+    val reader=nativeBufferAt(workspace.addressValue()+180,28)
+    val boot=nativeBufferAt(workspace.addressValue()+208,512)
+    val scratch=nativeBufferAt(workspace.addressValue()+720,1536)
+    val name=nativeBufferAt(workspace.addressValue()+2256,11)
+    val capacity=sdMmcCardBlockCount(sdMmcStartupCard(nativeBufferAt(workspace.addressValue(),128)))
+    val mounted=fatMountReadOwned(reader,capacity,partition,boot,nativeBufferAt(scratch.addressValue()+1024,512))
+    var result=0
+    if (!mounted.valid()) result=-300-mounted.status()
+    else {
+        val file=fatLookupPathOwned(reader,boot,mounted.firstSector(),mounted.sectors(),path,pathLength,budget,name,scratch)
+        if (!file.isFile()) result=-400-file.status()
+        else {
+            val read=fatFileReadAtOwned(reader,boot,mounted.firstSector(),mounted.sectors(),file,offset,512,budget,destination,scratch)
+            result=if (read.status() == 1) read.bytesRead() else if (read.status() == 2) 0 else -500-read.status()
+        }
+    }
+    // Keep pending/failed transport state instead of trying another FAT read.
+    if (workspace.loadU32(176) != 0) workspace.storeU32(2288,3)
+    return result
+}
+trusted fun sdMmcFatExampleDrain(workspace: NativeBuffer): int {
+    if (!workspace.hasAddressRange(0,2304) || workspace.loadU32(2288) != 3 || workspace.loadU32(176) != 1) return -1
+    return fatSdMmcDrainOwned(nativeBufferAt(workspace.addressValue()+180,28))
+}
+// Explicit operation4, followed by poll operation1 while closing. Pending FAT
+// IO must first drain; failed host/card traffic must be recovered explicitly.
+trusted fun sdMmcFatExampleClose(workspace: NativeBuffer): int {
+    if (!workspace.hasAddressRange(0,2304)) return -1
+    val stage=workspace.loadU32(2288)
+    if (stage == 5) return 1
+    if (stage != 2 && stage != 3 && stage != 6) return -1
+    // Startup can fail before session initialization: only inspect lifecycle
+    // after the immutable reader has actually been constructed.
+    val reader=nativeBufferAt(workspace.addressValue()+180,28)
+    if (fatSdMmcReaderValid(reader) && workspace.loadU32(176) == 1) return -1
+    val result=sdMmcStartupCloseBeginOwned(nativeBufferAt(workspace.addressValue(),128),true)
+    if (result == 2) { workspace.storeU32(2288,4); return 0 }
+    if (result == 1) { workspace.storeU32(2288,5); return 1 }
+    if (result == 5) workspace.storeU32(2288,6)
+    return -600-result
+}
