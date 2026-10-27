@@ -1,0 +1,110 @@
+import "./cpu_clock_p4_sequence.ab"
+import "../psram/speed_p4_sequence.ab"
+import "../flash/speed_p4_sequence.ab"
+// Single owner for optional flash120 and PSRAM low-speed leases plus CPU
+// XTAL parking and CPLL recovery. This does NOT request sleep, retain CPU
+// context, start MPLL/SPLL power, or acquire cache/IRQ/peer-core exclusion.
+// Caller supplies those prerequisites, internal retained code/stack/record,
+// pinned sources and calibrated timekeeping; keep all until fully restored.
+// Restore requires MPLL/SPLL/analog sources recovered and stable throughout
+// retries. CPLL power/gates and calibration are restored when CPU used it.
+// Ordering: flash20 -> PSRAM20 -> CPUXTAL; CPLL -> CPU -> PSRAM -> flash.
+// Record288B:magic,state,last,detail,cpuSourceMHz,revision,mpllMHz,flags,hart,rollback;
+// flash56@40,PSRAM112@96,CPU48@208,CPLL32@256. Children never independent.
+// States1flash2PSRAM3CPU4parked5CPLL6CPUrestore7PSRAMrestore8flashrestore9done.
+// Results1parked2invalid3stageFailure4pending5restored. Partial acquisition
+// stays owned; close finishes only already-owned children, never acquires a
+// missing child to undo a preparation failure. Pending hardware remains owned.
+trusted fun p4SleepClocksResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun esp32p4SleepClocksContinueOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,288) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50344353 || r.loadU32(4) < 1 || r.loadU32(4) > 9) return 2
+    if (r.loadU32(32) != int(p4CpllHart())) return 2
+    val flash=nativeBufferAt(r.addressValue()+40,56);val psram=nativeBufferAt(r.addressValue()+96,112)
+    val cpu=nativeBufferAt(r.addressValue()+208,48);val pll=nativeBufferAt(r.addressValue()+256,32)
+    while (true) {
+        val state=r.loadU32(4);val flags=r.loadU32(28)
+        if (state == 4) return p4SleepClocksResult(r,1,0)
+        if (state == 9) return p4SleepClocksResult(r,5,0)
+        var result=1
+        var done=1
+        var pending=false
+        if (state == 1 && (flags&1) != 0) {
+            result=if (flash.loadU32(0) == 0) esp32p4FlashSpeedOpenOwned(flash,polls,true) else esp32p4FlashSpeedContinueOwned(flash,polls,true)
+            pending=result == 4 || result == 6
+        } else if (state == 2 && (flags&2) != 0) {
+            result=if (psram.loadU32(0) == 0) esp32p4PsramSpeedOpenOwned(psram,r.loadU32(24),polls,true) else esp32p4PsramSpeedContinueOwned(psram,polls,true)
+            pending=result == 4
+        } else if (state == 3) {
+            result=if (cpu.loadU32(0) == 0) esp32p4CpuClockOpenOwned(cpu,r.loadU32(16),r.loadU32(20),polls,true) else esp32p4CpuClockContinueOwned(cpu,polls,true)
+            pending=result == 5
+        } else if (state == 5 && cpu.loadU32(16) == 1) {
+            result=if (pll.loadU32(0) == 0) esp32p4CpllWakeBeginOwned(pll,r.loadU32(16),r.loadU32(20),polls,true) else esp32p4CpllContinueOwned(pll,polls,true)
+            pending=result == 6
+        } else if (state == 6) {
+            done=6;result=esp32p4CpuClockCloseOwned(cpu,polls,true);pending=result == 5
+        } else if (state == 7 && (flags&2) != 0 && (r.loadU32(36) == 0 || psram.loadU32(0) != 0)) {
+            // MPLL must have reached END and STOP before restoring trained
+            // memory speed. Routing/divider matches alone do not prove this.
+            if ((p4FlashSpeedRccRead(188)&768) != 768) return p4SleepClocksResult(r,3,21)
+            done=6;result=esp32p4PsramSpeedCloseOwned(psram,polls,true,true);pending=result == 4
+        } else if (state == 8 && (flags&1) != 0 && (r.loadU32(36) == 0 || flash.loadU32(0) != 0)) {
+            // SYSPLL calibration is normally restored by the entry0 graph;
+            // require its actual END+STOP, including after a rejected request.
+            if ((p4FlashSpeedRccRead(188)&192) != 192) return p4SleepClocksResult(r,3,20)
+            done=7;result=esp32p4FlashSpeedCloseOwned(flash,polls,true,true);pending=result == 4 || result == 6
+        }
+        if (result != done) return p4SleepClocksResult(r,if (pending) 4 else 3,result)
+        r.storeU32(4,state+1)
+    }
+    return 2
+}
+trusted fun esp32p4SleepClocksOpenOwned(r: NativeBuffer,sourceMHz: int,revision: int,mpllMHz: int,flash120: bool,psram: bool,polls: int,exclusive: bool): int {
+    if (!exclusive || (sourceMHz != 20 && sourceMHz != 40 && sourceMHz != 360 && sourceMHz != 400) || revision < 0 || revision > 399 ||
+        (psram && mpllMHz != 320 && mpllMHz != 400 && mpllMHz != 500) || polls < 1 || polls > 1000000 ||
+        !r.hasAddressRange(0,288) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || p4CpllHart() > u32(1)) return 2
+    if (psram) {
+        // Do not inspect either controller bank with its clocks unavailable.
+        if (!p4PsramSpeedClockReady()) return 3
+        // Integer cross-products avoid rounding and RV32 division helpers.
+        // The child CPU preflight subsequently verifies this actual profile.
+        val cpuDiv=((p4CpuClockRead(0x500e6004)>>>5)&255)+1
+        if (sourceMHz < 20*cpuDiv) return 2
+        var port=0
+        while (port < 2) {
+            val clock=p4PsramMappedRead(if (port == 0) 80 else 4116)
+            val divider=if ((clock&0x80000000) != 0) 1 else ((clock>>>16)&255)+1
+            if (sourceMHz*divider < mpllMHz*cpuDiv) return 2
+            port=port+1
+        }
+    }
+    var i=4
+    while (i < 288) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344353);r.storeU32(4,1);r.storeU32(16,sourceMHz);r.storeU32(20,revision);r.storeU32(24,mpllMHz)
+    r.storeU32(28,(if (flash120) 1 else 0)|(if (psram) 2 else 0));r.storeU32(32,int(p4CpllHart()))
+    return esp32p4SleepClocksContinueOwned(r,polls,true)
+}
+trusted fun esp32p4SleepClocksRestoreOwned(r: NativeBuffer,polls: int,sourcesRecovered: bool,exclusive: bool): int {
+    if (!sourcesRecovered || !exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,288) ||
+        (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344353 || r.loadU32(4) < 1 || r.loadU32(4) > 9 ||
+        r.loadU32(32) != int(p4CpllHart())) return 2
+    if (r.loadU32(4) < 4) {
+        val cpu=nativeBufferAt(r.addressValue()+208,48)
+        if (cpu.loadU32(0) != 0) {
+            // An issued CPU divider update must settle; calibration requires
+            // undivided XTAL. Finish this owned child, not any new acquisition.
+            val parked=esp32p4CpuClockContinueOwned(cpu,polls,true)
+            if (parked != 1) return p4SleepClocksResult(r,if (parked == 5) 4 else 3,parked)
+            r.storeU32(4,4)
+        } else {
+            // No CPU lease means CPU never changed. Restore only memory
+            // leases that actually opened, even if a later preflight failed.
+            r.storeU32(36,1);r.storeU32(4,7)
+        }
+    }
+    val result=esp32p4SleepClocksContinueOwned(r,polls,exclusive)
+    if (result != 1) return result
+    r.storeU32(4,5);return esp32p4SleepClocksContinueOwned(r,polls,true)
+}

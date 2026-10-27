@@ -1,0 +1,105 @@
+import "./sleep_record_c5.ab"
+import "../cpu_clock_c5_sequence.ab"
+//192B retained preparation session: tag0,state4,prepare-stage8,Q19period12,
+// UART mask16,polls20,PVT policy24,cancel-stage28,child-result32,UART token36,
+// time40B@40,clock park48B@80,clock resume64B@128.
+// Results:1prepared,2invalid,3pending,4cancelled. Internal state5cancelling,
+//6transferred. Take transfers time40@40, saved CPU plan@92 and UART token@36
+// to the next owned lifecycle. Keep this storage alive through its recovery;
+// never cancel or reuse it after transfer until that lifecycle has finished.
+// Fresh tag must be zero. Immutable policy on retries. Never copy a live
+// session. Caller owns clocks/PVT/analog bus, timer observers and UART users;
+// interrupts/DMA quiesced, retained closure/data/stack, calibrated RTC/ticks,
+// stable XTAL and MSPI-safe clock transition prerequisites remain explicit.
+// This prepares clocks/UART/time only: not PMU profile, cache suspension,
+// retention, wake routing, entry, or permission to release scheduler users.
+// Clock failure may have changed voltage/shadows. Cancellation FINISHES park
+// before real clock restart; never blindly restores shadows or enables PVT.
+// Outstanding cleanup stays owned and is retried; cancellation is irreversible.
+@section(".iram1.abla.c5SleepPrepareTake")
+trusted fun esp32C5SleepPrepareTakeOwned(record: NativeBuffer,exclusive: bool): bool {
+    if (!exclusive || !record.hasAddressRange(0,192) || (record.addressValue()&3) != 0 ||
+        c5SleepRecordRead(record,0) != 0x43505232 || c5SleepRecordRead(record,4) != 1) return false
+    c5SleepRecordWrite(record,4,6)
+    true
+}
+@section(".iram1.abla.c5SleepPrepareCancel")
+trusted fun esp32C5SleepPrepareCancelOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,192) || (record.addressValue()&3) != 0 || c5SleepRecordRead(record,0) != 0x43505232) return 2
+    val state=c5SleepRecordRead(record,4)
+    if (state == 4) return 4
+    if (state != 1 && state != 3 && state != 5) return 2
+    if (c5SleepRecordRead(record,28) > 2) return 2
+    c5SleepRecordWrite(record,4,5)
+    val base=record.addressValue();val stage=c5SleepRecordRead(record,28)
+    val pvt=c5SleepRecordRead(record,24) != 0
+    if (stage <= 0) {
+        if (c5SleepRecordRead(record,80) != 0) {
+            val parked=c5SleepPreparePark(nativeBufferAt(base+80,48),pvt)
+            c5SleepRecordWrite(record,32,parked)
+            if (parked != 1) return 3
+            val restored=c5SleepPrepareRestore(nativeBufferAt(base+128,64),C5CpuClock(c5SleepRecordRead(record,92)),pvt)
+            c5SleepRecordWrite(record,32,restored)
+            if (restored != 1) return 3
+        }
+        c5SleepRecordWrite(record,28,1)
+    }
+    if (stage <= 1) {
+        val token=c5SleepRecordRead(record,36)
+        if ((token&0x300) != 0) {
+            val remaining=c5SleepPrepareUartsResume(token)
+            c5SleepRecordWrite(record,36,remaining);c5SleepRecordWrite(record,32,remaining)
+            if ((remaining&0x300) != 0) return 3
+        }
+        c5SleepRecordWrite(record,28,2)
+    }
+    if (c5SleepRecordRead(record,40) != 0) {
+        // No sleep request was issued by this session; do not compensate time.
+        val result=c5SleepPrepareTimeCancel(nativeBufferAt(base+40,40))
+        c5SleepRecordWrite(record,32,result)
+        if (result != 1) return 3
+    }
+    c5SleepRecordWrite(record,28,3);c5SleepRecordWrite(record,4,4)
+    4
+}
+@section(".iram1.abla.c5SleepPrepare")
+trusted fun esp32C5SleepPrepareOwned(record: NativeBuffer,period: int,ports: int,polls: int,usePvt: bool,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,192) || (record.addressValue()&3) != 0 ||
+        period < 1 || period > 0xffffffff || ports < 0 || ports > 3 || polls < 1 || polls > 1000000) return 2
+    val base=record.addressValue();val tag=c5SleepRecordRead(record,0);val policy=if (usePvt) 1 else 0
+    if (tag == 0) {
+        c5SleepRecordWrite(record,12,period);c5SleepRecordWrite(record,16,ports)
+        c5SleepRecordWrite(record,20,polls);c5SleepRecordWrite(record,24,policy)
+        c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,28,0)
+        c5SleepRecordWrite(record,32,0);c5SleepRecordWrite(record,36,0)
+        c5SleepRecordWrite(record,40,0);c5SleepRecordWrite(record,80,0);c5SleepRecordWrite(record,128,0)
+        c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x43505232)
+    } else if (tag != 0x43505232 || c5SleepRecordRead(record,12) != period || c5SleepRecordRead(record,16) != ports ||
+        c5SleepRecordRead(record,20) != polls || c5SleepRecordRead(record,24) != policy) return 2
+    val state=c5SleepRecordRead(record,4)
+    if (state == 1) return 1
+    if (state == 4) return 4
+    if (state == 5) return esp32C5SleepPrepareCancelOwned(record,true)
+    if (state != 3 || c5SleepRecordRead(record,8) > 2) return 2
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        val captured=c5SleepPrepareTimeCapture(nativeBufferAt(base+40,40),period,polls)
+        c5SleepRecordWrite(record,32,captured)
+        if (captured != 1) return 3
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        val token=c5SleepPrepareUarts(ports,polls)
+        c5SleepRecordWrite(record,36,token);c5SleepRecordWrite(record,32,token)
+        if ((token&255) != 1) {
+            c5SleepRecordWrite(record,4,5)
+            return esp32C5SleepPrepareCancelOwned(record,true)
+        }
+        c5SleepRecordWrite(record,8,2)
+    }
+    val parked=c5SleepPreparePark(nativeBufferAt(base+80,48),usePvt)
+    c5SleepRecordWrite(record,32,parked)
+    if (parked != 1) return 3
+    c5SleepRecordWrite(record,8,3);c5SleepRecordWrite(record,4,1)
+    1
+}

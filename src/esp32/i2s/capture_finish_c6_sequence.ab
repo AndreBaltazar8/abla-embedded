@@ -1,0 +1,66 @@
+import "./dma_completion_c6_sequence.ab"
+import "./dma_stop_c6_sequence.ab"
+//72B:tag0,phase4,completion28@8,stop24@36,DMAsnapshot60,I2Sraw64,error68.
+// Finite RX: acquire all -> successful EOF -> stop/park/FIFOempty -> recheck
+// errors -> acknowledge successful DMA and RX_DONE only. No reset/discard.
+// More than one descriptor requires timely service/appropriate stop policy;
+// trailing FIFO data or overrun is NOT silently discarded or called success.
+// Return1finished2invalid3latched error4blocked5pending. On failure retain all
+// resources; caller must explicitly stop/handle errors before reuse/cleanup.
+// Caller owns clocks/pads/IRQ/ETM, immutable layout and all destination memory.
+fun c6CaptureFinishStorage(q: NativeBuffer): bool = q.hasAddressRange(0,72) && (q.addressValue()&3) == 0 && (q.addressValue()+72 <= 0x60000000 || q.addressValue() >= 0x60100000)
+trusted fun c6CaptureFinishOwned(r: NativeBuffer,q: NativeBuffer,budget: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6I2sDmaStartStorage(r) || r.loadU32(0) != 0x43364944 || r.loadU32(16) != 0 || r.loadU32(40) != 0 || !c6CaptureFinishStorage(q) || budget < 1 || budget > 1024 || polls < 1 || polls > 1000000) return 2
+    val descriptors=r.loadU32(20);val count=r.loadU32(24);val buffers=r.loadU32(28);val stride=r.loadU32(32);val bytes=r.loadU32(36);val address=q.addressValue()
+    if (!c6GdmaRingValid(descriptors,count,buffers,stride,bytes) ||
+        (address < r.addressValue()+72 && r.addressValue() < address+72) ||
+        (address < descriptors+count*12 && descriptors < address+72) ||
+        (address < buffers+(count-1)*stride+bytes && buffers < address+72)) return 2
+    if (q.loadU32(0) == 0) {
+        if (r.loadU32(4) != 1) return 2
+        var at=0
+        while (at < 72) { q.storeU32(at,0);at=at+4 }
+        q.storeU32(0,0x43364643);q.storeU32(4,1)
+    } else if (q.loadU32(0) != 0x43364643 || q.loadU32(16) != r.addressValue()) return 2
+    if (q.loadU32(4) == 5) return 1
+    if (q.loadU32(4) == 6) return 3
+    if (q.loadU32(4) == 1) {
+        val result=c6I2sDmaCompletionPollOwned(r,nativeBufferAt(address+8,28),budget,true)
+        if (result == 5) return 5
+        if (result != 1) { q.storeU32(4,6);return 3 }
+        q.storeU32(4,2)
+    }
+    if (q.loadU32(4) == 2) {
+        val events=c6GdmaEventsReadOwned(r.loadU32(12),false,true)
+        q.storeU32(60,events|0)
+        if (events.status() != 1) return 4
+        if (events.errors() != 0) { q.storeU32(4,6);return 3 }
+        if (!c6I2sUpdateClocks(false)) return 4
+        val raw=c6I2sRead(0xc);q.storeU32(64,int(raw))
+        if ((raw&u32(4)) != u32(0)) { q.storeU32(68,0x10004);q.storeU32(4,6);return 3 }
+        if (!events.eof()) return 5
+        q.storeU32(4,3)
+    }
+    if (q.loadU32(4) == 3) {
+        val result=c6I2sDmaStopOwned(r,nativeBufferAt(address+36,24),polls,true)
+        if (result == 5 || result == 8) return 5
+        if (result != 1) return 4
+        q.storeU32(4,4)
+    }
+    if (q.loadU32(4) == 4) {
+        val events=c6GdmaEventsReadOwned(r.loadU32(12),false,true)
+        q.storeU32(60,events|0)
+        if (events.status() != 1) return 4
+        if (events.errors() != 0) { q.storeU32(4,6);return 3 }
+        if (!c6I2sUpdateClocks(false) || !c6I2sStopped()) return 4
+        val raw=c6I2sRead(0xc);q.storeU32(64,int(raw))
+        if ((raw&u32(4)) != u32(0)) { q.storeU32(68,0x10004);q.storeU32(4,6);return 3 }
+        if (events.acknowledgeOwned(events.raw(),true) != 1) return 4
+        if ((raw&u32(1)) != u32(0)) {
+            c6I2sWrite(0x18,u32(1))
+            if ((c6I2sRead(0xc)&u32(5)) != u32(0)) return 4
+        }
+        q.storeU32(4,5);return 1
+    }
+    return 2
+}

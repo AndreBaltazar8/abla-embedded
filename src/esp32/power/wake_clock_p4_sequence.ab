@@ -1,0 +1,47 @@
+import "../gpio_clock_p4_sequence.ab"
+import "abla/runtime/scalar"
+// Global clock lease for LP wake-pad access, not a peripheral reset or PMU
+// power-domain initializer. Caller serializes RCC/LP clocks across both cores
+// and LP firmware, and keeps every child pad/peripheral lease inside this one.
+// Close ONLY after all consumers stop and child pads are restored.
+// Scalar: status8, IOMUXowner10@8, acquiredLP-IOMUX18, acquiredLP-GPIO19.
+type P4WakeClock=int
+fun P4WakeClock.status(): int = this&255
+fun P4WakeClock.ownsResources(): bool = (this&0xf0000) != 0
+trusted fun p4WakeClockField(address: int,enabled: bool): bool {
+    val before=p4WakeClockRead(address)
+    p4WakeClockWrite(address,if (enabled) before|u32(1) else before&u32(0xfffffffe))
+    return ((p4WakeClockRead(address)&u32(1)) != u32(0)) == enabled
+}
+//1ready2invalid3IOMUXfailure4LP-IOMUXfailure5LP-GPIOfailure6closed.
+// Failed writes retain attempted ownership. No loops without a bound.
+trusted fun esp32p4WakeClockOpenOwned(layout: int,exclusive: bool): P4WakeClock {
+    if (!exclusive || (layout != 1 && layout != 3)) return P4WakeClock(2)
+    val hp=esp32P4IomuxClockOpenOwned(layout)
+    var token=(hp|0)<<8
+    if (!hp.ready()) return P4WakeClock(token|3)
+    if ((p4WakeClockRead(0x5012b000)&u32(1)) == u32(0)) {
+        token=token|(1<<18)
+        if (!p4WakeClockField(0x5012b000,true)) return P4WakeClock(token|4)
+    }
+    if ((p4WakeClockRead(0x5012a000)&u32(1)) == u32(0)) {
+        token=token|(1<<19)
+        if (!p4WakeClockField(0x5012a000,true)) return P4WakeClock(token|5)
+    }
+    return P4WakeClock(token|1)
+}
+trusted fun P4WakeClock.closeOwned(exclusive: bool): P4WakeClock {
+    if (!exclusive || this.status() == 6 || this.status() == 2 || this < 0 || (this>>>20) != 0) return this
+    var token=this&0xfff00
+    if ((token&(1<<19)) != 0) {
+        if (!p4WakeClockField(0x5012a000,false)) return P4WakeClock(token|5)
+        token=token&(~(1<<19))
+    }
+    if ((token&(1<<18)) != 0) {
+        if (!p4WakeClockField(0x5012b000,false)) return P4WakeClock(token|4)
+        token=token&(~(1<<18))
+    }
+    val remaining=Esp32P4IomuxClockOwner((token>>>8)&1023).closeOwned()
+    if ((remaining|0) != 0) return P4WakeClock(((remaining|0)<<8)|3)
+    return P4WakeClock(6)
+}

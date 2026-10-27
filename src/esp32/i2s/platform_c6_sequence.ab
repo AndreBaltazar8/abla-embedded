@@ -1,0 +1,83 @@
+import "../gpio_clock_c6_sequence.ab"
+import "./source_c6_sequence.ab"
+import "./reset_c6_sequence.ab"
+import "../gdma_control_c6_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// 40B retained:tag0,state4,primary8,cleanup12,GPIOclock16,source20,
+// I2Sclock24,GDMAclock28,reset-phase32,channel36(bits0..1,RXbit8).
+// TX is the default, preserving existing callers. States1ready4partial
+// 5closing6closed; returns1ready2invalid4partial6closed7cleanup blocked.
+// Own all GPIO/IOMUX/I2S/GDMA/IRQ/ETM/codec consumers. Physical GPIO clock
+// source and old/new audio roots already stable and pinned by caller.
+// Requires a quiescent controller (all DMA FIFOs initially empty). It enables
+// gates, selects the direction's source and initializes its DMA + I2S
+// direction/FIFO. discard=true is mandatory; initialization destroys old data.
+// Close only after all playback/pad leases close. No pin configuration/start.
+fun c6AudioPlatformStorage(r: NativeBuffer): bool = r.hasAddressRange(0,40) && (r.addressValue()&3) == 0 && (r.addressValue()+40 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6AudioPlatformFailure(r: NativeBuffer,detail: int): int { r.storeU32(8,detail);return 4 }
+trusted fun c6AudioPlatformOpenOwned(r: NativeBuffer,channel: int,source: int,discard: bool,exclusivePinnedRoots: bool,tx: bool=true): int {
+    if (!exclusivePinnedRoots || !discard || !c6AudioPlatformStorage(r) || r.loadU32(0) != 0 || channel < 0 || channel > 2 || source < 0 || source > 3) return 2
+    var at=0
+    while (at < 40) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x4336504c);r.storeU32(4,4);r.storeU32(36,channel|(if (tx) 0 else 256))
+    val gpio=esp32C6GpioClockOpenOwned(true);r.storeU32(16,gpio|0)
+    if (!gpio.ready()) return c6AudioPlatformFailure(r,0x10000|gpio.status())
+    val mux=c6I2sSourceOpenOwned(tx,source,true);r.storeU32(20,mux|0)
+    if (mux.status() != 1) return c6AudioPlatformFailure(r,0x20000|mux.status())
+    val clock=c6I2sClockOpenOwned(0,if (tx) 1 else 2,source,source,true);r.storeU32(24,clock|0)
+    if (!clock.ready()) return c6AudioPlatformFailure(r,0x30000|clock.status())
+    val dma=c6GdmaClockOpenOwned(true);r.storeU32(28,dma|0)
+    if (dma.status() != 1) return c6AudioPlatformFailure(r,0x40000|dma.status())
+    r.storeU32(32,1)
+    val dmaReset=c6GdmaResetOwned(channel,tx,true,true,false)
+    if (dmaReset != 1) return c6AudioPlatformFailure(r,0x50000|dmaReset)
+    r.storeU32(32,2)
+    val i2sReset=c6I2sResetOwned(0,tx,3,true,true)
+    if (i2sReset != 1) return c6AudioPlatformFailure(r,0x60000|i2sReset)
+    r.storeU32(32,3);r.storeU32(4,1);return 1
+}
+trusted fun c6AudioPlatformCloseOwned(r: NativeBuffer,exclusiveChildrenClosed: bool): int {
+    if (!exclusiveChildrenClosed || !c6AudioPlatformStorage(r) || r.loadU32(0) != 0x4336504c) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 4 && r.loadU32(4) != 5) return 2
+    if ((r.loadU32(36)&~259) != 0 || (r.loadU32(36)&3) > 2) return 2
+    val tx=(r.loadU32(36)&256) == 0
+    r.storeU32(4,5)
+    if (r.loadU32(32) == 3) {
+        if (!c6I2sUpdateClocks(tx) || !c6I2sStopped()) { r.storeU32(12,0x60004);return 7 }
+        // Subsequent cleanup retries may have already released I2S gates.
+        r.storeU32(32,4)
+    }
+    // Only release failed reset assertions; never repeat initialization pulses.
+    if (r.loadU32(32) == 1) {
+        val released=c6GdmaResetOwned(r.loadU32(36)&3,tx,true,true,true)
+        if (released != 1) { r.storeU32(12,0x50000|released);return 7 }
+        r.storeU32(32,0)
+    }
+    if (r.loadU32(32) == 2) {
+        val released=c6I2sResetReleaseOwned(0,tx,true)
+        if (released != 1) { r.storeU32(12,0x60000|released);return 7 }
+        r.storeU32(32,0)
+    }
+    var dma=C6GdmaClock(r.loadU32(28))
+    if ((dma&1024) != 0) {
+        dma=dma.closeOwned(true);r.storeU32(28,dma|0)
+        if (dma.status() != 7) { r.storeU32(12,0x40000|dma.status());return 7 }
+    }
+    var clock=C6I2sClock(r.loadU32(24))
+    if ((clock&1792) != 0 || clock.ready()) {
+        clock=clock.closeOwned(true);r.storeU32(24,clock|0)
+        if (clock.status() != 0) { r.storeU32(12,0x30000|clock.status());return 7 }
+    }
+    var source=C6I2sSource(r.loadU32(20))
+    if ((source&8192) != 0) {
+        source=source.closeOwned(true);r.storeU32(20,source|0)
+        if (source.status() != 7) { r.storeU32(12,0x20000|source.status());return 7 }
+    }
+    var gpio=Esp32C6GpioClock(r.loadU32(16))
+    if (gpio.ready() || gpio.ownedGates() != 0) {
+        gpio=gpio.closeOwned(true);r.storeU32(16,gpio|0)
+        if (gpio.status() != 0) { r.storeU32(12,0x10000|gpio.status());return 7 }
+    }
+    r.storeU32(12,0);r.storeU32(4,6);return 6
+}

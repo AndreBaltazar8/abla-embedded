@@ -1,0 +1,49 @@
+import "./sleep_psram_p4_sequence.ab"
+import "./sleep_mpll_p4_sequence.ab"
+import "../psram/mapped_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Combined live memory handoff: drain/park PSRAM -> suspend borrowed MPLL;
+// restore/calibrate MPLL -> restore PSRAM clocks -> release original holds.
+// Caller owns the complete child prerequisites, analog routing, PMU/REGDMA,
+// all consumers and internal retained code/stack/record. Cache writeback must
+// precede parking; no PSRAM traffic until closed. Never operate children alone.
+// This does NOT issue sleep or implement retention. Before closing after an
+// issued request, caller must finish light-resume barrier/rail/REGDMA recovery.
+// An aborted preparation (no request issued) can close immediately.
+// Record32B: magic,state,primary,cleanup,PSRAM32,reserved,MPLL64.
+// State1parked3partial4closed; result1parked2invalid3PSRAM4MPLL5cleanup8closed.
+trusted fun p4SleepMemoryMpllStore(r: NativeBuffer,token: P4SleepMpll): void {
+    r.storeU32(24,token&0xffffffff);r.storeU32(28,token>>>32);return
+}
+trusted fun esp32p4SleepMemoryOpenOwned(r: NativeBuffer,revision: int,regdmaBackup: bool,mhz: int,xtalMHz: int,polls: int,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        revision < 0 || revision > 399 || (mhz != 320 && mhz != 400 && mhz != 500) || xtalMHz != 40 || polls < 1 || polls > 1000000) return 2
+    var i=4
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344d31);r.storeU32(4,3)
+    val psram=esp32p4SleepPsramParkOwned(revision,regdmaBackup,polls,true)
+    r.storeU32(16,psram|0)
+    if (psram.status() != 1) { r.storeU32(8,3);return 3 }
+    val mpll=esp32p4SleepMpllSuspendOwned(mhz,xtalMHz,polls,true)
+    p4SleepMemoryMpllStore(r,mpll)
+    if (mpll.status() != 1) { r.storeU32(8,4);return 4 }
+    r.storeU32(4,1);return 1
+}
+trusted fun esp32p4SleepMemoryCloseOwned(r: NativeBuffer,polls: int,resumePrepared: bool,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !resumePrepared || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,32) ||
+        (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344d31) return 2
+    if (r.loadU32(4) == 4) return 8
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 2
+    r.storeU32(4,3)
+    var mpll=P4SleepMpll(r.loadU32(24)|(r.loadU32(28)<<32))
+    if (mpll.hasSnapshot()) {
+        mpll=mpll.restoreOwned(polls,true);p4SleepMemoryMpllStore(r,mpll)
+        if (mpll.status() != 8) { r.storeU32(12,4);return 5 }
+    }
+    var psram=P4SleepPsram(r.loadU32(16))
+    if (psram.hasSnapshot()) {
+        psram=psram.closeOwned(true,true);r.storeU32(16,psram|0)
+        if (psram.status() != 6) { r.storeU32(12,3);return 5 }
+    }
+    r.storeU32(12,0);r.storeU32(4,4);return 8
+}

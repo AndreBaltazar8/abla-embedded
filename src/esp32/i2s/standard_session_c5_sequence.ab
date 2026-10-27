@@ -1,0 +1,70 @@
+import "../sdk/raw_buffer.ab"
+import "./standard_mode_c5_sequence.ab"
+import "./frame_width_c5_sequence.ab"
+import "./update_c5_sequence.ab"
+// 44B retained alignedRAM: tag0,state4,TX8,primary12,oldCONF16,
+// oldCONF1@20,oldslots24,oldconverter28,update64@32,phase40.
+// states1ready2pending3partial4closing5closed; returns1ready2invalid3failure
+// 4pending5closed. Clock/divider/pad/GDMA/FIFO initialization is separate;
+// exclusively own both stopped directions and codec/clock consumers throughout.
+// Configures standard uncompressed PCM (bypass), not A-law/u-law conversion.
+// No reset/FIFO discard/start. Close restores fields AND latches restoration.
+fun c5I2sStandardStorage(r: NativeBuffer): bool = r.hasAddressRange(0,44) && (r.addressValue()&3) == 0 && (r.addressValue()+44 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c5I2sStandardValid(r: NativeBuffer): bool = c5I2sStandardStorage(r) && r.loadU32(0) == 0x43354953
+trusted fun c5I2sStandardSaveUpdate(r: NativeBuffer,u: C5I2sUpdate): void { r.storeU32(32,u|0);r.storeU32(36,u>>>32);return }
+trusted fun c5I2sStandardWaitOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5I2sStandardValid(r) || polls < 1 || polls > 1000000 || (r.loadU32(40) != 1 && r.loadU32(40) != 3)) return 2
+    val update=C5I2sUpdate(r.loadU32(32)|(r.loadU32(36)<<32)).waitOwned(polls,true)
+    c5I2sStandardSaveUpdate(r,update)
+    if (!update.complete()) return if (update.status() == 5) 4 else 3
+    if (r.loadU32(40) == 3) { r.storeU32(4,5);r.storeU32(40,0);return 5 }
+    r.storeU32(40,0)
+    if (r.loadU32(4) != 4) r.storeU32(4,1)
+    return 1
+}
+trusted fun c5I2sStandardOpenOwned(r: NativeBuffer,port: int,transmit: bool,dataBits: int,slotBits: int,wsWidth: int,shift: bool,slots: int,flags: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5I2sStandardStorage(r) || port != 0 || c5I2sFrameWidthWord(dataBits,slotBits,wsWidth) < 0 || c5I2sStandardConfigWord(transmit,slots,flags) < 0 || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(0) != 0) return 2
+    if (!c5I2sUpdateClocks(transmit) || !c5I2sStopped()) return 3
+    val conf=if (transmit) 0x24 else 0x20
+    r.storeU32(0,0x43354953);r.storeU32(4,3);r.storeU32(8,if (transmit) 1 else 0);r.storeU32(12,0)
+    r.storeU32(16,int(c5I2sRead(conf)));r.storeU32(20,int(c5I2sRead(conf+8)))
+    r.storeU32(24,int(c5I2sRead(if (transmit) 0x54 else 0x50)))
+    r.storeU32(28,if (transmit) int(c5I2sRead(0x40)) else 0);r.storeU32(32,0);r.storeU32(36,0);r.storeU32(40,0)
+    val frame=c5I2sFrameOpenOwned(0,transmit,dataBits,slotBits,wsWidth,shift,true)
+    if (!frame.ready()) { r.storeU32(12,0x10000|frame.status());return 3 }
+    val mode=c5I2sSetStandardModeOwned(0,transmit,slots,flags,true)
+    if (mode != 1) { r.storeU32(12,0x20000|mode);return 3 }
+    if (!c5I2sModeField(conf,u32(4096),u32(4096))) { r.storeU32(12,0x30005);return 3 }
+    val update=c5I2sUpdateBeginOwned(0,transmit,polls,true)
+    c5I2sStandardSaveUpdate(r,update)
+    if ((update&512) != 0) r.storeU32(40,1)
+    if (!update.complete()) {
+        r.storeU32(4,if (update.status() == 5) 2 else 3);r.storeU32(12,0x40000|update.status())
+        return if (update.status() == 5) 4 else 3
+    }
+    r.storeU32(40,0);r.storeU32(4,1);return 1
+}
+trusted fun c5I2sStandardCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5I2sStandardValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 5) return 5
+    r.storeU32(4,4)
+    if (r.loadU32(40) == 1 || r.loadU32(40) == 3) {
+        val result=c5I2sStandardWaitOwned(r,polls,true)
+        if (result != 1) return result
+    }
+    val transmit=r.loadU32(8) != 0
+    if (!c5I2sUpdateClocks(transmit) || !c5I2sStopped()) return 3
+    val conf=if (transmit) 0x24 else 0x20
+    r.storeU32(40,2)
+    val mask=u32(0x1eb0c8)|(if (transmit) u32(32) else u32(512))
+    if ((transmit && !c5I2sModeField(0x40,u32(0x2000000),u32(r.loadU32(28))&u32(0x2000000))) ||
+        !c5I2sModeField(if (transmit) 0x54 else 0x50,if (transmit) u32(0x1fffff) else u32(0xfffff),u32(r.loadU32(24))&(if (transmit) u32(0x1fffff) else u32(0xfffff))) ||
+        !c5I2sModeField(conf+8,u32(0xffffc1ff),u32(r.loadU32(20))&u32(0xffffc1ff)) ||
+        !c5I2sModeField(conf,mask,u32(r.loadU32(16))&mask)) return 3
+    val update=c5I2sUpdateBeginOwned(0,transmit,polls,true)
+    c5I2sStandardSaveUpdate(r,update)
+    if ((update&512) != 0) r.storeU32(40,3)
+    if (!update.complete()) return if (update.status() == 5) 4 else 3
+    r.storeU32(40,0);r.storeU32(4,5);return 5
+}

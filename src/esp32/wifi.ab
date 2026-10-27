@@ -1,57 +1,356 @@
 import "abla/unsafe/memory"
+import "abla/build"
+import "abla/unsafe/mmio"
+import "abla/unsafe/native"
 import "./sdk/buffer.ab"
 import "./clock.ab"
 import "./task.ab"
 import "./netif_idf6.ab"
-import "./nvs_idf6.ab"
 import "./wifi/mesh_quick_esp32.ab"
 import "../xtensa/assembly.ab"
+import "security/wpa/crypto_ops_esp32.ab"
+import "wifi/idf/os_adapter_esp32.ab"
+import "event/default_loop_esp32.ab"
+import "network/netif_lwip_esp32.ab"
+import "wifi/api_esp32.ab"
+import "wifi/ieee80211_core_esp32.ab"
+import "wifi/idf/default_netif_esp32.ab"
+import "wifi/idf/init_esp32.ab"
 
-trusted noescape extern:"c" fun esp_event_loop_create_default(): i32
-trusted noescape extern:"c" fun esp_netif_create_default_wifi_sta(): i64*
-trusted noescape extern:"c" fun esp_wifi_init(config: i64*): i32
-trusted noescape extern:"c" fun esp_wifi_set_storage(storage: i32): i32
-trusted noescape extern:"c" fun esp_wifi_set_mode(mode: i32): i32
-trusted noescape extern:"c" fun esp_wifi_start(): i32
-trusted noescape extern:"c" fun esp_wifi_stop(): i32
-trusted noescape extern:"c" fun esp_wifi_set_config(wifiInterface: i32, config: i64*): i32
-trusted noescape extern:"c" fun esp_wifi_connect(): i32
-trusted noescape extern:"c" fun esp_wifi_disconnect(): i32
-trusted noescape extern:"c" fun esp_wifi_set_ps(mode: i32): i32
-trusted noescape extern:"c" fun esp_netif_get_handle_from_ifkey(key: cstring): i64*
-trusted noescape extern:"c" fun esp_netif_get_ip_info(netif: i64*, info: i64*): i32
+var esp32WifiStationStarted = false
+
+@inline
+trusted fun esp32WifiPointerWord(value: i64*): u32 =
+    u32(nativePointerAddress(value))
+
+trusted noescape fun esp_event_loop_create_default(): i32 =
+    i32(esp32RecoveredEspEventLoopCreateDefault())
+
+trusted noescape fun esp_netif_create_default_wifi_sta(): i64* =
+    nativePointerFromAddress(int(esp32RecoveredEspNetifCreateDefaultWifiSta(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )))
+
+trusted noescape fun esp_wifi_init(config: i64*): i32 =
+    i32(esp32RecoveredEspWifiInit(
+        esp32WifiPointerWord(config),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_set_storage(storage: i32): i32 =
+    i32(esp32RecoveredEspWifiSetStorage(
+        u32(storage),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_set_mode(mode: i32): i32 =
+    i32(esp32RecoveredEspWifiSetMode(
+        u32(mode),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+// The station facade initializes mode before esp_wifi_start. At this point the
+// IDF runtime state is below two, so wifi_set_mode_process only updates the
+// RAM-backed configuration and commits it. Interface creation belongs to the
+// later wifi_start_process path, after wifi_hw_start.
+trusted fun esp32WifiSetInitialStationMode(): i32 {
+    val setStatus = esp32RecoveredWifiNvsSet(
+        u32(0), u32(1), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (setStatus != u32(0)) return i32(setStatus)
+    i32(esp32RecoveredWifiNvsCommit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+}
+
+// Constant-mode counterpart of the recovered `_do_wifi_start` dispatcher.
+// The generic SDK entry has runtime branches for STA, AP, AP+STA, and NAN.
+// This facade is deliberately expressed as normal Abla control flow so a
+// station-only firmware never takes the AP/NAN function tables as roots.
+trusted fun esp32WifiStartStationProtocol(): i32 {
+    val core = esp32Data_g_ic_8b88278667
+
+    val nvs = esp32RecoveredWifiNvsGet(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(
+        nvs + u32(4)
+    )))) + u32(1) >= u32(2)) {
+        val profile = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(
+            nvs + u32(159)
+        ))))
+        val pmk = nvs + u32(267) + profile * u32(140)
+        val valid = esp32Internal_abla_esp32_ioctl_local_wifi_pmk_is_valid_83431242b6(
+            pmk, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        ablaUnsafeStoreU8(
+            nativePointerFromAddress(int(core + u32(518))),
+            if (valid != u32(0)) 1 else 0
+        )
+        xtensaMemoryBarrier()
+    }
+
+    i32(esp32RecoveredWifiStationStart(
+        core + u32(530),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+}
+
+// Start only the station instance. This is the structured equivalent of the
+// `wifi_start_process` mode-1 path; the request allocation, callback pointer,
+// and mode jump table disappear from this build.
+trusted fun esp32WifiStartStationOnly(): i32 {
+    val runtime = esp32Data_g_ic_8b88278667 + u32(256)
+    if (esp32WifiStationStarted) return i32(0)
+
+    val acquired = esp32Internal_adc2_wifi_acquire_ac0253071e(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (acquired != u32(0)) return i32(acquired)
+
+    esp32RecoveredIeee80211SetHmacStop(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32Internal_wifi_hw_start_f997eca6e1(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+
+    val interfaceStatus = esp32Ieee80211CreateStationOnly()
+    if (interfaceStatus != i32(0)) return interfaceStatus
+    val startStatus = esp32WifiStartStationProtocol()
+    if (startStatus != i32(0)) return startStatus
+
+    ablaUnsafeStoreU8(
+        nativePointerFromAddress(int(runtime + u32(237))),
+        2
+    )
+    xtensaMemoryBarrier()
+    esp32RecoveredIeee80211UpdatePhyCountry(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32WifiStationStarted = true
+    i32(0)
+}
+
+// Stop only the station instance. In particular this does not call the AP or
+// NAN teardown slots that the generic `wifi_stop_process` must retain.
+trusted fun esp32WifiStopStationOnly(): i32 {
+    val core = esp32Data_g_ic_8b88278667
+    val runtime = core + u32(256)
+    if (!esp32WifiStationStarted) return i32(12290)
+
+    esp32RecoveredIeee80211SetHmacStop(
+        u32(1), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    val stopStatus = esp32RecoveredWifiStationStop(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32Ieee80211DestroyStationOnly()
+    esp32RecoveredPmWakeUp(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+
+    ablaUnsafeStoreU8(
+        nativePointerFromAddress(int(runtime + u32(237))),
+        1
+    )
+    esp32WifiStationStarted = false
+    if (u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(
+        runtime + u32(239)
+    )))) == u32(1)) {
+        val radio = core + u32(512)
+        ablaUnsafeStoreU8(
+            nativePointerFromAddress(int(radio + u32(81))),
+            int(u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(
+                radio + u32(81)
+            )))) & u32(4294967291))
+        )
+        ablaUnsafeStoreU8(
+            nativePointerFromAddress(int(radio + u32(82))),
+            int(u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(
+                radio + u32(82)
+            )))) & u32(4294967291))
+        )
+        ablaUnsafeStoreU8(
+            nativePointerFromAddress(int(runtime + u32(239))),
+            0
+        )
+    }
+    xtensaMemoryBarrier()
+
+    esp32Internal_wifi_hw_stop_13f1774ad3(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32Internal_adc2_wifi_release_086db887c7(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    i32(stopStatus)
+}
+
+// The Abla-owned ioctl path preserves Wi-Fi task context, serialization,
+// completion, and errors. Calling its process bodies from the app task is not
+// equivalent, even when their argument values match.
+trusted fun esp32WifiConnectStationOnly(): i32 = esp_wifi_connect()
+
+trusted fun esp32WifiDisconnectStationOnly(): i32 = esp_wifi_disconnect()
+
+trusted fun esp32WifiSetStationConfiguration(configuration: int): i32 =
+    esp_wifi_set_config(i32(0), nativePointerFromAddress(configuration))
+
+trusted fun esp32WifiSetPowerSave(mode: u32): i32 = esp_wifi_set_ps(i32(mode))
+
+trusted noescape fun esp_wifi_start(): i32 =
+    i32(esp32RecoveredEspWifiStart(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_stop(): i32 =
+    i32(esp32RecoveredEspWifiStop(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_set_config(
+    wifiInterface: i32,
+    config: i64*
+): i32 = i32(esp32RecoveredEspWifiSetConfig(
+    u32(wifiInterface), esp32WifiPointerWord(config),
+    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+    u32(0), u32(0)
+))
+
+trusted noescape fun esp_wifi_connect(): i32 =
+    i32(esp32RecoveredEspWifiConnect(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_disconnect(): i32 =
+    i32(esp32RecoveredEspWifiDisconnect(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_wifi_set_ps(mode: i32): i32 =
+    i32(esp32RecoveredEspWifiSetPs(
+        u32(mode),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ))
+
+trusted noescape fun esp_netif_get_handle_from_ifkey(key: string): i64* =
+    // The netif registry is immutable after station setup in this target.
+    // Reading the Abla-owned list directly avoids a synchronous TCP/IP-thread
+    // IPC round trip from the application task.
+    nativePointerFromAddress(int(esp32RecoveredEspNetifGetHandleFromIfkeyUnsafe(
+        u32(nativeCStringAddress(key))
+    )))
+
+trusted noescape fun esp_netif_get_ip_info(
+    netif: i64*,
+    info: i64*
+): i32 = i32(esp32RecoveredEspNetifGetIpInfo(
+    esp32WifiPointerWord(netif), esp32WifiPointerWord(info),
+    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+    u32(0), u32(0)
+))
+
+trusted noescape fun esp_netif_is_netif_up(netif: i64*): bool =
+    esp32RecoveredEspNetifIsNetifUp(
+        esp32WifiPointerWord(netif),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)
 
 type WifiStation = int
 
-// ESP-IDF 6 wifi_config_t is the 180-byte wifi_sta_config_t on ESP32.
+// ESP-IDF 6 wifi_config_t contains the 180-byte wifi_sta_config_t on ESP32.
 // Keep the entire SDK-owned value initialized: fields after the password include
 // SAE/PMF policy, and leaving them outside the cleared region makes the driver
 // interpret neighboring stack data as configuration.
-val esp32WifiStationConfigBytes = 180
+// ESP-IDF 6 copies the complete 184-byte wifi_config_t request payload even
+// though the STA view ends at byte 179. Reserve the union tail as well so the
+// source-owned API never reads beyond its Abla stack object.
+val esp32WifiStationConfigBytes = 184
 val esp32WifiInitializationConfigBytes = 152
 var esp32WifiInitialized = false
+var esp32WifiConnectionAttempted = false
 
-// ESP-IDF exposes these two tables as data symbols rather than functions.
-// Materialize their relocatable addresses as ordinary inline expressions so
-// the compiler preserves the surrounding windowed ABI. The following Abla
-// initializer copies the SDK ABI data into its own wifi_init_config_t. These
-// references disappear when the SDK radio boundary is replaced.
+// Fixed-width IDF credential arrays permit a full 32-byte SSID and 64-byte
+// password without a trailing NUL. The containing configuration is cleared
+// first, so shorter values remain NUL-terminated naturally.
+trusted fun esp32WifiCopyStationText(
+    address: int,
+    offset: int,
+    text: string
+): void {
+    var index = 0
+    while (index < text.size) {
+        nativeAddressStoreU8(address, offset + index, text[index])
+        index = index + 1
+    }
+    return
+}
+
+// These tables are ordinary Abla-owned values. Passing their addresses in the
+// SDK-shaped configuration does not require exporting linker symbols.
 @inline
 trusted fun esp32WifiOsiFunctionsAddress(): u32 =
-    xtensaAssemblyReadU32("movi $0, g_wifi_osi_funcs", "=a")
+    esp32Data_Labla_recovered_Esp32WifiOsAdapter_data_data_g_wifi_osi_funcs_g_wifi_osi_funcs_28fdf11b09
 
 @inline
 trusted fun esp32WifiCryptoFunctionsAddress(): u32 =
-    xtensaAssemblyReadU32(
-        "movi $0, g_wifi_default_wpa_crypto_funcs",
-        "=a"
-    )
+    esp32Data_g_wifi_default_wpa_crypto_funcs_4a85006df3
 
 trusted fun esp32InitializeIdfWifi(): bool {
     if (esp32WifiInitialized) return true
-    esp32ProvideMeshQuickSharedState()
-    if (!nvsInitialize() || esp_netif_init() != 0 ||
-        esp_event_loop_create_default() != 0) return false
+    if (esp_netif_init() != 0) return false
+    if (esp_event_loop_create_default() != 0) return false
     val station = esp_netif_create_default_wifi_sta()
     if (pointerIsNull(station)) return false
 
@@ -84,14 +383,19 @@ trusted fun esp32InitializeIdfWifi(): bool {
     nativeAddressStoreU32(config, 116, 32)
     nativeAddressStoreU32(config, 120, 0)
     nativeAddressStoreU32(config, 124, 0)
+    // This facade always supplies credentials from application memory and
+    // selects RAM driver storage below. Avoid initializing or retaining NVS.
     nativeAddressStoreU8(config, 128, 1)
     nativeAddressStoreU32(config, 132, 7)
     nativeAddressStoreU32(config, 136, 1)
     nativeAddressStoreU8(config, 140, 0)
     nativeAddressStoreU32(config, 144, 523190095)
 
-    if (esp_wifi_init(nativePointerFromAddress(config)) != 0 ||
-        esp_wifi_set_storage(1) != 0) return false
+    val initializationStatus = esp_wifi_init(nativePointerFromAddress(config))
+    if (initializationStatus != 0) {
+        return false
+    }
+    if (esp_wifi_set_storage(1) != 0) return false
     esp32WifiInitialized = true
     true
 }
@@ -100,24 +404,39 @@ fun wifiStation(): WifiStation = WifiStation(0)
 
 trusted fun WifiStation.initialize(): bool {
     if (!esp32InitializeIdfWifi()) false
-    else esp_wifi_set_mode(1) == 0 && esp_wifi_start() == 0
+    else {
+        val modeReady = esp32WifiSetInitialStationMode() == 0
+        val started = modeReady && esp32WifiStartStationOnly() == 0
+        if (started) esp32WifiConnectionAttempted = false
+        started
+    }
 }
 
 trusted fun WifiStation.connect(ssid: string, password: string): bool {
+    if (ssid.size == 0 || ssid.size > 32 || password.size > 64) return false
     val config = nativeStackAllocate(esp32WifiStationConfigBytes)
     nativeAddressClear(config, esp32WifiStationConfigBytes)
-    nativeAddressCopyText(config, 0, 32, ssid)
-    nativeAddressCopyText(config, 32, 64, password)
-    val configured = esp_wifi_set_config(
-        0,
-        nativePointerFromAddress(config)
-    ) == 0
-    configured && esp_wifi_connect() == 0
+    esp32WifiCopyStationText(config, 0, ssid)
+    esp32WifiCopyStationText(config, 32, password)
+    val configured = esp32WifiSetStationConfiguration(config) == 0
+    if (!configured) false
+    else {
+        esp32WifiConnectionAttempted = true
+        esp32WifiConnectStationOnly() == 0
+    }
 }
 
 trusted fun WifiStation.hasAddress(): bool {
-    val netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")
-    if (pointerIsNull(netif)) false
+    // This check runs every application iteration. A fixed registry key must
+    // not allocate a new runtime C-string on every poll.
+    val netif = nativePointerFromAddress(int(
+        esp32RecoveredEspNetifGetHandleFromIfkeyUnsafe(
+            u32(nativeStaticBytes("WIFI_STA_DEF\x00"))
+        )
+    ))
+    // get_ip_info deliberately returns the cached previous lease when down.
+    // A previous lease is not evidence that the station is connected now.
+    if (pointerIsNull(netif) || !esp_netif_is_netif_up(netif)) false
     else {
         val info = nativeStackAllocate(12)
         val status = esp_netif_get_ip_info(
@@ -125,31 +444,39 @@ trusted fun WifiStation.hasAddress(): bool {
             nativePointerFromAddress(info)
         )
         val address = nativeAddressLoadU32(info, 0)
-        status == 0 && address != 0
+        status == 0 && address != 0 && esp_netif_is_netif_up(netif)
     }
 }
 
 trusted fun WifiStation.waitForAddress(timeoutMilliseconds: int): bool {
-    val started = esp_timer_get_time() / 1000
-    while (!this.hasAddress() &&
-        esp_timer_get_time() / 1000 - started < timeoutMilliseconds) {
-        vTaskDelay(u32(25))
+    var remaining = timeoutMilliseconds
+    while (!this.hasAddress() && remaining > 0) {
+        val slice = if (remaining < 25) remaining else 25
+        vTaskDelay(u32(slice))
+        remaining = remaining - slice
     }
     this.hasAddress()
 }
 
 trusted fun WifiStation.disconnect(): void {
-    esp_wifi_disconnect()
+    // The application deliberately calls disconnect before its first attempt.
+    // At that point the station interface exists but no connection state
+    // machine has run, so entering the recovered disconnect path can wait for
+    // an event which cannot exist.  Only tear down an actual prior attempt.
+    if (esp32WifiConnectionAttempted) {
+        esp32WifiDisconnectStationOnly()
+        esp32WifiConnectionAttempted = false
+    }
     return
 }
 
 trusted fun WifiStation.sleep(enabled: bool): void {
-    esp_wifi_set_ps(if (enabled) 1 else 0)
+    esp32WifiSetPowerSave(if (enabled) u32(1) else u32(0))
     return
 }
 
 trusted fun WifiStation.off(): void {
-    esp_wifi_disconnect()
-    esp_wifi_stop()
+    esp32WifiDisconnectStationOnly()
+    esp32WifiStopStationOnly()
     return
 }

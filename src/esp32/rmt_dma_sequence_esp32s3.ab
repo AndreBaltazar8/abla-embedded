@@ -1,0 +1,73 @@
+import "./sdk/raw_buffer.ab"
+
+// Fully encoded finite RMT frame in DMA-addressable internalSRAM, including
+// final zero stop word. Preceding symbols have two nonzero15-bit durations.
+// Caller owns stopped RMTchannel3, parked GDMA TX, all descriptor/payload
+// storage, routed pad and active/prepared RMT group clock/memory. Immutable
+// frame until completion, calibrated ROM delay, no ISR sharing or allocation.
+// Low8 status:1 complete,2 invalid,3 busy,4 RMTconfig,5 chain,6 DMArouting,
+// 7 acknowledge,8 start,9 hardwareerror,10 timeout,11 finalcleanup.
+// Bits8..15 DMAevents,16..19 RMTevents,20 DMAparked,21 RMTstoprequested,
+// 22 DMAstoprequested. DMA EOF alone NEVER proves waveform completion.
+trusted fun esp32s3RmtTransmitDmaOwned(dmaChannel: int, divider: int,
+    descriptors: int, source: NativeBuffer, bytes: int, polls: int): int {
+    if (dmaChannel < 0 || dmaChannel > 4 || divider < 1 || divider > 256 ||
+        bytes < 8 || polls < 1 || polls > 1000000 || !source.hasAddressRange(0, bytes) ||
+        !esp32s3GdmaLinearTxLayoutValid(descriptors, source.addressValue(), bytes)) return 2
+    if (source.loadU32(bytes - 4) != 0) return 2
+    var offset = 0
+    while (offset < bytes - 4) {
+        val word = source.loadU32(offset)
+        if ((word & 32767) == 0 || ((word >>> 16) & 32767) == 0) return 2
+        offset = offset + 4
+    }
+    if (!esp32s3GdmaParked(dmaChannel, true)) return 3
+    if (!esp32s3RmtConfigureSingleBlockTxOwned(3, divider)) return 4
+    if (esp32s3GdmaInitializeTxChainOwned(descriptors, source.addressValue(), bytes) == 0) return 5
+    if (!esp32s3GdmaConfigureRmt(dmaChannel, descriptors)) return 6
+    if (!esp32s3RmtTxAcknowledge(3, 15) || !esp32s3GdmaAcknowledge(dmaChannel, true, 255)) return 7
+    if (!esp32s3RmtSetTxDmaOwned(3, true)) return 4
+    if (!esp32s3GdmaStart(dmaChannel, true)) {
+        esp32s3RmtSetTxDmaOwned(3, false)
+        return 8
+    }
+    // Matches SDK: allow the first DMA data to enter RMT SRAM before TX.
+    peripheralDelayMicroseconds(1)
+    var status = 8
+    var dmaEvents = 0
+    var rmtEvents = 0
+    if (esp32s3RmtTxRequestOwned(3, true)) {
+        status = 10
+        var attempt = 0
+        while (attempt < polls) {
+            rmtEvents = esp32s3RmtTxEvents(3)
+            dmaEvents = esp32s3GdmaEvents(dmaChannel, true)
+            if (rmtEvents < 0 || dmaEvents < 0 || (rmtEvents & 2) != 0 ||
+                esp32s3GdmaEventErrors(dmaEvents, true) != 0) { status = 9; break }
+            if ((rmtEvents & 1) != 0 && esp32s3GdmaEventEof(dmaEvents) &&
+                esp32s3GdmaParked(dmaChannel, true)) {
+                esp32s3GdmaPublish()
+                val disabled = esp32s3RmtSetTxDmaOwned(3, false)
+                val rmtCleared = esp32s3RmtTxAcknowledge(3, rmtEvents)
+                val dmaCleared = esp32s3GdmaAcknowledge(dmaChannel, true, dmaEvents)
+                return (if (disabled && rmtCleared && dmaCleared) 1 else 11) |
+                    (dmaEvents << 8) | (rmtEvents << 16) | (1 << 20)
+            }
+            attempt = attempt + 1
+        }
+    }
+    // On any running failure, request BOTH stops, even if the first fails.
+    val rmtStop = esp32s3RmtTxRequestOwned(3, false)
+    val dmaStop = esp32s3GdmaRequestStop(dmaChannel, true)
+    var parked = false
+    var attempts = 0
+    while (!parked && attempts < polls) {
+        parked = esp32s3GdmaParked(dmaChannel, true)
+        attempts = attempts + 1
+    }
+    if (parked) esp32s3GdmaPublish()
+    // Leave group clocks on. RMTstop is asynchronous, not verified idle.
+    status | ((dmaEvents & 255) << 8) | ((rmtEvents & 15) << 16) |
+        (if (parked) 1 << 20 else 0) | (if (rmtStop) 1 << 21 else 0) |
+        (if (dmaStop) 1 << 22 else 0)
+}

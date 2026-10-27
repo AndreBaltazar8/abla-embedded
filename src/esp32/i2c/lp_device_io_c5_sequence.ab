@@ -1,0 +1,54 @@
+import "./lp_devices_c5_sequence.ab"
+import "./timeout_logic.ab"
+// No descriptor snapshot is trusted before controller admission. Device close
+// takes the same gate, so resolution remains live for the entire transfer.
+trusted fun Esp32C5LpI2cBusState.transferDeviceOwned(pool: I2cDeviceSlots,owner: u32,handle: int,
+    output: NativeBuffer,written: int,input: NativeBuffer,read: int,milliseconds: int,prefix: int = -1): int {
+    if (!i2cDeviceSlotHandleValid(handle)) return 7
+    this.transferDeviceDescriptorOwned(pool,owner,handle,0,output,written,input,read,milliseconds,prefix)
+}
+// A probe uses a generation-bound ephemeral descriptor, never a device slot.
+// NACK remains a real transfer failure requiring recovery before another try.
+trusted fun Esp32C5LpI2cBusState.probeOwned(pool: I2cDeviceSlots,owner: u32,epoch: int,address: int,milliseconds: int): int {
+    val descriptor=esp32S3I2cDeviceKey(1,address,100000,epoch)
+    if (descriptor == 0) return 7
+    this.transferDeviceDescriptorOwned(pool,owner,0,descriptor,nativeBufferAt(0,0),0,nativeBufferAt(0,0),0,milliseconds,-1)
+}
+trusted fun Esp32C5LpI2cBusState.transferDeviceDescriptorOwned(pool: I2cDeviceSlots,owner: u32,handle: int,ephemeral: int,
+    output: NativeBuffer,written: int,input: NativeBuffer,read: int,milliseconds: int,prefix: int): int {
+    val probe=handle == 0 && esp32S3I2cDeviceKeyValid(ephemeral) && written == 0 && read == 0 && prefix == -1
+    if (!this.devicePoolValid(pool) || !peripheralOwnerValid(owner) || (!probe && !i2cDeviceSlotHandleValid(handle)) ||
+        !output.hasAddressRange(0,written) || !input.hasAddressRange(0,read) ||
+        milliseconds < 1 || milliseconds > 2147483647 || prefix < -1 || prefix > 255) return 7
+    val poolBytes=i2cDeviceSlotsBytes(nativeAddressLoadU32(pool.address(),4))
+    val stateAddress=this.buffer().addressValue()
+    if (written > 0 && ((output.addressValue() < stateAddress+64 && stateAddress < output.addressValue()+written) ||
+        (output.addressValue() < pool.address()+poolBytes && pool.address() < output.addressValue()+written))) return 7
+    if (read > 0 && ((input.addressValue() < stateAddress+64 && stateAddress < input.addressValue()+read) ||
+        (input.addressValue() < pool.address()+poolBytes && pool.address() < input.addressValue()+read))) return 7
+    val gate=this.gate()
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return if (admission == 2) 10 else if (admission == 1) 9 else 7
+    val descriptor=if (probe) ephemeral else pool.resolve(handle)
+    var result=7
+    var healthy=true
+    val budget=esp32S3I2cTimeoutCycles(milliseconds,this.buffer().loadU32(32))
+    val frequency=esp32S3I2cDeviceKeyFrequency(descriptor)
+    val timing=esp32S3I2cTiming(u32(this.buffer().loadU32(28)),u32(frequency))
+    if (esp32S3I2cDeviceKeyValid(descriptor) && esp32S3I2cDeviceKeyPort(descriptor) == 1 &&
+        this.matches(esp32S3I2cDeviceKeyGeneration(descriptor)) && budget != u32(0) && timing.valid()) {
+        healthy=false
+        result=8
+        // Never change timing with a live transaction or leftover FIFO bytes.
+        if (c5LpI2cDeviceIdle()) {
+            result=7
+            if (c5LpI2cDeviceTiming(timing | u32(0))) {
+                result=c5LpI2cDeviceTransfer(esp32S3I2cDeviceKeyAddress(descriptor),output,written,input,read,budget,prefix)
+                healthy=result == 1
+            }
+        }
+        this.buffer().storeU32(48,result)
+    }
+    if (!gate.finish(owner,healthy)) return 11
+    result
+}

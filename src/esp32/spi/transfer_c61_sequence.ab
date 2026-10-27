@@ -1,0 +1,66 @@
+import "./config_c61_sequence.ab"
+import "../sdk/raw_buffer.ab"
+fun c61SpiBufferValid(buffer: NativeBuffer,bytes: int): bool =
+    bytes >= 1 && bytes <= 64 && buffer.hasAddressRange(0,bytes) &&
+    (buffer.addressValue()+bytes <= 0x60000000 || buffer.addressValue() >= 0x60100000)
+// Owned CPU-buffer transfer, no CS/pad/clock initialization. Caller holds the
+// canonical bus gate, configured single-line master and inactive other CS.
+// TX/RX may overlap: all TX copied before any RX publication.
+// Status1done2invalid3admission4unsupported5setup6updateTimeout7transferTimeout
+// 8receiveAdmission9FIFOerror10priorFIFOerror. Bit8 START issued.
+// Error evidence bits17/18/19/20 correspond raw FIFO bits17/18/0/1.
+// No reset/clock gate/automatic replay; retain gate/pad ownership on failure.
+trusted fun esp32C61SpiTransferOwned(source: NativeBuffer,destination: NativeBuffer,bytes: int,polls: int,receive: bool): int {
+    if (!c61SpiBufferValid(source,bytes) || (receive && !c61SpiBufferValid(destination,bytes)) ||
+        polls < 1 || polls > 1000000) return 2
+    if (!esp32C61SpiCpuIdleOwned() || (c61SpiRead(0x60096098)&u32(1<<22)) == u32(0)) return 3
+    val control=c61SpiRead(0x60081008)
+    val user=c61SpiRead(0x60081010)
+    if ((control&u32(0x1c000)) != u32(0) || (user&u32(0x27000)) != u32(0) ||
+        (c61SpiRead(0x60081030)&u32(1<<18)) != u32(0)) return 4
+    // Preserve previous errors for explicit recovery; only stale DONE cleared.
+    val prior=c61SpiRead(0x6008103c)
+    if ((prior&u32(0x60003)) != u32(0)) return 10|int(prior&u32(0x60000))|(int(prior&u32(3))<<19)
+    val configured=(user&u32(0x04fdfffe))|(if (receive) u32(0x18000001) else u32(0x08000000))
+    c61SpiWrite(0x60081010,configured)
+    if (c61SpiRead(0x60081010) != configured ||
+        !c61SpiConfigField(0x6008101c,u32(0x3ffff),u32(bytes*8-1))) return 5
+    var offset=0
+    while (offset < bytes) {
+        var word=u32(0)
+        var lane=0
+        while (lane < 4 && offset+lane < bytes) {
+            word=word|(u32(source.load(offset+lane))<<u32(lane*8));lane=lane+1
+        }
+        c61SpiWrite(0x60081098+offset,word)
+        if (c61SpiRead(0x60081098+offset) != word) return 5
+        offset=offset+4
+    }
+    c61SpiWrite(0x60081038,u32(4096))
+    if ((c61SpiRead(0x6008103c)&u32(0x61003)) != u32(0)) return 5
+    if (esp32C61SpiLatchOwned(polls) != 1) return 6
+    c61SpiWrite(0x60081000,u32(1<<24))
+    var left=polls
+    while (left > 0) {
+        val events=c61SpiRead(0x6008103c)
+        if ((events&u32(0x60003)) != u32(0)) return 265|int(events&u32(0x60000))|(int(events&u32(3))<<19)
+        if ((events&u32(4096)) != u32(0) && (c61SpiRead(0x60081000)&u32(0x01800000)) == u32(0)) {
+            if (!esp32C61SpiCpuIdleOwned()) return 264
+            if (receive) {
+                offset=0
+                while (offset < bytes) {
+                    val word=c61SpiRead(0x60081098+offset)
+                    var lane=0
+                    while (lane < 4 && offset+lane < bytes) {
+                        destination.store(offset+lane,int(word>>u32(lane*8)));lane=lane+1
+                    }
+                    offset=offset+4
+                }
+            }
+            // Keep DONE as evidence; next transfer clears and checks it.
+            return 257
+        }
+        left=left-1
+    }
+    return 263
+}

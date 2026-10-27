@@ -1,0 +1,75 @@
+import "../../peripheral_gate.ab"
+import "../sdk/raw_buffer.ab"
+// One canonical caller-owned64B RAM record for HP I2C0. Never copy ownership.
+// gate0,magic4,epoch8,phase12(0closed/1open/2partial), SDA16,SCL20,
+// source24,sourceHz28,CPUHz32,busHz36,filter40,pulls44,lastResult48.
+// Initialize fresh unpublished RAM only; caller serializes shared PCR/GPIO.
+type Esp32C5I2cBusState = int
+fun esp32C5I2cBusStateAt(buffer: NativeBuffer): Esp32C5I2cBusState =
+    if (buffer.hasAddressRange(0,64) && (buffer.addressValue()&3) == 0) Esp32C5I2cBusState(buffer | 0) else Esp32C5I2cBusState(0)
+fun Esp32C5I2cBusState.buffer(): NativeBuffer = NativeBuffer(this | 0)
+fun Esp32C5I2cBusState.gate(): PeripheralGate = peripheralGateAt(this.buffer().addressValue())
+trusted fun Esp32C5I2cBusState.valid(): bool = this.buffer().hasAddressRange(0,64) &&
+    (this.buffer().addressValue()&3) == 0 && this.buffer().loadU32(4) == 0x43354942
+trusted fun Esp32C5I2cBusState.initialize(): bool {
+    val buffer=this.buffer()
+    if (!buffer.hasAddressRange(0,64) || (buffer.addressValue()&3) != 0) return false
+    var i=0
+    while (i < 64) { buffer.storeU32(i,0); i=i+4 }
+    buffer.storeU32(4,0x43354942)
+}
+trusted fun Esp32C5I2cBusState.phase(): int = if (this.valid()) this.buffer().loadU32(12) else -1
+trusted fun Esp32C5I2cBusState.epoch(): int = if (this.valid()) this.buffer().loadU32(8) else 0
+// Check while owning gate. Faults retain identity, but gate blocks transfers.
+trusted fun Esp32C5I2cBusState.matches(epoch: int): bool = epoch > 0 && epoch <= 2147483647 &&
+    this.phase() == 1 && this.epoch() == epoch
+// Zero means not opened. No wrapping epochs or changing an already-open bus.
+trusted fun Esp32C5I2cBusState.openOwned(owner: u32,sda: int,scl: int,source: int,
+    sourceHz: u32,cpuHz: u32,busHz: u32,filter: int = 7,pulls: bool = true): int {
+    if (!this.valid() || cpuHz == u32(0) || !peripheralOwnerValid(owner)) return 0
+    if (this.gate().tryBegin(owner) != 0) return 0
+    val buffer=this.buffer()
+    var result=0
+    var healthy=true
+    if (buffer.loadU32(12) == 1) {
+        if (buffer.loadU32(16) == sda && buffer.loadU32(20) == scl && buffer.loadU32(24) == source &&
+            buffer.loadU32(28) == int(sourceHz) && buffer.loadU32(32) == int(cpuHz) &&
+            buffer.loadU32(36) == int(busHz) && buffer.loadU32(40) == filter &&
+            buffer.loadU32(44) == (if (pulls) 1 else 0)) result=buffer.loadU32(8)
+    } else if (buffer.loadU32(12) == 0 && buffer.loadU32(8) < 2147483647) {
+        // Record attempted ownership before any hardware change.
+        buffer.storeU32(16,sda); buffer.storeU32(20,scl); buffer.storeU32(24,source)
+        buffer.storeU32(28,int(sourceHz)); buffer.storeU32(32,int(cpuHz)); buffer.storeU32(36,int(busHz))
+        buffer.storeU32(40,filter); buffer.storeU32(44,if (pulls) 1 else 0); buffer.storeU32(12,2)
+        val setup=c5I2cBusSetup(sda,scl,source,sourceHz,busHz,filter,pulls)
+        buffer.storeU32(48,setup)
+        if ((setup&255) == 1) {
+            result=buffer.loadU32(8)+1
+            buffer.storeU32(8,result); buffer.storeU32(12,1)
+        } else {
+            healthy=(setup&255) == 2 || (setup&255) == 3 || (setup&256) != 0 && (setup&512) == 0
+            if (healthy) buffer.storeU32(12,0)
+        }
+    } else if (buffer.loadU32(12) != 0) healthy=false
+    if (!this.gate().finish(owner,healthy)) return 0
+    result
+}
+// Close may acquire faulted admission to clean up partial setup. Busy/held
+// pads/clock failures retain phase+epoch and fault; repeated close retries.
+trusted fun Esp32C5I2cBusState.closeOwned(owner: u32): bool {
+    if (!this.valid() || !peripheralOwnerValid(owner)) return false
+    val admission=this.gate().tryBegin(owner)
+    if (admission == 1 || admission == 3) return false
+    val recovering=admission == 2
+    if (recovering && !this.gate().tryBeginRecovery(owner)) return false
+    val buffer=this.buffer()
+    var closed=buffer.loadU32(12) == 0
+    if (!closed) {
+        val status=c5I2cBusTeardown(buffer.loadU32(16),buffer.loadU32(20))
+        buffer.storeU32(48,status)
+        closed=status == 1
+        if (closed) buffer.storeU32(12,0)
+    }
+    val released=if (recovering) this.gate().finishRecovery(owner,closed) else this.gate().finish(owner,closed)
+    closed && released
+}

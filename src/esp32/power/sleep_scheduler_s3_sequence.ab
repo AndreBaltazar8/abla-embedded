@@ -1,0 +1,49 @@
+import "./sleep_quiesce_s3_sequence.ab"
+import "../../xtensa/critical_lock_sequence.ab"
+// Coordinator-side scheduler freeze. All scheduler participants MUST use the
+// supplied existing lock via the mask15 critical-lock protocol. Peer handler
+// is level1..3, takes no locks, and cannot preempt a lock holder at level15.
+// Acquire shared lock BEFORE notification; busy acquisition never parks peer.
+// Local mask remains15 through peer release, then unlock restores original PS.
+// Other clients/DMA/NMI/debug safety is separate. No scheduler callback/yield
+// while owned. Internal record64/lock/mailbox/code/stack, exclusive lifetime.
+// Header32:magic,core,lock,guard,lockOwned,reserved12; quiescence32@32.
+// Results1critical,2pending,3invalid,4busy/request-refused,5closed,6retry-release.
+fun s3SleepSchedulerValid(r: NativeBuffer): bool = r.hasAddressRange(0,64) && (r.addressValue()&3) == 0 &&
+    r.loadU32(0) == 0x53335343 && r.loadU32(4) == xtensaGuardCore()
+@section(".iram1.abla.s3SleepSchedulerOpen")
+trusted fun esp32S3SleepSchedulerOpenOwned(r: NativeBuffer,lock: NativeBuffer,mailbox: NativeBuffer,channel: int,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !xtensaCriticalLockValid(lock) || !mailbox.hasAddressRange(0,4) || (mailbox.addressValue()&3) != 0 || channel < 0 || channel > 3) return 3
+    val a=r.addressValue();val b=lock.addressValue();val c=mailbox.addressValue()
+    if ((a < b+4 && b < a+64) || (a < c+4 && c < a+64) || b == c) return 3
+    val guard=xtensaCriticalLockTry(lock)
+    if (!guard.valid()) return 4
+    var offset=4
+    while (offset < 64) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x53335343);r.storeU32(4,guard.core());r.storeU32(8,b);r.storeU32(12,guard|0);r.storeU32(16,1)
+    val result=esp32S3SleepQuiesceOpenOwned(nativeBufferAt(a+32,32),mailbox,channel,true)
+    // Failed request still owns the lock; close explicitly, without pretending
+    // that parking happened or losing the original interrupt-level token.
+    return if (result == 2) 2 else 4
+}
+@section(".iram1.abla.s3SleepSchedulerPoll")
+trusted fun esp32S3SleepSchedulerPollOwned(r: NativeBuffer): int {
+    if (!s3SleepSchedulerValid(r) || r.loadU32(16) != 1 || (xtensaGuardStatus()&15) != 15 ||
+        xtensaCriticalLockCas(r.loadU32(8),0,0) != r.loadU32(4)+1) return 3
+    return esp32S3SleepQuiescePollOwned(nativeBufferAt(r.addressValue()+32,32))
+}
+@section(".iram1.abla.s3SleepSchedulerClose")
+trusted fun esp32S3SleepSchedulerCloseOwned(r: NativeBuffer,resourcesRecovered: bool): int {
+    if (!resourcesRecovered || !s3SleepSchedulerValid(r)) return 3
+    if (r.loadU32(16) == 0) return 5
+    // Validate shared ownership BEFORE letting either core run again.
+    if ((xtensaGuardStatus()&15) != 15 || xtensaCriticalLockCas(r.loadU32(8),0,0) != r.loadU32(4)+1) return 6
+    val q=nativeBufferAt(r.addressValue()+32,32)
+    if (q.loadU32(0) != 0) {
+        val closed=esp32S3SleepQuiesceCloseOwned(q,true)
+        if (closed != 5) return if (closed == 2) 2 else 6
+    }
+    if (!xtensaCriticalLockRelease(nativeBufferAt(r.loadU32(8),4),XtensaInterruptGuard(r.loadU32(12)))) return 6
+    r.storeU32(16,0);return 5
+}

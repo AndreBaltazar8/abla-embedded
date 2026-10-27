@@ -1,0 +1,1009 @@
+import "registry_esp32.ab"
+import "../freertos/queue_esp32.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Structured Abla implementation of ESP-IDF's VFS syscall dispatch. Indirect
+// calls are the VFS protocol itself; the control flow around them is ordinary
+// Abla and remains visible to monolithic LLVM optimization.
+val esp32VfsCallFailure = u32(0xffffffff)
+val esp32VfsErrInterrupted = u32(4)
+val esp32VfsErrBadDescriptor = u32(9)
+val esp32VfsErrNoMemory = u32(12)
+val esp32VfsErrCrossDevice = u32(18)
+val esp32VfsErrInvalidArgument = u32(22)
+val esp32VfsErrFileTableFull = u32(23)
+val esp32VfsErrReadOnly = u32(30)
+val esp32VfsErrNoEntry = u32(2)
+val esp32VfsErrNotImplemented = u32(88)
+val esp32VfsErrorNotSupported = u32(0x106)
+val esp32VfsFdSetBytes = u32(8)
+val esp32VfsTripleBytes = u32(28)
+
+@inline trusted fun esp32VfsErrnoAddress(): u32 =
+    u32(nativeInternalSectionThreadLocalAllocate(
+        4, "errno", ".tdata.errno", 4
+    ))
+
+@inline trusted fun esp32VfsSetErrno(value: u32): void =
+    esp32VfsStore(esp32VfsErrnoAddress(), value)
+
+@inline trusted fun esp32VfsOperation(entry: u32, offset: u32): u32 {
+    if (entry == u32(0)) return u32(0)
+    return esp32VfsLoad(esp32VfsEntryOperations(entry) + offset)
+}
+
+@inline trusted fun esp32VfsDirectory(entry: u32): u32 {
+    if (entry == u32(0)) return u32(0)
+    return esp32VfsLoad(esp32VfsEntryOperations(entry) + u32(44))
+}
+
+@inline trusted fun esp32VfsDirectoryOperation(
+    entry: u32,
+    offset: u32
+): u32 {
+    val directory = esp32VfsDirectory(entry)
+    return if (directory == u32(0)) u32(0)
+        else esp32VfsLoad(directory + offset)
+}
+
+@inline trusted fun esp32VfsSelectOperations(entry: u32): u32 {
+    if (entry == u32(0)) return u32(0)
+    return esp32VfsLoad(esp32VfsEntryOperations(entry) + u32(48))
+}
+
+trusted fun esp32VfsInvoke(
+    entry: u32,
+    function: u32,
+    count: u32,
+    first: u32,
+    second: u32,
+    third: u32,
+    fourth: u32
+): u32 {
+    if (function == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNotImplemented)
+        return esp32VfsCallFailure
+    }
+    val context = esp32VfsEntryContext(entry)
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagContext) != u32(0)) {
+        return when (count) {
+            0 -> u32(ablaUnsafeCallI32I32(
+                int(function), int(context)
+            ))
+            1 -> u32(ablaUnsafeCallI32I32I32(
+                int(function), int(context), int(first)
+            ))
+            2 -> u32(ablaUnsafeCallI32I32I32I32(
+                int(function), int(context), int(first), int(second)
+            ))
+            3 -> u32(ablaUnsafeCallI32I32I32I32I32(
+                int(function), int(context), int(first), int(second),
+                int(third)
+            ))
+            else -> u32(ablaUnsafeCallI32I32I32I32I32I32(
+                int(function), int(context), int(first), int(second),
+                int(third), int(fourth)
+            ))
+        }
+    }
+    return when (count) {
+        0 -> u32(ablaUnsafeCallI32(int(function)))
+        1 -> u32(ablaUnsafeCallI32I32(int(function), int(first)))
+        2 -> u32(ablaUnsafeCallI32I32I32(
+            int(function), int(first), int(second)
+        ))
+        3 -> u32(ablaUnsafeCallI32I32I32I32(
+            int(function), int(first), int(second), int(third)
+        ))
+        else -> u32(ablaUnsafeCallI32I32I32I32I32(
+            int(function), int(first), int(second), int(third), int(fourth)
+        ))
+    }
+}
+
+trusted fun esp32VfsInvokeVoid2(
+    entry: u32,
+    function: u32,
+    first: u32,
+    second: u32
+): void {
+    if (function == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNotImplemented)
+        return
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagContext) != u32(0)) {
+        ablaUnsafeCallVoidI32I32I32(
+            int(function),
+            int(esp32VfsEntryContext(entry)),
+            int(first),
+            int(second)
+        )
+    } else {
+        ablaUnsafeCallVoidI32I32(
+            int(function), int(first), int(second)
+        )
+    }
+}
+
+trusted fun esp32VfsOpen(
+    reentrant: u32,
+    path: u32,
+    flags: u32,
+    mode: u32
+): u32 {
+    val entry = esp32VfsGetForPath(path)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    if ((flags & u32(3)) != u32(0) &&
+        (esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    val local = esp32VfsInvoke(
+        entry,
+        esp32VfsOperation(entry, u32(20)),
+        u32(3),
+        esp32VfsTranslatePath(entry, path),
+        flags,
+        mode,
+        u32(0)
+    )
+    if (i32(local) < i32(0)) return esp32VfsCallFailure
+    val fd = esp32VfsRegisterLocalFd(
+        esp32VfsEntryIndex(entry), local, false
+    )
+    if (i32(fd) >= i32(0)) return fd
+    esp32VfsInvoke(
+        entry,
+        esp32VfsOperation(entry, u32(24)),
+        u32(1),
+        local,
+        u32(0), u32(0), u32(0)
+    )
+    esp32VfsSetErrno(esp32VfsErrFileTableFull)
+    return esp32VfsCallFailure
+}
+
+trusted fun esp32VfsDescriptorCall(
+    fd: u32,
+    operationOffset: u32,
+    trailingCount: u32,
+    firstTrailing: u32,
+    secondTrailing: u32,
+    thirdTrailing: u32
+): u32 {
+    val entry = esp32VfsGetForFd(fd)
+    val local = esp32VfsGetLocalFd(entry, fd)
+    if (entry == u32(0) || i32(local) < i32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsOperation(entry, operationOffset),
+        trailingCount + u32(1),
+        local,
+        firstTrailing,
+        secondTrailing,
+        thirdTrailing
+    )
+}
+
+trusted fun esp32VfsWrite(
+    reentrant: u32,
+    fd: u32,
+    data: u32,
+    size: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(0), u32(2), data, size, u32(0)
+)
+
+trusted fun esp32VfsLseek(
+    reentrant: u32,
+    fd: u32,
+    offset: u32,
+    mode: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(4), u32(2), offset, mode, u32(0)
+)
+
+trusted fun esp32VfsRead(
+    reentrant: u32,
+    fd: u32,
+    destination: u32,
+    size: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(8), u32(2), destination, size, u32(0)
+)
+
+trusted fun esp32VfsPread(
+    fd: u32,
+    destination: u32,
+    size: u32,
+    offset: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(12), u32(3), destination, size, offset
+)
+
+trusted fun esp32VfsPwrite(
+    fd: u32,
+    source: u32,
+    size: u32,
+    offset: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(16), u32(3), source, size, offset
+)
+
+trusted fun esp32VfsClose(reentrant: u32, fd: u32): u32 {
+    val result = esp32VfsDescriptorCall(
+        fd, u32(24), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (result != esp32VfsCallFailure ||
+        esp32VfsGetForFd(fd) != u32(0)) {
+        esp32VfsUnregisterLocalFd(fd)
+    }
+    return result
+}
+
+trusted fun esp32VfsFstat(
+    reentrant: u32,
+    fd: u32,
+    status: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(28), u32(1), status, u32(0), u32(0)
+)
+
+trusted fun esp32VfsFcntl(
+    reentrant: u32,
+    fd: u32,
+    command: u32,
+    argument: u32
+): u32 = esp32VfsDescriptorCall(
+    fd, u32(32), u32(2), command, argument, u32(0)
+)
+
+// Xtensa va_list contains register-save and overflow pointers. Keeping the
+// variadic ABI capture here is generic ABI work, not target instruction code.
+trusted fun esp32VfsIoctlAbi(
+    fd:u32,command:u32,a4:u32,a5:u32,a6:u32,a7:u32,
+    stack0:u32,stack1:u32,stack2:u32,stack3:u32,stack4:u32,
+    stack5:u32,stack6:u32,stack7:u32,stack8:u32,stack9:u32
+): u32 {
+    val entry = esp32VfsGetForFd(fd)
+    val local = esp32VfsGetLocalFd(entry, fd)
+    if (entry == u32(0) || i32(local) < i32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    val function = esp32VfsOperation(entry, u32(36))
+    if (function == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNotImplemented)
+        return esp32VfsCallFailure
+    }
+    val frame = u32(nativeStackAllocate(80))
+    esp32VfsStore(frame + u32(24), a4)
+    esp32VfsStore(frame + u32(28), a5)
+    esp32VfsStore(frame + u32(32), a6)
+    esp32VfsStore(frame + u32(36), a7)
+    esp32VfsStore(frame, frame + u32(48))
+    esp32VfsStore(frame + u32(4), frame + u32(16))
+    esp32VfsStore(frame + u32(8), u32(8))
+    // Xtensa passes va_list's three 32-bit fields by value.  Preserve that
+    // ABI at the indirect boundary so drivers can consume the list with
+    // ordinary structured Abla instead of reconstructing register state.
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagContext) != u32(0)) {
+        return u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+            int(function),
+            int(esp32VfsEntryContext(entry)),
+            int(local),
+            int(command),
+            int(esp32VfsLoad(frame)),
+            int(esp32VfsLoad(frame + u32(4))),
+            int(esp32VfsLoad(frame + u32(8)))
+        ))
+    }
+    return u32(ablaUnsafeCallI32I32I32I32I32I32(
+        int(function), int(local), int(command),
+        int(esp32VfsLoad(frame)),
+        int(esp32VfsLoad(frame + u32(4))),
+        int(esp32VfsLoad(frame + u32(8)))
+    ))
+}
+
+trusted fun esp32VfsFsync(fd: u32): u32 =
+    esp32VfsDescriptorCall(
+        fd, u32(40), u32(0), u32(0), u32(0), u32(0)
+    )
+
+trusted fun esp32VfsPathCall(
+    path: u32,
+    operationOffset: u32,
+    trailingCount: u32,
+    firstTrailing: u32
+): u32 {
+    val entry = esp32VfsGetForPath(path)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, operationOffset),
+        trailingCount + u32(1),
+        esp32VfsTranslatePath(entry, path),
+        firstTrailing,
+        u32(0),
+        u32(0)
+    )
+}
+
+trusted fun esp32VfsStat(
+    reentrant: u32,
+    path: u32,
+    status: u32
+): u32 = esp32VfsPathCall(path, u32(0), u32(1), status)
+
+trusted fun esp32VfsUtime(path: u32, times: u32): u32 =
+    esp32VfsPathCall(path, u32(60), u32(1), times)
+
+trusted fun esp32VfsLink(
+    reentrant: u32,
+    firstPath: u32,
+    secondPath: u32
+): u32 {
+    val entry = esp32VfsGetForPath(firstPath)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    val other = esp32VfsGetForPath(secondPath)
+    if (entry != other) {
+        esp32VfsSetErrno(esp32VfsErrCrossDevice)
+        return esp32VfsCallFailure
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(4)),
+        u32(2),
+        esp32VfsTranslatePath(entry, firstPath),
+        esp32VfsTranslatePath(entry, secondPath),
+        u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsUnlink(reentrant: u32, path: u32): u32 {
+    val entry = esp32VfsGetForPath(path)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(8)),
+        u32(1),
+        esp32VfsTranslatePath(entry, path),
+        u32(0), u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsRename(
+    reentrant: u32,
+    source: u32,
+    destination: u32
+): u32 {
+    val entry = esp32VfsGetForPath(source)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    val destinationEntry = esp32VfsGetForPath(destination)
+    if (entry != destinationEntry) {
+        esp32VfsSetErrno(esp32VfsErrCrossDevice)
+        return esp32VfsCallFailure
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(12)),
+        u32(2),
+        esp32VfsTranslatePath(entry, source),
+        esp32VfsTranslatePath(entry, destination),
+        u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsOpendir(path: u32): u32 {
+    val entry = esp32VfsGetForPath(path)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return u32(0)
+    }
+    val directory = esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(16)),
+        u32(1),
+        esp32VfsTranslatePath(entry, path),
+        u32(0), u32(0), u32(0)
+    )
+    if (directory != u32(0) && directory != esp32VfsCallFailure) {
+        ablaUnsafeStoreU16(
+            nativePointerFromAddress(int(directory)),
+            int(esp32VfsEntryIndex(entry))
+        )
+    }
+    return if (directory == esp32VfsCallFailure) u32(0) else directory
+}
+
+@inline trusted fun esp32VfsDirectoryEntry(directory: u32): u32 {
+    if (directory == u32(0)) return u32(0)
+    return esp32VfsGetForIndex(u32(
+        ablaUnsafeLoadU16(nativePointerFromAddress(int(directory)))
+    ))
+}
+
+trusted fun esp32VfsReaddir(directory: u32): u32 {
+    val entry = esp32VfsDirectoryEntry(directory)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return u32(0)
+    }
+    val result = esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(20)),
+        u32(1),
+        directory,
+        u32(0), u32(0), u32(0)
+    )
+    return if (result == esp32VfsCallFailure) u32(0) else result
+}
+
+trusted fun esp32VfsReaddirR(
+    directory: u32,
+    output: u32,
+    resultOutput: u32
+): u32 {
+    val entry = esp32VfsDirectoryEntry(directory)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(24)),
+        u32(3),
+        directory,
+        output,
+        resultOutput,
+        u32(0)
+    )
+}
+
+trusted fun esp32VfsTelldir(directory: u32): u32 {
+    val entry = esp32VfsDirectoryEntry(directory)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(28)),
+        u32(1),
+        directory,
+        u32(0), u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsSeekdir(directory: u32, location: u32): void {
+    val entry = esp32VfsDirectoryEntry(directory)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return
+    }
+    esp32VfsInvokeVoid2(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(32)),
+        directory,
+        location
+    )
+}
+
+trusted fun esp32VfsRewinddir(directory: u32): void =
+    esp32VfsSeekdir(directory, u32(0))
+
+trusted fun esp32VfsClosedir(directory: u32): u32 {
+    val entry = esp32VfsDirectoryEntry(directory)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(36)),
+        u32(1),
+        directory,
+        u32(0), u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsReadonlyPathCall(
+    path: u32,
+    operationOffset: u32,
+    trailingCount: u32,
+    firstTrailing: u32
+): u32 {
+    val entry = esp32VfsGetForPath(path)
+    if (entry == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoEntry)
+        return esp32VfsCallFailure
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, operationOffset),
+        trailingCount + u32(1),
+        esp32VfsTranslatePath(entry, path),
+        firstTrailing,
+        u32(0), u32(0)
+    )
+}
+
+trusted fun esp32VfsMkdir(path: u32, mode: u32): u32 =
+    esp32VfsReadonlyPathCall(path, u32(40), u32(1), mode)
+
+trusted fun esp32VfsRmdir(path: u32): u32 =
+    esp32VfsReadonlyPathCall(path, u32(44), u32(0), u32(0))
+
+trusted fun esp32VfsAccess(path: u32, mode: u32): u32 =
+    esp32VfsPathCall(path, u32(48), u32(1), mode)
+
+trusted fun esp32VfsTruncate(path: u32, length: u32): u32 =
+    esp32VfsReadonlyPathCall(path, u32(52), u32(1), length)
+
+trusted fun esp32VfsFtruncate(fd: u32, length: u32): u32 {
+    val entry = esp32VfsGetForFd(fd)
+    val local = esp32VfsGetLocalFd(entry, fd)
+    if (entry == u32(0) || i32(local) < i32(0)) {
+        esp32VfsSetErrno(esp32VfsErrBadDescriptor)
+        return esp32VfsCallFailure
+    }
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagReadonly) != u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrReadOnly)
+        return esp32VfsCallFailure
+    }
+    return esp32VfsInvoke(
+        entry,
+        esp32VfsDirectoryOperation(entry, u32(56)),
+        u32(2),
+        local,
+        length,
+        u32(0), u32(0)
+    )
+}
+
+@inline trusted fun esp32VfsFdSetAddress(set: u32, fd: u32): u32 =
+    set + (fd >> u32(5)) * u32(4)
+
+@inline trusted fun esp32VfsFdSetMask(fd: u32): u32 =
+    u32(1) << (fd & u32(31))
+
+trusted fun esp32VfsFdSetAdd(set: u32, fd: u32): void {
+    if (set == u32(0) || fd >= esp32VfsMaximumDescriptors) return
+    val address = esp32VfsFdSetAddress(set, fd)
+    esp32VfsStore(address, esp32VfsLoad(address) | esp32VfsFdSetMask(fd))
+}
+
+trusted fun esp32VfsFdSetRemove(set: u32, fd: u32): void {
+    if (set == u32(0) || fd >= esp32VfsMaximumDescriptors) return
+    val address = esp32VfsFdSetAddress(set, fd)
+    esp32VfsStore(address, esp32VfsLoad(address) & ~esp32VfsFdSetMask(fd))
+}
+
+trusted fun esp32VfsFdSetClear(set: u32): void {
+    if (set != u32(0)) freestandingSet(set, i32(0), esp32VfsFdSetBytes)
+}
+
+@inline trusted fun esp32VfsTriple(base: u32, index: u32): u32 =
+    base + index * esp32VfsTripleBytes
+
+trusted fun esp32VfsCallEndSelects(
+    endIndex: u32,
+    triples: u32,
+    driverArguments: u32
+): void {
+    var index = u32(0)
+    while (index < endIndex) {
+        val entry = esp32VfsGetForIndex(index)
+        val select = esp32VfsSelectOperations(entry)
+        val item = esp32VfsTriple(triples, index)
+        if (entry != u32(0) && select != u32(0) &&
+            esp32VfsLoad(select + u32(20)) != u32(0) &&
+            esp32VfsLoadByte(item) != u32(0)) {
+            ablaUnsafeCallI32I32(
+                int(esp32VfsLoad(select + u32(20))),
+                int(esp32VfsLoad(driverArguments + index * u32(4)))
+            )
+        }
+        index = index + u32(1)
+    }
+}
+
+trusted fun esp32VfsSetGlobalFdSets(
+    triples: u32,
+    count: u32,
+    readFds: u32,
+    writeFds: u32,
+    errorFds: u32
+): u32 {
+    var ready = u32(0)
+    var index = u32(0)
+    while (index < count) {
+        val item = esp32VfsTriple(triples, index)
+        if (esp32VfsLoadByte(item) != u32(0)) {
+            var fd = u32(0)
+            while (fd < esp32VfsMaximumDescriptors) {
+                val descriptor = esp32VfsGetFdEntry(fd)
+                if (esp32VfsDescriptorIndex(fd) == index) {
+                    val local = esp32VfsDescriptorLocal(fd)
+                    if (readFds != u32(0) &&
+                        esp32VfsFdSetContains(item + u32(4), local)) {
+                        esp32VfsFdSetAdd(readFds, fd)
+                        ready = ready + u32(1)
+                    }
+                    if (writeFds != u32(0) &&
+                        esp32VfsFdSetContains(item + u32(12), local)) {
+                        esp32VfsFdSetAdd(writeFds, fd)
+                        ready = ready + u32(1)
+                    }
+                    if (errorFds != u32(0) &&
+                        esp32VfsFdSetContains(item + u32(20), local)) {
+                        esp32VfsFdSetAdd(errorFds, fd)
+                        ready = ready + u32(1)
+                    }
+                }
+                fd = fd + u32(1)
+            }
+        }
+        index = index + u32(1)
+    }
+    return ready
+}
+
+trusted fun esp32VfsDeleteLocalSemaphore(
+    local: bool,
+    semaphore: u32
+): void {
+    if (local && semaphore != u32(0)) {
+        esp32RecoveredVQueueDelete(
+            semaphore,u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0)
+        )
+    }
+}
+
+trusted fun esp32VfsSelect(
+    descriptorCount: u32,
+    readFds: u32,
+    writeFds: u32,
+    errorFds: u32,
+    timeout: u32
+): u32 {
+    if (i32(descriptorCount) < i32(0) ||
+        descriptorCount > esp32VfsMaximumDescriptors) {
+        esp32VfsSetErrno(esp32VfsErrInvalidArgument)
+        return esp32VfsCallFailure
+    }
+    val count = esp32VfsGetCount()
+    val triples = esp32LibcCalloc(count, esp32VfsTripleBytes)
+    if (triples == u32(0)) {
+        esp32VfsSetErrno(esp32VfsErrNoMemory)
+        return esp32VfsCallFailure
+    }
+    var semaphore = u32(0)
+    var localSemaphore = false
+    var socketSelect = u32(0)
+    var fd = u32(0)
+    while (fd < descriptorCount) {
+        val packed = esp32VfsStartSelect(fd, errorFds)
+        val flags = packed & u32(255)
+        val rawIndex = (packed >> u32(8)) & u32(255)
+        val index = if (rawIndex >= u32(128))
+            rawIndex | u32(0xffffff00) else rawIndex
+        val local = (packed >> u32(16)) & u32(255)
+        if (i32(index) >= i32(0)) {
+            if ((flags & u32(1)) != u32(0)) {
+                if (socketSelect == u32(0) &&
+                    (esp32VfsFdSetContains(readFds, fd) ||
+                    esp32VfsFdSetContains(writeFds, fd) ||
+                    esp32VfsFdSetContains(errorFds, fd))) {
+                    val entry = esp32VfsGetForIndex(index)
+                    val select = esp32VfsSelectOperations(entry)
+                    if (select != u32(0)) {
+                        socketSelect = esp32VfsLoad(select + u32(4))
+                        val getSemaphore = esp32VfsLoad(select + u32(16))
+                        if (getSemaphore != u32(0)) {
+                            semaphore = u32(ablaUnsafeCallI32(
+                                int(getSemaphore)
+                            ))
+                        }
+                    }
+                }
+            } else {
+                val item = esp32VfsTriple(triples, index)
+                if (esp32VfsFdSetContains(readFds, fd)) {
+                    esp32VfsStoreByte(item, u32(1))
+                    esp32VfsFdSetAdd(item + u32(4), local)
+                    esp32VfsFdSetRemove(readFds, fd)
+                }
+                if (esp32VfsFdSetContains(writeFds, fd)) {
+                    esp32VfsStoreByte(item, u32(1))
+                    esp32VfsFdSetAdd(item + u32(12), local)
+                    esp32VfsFdSetRemove(writeFds, fd)
+                }
+                if (esp32VfsFdSetContains(errorFds, fd)) {
+                    esp32VfsStoreByte(item, u32(1))
+                    esp32VfsFdSetAdd(item + u32(20), local)
+                    esp32VfsFdSetRemove(errorFds, fd)
+                }
+            }
+        }
+        fd = fd + u32(1)
+    }
+    if (socketSelect == u32(0)) {
+        localSemaphore = true
+        semaphore = esp32RecoveredXQueueGenericCreate(
+            u32(1),u32(0),u32(3),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0)
+        )
+        if (semaphore == u32(0)) {
+            esp32LibcFree(triples)
+            esp32VfsSetErrno(esp32VfsErrNoMemory)
+            return esp32VfsCallFailure
+        }
+    }
+    val driverArguments = esp32LibcCalloc(count, u32(4))
+    if (driverArguments == u32(0)) {
+        esp32VfsDeleteLocalSemaphore(localSemaphore, semaphore)
+        esp32LibcFree(triples)
+        esp32VfsSetErrno(esp32VfsErrNoMemory)
+        return esp32VfsCallFailure
+    }
+    var index = u32(0)
+    while (index < count) {
+        val entry = esp32VfsGetForIndex(index)
+        val select = esp32VfsSelectOperations(entry)
+        val item = esp32VfsTriple(triples, index)
+        if (entry != u32(0) && select != u32(0) &&
+            esp32VfsLoad(select) != u32(0) &&
+            esp32VfsLoadByte(item) != u32(0)) {
+            val result = u32(
+                ablaUnsafeCallI32I32I32I32I32I32I32I32(
+                    int(esp32VfsLoad(select)),
+                    int(descriptorCount),
+                    int(item + u32(4)),
+                    int(item + u32(12)),
+                    int(item + u32(20)),
+                    int(if (localSemaphore) u32(1) else u32(0)),
+                    int(semaphore),
+                    int(driverArguments + index * u32(4))
+                )
+            )
+            if (result != esp32VfsOk) {
+                if (result != esp32VfsErrorNotSupported) {
+                    esp32VfsCallEndSelects(
+                        index, triples, driverArguments
+                    )
+                }
+                esp32VfsSetGlobalFdSets(
+                    triples, count, readFds, writeFds, errorFds
+                )
+                esp32VfsDeleteLocalSemaphore(
+                    localSemaphore, semaphore
+                )
+                esp32LibcFree(triples)
+                esp32LibcFree(driverArguments)
+                esp32VfsSetErrno(esp32VfsErrInterrupted)
+                return esp32VfsCallFailure
+            }
+        }
+        index = index + u32(1)
+    }
+    var ready = u32(0)
+    if (socketSelect != u32(0)) {
+        ready = u32(ablaUnsafeCallI32I32I32I32I32I32(
+            int(socketSelect),
+            int(descriptorCount),
+            int(readFds),
+            int(writeFds),
+            int(errorFds),
+            int(timeout)
+        ))
+    } else {
+        esp32VfsFdSetClear(readFds)
+        esp32VfsFdSetClear(writeFds)
+        esp32VfsFdSetClear(errorFds)
+        var ticks = u32(0xffffffff)
+        if (timeout != u32(0)) {
+            val milliseconds =
+                esp32VfsLoad(timeout) * u32(1000) +
+                esp32VfsLoad(timeout + u32(8)) / u32(1000)
+            ticks = milliseconds + u32(1)
+        }
+        esp32RecoveredXQueueSemaphoreTake(
+            semaphore,ticks,u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0)
+        )
+    }
+    esp32VfsCallEndSelects(count, triples, driverArguments)
+    if (i32(ready) >= i32(0)) {
+        ready = ready + esp32VfsSetGlobalFdSets(
+            triples, count, readFds, writeFds, errorFds
+        )
+    }
+    if (semaphore != u32(0)) {
+        if (localSemaphore) {
+            esp32VfsDeleteLocalSemaphore(true, semaphore)
+        } else if (socketSelect != u32(0)) {
+            esp32RecoveredXQueueSemaphoreTake(
+                esp32VfsLoad(semaphore),u32(0),u32(0),u32(0),
+                u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+                u32(0),u32(0),u32(0),u32(0),u32(0),u32(0)
+            )
+        }
+    }
+    esp32VfsClosePending(descriptorCount)
+    esp32LibcFree(triples)
+    esp32LibcFree(driverArguments)
+    return ready
+}
+
+trusted fun esp32VfsSelectTriggered(
+    localSemaphore: u32,
+    semaphore: u32
+): void {
+    if (localSemaphore != u32(0)) {
+        esp32RecoveredXQueueGenericSend(
+            semaphore,u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0)
+        )
+        return
+    }
+    var index = u32(0)
+    while (index < esp32VfsGetCount()) {
+        val select = esp32VfsSelectOperations(
+            esp32VfsGetForIndex(index)
+        )
+        if (select != u32(0) &&
+            esp32VfsLoad(select + u32(8)) != u32(0)) {
+            ablaUnsafeCallVoidI32(
+                int(esp32VfsLoad(select + u32(8))),
+                int(semaphore)
+            )
+            return
+        }
+        index = index + u32(1)
+    }
+}
+
+trusted fun esp32VfsSelectTriggeredIsr(
+    localSemaphore: u32,
+    semaphore: u32,
+    woken: u32
+): void {
+    if (localSemaphore != u32(0)) {
+        esp32RecoveredXQueueGiveFromISR(
+            semaphore,woken,u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+            u32(0),u32(0),u32(0),u32(0)
+        )
+        return
+    }
+    var index = u32(0)
+    while (index < esp32VfsGetCount()) {
+        val select = esp32VfsSelectOperations(
+            esp32VfsGetForIndex(index)
+        )
+        if (select != u32(0) &&
+            esp32VfsLoad(select + u32(12)) != u32(0)) {
+            ablaUnsafeCallVoidI32I32(
+                int(esp32VfsLoad(select + u32(12))),
+                int(semaphore),
+                int(woken)
+            )
+            return
+        }
+        index = index + u32(1)
+    }
+}
+
+trusted fun esp32VfsIncludeSyscallsImplementation(): void {}
+
+// Temporary source adapters for lifted neighbors which still call the old
+// six-register-plus-stack reconstruction signature. No adapter contains
+// decoded instructions; direct typed call sites use the functions above.
+trusted fun esp32RecoveredOpenR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsOpen(a2,a3,a4,a5)
+trusted fun esp32RecoveredWriteR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsWrite(a2,a3,a4,a5)
+trusted fun esp32RecoveredLseekR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsLseek(a2,a3,a4,a5)
+trusted fun esp32RecoveredReadR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsRead(a2,a3,a4,a5)
+trusted fun esp32RecoveredEspVfsPread(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsPread(a2,a3,a4,a5)
+trusted fun esp32RecoveredEspVfsPwrite(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsPwrite(a2,a3,a4,a5)
+trusted fun esp32RecoveredCloseR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsClose(a2,a3)
+trusted fun esp32RecoveredFstatR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFstat(a2,a3,a4)
+trusted fun esp32RecoveredFcntlR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFcntl(a2,a3,a4,a5)
+trusted fun esp32RecoveredEspVfsIoctl(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsIoctlAbi(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsFsync(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFsync(a2)
+trusted fun esp32RecoveredStatR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsStat(a2,a3,a4)
+trusted fun esp32RecoveredEspVfsUtime(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsUtime(a2,a3)
+trusted fun esp32RecoveredLinkR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsLink(a2,a3,a4)
+trusted fun esp32RecoveredUnlinkR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsUnlink(a2,a3)
+trusted fun esp32RecoveredRenameR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsRename(a2,a3,a4)
+trusted fun esp32RecoveredEspVfsOpendir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsOpendir(a2)
+trusted fun esp32RecoveredEspVfsReaddir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsReaddir(a2)
+trusted fun esp32RecoveredEspVfsReaddirR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsReaddirR(a2,a3,a4)
+trusted fun esp32RecoveredEspVfsTelldir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsTelldir(a2)
+trusted fun esp32RecoveredEspVfsSeekdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsSeekdir(a2,a3);return u32(0)}
+trusted fun esp32RecoveredEspVfsRewinddir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsRewinddir(a2);return u32(0)}
+trusted fun esp32RecoveredClosedir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsClosedir(a2)
+trusted fun esp32RecoveredEspVfsMkdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsMkdir(a2,a3)
+trusted fun esp32RecoveredEspVfsRmdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsRmdir(a2)
+trusted fun esp32RecoveredAccess(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsAccess(a2,a3)
+trusted fun esp32RecoveredEspVfsTruncate(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsTruncate(a2,a3)
+trusted fun esp32RecoveredEspVfsFtruncate(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFtruncate(a2,a3)
+trusted fun esp32RecoveredEspVfsSelect(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsSelect(a2,a3,a4,a5,a6)
+trusted fun esp32RecoveredEspVfsSelectTriggered(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsSelectTriggered(a2,a3);return u32(0)}
+trusted fun esp32RecoveredEspVfsSelectTriggeredIsr(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsSelectTriggeredIsr(a2,a3,a4);return u32(0)}
+trusted fun esp32RecoveredVfsIncludeSyscallsImpl(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsIncludeSyscallsImplementation();return u32(0)}
+
+// Source aliases retained only for lifted callers; ABI aliases in the link
+// map point straight at typed implementations.
+trusted fun esp32RecoveredEspVfsOpen(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredOpenR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsWrite(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredWriteR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsLseek(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredLseekR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsRead(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredReadR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredPread(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredEspVfsPread(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredPwrite(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredEspVfsPwrite(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsClose(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredCloseR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsFstat(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredFstatR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsFcntlR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredFcntlR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredIoctl(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsIoctlAbi(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredFsync(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFsync(a2)
+trusted fun esp32RecoveredEspVfsStat(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredStatR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredUtime(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsUtime(a2,a3)
+trusted fun esp32RecoveredEspVfsLink(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredLinkR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsUnlink(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredUnlinkR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredEspVfsRename(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32RecoveredRenameR(a2,a3,a4,a5,a6,a7,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9)
+trusted fun esp32RecoveredOpendir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsOpendir(a2)
+trusted fun esp32RecoveredReaddir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsReaddir(a2)
+trusted fun esp32RecoveredReaddirR(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsReaddirR(a2,a3,a4)
+trusted fun esp32RecoveredTelldir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsTelldir(a2)
+trusted fun esp32RecoveredSeekdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsSeekdir(a2,a3);return u32(0)}
+trusted fun esp32RecoveredRewinddir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32{esp32VfsRewinddir(a2);return u32(0)}
+trusted fun esp32RecoveredEspVfsClosedir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsClosedir(a2)
+trusted fun esp32RecoveredMkdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsMkdir(a2,a3)
+trusted fun esp32RecoveredRmdir(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsRmdir(a2)
+trusted fun esp32RecoveredEspVfsAccess(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsAccess(a2,a3)
+trusted fun esp32RecoveredTruncate(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsTruncate(a2,a3)
+trusted fun esp32RecoveredFtruncate(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsFtruncate(a2,a3)
+trusted fun esp32RecoveredSelect(a2:u32,a3:u32,a4:u32,a5:u32,a6:u32,a7:u32,s0:u32,s1:u32,s2:u32,s3:u32,s4:u32,s5:u32,s6:u32,s7:u32,s8:u32,s9:u32):u32=esp32VfsSelect(a2,a3,a4,a5,a6)

@@ -1,0 +1,77 @@
+import "abla/runtime/scalar"
+// Owner excludes ISR/ETM/register writers. Bus enabled; direction clocks live.
+// Reset requires parked DMA; start requires prepared DMA/pins/codec. None of
+// these operations establishes/reclaims DMA ownership or proves audible output.
+// Common status1 done,2 invalid/unowned,3 APB off,4 busy/reset/update.
+trusted fun p4I2sTransferPreflight(port: int, exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 2) return 2
+    if ((p4I2sTransferRead(0x500e601c) & int(u32(1) << u32(14+port))) == 0) return 3
+    return 1
+}
+trusted fun p4I2sTransferField(address: int, mask: int, value: int): void {
+    p4I2sTransferWrite(address,(p4I2sTransferRead(address) & (0xffffffff ^ mask)) | value)
+    return
+}
+// Issues the documented reset pulses, then checks deassertion. WT reset bits
+// need not read back asserted; readback cannot prove internal reset completion.
+// Status5 reset remained asserted,6 FIFO reset remained asserted.
+trusted fun esp32p4I2sResetDirectionOwned(port: int, transmit: bool, exclusive: bool): int {
+    val pre=p4I2sTransferPreflight(port,exclusive)
+    if (pre != 1) return pre
+    val conf=0x500c6000+port*4096+(if (transmit) 36 else 32)
+    if ((p4I2sTransferRead(conf) & 263) != 0) return 4
+    p4I2sTransferField(conf,1,1)
+    p4I2sTransferField(conf,1,0)
+    if ((p4I2sTransferRead(conf) & 1) != 0) return 5
+    p4I2sTransferField(conf,2,2)
+    p4I2sTransferField(conf,2,0)
+    if ((p4I2sTransferRead(conf) & 2) != 0) return 6
+    return 1
+}
+// Bounded register polls, not milliseconds. Timeout5 leaves UPDATE pending;
+// do not force it clear or start. Clock failure must be resolved before retry.
+trusted fun esp32p4I2sLatchOwned(port: int, transmit: bool, pollLimit: int, exclusive: bool): int {
+    if (pollLimit < 1 || pollLimit > 1000000) return 2
+    val pre=p4I2sTransferPreflight(port,exclusive)
+    if (pre != 1) return pre
+    val conf=0x500c6000+port*4096+(if (transmit) 36 else 32)
+    if ((p4I2sTransferRead(conf) & 263) != 0) return 4
+    p4I2sTransferField(conf,256,256)
+    var poll=0
+    while (poll < pollLimit) {
+        if ((p4I2sTransferRead(conf) & 256) == 0) return 1
+        poll=poll+1
+    }
+    return 5
+}
+// Failed latch never writes START. Status6 START not observed: could include
+// a very short transfer already completed, not proof that no transfer occurred.
+trusted fun esp32p4I2sStartDirectionOwned(port: int, transmit: bool, pollLimit: int, exclusive: bool): int {
+    val latch=esp32p4I2sLatchOwned(port,transmit,pollLimit,exclusive)
+    if (latch != 1) return latch
+    val conf=0x500c6000+port*4096+(if (transmit) 36 else 32)
+    p4I2sTransferField(conf,4,4)
+    if ((p4I2sTransferRead(conf) & 4) == 0) return 6
+    return 1
+}
+// Clears START only. Success is NOT FIFO drained or DMA parked; no buffer
+// reclamation or clock gating until the caller separately proves those states.
+trusted fun esp32p4I2sStopDirectionOwned(port: int, transmit: bool, exclusive: bool): int {
+    val pre=p4I2sTransferPreflight(port,exclusive)
+    if (pre != 1) return pre
+    val conf=0x500c6000+port*4096+(if (transmit) 36 else 32)
+    p4I2sTransferField(conf,4,0)
+    if ((p4I2sTransferRead(conf) & 4) != 0) return 5
+    return 1
+}
+// Match IDF driver: EOF count is DMA block bytes (not sample frames).
+trusted fun esp32p4I2sSetReceiveBlockBytesOwned(port: int, bytes: int, exclusive: bool): int {
+    if (bytes < 1 || bytes > 4095) return 2
+    val pre=p4I2sTransferPreflight(port,exclusive)
+    if (pre != 1) return pre
+    val base=0x500c6000+port*4096
+    if ((p4I2sTransferRead(base+32) & 263) != 0) return 4
+    p4I2sTransferField(base+100,4095,bytes)
+    if ((p4I2sTransferRead(base+100) & 4095) != bytes) return 5
+    return 1
+}

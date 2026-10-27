@@ -1,0 +1,323 @@
+import "../cpu/interrupt_allocator_esp32.ab"
+import "../freertos/queue_esp32.ab"
+import "../freertos/tasks_esp32.ab"
+import "../gpio/driver_esp32.ab"
+import "../rom/gpio_esp32.ab"
+import "../rom/system_esp32.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "hal_esp32.ab"
+import "hal_iram_esp32.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
+import "abla/unsafe/native"
+
+// Complete classic-ESP32 UART driver in structured Abla. All state and all
+// behavior stay in this module so monolithic LLVM optimization can see them.
+val esp32UartOk = u32(0)
+val esp32UartFail = u32(0xffffffff)
+val esp32UartNoMemory = u32(0x101)
+val esp32UartInvalidArgument = u32(0x102)
+val esp32UartInvalidState = u32(0x103)
+val esp32UartTimeout = u32(0x107)
+val esp32UartPortCount = u32(3)
+val esp32UartFifoLength = u32(128)
+val esp32UartStateBytes = u32(128)
+val esp32UartAllInterrupts = u32(0x7ffff)
+val esp32UartRxFull = u32(1)
+val esp32UartTxEmpty = u32(2)
+val esp32UartParityError = u32(4)
+val esp32UartFrameError = u32(8)
+val esp32UartRxOverflow = u32(16)
+val esp32UartBreak = u32(128)
+val esp32UartRxTimeout = u32(256)
+val esp32UartBreakDone = u32(1) << u32(12)
+val esp32UartTxDone = u32(1) << u32(14)
+val esp32UartCollision = u32(1) << u32(17)
+val esp32UartPattern = u32(1) << u32(18)
+val esp32UartRxInterrupts = esp32UartRxFull | esp32UartRxTimeout
+
+val esp32UartContextsStorage = nativeStaticMutableU32s([
+    int(u32(0x3ff40000)), int(u32(0x3ff50000)), int(u32(0x3ff6e000))
+])
+val esp32UartContexts = u32(esp32UartContextsStorage)
+
+// 32 words per port: installed, hardware, RX pointer/capacity/head/tail/count,
+// TX capacity, pattern pointer/capacity/head/tail/count/char/repeat/run,
+// callback, always-timeout, collision, mode, user interrupt mask, event queue,
+// interrupt handle, source clock, TX/RX/RTS/CTS/DTR/DSR pins, queue depth.
+val esp32UartStatesStorage = nativeStaticMutableU32s([
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,
+    4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,
+    4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,
+    4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,0
+])
+val esp32UartStates = u32(esp32UartStatesStorage)
+val esp32UartSelectLockStorage = nativeStaticMutableU32s([3007315967, 0])
+val esp32UartSelectLock = u32(esp32UartSelectLockStorage)
+
+@inline trusted fun esp32UartLoad(address: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+@inline trusted fun esp32UartStore(address: u32, value: u32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+@inline trusted fun esp32UartLoadByte(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+@inline trusted fun esp32UartStoreByte(address: u32, value: u32): void =
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), int(value & u32(255)))
+@inline trusted fun esp32UartValid(port: u32): bool = port < esp32UartPortCount
+@inline trusted fun esp32UartContext(port: u32): u32 = esp32UartContexts + port * u32(4)
+@inline trusted fun esp32UartDevice(port: u32): u32 = esp32UartLoad(esp32UartContext(port))
+@inline trusted fun esp32UartState(port: u32): u32 = esp32UartStates + port * esp32UartStateBytes
+@inline trusted fun esp32UartStateLoad(port: u32, offset: u32): u32 = esp32UartLoad(esp32UartState(port) + offset)
+@inline trusted fun esp32UartStateStore(port: u32, offset: u32, value: u32): void = esp32UartStore(esp32UartState(port) + offset, value)
+@inline trusted fun esp32UartReadRegister(port: u32, offset: u32): u32 = u32(mmioLoadU32(int(esp32UartDevice(port) + offset)))
+@inline trusted fun esp32UartWriteRegister(port: u32, offset: u32, value: u32): void = mmioStoreU32(int(esp32UartDevice(port) + offset), int(value))
+@inline trusted fun esp32UartUpdateRegister(port: u32, offset: u32, clear: u32, set: u32): void = esp32UartWriteRegister(port, offset, (esp32UartReadRegister(port, offset) & ~clear) | set)
+
+trusted fun esp32UartTicks(): u32 = esp32RecoveredXTaskGetTickCount(
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+trusted fun esp32UartDelayTick(): void {
+    esp32RecoveredVTaskDelay(u32(1),u32(0),u32(0),u32(0),u32(0),u32(0),
+        u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    return
+}
+trusted fun esp32UartTimedOut(start: u32, ticks: u32): bool =
+    ticks != u32(0xffffffff) && esp32UartTicks() - start >= ticks
+trusted fun esp32UartClockBit(port: u32): u32 = if (port == u32(0)) u32(4) else if (port == u32(1)) u32(32) else u32(1) << u32(23)
+
+trusted fun esp32UartModuleEnable(port: u32): void {
+    if (esp32UartStateLoad(port, u32(4)) != u32(0)) return
+    val bit = esp32UartClockBit(port)
+    val clock = u32(0x3ff000c0)
+    val reset = u32(0x3ff000c4)
+    mmioStoreU32(int(clock), int(u32(mmioLoadU32(int(clock))) | bit | (u32(1) << u32(24))))
+    mmioStoreU32(int(reset), int(u32(mmioLoadU32(int(reset))) & ~bit))
+    esp32UartStateStore(port, u32(4), u32(1))
+    esp32UartHalInitialize(esp32UartContext(port))
+}
+trusted fun esp32UartModuleDisable(port: u32): void {
+    if (esp32UartStateLoad(port, u32(4)) == u32(0)) return
+    if (port != u32(0)) {
+        val bit = esp32UartClockBit(port)
+        val clock = u32(0x3ff000c0)
+        val reset = u32(0x3ff000c4)
+        mmioStoreU32(int(reset), int(u32(mmioLoadU32(int(reset))) | bit))
+        mmioStoreU32(int(clock), int(u32(mmioLoadU32(int(clock))) & ~bit))
+    }
+    esp32UartStateStore(port, u32(4), u32(0))
+}
+trusted fun esp32UartSourceFrequency(source: u32): u32 =
+    if (source == u32(0)) u32(80000000) else if (source == u32(2)) u32(40000000) else if (source == u32(3)) u32(1000000) else u32(0)
+trusted fun esp32UartSetSource(port: u32, source: u32): u32 {
+    if (!(source == u32(0) || source == u32(3))) return esp32UartInvalidArgument
+    esp32UartUpdateRegister(port, u32(32), u32(1) << u32(27), if (source == u32(0)) u32(1) << u32(27) else u32(0))
+    esp32UartStateStore(port, u32(92), source)
+    return esp32UartOk
+}
+trusted fun esp32UartSetBaudrateValue(port: u32, baudrate: u32): u32 {
+    if (!esp32UartValid(port) || baudrate == u32(0)) return esp32UartFail
+    esp32UartModuleEnable(port)
+    val source = if ((esp32UartReadRegister(port,u32(32)) & (u32(1)<<u32(27))) != u32(0)) u32(80000000) else u32(1000000)
+    val divisor = u32((u64(source) << u32(4)) / u64(baudrate))
+    if (divisor == u32(0) || (divisor >>> u32(4)) > u32(0xfffff)) return esp32UartFail
+    esp32UartWriteRegister(port,u32(20),divisor & u32(0xffffff))
+    return esp32UartOk
+}
+trusted fun esp32UartGetBaudrateValue(port: u32): u32 {
+    val source = if ((esp32UartReadRegister(port,u32(32)) & (u32(1)<<u32(27))) != u32(0)) u32(80000000) else u32(1000000)
+    val divisor = esp32UartReadRegister(port,u32(20)) & u32(0xffffff)
+    return if (divisor == u32(0)) u32(0) else u32((u64(source)<<u32(4))/u64(divisor))
+}
+
+trusted fun esp32UartNotify(port: u32, kind: u32, woken: u32): void {
+    val callback = esp32UartStateLoad(port,u32(64))
+    if (callback != u32(0)) ablaUnsafeCallI32I32I32I32(int(callback),int(port),int(kind),int(woken))
+}
+trusted fun esp32UartQueueEvent(port: u32, kind: u32, size: u32, timeout: u32): void {
+    val queue = esp32UartStateLoad(port,u32(84))
+    if (queue == u32(0)) return
+    val event = u32(nativeStackAllocate(12))
+    val woken = u32(nativeStackAllocate(4))
+    freestandingSet(event,i32(0),u32(12))
+    esp32UartStore(event,kind); esp32UartStore(event+u32(4),size); esp32UartStoreByte(event+u32(8),timeout); esp32UartStore(woken,u32(0))
+    esp32RecoveredXQueueGenericSendFromISR(queue,event,woken,u32(0),u32(0),u32(0),
+        u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    return
+}
+trusted fun esp32UartPatternEnqueue(port: u32, position: u32): bool {
+    val data=esp32UartStateLoad(port,u32(32)); val cap=esp32UartStateLoad(port,u32(36)); val count=esp32UartStateLoad(port,u32(48))
+    if (data==u32(0) || count>=cap) return false
+    val tail=esp32UartStateLoad(port,u32(44)); esp32UartStore(data+tail*u32(4),position)
+    esp32UartStateStore(port,u32(44),if (tail+u32(1)==cap) u32(0) else tail+u32(1)); esp32UartStateStore(port,u32(48),count+u32(1)); return true
+}
+trusted fun esp32UartPatternAdvance(port: u32, amount: u32): void {
+    val data=esp32UartStateLoad(port,u32(32)); val cap=esp32UartStateLoad(port,u32(36)); var head=esp32UartStateLoad(port,u32(40)); var count=esp32UartStateLoad(port,u32(48)); var left=count
+    while (left!=u32(0)) { val slot=data+head*u32(4); val pos=esp32UartLoad(slot); val next=if (head+u32(1)==cap) u32(0) else head+u32(1)
+        if (pos<amount) { head=next; count=count-u32(1); esp32UartStateStore(port,u32(40),head); esp32UartStateStore(port,u32(48),count) } else { esp32UartStore(slot,pos-amount); head=next }
+        left=left-u32(1)
+    }
+}
+trusted fun esp32UartReceiveByte(port: u32, byte: u32): bool {
+    val cap=esp32UartStateLoad(port,u32(12)); val count=esp32UartStateLoad(port,u32(24)); if (cap==u32(0)||count>=cap) return false
+    val tail=esp32UartStateLoad(port,u32(20)); esp32UartStoreByte(esp32UartStateLoad(port,u32(8))+tail,byte)
+    esp32UartStateStore(port,u32(20),if (tail+u32(1)==cap) u32(0) else tail+u32(1)); esp32UartStateStore(port,u32(24),count+u32(1))
+    val repeat=esp32UartStateLoad(port,u32(56)); if (repeat!=u32(0)) { var run=if ((byte&u32(255))==esp32UartStateLoad(port,u32(52))) esp32UartStateLoad(port,u32(60))+u32(1) else u32(0)
+        if (run>=repeat) { esp32UartPatternEnqueue(port,count+u32(1)-repeat); esp32UartQueueEvent(port,u32(7),u32(0),u32(0)); run=u32(0) }; esp32UartStateStore(port,u32(60),run) }
+    return true
+}
+trusted fun esp32UartDrainFifo(port: u32): u32 {
+    var available=esp32UartReadRegister(port,u32(28))&u32(255); var received=u32(0)
+    while (available!=u32(0)) { if (!esp32UartReceiveByte(port,esp32UartReadRegister(port,u32(0))&u32(255))) { esp32UartQueueEvent(port,u32(2),u32(0),u32(0)); esp32UartWriteRegister(port,u32(12),esp32UartReadRegister(port,u32(12))&~esp32UartRxInterrupts); return received }; received=received+u32(1); available=esp32UartReadRegister(port,u32(28))&u32(255) }
+    return received
+}
+
+@section(".iram1.0.abla.uartInterruptService")
+trusted fun esp32UartInterruptService(port: u32): void {
+    if (!esp32UartValid(port)) return
+    var status=esp32UartReadRegister(port,u32(8))&esp32UartReadRegister(port,u32(12)); var rounds=u32(0)
+    while (status!=u32(0)&&rounds<u32(32)) {
+        if ((status&esp32UartRxInterrupts)!=u32(0)) { val count=esp32UartDrainFifo(port); esp32UartWriteRegister(port,u32(16),status&esp32UartRxInterrupts); if (count!=u32(0)) { esp32UartQueueEvent(port,u32(0),count,if ((status&esp32UartRxTimeout)!=u32(0)) u32(1) else u32(0)); val w=u32(nativeStackAllocate(4)); esp32UartStore(w,u32(0)); esp32UartNotify(port,u32(0),w) } }
+        else if ((status&esp32UartRxOverflow)!=u32(0)) { esp32UartHalResetReceiveFifo(esp32UartContext(port)); esp32UartWriteRegister(port,u32(16),esp32UartRxOverflow); esp32UartQueueEvent(port,u32(3),u32(0),u32(0)) }
+        else if ((status&esp32UartBreak)!=u32(0)) { esp32UartWriteRegister(port,u32(16),esp32UartBreak); esp32UartQueueEvent(port,u32(1),u32(0),u32(0)) }
+        else if ((status&esp32UartFrameError)!=u32(0)) { esp32UartWriteRegister(port,u32(16),esp32UartFrameError); esp32UartQueueEvent(port,u32(4),u32(0),u32(0)) }
+        else if ((status&esp32UartParityError)!=u32(0)) { esp32UartWriteRegister(port,u32(16),esp32UartParityError); esp32UartQueueEvent(port,u32(5),u32(0),u32(0)) }
+        else if ((status&esp32UartCollision)!=u32(0)) { esp32UartStateStore(port,u32(72),u32(1)); esp32UartWriteRegister(port,u32(16),esp32UartCollision) }
+        else if ((status&esp32UartBreakDone)!=u32(0)) { esp32UartHalSetTransmitBreak(esp32UartContext(port),u32(0)); esp32UartWriteRegister(port,u32(16),esp32UartBreakDone) }
+        else esp32UartWriteRegister(port,u32(16),status)
+        rounds=rounds+u32(1); status=esp32UartReadRegister(port,u32(8))&esp32UartReadRegister(port,u32(12))
+    }
+}
+
+trusted fun esp32UartGetSclkFreq(source: u32, out: u32): u32 {
+    if (out==u32(0)) return esp32UartInvalidArgument
+    val frequency=esp32UartSourceFrequency(source); if (frequency==u32(0)) return esp32UartInvalidArgument
+    esp32UartStore(out,frequency); return esp32UartOk
+}
+trusted fun esp32UartSetWordLength(port:u32,bits:u32):u32 { if (!esp32UartValid(port)||bits>=u32(4)) return esp32UartFail; esp32UartHalSetDataBits(esp32UartContext(port),bits); return esp32UartOk }
+trusted fun esp32UartGetWordLength(port:u32,out:u32):u32 { if (!esp32UartValid(port)||out==u32(0)) return esp32UartFail; esp32UartHalGetDataBits(esp32UartContext(port),out); return esp32UartOk }
+trusted fun esp32UartSetStopBits(port:u32,bits:u32):u32 { if (!esp32UartValid(port)||bits==u32(0)||bits>=u32(4)) return esp32UartFail; esp32UartHalSetStopBits(esp32UartContext(port),bits); return esp32UartOk }
+trusted fun esp32UartGetStopBits(port:u32,out:u32):u32 { if (!esp32UartValid(port)||out==u32(0)) return esp32UartFail; esp32UartHalGetStopBits(esp32UartContext(port),out); return esp32UartOk }
+trusted fun esp32UartSetParity(port:u32,parity:u32):u32 { if (!esp32UartValid(port)||parity>u32(3)||parity==u32(1)) return esp32UartFail; esp32UartHalSetParity(esp32UartContext(port),parity); return esp32UartOk }
+trusted fun esp32UartGetParity(port:u32,out:u32):u32 { if (!esp32UartValid(port)||out==u32(0)) return esp32UartFail; esp32UartHalGetParity(esp32UartContext(port),out); return esp32UartOk }
+trusted fun esp32UartSetBaudrate(port:u32,baud:u32):u32=esp32UartSetBaudrateValue(port,baud)
+trusted fun esp32UartGetBaudrate(port:u32,out:u32):u32 { if (!esp32UartValid(port)||out==u32(0)||esp32UartStateLoad(port,u32(4))==u32(0)) return esp32UartFail; esp32UartStore(out,esp32UartGetBaudrateValue(port)); return esp32UartOk }
+trusted fun esp32UartSetLineInverse(port:u32,mask:u32):u32 { if (!esp32UartValid(port)) return esp32UartFail; esp32UartHalInverseSignals(esp32UartContext(port),mask); return esp32UartOk }
+trusted fun esp32UartSetSoftwareFlowControl(port:u32,enabled:u32,xon:u32,xoff:u32):u32 {
+    if (!esp32UartValid(port)||xon>=esp32UartFifoLength||xoff>=esp32UartFifoLength) return esp32UartFail
+    val c=u32(nativeStackAllocate(4)); esp32UartStoreByte(c,u32(0x11)); esp32UartStoreByte(c+u32(1),u32(0x13)); esp32UartStoreByte(c+u32(2),xon); esp32UartStoreByte(c+u32(3),xoff)
+    esp32UartHalSetSoftwareFlowControl(esp32UartContext(port),c,enabled); return esp32UartOk
+}
+trusted fun esp32UartSetHardwareFlowControl(port:u32,flow:u32,threshold:u32):u32 { if (!esp32UartValid(port)||flow>=u32(4)||threshold>=esp32UartFifoLength) return esp32UartFail; esp32UartHalSetHardwareFlowControl(esp32UartContext(port),flow,threshold); return esp32UartOk }
+trusted fun esp32UartGetHardwareFlowControl(port:u32,out:u32):u32 { if (!esp32UartValid(port)||out==u32(0)) return esp32UartFail; esp32UartHalGetHardwareFlowControl(esp32UartContext(port),out); return esp32UartOk }
+trusted fun esp32UartClearInterruptStatus(port:u32,mask:u32):u32 { if (!esp32UartValid(port)) return esp32UartFail; esp32UartWriteRegister(port,u32(16),mask); return esp32UartOk }
+trusted fun esp32UartEnableInterruptMask(port:u32,mask:u32):u32 { if (!esp32UartValid(port)) return esp32UartFail; esp32UartStateStore(port,u32(80),esp32UartStateLoad(port,u32(80))|mask); esp32UartWriteRegister(port,u32(16),mask); esp32UartWriteRegister(port,u32(12),esp32UartReadRegister(port,u32(12))|mask); return esp32UartOk }
+trusted fun esp32UartDisableInterruptMask(port:u32,mask:u32):u32 { if (!esp32UartValid(port)) return esp32UartFail; esp32UartStateStore(port,u32(80),esp32UartStateLoad(port,u32(80))&~mask); esp32UartWriteRegister(port,u32(12),esp32UartReadRegister(port,u32(12))&~mask); return esp32UartOk }
+
+trusted fun esp32UartPatternGetPosition(port:u32):u32 { if (!esp32UartValid(port)||esp32UartStateLoad(port,u32(0))==u32(0)||esp32UartStateLoad(port,u32(48))==u32(0)) return u32(0xffffffff); return esp32UartLoad(esp32UartStateLoad(port,u32(32))+esp32UartStateLoad(port,u32(40))*u32(4)) }
+trusted fun esp32UartPatternGetPos(port:u32):u32=esp32UartPatternGetPosition(port)
+trusted fun esp32UartPatternPopPos(port:u32):u32 { val position=esp32UartPatternGetPosition(port); if (position==u32(0xffffffff)) return position; val cap=esp32UartStateLoad(port,u32(36)); val head=esp32UartStateLoad(port,u32(40)); esp32UartStateStore(port,u32(40),if (head+u32(1)==cap) u32(0) else head+u32(1)); esp32UartStateStore(port,u32(48),esp32UartStateLoad(port,u32(48))-u32(1)); return position }
+trusted fun esp32UartPatternQueueReset(port:u32,length:u32):u32 {
+    if (!esp32UartValid(port)) return esp32UartFail
+    if (esp32UartStateLoad(port,u32(0))==u32(0)) return esp32UartInvalidState
+    if (length==u32(0)||length>u32(0x3fffffff)) return esp32UartInvalidArgument
+    val replacement=esp32LibcMalloc(length*u32(4)); if (replacement==u32(0)) return esp32UartNoMemory
+    val previous=esp32UartStateLoad(port,u32(32)); esp32UartStateStore(port,u32(32),replacement); esp32UartStateStore(port,u32(36),length); esp32UartStateStore(port,u32(40),u32(0)); esp32UartStateStore(port,u32(44),u32(0)); esp32UartStateStore(port,u32(48),u32(0)); if (previous!=u32(0)) esp32LibcFree(previous); return esp32UartOk
+}
+trusted fun esp32UartEnablePatternDetection(port:u32,character:u32,repeat:u32,gap:u32,post:u32,pre:u32):u32 {
+    if (!esp32UartValid(port)||repeat==u32(0)||gap>u32(0xffffff)||post>u32(0xffffff)||pre>u32(0xffffff)) return esp32UartFail
+    val baud=esp32UartGetBaudrateValue(port); val divisor=if (baud==u32(0)) u32(1) else u32(80000000)/baud; val c=u32(nativeStackAllocate(16)); freestandingSet(c,i32(0),u32(16)); esp32UartStoreByte(c,character); esp32UartStoreByte(c+u32(1),repeat); esp32UartStore(c+u32(4),gap*divisor); esp32UartStore(c+u32(8),pre*divisor); esp32UartStore(c+u32(12),post*divisor)
+    esp32UartStateStore(port,u32(52),character&u32(255)); esp32UartStateStore(port,u32(56),repeat&u32(255)); esp32UartStateStore(port,u32(60),u32(0)); esp32UartHalSetAtCommand(esp32UartContext(port),c); return esp32UartEnableInterruptMask(port,esp32UartPattern)
+}
+trusted fun esp32UartDisablePatternDetection(port:u32):u32 { if (esp32UartValid(port)) { esp32UartStateStore(port,u32(56),u32(0)); esp32UartStateStore(port,u32(60),u32(0)) }; return esp32UartDisableInterruptMask(port,esp32UartPattern) }
+trusted fun esp32UartEnableRxInterrupt(port:u32):u32=esp32UartEnableInterruptMask(port,esp32UartRxInterrupts)
+trusted fun esp32UartDisableRxInterrupt(port:u32):u32=esp32UartDisableInterruptMask(port,esp32UartRxInterrupts)
+trusted fun esp32UartDisableTxInterrupt(port:u32):u32=esp32UartDisableInterruptMask(port,esp32UartTxEmpty)
+trusted fun esp32UartEnableTxInterrupt(port:u32,enabled:u32,threshold:u32):u32 { if (!esp32UartValid(port)||(threshold!=u32(0xffffffff)&&threshold>=esp32UartFifoLength)) return esp32UartFail; if (threshold!=u32(0xffffffff)) esp32UartHalSetTransmitThreshold(esp32UartContext(port),threshold); return esp32UartEnableInterruptMask(port,esp32UartTxEmpty) }
+
+trusted fun esp32UartTransmitSignal(port:u32):u32=if(port==u32(0))u32(14)else if(port==u32(1))u32(17)else u32(198)
+trusted fun esp32UartFlowSignal(port:u32):u32=if(port==u32(0))u32(15)else if(port==u32(1))u32(18)else u32(199)
+trusted fun esp32UartSetPin6(port:u32,tx:u32,rx:u32,rts:u32,cts:u32,dtr:u32,dsr:u32):u32 {
+    if (!esp32UartValid(port)) return esp32UartFail
+    if ((i32(tx)>=i32(0)&&!esp32GpioOutputValid(tx))||(i32(rx)>=i32(0)&&!esp32GpioValid(rx))||(i32(rts)>=i32(0)&&!esp32GpioOutputValid(rts))||(i32(cts)>=i32(0)&&!esp32GpioValid(cts))||(i32(dtr)>=i32(0)&&(!esp32GpioOutputValid(dtr)||port!=u32(0)))||(i32(dsr)>=i32(0)&&(!esp32GpioValid(dsr)||port!=u32(0)))) return esp32UartFail
+    esp32UartModuleEnable(port)
+    if (i32(tx)>=i32(0)) { esp32GpioSetDirection(tx,if(tx==rx)u32(3)else u32(2)); esp32RomGpioConnectOutSignal(tx,esp32UartTransmitSignal(port),u32(0),u32(0)); esp32UartStateStore(port,u32(96),tx) }
+    if (i32(rx)>=i32(0)) { esp32GpioInput(rx,true); esp32RomGpioConnectInSignal(rx,esp32UartTransmitSignal(port),u32(0)); esp32UartStateStore(port,u32(100),rx) }
+    if (i32(rts)>=i32(0)) { esp32GpioSetDirection(rts,u32(2)); esp32RomGpioConnectOutSignal(rts,esp32UartFlowSignal(port),u32(0),u32(0)); esp32UartStateStore(port,u32(104),rts) }
+    if (i32(cts)>=i32(0)) { esp32GpioInput(cts,true); esp32RomGpioConnectInSignal(cts,esp32UartFlowSignal(port),u32(0)); esp32UartStateStore(port,u32(108),cts) }
+    if (i32(dtr)>=i32(0)) { esp32GpioSetDirection(dtr,u32(2)); esp32RomGpioConnectOutSignal(dtr,u32(16),u32(0),u32(0)); esp32UartStateStore(port,u32(112),dtr) }
+    if (i32(dsr)>=i32(0)) { esp32GpioInput(dsr,true); esp32RomGpioConnectInSignal(dsr,u32(16),u32(0)); esp32UartStateStore(port,u32(116),dsr) }
+    return esp32UartOk
+}
+trusted fun esp32UartReleasePins(port:u32):void { if (!esp32UartValid(port)) return; val tx=esp32UartStateLoad(port,u32(96)); val rts=esp32UartStateLoad(port,u32(104)); val dtr=esp32UartStateLoad(port,u32(112)); if(i32(tx)>=i32(0))esp32GpioOutput(tx,false); if(i32(rts)>=i32(0))esp32GpioOutput(rts,false); if(i32(dtr)>=i32(0))esp32GpioOutput(dtr,false); esp32RomGpioConnectInSignal(u32(56),esp32UartTransmitSignal(port),u32(0)); esp32RomGpioConnectInSignal(u32(48),esp32UartFlowSignal(port),u32(0)); var o=u32(96); while(o<=u32(116)){esp32UartStateStore(port,o,u32(0xffffffff));o=o+u32(4)} }
+trusted fun esp32UartSetRts(port:u32,level:u32):u32 { if(!esp32UartValid(port)||esp32UartHalHardwareRtsEnabled(esp32UartContext(port))!=u32(0))return esp32UartFail; esp32UartUpdateRegister(port,u32(32),u32(1)<<u32(6),(level&u32(1))<<u32(6)); return esp32UartOk }
+trusted fun esp32UartSetDtr(port:u32,level:u32):u32 { if(!esp32UartValid(port))return esp32UartFail; esp32UartHalSetDtr(esp32UartContext(port),level); return esp32UartOk }
+trusted fun esp32UartSetTxIdleNum(port:u32,cycles:u32):u32 { if(!esp32UartValid(port)||cycles>u32(1023))return esp32UartFail; esp32UartHalSetTxIdle(esp32UartContext(port),cycles); return esp32UartOk }
+
+trusted fun esp32UartParamConfig(port:u32,c:u32):u32 {
+    if(!esp32UartValid(port)||c==u32(0))return esp32UartInvalidArgument; esp32UartModuleEnable(port)
+    var source=esp32UartLoad(c+u32(24)); if(source==u32(0xffffffff))source=u32(0); var result=esp32UartSetSource(port,source); if(result!=u32(0))return result
+    result=esp32UartSetBaudrateValue(port,esp32UartLoad(c)); if(result!=u32(0))return result
+    result=esp32UartSetWordLength(port,esp32UartLoad(c+u32(4))); if(result!=u32(0))return result
+    result=esp32UartSetParity(port,esp32UartLoad(c+u32(8))); if(result!=u32(0))return result
+    result=esp32UartSetStopBits(port,esp32UartLoad(c+u32(12))); if(result!=u32(0))return result
+    return esp32UartSetHardwareFlowControl(port,esp32UartLoad(c+u32(16)),esp32UartLoadByte(c+u32(20)))
+}
+trusted fun esp32UartIntrConfig(port:u32,c:u32):u32 {
+    if(!esp32UartValid(port)||c==u32(0))return esp32UartFail
+    val mask=esp32UartLoad(c); val timeout=esp32UartLoadByte(c+u32(4)); val tx=esp32UartLoadByte(c+u32(5)); val rx=esp32UartLoadByte(c+u32(6))
+    if(tx>=u32(128)||rx>=u32(128))return esp32UartFail
+    esp32UartHalSetReceiveThreshold(esp32UartContext(port),rx); esp32UartHalSetTransmitThreshold(esp32UartContext(port),tx); esp32UartHalSetReceiveTimeout(esp32UartContext(port),timeout)
+    esp32UartWriteRegister(port,u32(12),u32(0)); esp32UartWriteRegister(port,u32(16),esp32UartAllInterrupts); return esp32UartEnableInterruptMask(port,mask)
+}
+trusted fun esp32UartTransmitIdle(port:u32):bool { val s=esp32UartReadRegister(port,u32(28)); return ((s>>>u32(16))&u32(255))==u32(0)&&((s>>>u32(24))&u32(15))==u32(0) }
+trusted fun esp32UartWaitTxDone(port:u32,ticks:u32):u32 { if(!esp32UartValid(port)||esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartFail; val start=esp32UartTicks(); while(!esp32UartTransmitIdle(port)){if(esp32UartTimedOut(start,ticks))return esp32UartTimeout;esp32UartDelayTick()};return esp32UartOk }
+trusted fun esp32UartTxChars(port:u32,buffer:u32,length:u32):u32 {
+    if(!esp32UartValid(port)||esp32UartStateLoad(port,u32(0))==u32(0)||buffer==u32(0))return u32(0xffffffff); if(length==u32(0))return u32(0)
+    val out=u32(nativeStackAllocate(4));esp32UartStore(out,u32(0));esp32UartHalWriteTransmitFifo(esp32UartContext(port),buffer,length,out);val count=esp32UartLoad(out)
+    if(count!=u32(0)){val w=u32(nativeStackAllocate(4));esp32UartStore(w,u32(0));esp32UartNotify(port,u32(1),w)};return count
+}
+trusted fun esp32UartWriteBytes(port:u32,source:u32,size:u32):u32 { if(!esp32UartValid(port)||esp32UartStateLoad(port,u32(0))==u32(0)||source==u32(0))return u32(0xffffffff);var offset=u32(0);while(offset<size){val sent=esp32UartTxChars(port,source+offset,size-offset);if(sent==u32(0xffffffff))return sent;if(sent==u32(0))esp32UartDelayTick()else offset=offset+sent};return size }
+trusted fun esp32UartWriteBytesWithBreak(port:u32,source:u32,size:u32,length:u32):u32 { if(size==u32(0)||length==u32(0)||length>=u32(256))return u32(0xffffffff);val result=esp32UartWriteBytes(port,source,size);if(result==u32(0xffffffff))return result;while(!esp32UartTransmitIdle(port)){};esp32UartHalSetTransmitBreak(esp32UartContext(port),length);val baud=esp32UartGetBaudrateValue(port);esp32RomDelayUs(if(baud==u32(0))u32(1000)else u32((u64(length)*u64(1000000))/u64(baud))+u32(2));esp32UartHalSetTransmitBreak(esp32UartContext(port),u32(0));return result }
+trusted fun esp32UartReadBytes(port:u32,out:u32,requested:u32,ticks:u32):u32 {
+    if(!esp32UartValid(port)||out==u32(0)||esp32UartStateLoad(port,u32(0))==u32(0))return u32(0xffffffff);val start=esp32UartTicks();var copied=u32(0)
+    while(copied<requested){esp32UartDrainFifo(port);var count=esp32UartStateLoad(port,u32(24));if(count==u32(0)){if(ticks==u32(0)||esp32UartTimedOut(start,ticks))return copied;esp32UartDelayTick()}else{var head=esp32UartStateLoad(port,u32(16));val cap=esp32UartStateLoad(port,u32(12));val before=copied;while(count!=u32(0)&&copied<requested){esp32UartStoreByte(out+copied,esp32UartLoadByte(esp32UartStateLoad(port,u32(8))+head));head=if(head+u32(1)==cap)u32(0)else head+u32(1);count=count-u32(1);copied=copied+u32(1)};esp32UartStateStore(port,u32(16),head);esp32UartStateStore(port,u32(24),count);esp32UartPatternAdvance(port,copied-before);val mask=esp32UartStateLoad(port,u32(80))&esp32UartRxInterrupts;esp32UartWriteRegister(port,u32(16),mask);esp32UartWriteRegister(port,u32(12),esp32UartReadRegister(port,u32(12))|mask)}};return copied
+}
+trusted fun esp32UartGetBufferedDataLen(port:u32,out:u32):u32 { if(!esp32UartValid(port)||out==u32(0)||esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartFail;esp32UartDrainFifo(port);esp32UartStore(out,esp32UartStateLoad(port,u32(24)));return esp32UartOk }
+trusted fun esp32UartGetTxBufferFreeSize(port:u32,out:u32):u32 { if(!esp32UartValid(port)||out==u32(0)||esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartFail;esp32UartStore(out,esp32UartStateLoad(port,u32(28)));return esp32UartOk }
+trusted fun esp32UartFlush(port:u32):u32 { if(!esp32UartValid(port)||esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartFail;esp32UartStateStore(port,u32(16),u32(0));esp32UartStateStore(port,u32(20),u32(0));esp32UartStateStore(port,u32(24),u32(0));esp32UartStateStore(port,u32(40),u32(0));esp32UartStateStore(port,u32(44),u32(0));esp32UartStateStore(port,u32(48),u32(0));esp32UartHalResetReceiveFifo(esp32UartContext(port));esp32UartWriteRegister(port,u32(16),esp32UartRxInterrupts|esp32UartRxOverflow);return esp32UartOk }
+
+trusted fun esp32UartDriverDelete(port:u32):u32 {
+    if(!esp32UartValid(port))return esp32UartFail;if(esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartOk;esp32UartWriteRegister(port,u32(12),u32(0))
+    val interrupt=esp32UartStateLoad(port,u32(88));if(interrupt!=u32(0))esp32RecoveredEspIntrFree(interrupt,u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    val queue=esp32UartStateLoad(port,u32(84));if(queue!=u32(0))esp32RecoveredVQueueDelete(queue,u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    val receive=esp32UartStateLoad(port,u32(8));val patterns=esp32UartStateLoad(port,u32(32));if(receive!=u32(0))esp32LibcFree(receive);if(patterns!=u32(0))esp32LibcFree(patterns);esp32UartReleasePins(port);esp32UartModuleDisable(port);freestandingSet(esp32UartState(port),i32(0),esp32UartStateBytes);var o=u32(96);while(o<=u32(116)){esp32UartStateStore(port,o,u32(0xffffffff));o=o+u32(4)};return esp32UartOk
+}
+trusted fun esp32UartDriverInstall(port:u32,rxSize:u32,txSize:u32,eventSize:u32,queueOut:u32,flags:u32):u32 {
+    if(!esp32UartValid(port)||rxSize<=u32(128)||(txSize!=u32(0)&&txSize<=u32(128)))return esp32UartFail;if(esp32UartStateLoad(port,u32(0))!=u32(0))return esp32UartFail
+    val receive=esp32LibcMalloc(rxSize);if(receive==u32(0))return esp32UartFail;esp32UartStateStore(port,u32(0),u32(1));esp32UartStateStore(port,u32(8),receive);esp32UartStateStore(port,u32(12),rxSize);esp32UartStateStore(port,u32(28),txSize);esp32UartStateStore(port,u32(80),esp32UartRxInterrupts);esp32UartStateStore(port,u32(120),eventSize);esp32UartModuleEnable(port)
+    if(esp32UartPatternQueueReset(port,u32(20))!=u32(0)){esp32UartDriverDelete(port);return esp32UartFail}
+    if(eventSize!=u32(0)){val queue=esp32RecoveredXQueueGenericCreate(eventSize,u32(12),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0));if(queue==u32(0)){esp32UartDriverDelete(port);return esp32UartFail};esp32UartStateStore(port,u32(84),queue);if(queueOut!=u32(0))esp32UartStore(queueOut,queue)}else if(queueOut!=u32(0))esp32UartStore(queueOut,u32(0))
+    esp32UartWriteRegister(port,u32(12),u32(0));esp32UartWriteRegister(port,u32(16),esp32UartAllInterrupts)
+    val irq=esp32RecoveredEspIntrAllocIntrstatus(u32(34)+port,flags&~u32(0x400),esp32UartDevice(port)+u32(8),esp32UartAllInterrupts,u32(nativeFunctionAddress(esp32UartInterruptService)),port,esp32UartState(port)+u32(88),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0));if(irq!=u32(0)){esp32UartDriverDelete(port);return irq}
+    esp32UartHalSetReceiveThreshold(esp32UartContext(port),u32(120));esp32UartHalSetTransmitThreshold(esp32UartContext(port),u32(10));esp32UartHalSetReceiveTimeout(esp32UartContext(port),u32(10));return esp32UartEnableInterruptMask(port,esp32UartRxInterrupts|esp32UartRxOverflow|esp32UartBreak|esp32UartFrameError|esp32UartParityError)
+}
+trusted fun esp32UartIsDriverInstalled(port:u32):u32=if(esp32UartValid(port)&&esp32UartStateLoad(port,u32(0))!=u32(0))u32(1)else u32(0)
+trusted fun esp32UartSetSelectNotifCallback(port:u32,callback:u32):u32 { if(esp32UartValid(port)&&esp32UartStateLoad(port,u32(0))!=u32(0))esp32UartStateStore(port,u32(64),callback); return u32(0) }
+trusted fun esp32UartGetSelectLock():u32=esp32UartSelectLock
+
+trusted fun esp32UartSetMode(port:u32,mode:u32):u32 { if(!esp32UartValid(port))return esp32UartInvalidArgument;if(esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartInvalidState;if(mode>u32(4))return esp32UartInvalidArgument;if((mode==u32(1)||mode==u32(3)||mode==u32(4))&&esp32UartHalHardwareRtsEnabled(esp32UartContext(port))!=u32(0))return esp32UartInvalidArgument;esp32UartHalSetMode(esp32UartContext(port),mode);esp32UartStateStore(port,u32(72),u32(0));esp32UartStateStore(port,u32(76),mode);if(mode==u32(3))esp32UartEnableInterruptMask(port,esp32UartRxInterrupts|esp32UartCollision);return esp32UartOk }
+trusted fun esp32UartSetRxFullThreshold(port:u32,threshold:u32):u32 { if(!esp32UartValid(port)||threshold==u32(0)||threshold>=u32(128))return esp32UartInvalidArgument;if(esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartInvalidState;esp32UartHalSetReceiveThreshold(esp32UartContext(port),threshold);return esp32UartOk }
+trusted fun esp32UartSetTxEmptyThreshold(port:u32,threshold:u32):u32 { if(!esp32UartValid(port)||threshold==u32(0)||threshold>=u32(128))return esp32UartInvalidArgument;if(esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartInvalidState;esp32UartHalSetTransmitThreshold(esp32UartContext(port),threshold);return esp32UartOk }
+trusted fun esp32UartSetRxTimeout(port:u32,threshold:u32):u32 { if(!esp32UartValid(port)||threshold>esp32UartHalMaximumReceiveTimeout(esp32UartContext(port)))return esp32UartInvalidArgument;esp32UartHalSetReceiveTimeout(esp32UartContext(port),threshold);return esp32UartOk }
+trusted fun esp32UartGetCollisionFlag(port:u32,out:u32):u32 { if(!esp32UartValid(port)||out==u32(0))return esp32UartInvalidArgument;if(esp32UartStateLoad(port,u32(0))==u32(0))return esp32UartFail;val mode=esp32UartStateLoad(port,u32(76));if(!(mode==u32(1)||mode==u32(3)))return esp32UartInvalidArgument;esp32UartStoreByte(out,esp32UartStateLoad(port,u32(72)));return esp32UartOk }
+trusted fun esp32UartSetWakeupThreshold(port:u32,threshold:u32):u32 { if(!esp32UartValid(port)||threshold<u32(3)||threshold>u32(1023))return esp32UartInvalidArgument;esp32UartHalSetWakeupThreshold(esp32UartContext(port),threshold);return esp32UartOk }
+trusted fun esp32UartGetWakeupThreshold(port:u32,out:u32):u32 { if(!esp32UartValid(port)||out==u32(0))return esp32UartInvalidArgument;esp32UartHalGetWakeupThreshold(esp32UartContext(port),out);return esp32UartOk }
+trusted fun esp32UartWaitTxIdlePolling(port:u32):u32 { if(!esp32UartValid(port))return esp32UartInvalidArgument;if(esp32UartStateLoad(port,u32(4))!=u32(0)){while(!esp32UartTransmitIdle(port)){}};return esp32UartOk }
+trusted fun esp32UartSetLoopBack(port:u32,enabled:u32):u32 { if(!esp32UartValid(port))return esp32UartInvalidArgument;esp32UartHalSetLoopback(esp32UartContext(port),enabled);return esp32UartOk }
+trusted fun esp32UartSetAlwaysRxTimeout(port:u32,enabled:u32):void { if(esp32UartValid(port)&&esp32UartStateLoad(port,u32(0))!=u32(0)){val configured=((esp32UartReadRegister(port,u32(36))>>>u32(24))&u32(127))!=u32(0);esp32UartStateStore(port,u32(68),if(configured&&enabled!=u32(0))u32(1)else u32(0))} }
+trusted fun esp32UartDetectBitrateStart(port:u32,c:u32):u32 { if(!esp32UartValid(port))return esp32UartInvalidArgument;val fresh=esp32UartStateLoad(port,u32(4))==u32(0);if(fresh){if(c==u32(0))return esp32UartInvalidArgument;val pin=esp32UartLoad(c);if(!esp32GpioValid(pin))return esp32UartInvalidArgument;val source=esp32UartLoad(c+u32(4));esp32UartModuleEnable(port);val sr=esp32UartSetSource(port,source);if(sr!=u32(0)){esp32UartModuleDisable(port);return sr};esp32UartSetBaudrateValue(port,u32(57600));esp32UartSetPin6(port,u32(0xffffffff),pin,u32(0xffffffff),u32(0xffffffff),u32(0xffffffff),u32(0xffffffff))};esp32UartUpdateRegister(port,u32(24),u32(1),u32(1));return esp32UartOk }
+trusted fun esp32UartDetectBitrateStop(port:u32,deinitialize:u32,out:u32):u32 { if(!esp32UartValid(port)||out==u32(0)||esp32UartStateLoad(port,u32(4))==u32(0))return esp32UartInvalidArgument;var low=esp32UartReadRegister(port,u32(40))&u32(0xfffff);var high=esp32UartReadRegister(port,u32(44))&u32(0xfffff);var positive=esp32UartReadRegister(port,u32(104))&u32(0xfffff);var negative=esp32UartReadRegister(port,u32(108))&u32(0xfffff);val edges=esp32UartReadRegister(port,u32(48))&u32(0x3ff);esp32UartUpdateRegister(port,u32(24),u32(1),u32(0));if(low!=u32(0)&&low!=u32(0xfffff))low=low+u32(1);if(high!=u32(0)&&high!=u32(0xfffff))high=high+u32(1);if(positive!=u32(0)&&positive!=u32(0xfffff))positive=positive+u32(1);if(negative!=u32(0)&&negative!=u32(0xfffff))negative=negative+u32(1);esp32UartStore(out,low);esp32UartStore(out+u32(4),high);esp32UartStore(out+u32(8),positive);esp32UartStore(out+u32(12),negative);esp32UartStore(out+u32(16),edges);esp32UartStore(out+u32(20),u32(80000000));if(deinitialize!=u32(0)){esp32UartReleasePins(port);esp32UartModuleDisable(port)};return esp32UartOk }
+trusted fun esp32UartFlushInput(port:u32):u32=esp32UartFlush(port)

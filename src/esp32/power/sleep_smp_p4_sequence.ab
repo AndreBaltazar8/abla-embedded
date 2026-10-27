@@ -1,0 +1,120 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Two-hart sleep rendezvous in ONE aligned atomic retained u32 (initially0).
+// Atomic transitions prevent a peer join racing cancellation or a new round
+// starting while the previous peer still restores. No heap/global allocation.
+// Word: hart phases0..3/4..7; coordinator8; stage9..11; notify12/ack13;
+// generation16..31. A claimed notification blocks early-cancel round reuse
+// until the peer clears its interrupt and acknowledges, even before join.
+// Phases0idle1saving2backed3restoring4restored.
+// Stages0idle1prepare2request-authorized3wake-recovery4cancel5leader-released.
+// Generation is carried by the IPC request and every operation; do not retain
+// stale IPC work across 65536 rounds. Only open advances it; both harts must
+// finish before reuse. Caller initializes once before either hart can access.
+// Retained coherent internal memory, machine mode, MIEoff, pinned hart and
+// exclusive per-hart retention owner are required. This is synchronization,
+// not IRQ delivery, CPU restart, cache publication or a PMU sleep request.
+// Backed is called INSIDE the integer boundary after all CPU snapshots exist.
+// Authorize BEFORE final cache clean/request. Peer waits without releasing its
+// boundary while stage2 is active. Wake/reject reports require actual hardware
+// evidence. Restored means all FPU/CLIC/aux/cache/clock owners recovered.
+// Result low8:1transition2invalid3wait4wrong-state/role5stale-generation.
+// Remaining bits contain observed/new control word, permitting epoch transfer.
+type P4SleepSmp=int
+fun P4SleepSmp.status(): int = this&255
+fun P4SleepSmp.generation(): int = (this>>>24)&65535
+fun P4SleepSmp.control(): int = this>>>8
+fun P4SleepSmp.stage(): int = (this>>>17)&7
+fun P4SleepSmp.coordinator(): int = (this>>>16)&1
+fun P4SleepSmp.phase(hart: int): int = if (hart < 0 || hart > 1) -1 else if (hart == 0) (this>>>8)&15 else (this>>>12)&15
+fun p4SmpResult(word: int,status: int): P4SleepSmp = P4SleepSmp((word<<8)|status)
+// Operations:0open1join2backed3authorize4woke5rejected6cancel-before-request
+// 7restoring8restored9leader-release10peer-release11claim-notify12ack-notify
+// 13peer-save-failed (only before backed/request authorization);
+// 14authorized-but-no-request (leader has proven no PMU request was issued).
+fun p4SmpNext(word: int,hart: int,operation: int): int {
+    val stage=(word>>>9)&7
+    val leader=(word>>>8)&1
+    val phase=if (hart == 0) word&15 else (word>>>4)&15
+    val peer=if (hart == 0) (word>>>4)&15 else word&15
+    if (operation == 0) {
+        if (stage != 0 || (word&255) != 0) return -2
+        return (((((word>>>16)+1)&65535)<<16)|(hart<<8)|(1<<9)|(if (hart == 0) 1 else 16))
+    }
+    var nextPhase=phase
+    var nextStage=stage
+    if (operation == 1) {
+        if (hart == leader || stage != 1 || phase != 0) return -1
+        if ((word&4096) != 0 && (word&8192) == 0) return -2
+        nextPhase=1
+    } else if (operation == 2) {
+        if (stage != 1 || phase != 1) return -1
+        nextPhase=2
+    } else if (operation == 3) {
+        if (hart != leader || stage != 1 || phase != 2) return -1
+        if (peer != 2) return -2
+        nextStage=2
+    } else if (operation == 4 || operation == 5) {
+        if (hart != leader || stage != 2 || phase != 2 || peer != 2) return -1
+        nextStage=if (operation == 4) 3 else 4
+    } else if (operation == 6) {
+        if (hart != leader || stage != 1) return -1
+        nextStage=4
+    } else if (operation == 7) {
+        if ((stage != 3 && stage != 4) || (phase != 1 && phase != 2)) return -1
+        nextPhase=3
+    } else if (operation == 8) {
+        if ((stage != 3 && stage != 4) || phase != 3) return -1
+        nextPhase=4
+    } else if (operation == 9) {
+        if (hart != leader || (stage != 3 && stage != 4) || phase != 4) return -1
+        if (peer != 4 && !(stage == 4 && peer == 0)) return -2
+        if ((word&4096) != 0 && (word&8192) == 0) return -2
+        nextPhase=0
+        nextStage=if (peer == 0) 0 else 5
+    } else if (operation == 10) {
+        if (hart == leader || stage != 5 || phase != 4 || peer != 0) return -1
+        nextPhase=0;nextStage=0
+    } else if (operation == 11) {
+        if (hart != leader || stage != 1 || peer != 0 || (word&4096) != 0) return -1
+        return word|4096
+    } else if (operation == 12) {
+        if (hart == leader || (stage != 1 && stage != 4) || phase != 0 ||
+            (word&4096) == 0 || (word&8192) != 0) return -1
+        return word|8192
+    } else if (operation == 13) {
+        if (hart == leader || stage != 1 || phase != 1) return -1
+        nextStage=4
+    } else if (operation == 14) {
+        if (hart != leader || stage != 2 || phase != 2 || peer != 2) return -1
+        nextStage=4
+    } else return -1
+    return (word&(~((if (hart == 0) 15 else 240)|(7<<9))))|(if (hart == 0) nextPhase else nextPhase<<4)|(nextStage<<9)
+}
+trusted fun esp32p4SleepSmpAdvanceOwned(r: NativeBuffer,generation: int,operation: int,polls: int,exclusiveHart: bool): P4SleepSmp {
+    if (!exclusiveHart || !r.hasAddressRange(0,4) || (r.addressValue()&3) != 0 ||
+        operation < 0 || operation > 14 || generation < 0 || generation > 65535 || polls < 1 || polls > 1000000) return P4SleepSmp(2)
+    val hart=int(p4SmpHart())
+    if (hart < 0 || hart > 1 || (p4SmpStatus()&u32(8)) != u32(0)) return P4SleepSmp(2)
+    var word=int(p4SmpLoad(r.addressValue()))
+    var remaining=polls
+    while (remaining > 0) {
+        if (operation != 0 && (word>>>16) != generation) return p4SmpResult(word,5)
+        val next=p4SmpNext(word,hart,operation)
+        if (next < 0) return p4SmpResult(word,if (next == -2) 3 else 4)
+        val actual=int(p4SmpCas(r.addressValue(),u32(word),u32(next)))
+        if (actual == word) return p4SmpResult(next,1)
+        word=actual
+        remaining=remaining-1
+    }
+    return p4SmpResult(word,3)
+}
+// Acquire-only observation for the peer's parked callback. Status1 is a valid
+// snapshot here, NOT a newly granted request authorization. Never use a stage
+// observation as permission to request sleep; only operation3's successful CAS
+// grants that once. No RMW/spurious dirty cache line while the peer is parked.
+trusted fun esp32p4SleepSmpObserve(r: NativeBuffer,generation: int): P4SleepSmp {
+    if (!r.hasAddressRange(0,4) || (r.addressValue()&3) != 0 || generation < 0 || generation > 65535) return P4SleepSmp(2)
+    val word=int(p4SmpLoad(r.addressValue()))
+    return p4SmpResult(word,if ((word>>>16) == generation) 1 else 5)
+}

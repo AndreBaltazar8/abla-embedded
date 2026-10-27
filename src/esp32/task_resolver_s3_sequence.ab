@@ -1,0 +1,81 @@
+import "./sdk/raw_buffer.ab"
+// Current table8: one task-binding pointer/core. Binding16: CP0 pointer0,
+// CP3 pointer4, core+1 at8, magic12. Caller owns stable bindings/CP records and
+// serializes publication with the SAME lock used by coprocessor dispatch.
+// This is first-task publication/lookup, not a runnable queue/task scheduler.
+@inline
+fun esp32S3TaskResolverRange(address: int,size: int,mask: int): bool =
+    address >= 0x3FC88000 && address <= 0x3FD00000-size && (address & mask) == 0
+@inline
+fun esp32S3TaskResolverOverlap(a: int,size: int,b: int,length: int): bool = a < b+length && b < a+size
+@inline
+trusted fun esp32S3TaskResolverCpFresh(address: int,cp: int): bool =
+    esp32S3TaskResolverRange(address,256,15) && esp32S3TaskResolverRead(address) == 0x43503331 &&
+    esp32S3TaskResolverRead(address+4) == cp && esp32S3TaskResolverRead(address+8) == 0 && esp32S3TaskResolverRead(address+12) == 1
+// Common publication; resuming callers additionally enforce scheduler-lock,
+// level15/live-CP and owner-table/frame invariants before invoking this helper.
+@section(".iram1.abla.s3TaskBindingPublish")
+trusted fun esp32S3TaskBindingPublishOwned(current: NativeBuffer,binding: NativeBuffer,cp0: NativeBuffer,cp3: NativeBuffer,core: int,initial: bool): bool {
+    if (core < 0 || core > 1 || esp32S3TaskResolverCore() != core || (initial && esp32S3TaskResolverEnabled() != 0) ||
+        !current.hasAddressRange(0,8) || !esp32S3TaskResolverRange(current.addressValue(),8,3) ||
+        !binding.hasAddressRange(0,16) || !esp32S3TaskResolverRange(binding.addressValue(),16,3) ||
+        !cp0.hasAddressRange(0,256) || !cp3.hasAddressRange(0,256)) return false
+    val table=current.addressValue()
+    val address=binding.addressValue()
+    val first=cp0.addressValue()
+    val second=cp3.addressValue()
+    if (!esp32S3TaskResolverCpFresh(first,0) || !esp32S3TaskResolverCpFresh(second,3) ||
+        esp32S3TaskResolverOverlap(first,256,second,256) ||
+        esp32S3TaskResolverOverlap(table,8,address,16) ||
+        esp32S3TaskResolverOverlap(table,8,first,256) || esp32S3TaskResolverOverlap(table,8,second,256) ||
+        esp32S3TaskResolverOverlap(address,16,first,256) || esp32S3TaskResolverOverlap(address,16,second,256)) return false
+    if (esp32S3TaskResolverRead(table+core*4) != 0 || esp32S3TaskResolverRead(table+(core ^ 1)*4) == address ||
+        esp32S3TaskResolverRead(address+12) != (if (initial) 0 else 0x54415331)) return false
+    if (initial) {
+        if (esp32S3TaskResolverRead(esp32S3TaskResolverConfig()+core*32+4) != 0) return false
+    } else if (esp32S3TaskResolverRead(address+8) != 0 || esp32S3TaskResolverRead(address) != first || esp32S3TaskResolverRead(address+4) != second) return false
+    val peer=esp32S3TaskResolverRead(table+(core ^ 1)*4)
+    if (peer != 0) {
+        if (!esp32S3TaskResolverRange(peer,16,3) || esp32S3TaskResolverRead(peer+12) != 0x54415331 ||
+            esp32S3TaskResolverRead(peer+8) != (core ^ 1)+1) return false
+        var index=0
+        while (index < 3) {
+            val other=if (index == 0) peer else esp32S3TaskResolverRead(peer+(index-1)*4)
+            val size=if (index == 0) 16 else 256
+            if (!esp32S3TaskResolverRange(other,size,if (index == 0) 3 else 15) ||
+                esp32S3TaskResolverOverlap(other,size,table,8) || esp32S3TaskResolverOverlap(other,size,address,16) ||
+                esp32S3TaskResolverOverlap(other,size,first,256) || esp32S3TaskResolverOverlap(other,size,second,256)) return false
+            index=index+1
+        }
+    }
+    esp32S3TaskResolverWrite(address,first)
+    esp32S3TaskResolverWrite(address+4,second)
+    esp32S3TaskResolverWrite(address+8,core+1)
+    esp32S3TaskResolverWrite(address+12,0x54415331)
+    esp32S3TaskResolverWrite(table+core*4,address)
+    true
+}
+@inline
+trusted fun esp32S3TaskPublishFirstOwned(current: NativeBuffer,binding: NativeBuffer,cp0: NativeBuffer,cp3: NativeBuffer,core: int): bool =
+    esp32S3TaskBindingPublishOwned(current,binding,cp0,cp3,core,true)
+// Exact u32(core,cp,context) resolver ABI. CP dispatch holds scheduler lock and
+// masks to level15 before calling. Active depth must be exactly1: the current
+// exception, not an exception nested inside an IRQ/another exception handler.
+@section(".iram1.abla.s3TaskResolve")
+trusted fun esp32S3TaskResolve(core: u32,cp: u32,context: u32): u32 {
+    val selected=int(core)
+    val coprocessor=int(cp)
+    val table=int(context)
+    if (selected > 1 || (coprocessor != 0 && coprocessor != 3) || esp32S3TaskResolverCore() != selected ||
+        !esp32S3TaskResolverRange(table,8,3) ||
+        esp32S3TaskResolverRead(esp32S3TaskResolverConfig()+selected*32+4) != 1) return u32(0)
+    val binding=esp32S3TaskResolverRead(table+selected*4)
+    if (!esp32S3TaskResolverRange(binding,16,3) || esp32S3TaskResolverRead(binding+12) != 0x54415331 ||
+        esp32S3TaskResolverRead(binding+8) != selected+1 || esp32S3TaskResolverRead(table+(selected ^ 1)*4) == binding) return u32(0)
+    val record=esp32S3TaskResolverRead(binding+(if (coprocessor == 0) 0 else 4))
+    if (!esp32S3TaskResolverRange(record,256,15) || esp32S3TaskResolverRead(record) != 0x43503331 ||
+        esp32S3TaskResolverRead(record+4) != coprocessor) return u32(0)
+    val resident=esp32S3TaskResolverRead(record+8)
+    if (resident != 0 && resident != selected+1) return u32(0)
+    u32(record)
+}

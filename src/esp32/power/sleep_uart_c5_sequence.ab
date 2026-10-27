@@ -1,0 +1,63 @@
+// HP UART0/1 only. Caller excludes FIFO producers, DMA, interrupts and other
+// register writers, keeps source clocks live through synchronization, and
+// restores clocks/configuration before resume. Retain full closure and stack.
+// Drain before TOP/CPU power loss: suspension alone does NOT retain a FIFO.
+// Never reset/discard FIFO contents. RX retention is a separate prerequisite.
+@section(".iram1.abla.c5SleepUartUpdate")
+trusted fun c5SleepUartUpdate(base: int,clear: int,set: int): void {
+    c5SleepUartWrite(base+0x3c,(c5SleepUartRead(base+0x3c)&~clear)|set)
+    return
+}
+@section(".iram1.abla.c5SleepUartSync")
+trusted fun c5SleepUartSync(base: int): void {
+    c5SleepUartWrite(base+0x98,1)
+    // Once published, do not return while the core-domain update is pending.
+    while ((c5SleepUartRead(base+0x98)&1) != 0) {}
+    return
+}
+// Only resume a successful suspension or retained cleanup-failure status6.
+// C5 LL deliberately performs all four shadow changes BEFORE one update;
+// this differs from S3's immediate flow-control registers.
+@section(".iram1.abla.c5SleepUartResume")
+trusted fun esp32C5SleepUartResumeOwned(port: int,exclusive: bool): bool {
+    if (!exclusive || port < 0 || port > 1) return false
+    val gate=0x60096000+port*12
+    if ((c5SleepUartRead(gate)&3) != 1 || (c5SleepUartRead(gate+4)&0x400000) == 0) return false
+    val base=0x60000000+port*4096
+    if ((c5SleepUartRead(base+0x98)&1) != 0) return false
+    c5SleepUartUpdate(base,0x100000,0)
+    c5SleepUartUpdate(base,0,0x80000)
+    c5SleepUartUpdate(base,0x20000,0)
+    c5SleepUartUpdate(base,0x80000,0)
+    c5SleepUartSync(base)
+    (c5SleepUartRead(base+0x3c)&0x1a0000) == 0
+}
+// 0invalid,1disabled/reset untouched,2drained,3suspended,4timeout restored,
+// 5preexisting flow owner,6cleanup failed (retain ownership),7clock/update busy.
+// Poll limit bounds TX observations, not core synchronization or wall time.
+@section(".iram1.abla.c5SleepUartPrepare")
+trusted fun esp32C5SleepUartPrepareOwned(port: int,drain: bool,polls: int,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || polls < 1 || polls > 0x7fffffff) return 0
+    val gate=0x60096000+port*12
+    if ((c5SleepUartRead(gate)&3) != 1) return 1
+    if ((c5SleepUartRead(gate+4)&0x400000) == 0) return 7
+    val base=0x60000000+port*4096
+    if ((c5SleepUartRead(base+0x98)&1) != 0) return 7
+    if (!drain) {
+        if ((c5SleepUartRead(base+0x3c)&0x1a0000) != 0) return 5
+        c5SleepUartUpdate(base,0x80000,0)
+        c5SleepUartUpdate(base,0,0x20000)
+        c5SleepUartUpdate(base,0,0x100000)
+        c5SleepUartSync(base)
+    }
+    var remaining=polls
+    while (remaining > 0) {
+        val fsm=(c5SleepUartRead(base+0x70)>>>4)&15
+        if (drain) {
+            if (fsm == 0 && ((c5SleepUartRead(base+0x1c)>>>16)&255) == 0) return 2
+        } else if ((fsm == 0 || fsm == 15) && (c5SleepUartRead(base+0x3c)&0x1a0000) == 0x120000) return 3
+        remaining=remaining-1
+    }
+    if (!drain && !esp32C5SleepUartResumeOwned(port,true)) return 6
+    4
+}

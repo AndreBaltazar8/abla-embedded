@@ -1,0 +1,298 @@
+import "../runtime/libc_heap_esp32.ab"
+import "../heap/capabilities_policy_esp32.ab"
+import "../freertos/port_esp32.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
+import "abla/unsafe/native"
+
+// RTC interrupt dispatch written as ordinary Abla list operations. A single
+// CPU interrupt owns the RTC controller status word and dispatches only nodes
+// whose masks overlap that snapshot. Nodes live in internal RAM because the
+// dispatcher can run while flash-backed code is unavailable.
+
+val esp32RtcInterruptStatusRegister = 0x3ff48044
+val esp32RtcInterruptClearRegister = 0x3ff48048
+val esp32RtcInterruptEnableRegister = 0x3ff4803c
+val esp32RtcInterruptSource = u32(46)
+val esp32RtcInterruptIramAllocationFlag = u32(1024)
+
+val esp32RtcInterruptCacheStorage = nativeStaticMutableU32s([0])
+val esp32RtcInterruptCache = u32(esp32RtcInterruptCacheStorage)
+val esp32RtcInterruptEnabledStorage = nativeStaticMutableU32s([0])
+val esp32RtcInterruptEnabled = u32(esp32RtcInterruptEnabledStorage)
+val esp32RtcInterruptHandleStorage = nativeStaticMutableU32s([0])
+val esp32RtcInterruptHandle = u32(esp32RtcInterruptHandleStorage)
+val esp32RtcInterruptHandlersStorage = nativeStaticMutableU32s([0])
+val esp32RtcInterruptHandlers = u32(esp32RtcInterruptHandlersStorage)
+val esp32RtcInterruptCpuStorage = nativeStaticMutableU32s([0xffffffff])
+val esp32RtcInterruptCpu = u32(esp32RtcInterruptCpuStorage)
+val esp32RtcInterruptLockStorage = nativeStaticMutableU32s([
+    3007315967, 0
+])
+val esp32RtcInterruptLock = u32(esp32RtcInterruptLockStorage)
+
+@inline
+trusted fun esp32RtcInterruptLoad(address: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32RtcInterruptStore(address: u32, value: u32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+
+@inline
+trusted fun esp32RtcInterruptEnter(): void {
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32RtcInterruptLock, u32(0xffffffff)
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcInterruptExit(): void {
+    esp32RecoveredVPortExitCritical(esp32RtcInterruptLock)
+    return
+}
+
+trusted fun esp32RtcInterruptCacheAdd(mask: u32): void =
+    esp32RtcInterruptStore(
+        esp32RtcInterruptCache,
+        esp32RtcInterruptLoad(esp32RtcInterruptCache) | mask
+    )
+
+trusted fun esp32RtcInterruptCacheRemove(mask: u32): void =
+    esp32RtcInterruptStore(
+        esp32RtcInterruptCache,
+        esp32RtcInterruptLoad(esp32RtcInterruptCache) & ~mask
+    )
+
+// esp_intr_alloc currently retains its recovered compatibility shape. This
+// call is isolated here; the RTC dispatcher and list management are fully
+// structured and this adapter disappears with the allocator conversion.
+trusted fun esp32RtcInterruptInstall(): u32 {
+    esp32RtcInterruptEnter()
+    if (esp32RtcInterruptLoad(esp32RtcInterruptHandle) != u32(0)) {
+        esp32RtcInterruptExit()
+        return u32(0)
+    }
+    mmioStoreU32(esp32RtcInterruptEnableRegister, 0)
+    mmioStoreU32(esp32RtcInterruptClearRegister, -1)
+    val result = esp32RecoveredEspIntrAlloc(
+        esp32RtcInterruptSource,
+        esp32RtcInterruptIramAllocationFlag,
+        u32(nativeFunctionAddress(esp32RtcInterruptDispatch)),
+        u32(0),
+        esp32RtcInterruptHandle,
+        u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (result == u32(0)) {
+        val handle = esp32RtcInterruptLoad(esp32RtcInterruptHandle)
+        val vector = esp32RtcInterruptLoad(handle)
+        val cpu = (esp32RtcInterruptLoad(vector) >>> u32(16)) & u32(1)
+        esp32RtcInterruptStore(esp32RtcInterruptCpu, cpu)
+    }
+    esp32RtcInterruptExit()
+    return result
+}
+
+@section(".iram1.abla.esp32RtcInterruptDispatch")
+trusted fun esp32RtcInterruptDispatch(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val status = u32(mmioLoadU32(esp32RtcInterruptStatusRegister))
+    esp32RtcInterruptEnter()
+    var node = esp32RtcInterruptLoad(esp32RtcInterruptHandlers)
+    while (node != u32(0)) {
+        if ((esp32RtcInterruptLoad(node) & status) != u32(0)) {
+            val handler = esp32RtcInterruptLoad(node + u32(4))
+            val argument = esp32RtcInterruptLoad(node + u32(8))
+            esp32RtcInterruptExit()
+            ablaUnsafeCallI32I32(int(handler), int(argument))
+            esp32RtcInterruptEnter()
+        }
+        node = esp32RtcInterruptLoad(node + u32(16))
+    }
+    esp32RtcInterruptExit()
+    mmioStoreU32(esp32RtcInterruptClearRegister, int(status))
+    return a2
+}
+
+trusted fun esp32RtcInterruptRegister(
+    handler: u32,
+    argument: u32,
+    mask: u32,
+    flags: u32
+): i32 {
+    if (handler == u32(0) || mask == u32(0)) return i32(258)
+    val installed = esp32RtcInterruptInstall()
+    if (installed != u32(0)) return i32(installed)
+    val node = if (!esp32HeapCapsSchedulerRunning())
+        esp32HeapCapsAllocateInterruptStartup(u32(20), u32(2048))
+    else esp32HeapCapsMallocBase(u32(20), u32(2048))
+    if (node == u32(0)) return i32(257)
+    esp32RtcInterruptStore(node, mask)
+    esp32RtcInterruptStore(node + u32(4), handler)
+    esp32RtcInterruptStore(node + u32(8), argument)
+    esp32RtcInterruptStore(node + u32(12), flags)
+
+    esp32RtcInterruptEnter()
+    if ((flags & u32(1)) != u32(0)) esp32RtcInterruptCacheAdd(mask)
+    else esp32RtcInterruptCacheRemove(mask)
+    esp32RtcInterruptStore(
+        node + u32(16), esp32RtcInterruptLoad(esp32RtcInterruptHandlers)
+    )
+    esp32RtcInterruptStore(esp32RtcInterruptHandlers, node)
+    esp32RtcInterruptExit()
+    return i32(0)
+}
+
+trusted fun esp32RtcInterruptDeregister(
+    handler: u32, argument: u32
+): i32 {
+    esp32RtcInterruptEnter()
+    var previous = u32(0)
+    var node = esp32RtcInterruptLoad(esp32RtcInterruptHandlers)
+    while (node != u32(0)) {
+        if (esp32RtcInterruptLoad(node + u32(4)) == handler &&
+            esp32RtcInterruptLoad(node + u32(8)) == argument) {
+            val next = esp32RtcInterruptLoad(node + u32(16))
+            if (previous == u32(0))
+                esp32RtcInterruptStore(esp32RtcInterruptHandlers, next)
+            else esp32RtcInterruptStore(previous + u32(16), next)
+            if ((esp32RtcInterruptLoad(node + u32(12)) & u32(1)) != u32(0))
+                esp32RtcInterruptCacheRemove(esp32RtcInterruptLoad(node))
+            esp32LibcFree(node)
+            esp32RtcInterruptExit()
+            return i32(0)
+        }
+        previous = node
+        node = esp32RtcInterruptLoad(node + u32(16))
+    }
+    esp32RtcInterruptExit()
+    return i32(259)
+}
+
+trusted fun esp32RtcInterruptNonIramDisable(cpu: u32): void {
+    if (esp32RtcInterruptLoad(esp32RtcInterruptCpu) != cpu) return
+    // Keep all currently enabled bits so the exact state can be restored.
+    val enabled = u32(mmioLoadU32(esp32RtcInterruptEnableRegister))
+    esp32RtcInterruptStore(
+        esp32RtcInterruptEnabled,
+        esp32RtcInterruptLoad(esp32RtcInterruptEnabled) | enabled
+    )
+    mmioStoreU32(
+        esp32RtcInterruptEnableRegister,
+        int(enabled & esp32RtcInterruptLoad(esp32RtcInterruptCache))
+    )
+    return
+}
+
+trusted fun esp32RtcInterruptNonIramEnable(cpu: u32): void {
+    if (esp32RtcInterruptLoad(esp32RtcInterruptCpu) != cpu) return
+    mmioStoreU32(
+        esp32RtcInterruptEnableRegister,
+        int(esp32RtcInterruptLoad(esp32RtcInterruptEnabled))
+    )
+    esp32RtcInterruptStore(esp32RtcInterruptEnabled, u32(0))
+    return
+}
+
+trusted fun esp32RecoveredRtcIsrRegister(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 = u32(esp32RtcInterruptRegister(a2, a3, a4, a5))
+
+trusted fun esp32RecoveredRtcIsrDeregister(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 = u32(esp32RtcInterruptDeregister(a2, a3))
+
+@section(".iram1.6.abla.esp32RecoveredRtcIsrNoniramDisable")
+trusted fun esp32RecoveredRtcIsrNoniramDisable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    esp32RtcInterruptNonIramDisable(a2)
+    return u32(0)
+}
+
+@section(".iram1.7.abla.esp32RecoveredRtcIsrNoniramEnable")
+trusted fun esp32RecoveredRtcIsrNoniramEnable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    esp32RtcInterruptNonIramEnable(a2)
+    return u32(0)
+}

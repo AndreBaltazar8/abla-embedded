@@ -1,0 +1,91 @@
+import "./master_c61_sequence.ab"
+import "../../spi/buffer_gate.ab"
+import "../../spi/transaction_result.ab"
+fun c61SpiGateValid(gate: PeripheralGate): bool =
+    gate.word().valid() && (gate.word().address() < 0x60000000 || gate.word().address() >= 0x60100000)
+trusted fun c61SpiManualSelectReady(cs: int): bool {
+    if (cs < 0 || cs >= 30) return false
+    val bit=u32(1)<<u32(cs)
+    return (c61GpioRead(0x60091034)&bit) != u32(0) &&
+        (c61GpioRead(0x60091ad4+cs*4)&u32(4095)) == u32(1280) &&
+        (c61GpioRead(0x60090000+cs*4)&u32(0x7002)) == u32(0x1000) &&
+        (c61GpioRead(0x600910d4+cs*4)&u32(4)) == u32(0) &&
+        (c61GpioRead(0x600b102c)&bit) == u32(0) &&
+        (cs >= 7 || (c61GpioRead(0x600b1028)&bit) == u32(0))
+}
+trusted fun c61SpiSelectLevel(cs: int,high: bool): bool {
+    esp32C61GpioWriteOwned(cs,high)
+    return ((c61GpioRead(0x60091004)&(u32(1)<<u32(cs))) != u32(0)) == high
+}
+// A scalar owner is not evidence that its live routes still match. Validate
+// all used data pads before selecting the device, including optional MISO.
+trusted fun c61SpiDataPadReady(pin: int,signal: int,input: bool): bool {
+    if (pin < 0 || pin >= 30) return false
+    val bit=u32(1)<<u32(pin)
+    if ((c61GpioRead(0x600b102c)&bit) != u32(0) ||
+        (pin < 7 && (c61GpioRead(0x600b1028)&bit) != u32(0)) ||
+        ((pin == 12 || pin == 13) && (c61GpioRead(0x6000f018)&u32(16384)) != u32(0))) return false
+    val mux=c61GpioRead(0x60090000+pin*4)
+    if ((mux&u32(0x7002)) != u32(0x1000)) return false
+    if (input) return (mux&u32(512)) != u32(0) && (c61GpioRead(0x60091034)&bit) == u32(0) &&
+        (c61GpioRead(0x600913d8)&u32(511)) == u32(256|pin)
+    return (c61GpioRead(0x60091034)&bit) != u32(0) &&
+        (c61GpioRead(0x60091ad4+pin*4)&u32(4095)) == u32(1024|signal) &&
+        (c61GpioRead(0x600910d4+pin*4)&u32(4)) == u32(0)
+}
+// Canonical physical-bus gate required for every user, including close.
+trusted fun c61SpiMasterDataReady(master: Esp32C61SpiMaster,receive: bool): bool {
+    val cs=master.pins().pinAt(3)
+    return esp32C61SpiCpuIdleOwned() && c61SpiManualSelectReady(cs) &&
+        c61SpiDataPadReady(master.pins().pinAt(0),64,false) && c61SpiDataPadReady(master.pins().pinAt(1),66,false) &&
+        (!receive || c61SpiDataPadReady(master.pins().pinAt(2),65,true)) &&
+        (c61GpioRead(0x60091004)&(u32(1)<<u32(cs))) != u32(0)
+}
+// Value preserves low-level transfer report;11CSassert,12CSrelease,13admission.
+// Bit24 means CS/controller cleanup still pending. RX remains provisional
+// until result.valid(); a final CS failure can follow a successful RX copy.
+trusted fun Esp32C61SpiMaster.transfer(gate: PeripheralGate,owner: u32,
+    tx: NativeBuffer,rx: NativeBuffer,bytes: int,polls: int,receive: bool = true): SpiTransactionResult {
+    if (!this.ready() || this.pins().pinAt(1) >= 30 || (receive && this.pins().pinAt(2) >= 30) ||
+        !c61SpiGateValid(gate) || !c61SpiBufferValid(tx,bytes) ||
+        (receive && !c61SpiBufferValid(rx,bytes)) || !gate.bufferDisjoint(tx,bytes) ||
+        (receive && !gate.bufferDisjoint(rx,bytes)) || polls < 1 || polls > 1000000) return SpiTransactionResult(3<<32)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<32)
+    val cs=this.pins().pinAt(3)
+    var report=13
+    var healthy=false
+    if (c61SpiMasterDataReady(this,receive)) {
+        if (!c61SpiSelectLevel(cs,false)) report=11
+        else report=esp32C61SpiTransferOwned(tx,rx,bytes,polls,receive)
+        // Never detach CS from a running timed-out transfer.
+        if (esp32C61SpiCpuIdleOwned()) {
+            if (!c61SpiSelectLevel(cs,true)) report=report|(12<<16)|(1<<24)
+            else healthy=report == 257
+        } else report=report|(1<<24)
+    }
+    if (!gate.finish(owner,healthy)) return SpiTransactionResult((5<<32)|report)
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|report)
+}
+// Caller has quiesced all users and explicitly decides whether to discard
+// retained FIFO errors. No forced stop/reset/replay; only idle controller can
+// release CS. Successful recovery does not undo a partially accepted command.
+trusted fun Esp32C61SpiMaster.recover(gate: PeripheralGate,owner: u32,
+    exclusiveUsersQuiesced: bool,discardFifoErrors: bool = false): bool {
+    if (!this.ready() || !exclusiveUsersQuiesced || !c61SpiGateValid(gate) || !gate.tryBeginRecovery(owner)) return false
+    var healthy=false
+    val cs=this.pins().pinAt(3)
+    if (esp32C61SpiCpuIdleOwned() && c61SpiManualSelectReady(cs) && c61SpiSelectLevel(cs,true) &&
+        c61SpiDataPadReady(this.pins().pinAt(0),64,false) &&
+        (this.pins().pinAt(1) == 31 || c61SpiDataPadReady(this.pins().pinAt(1),66,false)) &&
+        (this.pins().pinAt(2) == 31 || c61SpiDataPadReady(this.pins().pinAt(2),65,true))) {
+        val errors=c61SpiRead(0x6008103c)&u32(0x60003)
+        if (errors == u32(0)) healthy=true
+        else if (discardFifoErrors) {
+            c61SpiWrite(0x60081038,errors)
+            healthy=(c61SpiRead(0x6008103c)&u32(0x60003)) == u32(0)
+        }
+    }
+    val released=gate.finishRecovery(owner,healthy)
+    return healthy && released
+}

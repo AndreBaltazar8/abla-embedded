@@ -1,0 +1,52 @@
+import "abla/runtime/scalar"
+// P4 AHB DMA only, three channel pairs. Clock/power/PMS must already permit
+// access. Caller owns direction, peripheral requests, ISR and ETM writers.
+fun esp32p4AhbGdmaChannelBase(channel: int, transmit: bool): int {
+    if (channel < 0 || channel > 2) return 0
+    return 0x50085070+channel*192+(if (transmit) 96 else 0)
+}
+trusted fun p4AhbGdmaField(address: int,mask: int,value: int): bool {
+    p4AhbGdmaWrite(address,(p4AhbGdmaRead(address)&(0xffffffff ^ mask))|value)
+    return (p4AhbGdmaRead(address)&mask) == value
+}
+// 1 parked,0 not parked,-1 invalid/unowned. PARK is descriptor FSM state,
+// not proof that peripheral/FIFO/cache ownership has been released.
+trusted fun esp32p4AhbGdmaParkedOwned(channel: int,transmit: bool,exclusive: bool): int {
+    val base=esp32p4AhbGdmaChannelBase(channel,transmit)
+    if (!exclusive || base == 0) return -1
+    return if ((p4AhbGdmaRead(base+16)&(if (transmit) 8 else 16)) != 0) 1 else 0
+}
+// Stop request then bounded polls. Never reset a still-active channel on timeout.
+// 1 parked,2 invalid/unowned,3 timeout. Preserve RX AUTO_RET/reserved fields;
+// never replay START/RESTART commands observed during read-modify-write.
+trusted fun esp32p4AhbGdmaStopOwned(channel: int,transmit: bool,pollLimit: int,exclusive: bool): int {
+    val base=esp32p4AhbGdmaChannelBase(channel,transmit)
+    if (!exclusive || base == 0 || pollLimit < 1 || pollLimit > 1000000) return 2
+    val link=base+16
+    p4AhbGdmaWrite(link,(p4AhbGdmaRead(link)&(if (transmit) 0xfffffff8 else 0xfffffff1))|(if (transmit) 1 else 2))
+    var poll=0
+    while (poll < pollLimit) {
+        if ((p4AhbGdmaRead(link)&(if (transmit) 8 else 16)) != 0) return 1
+        poll=poll+1
+    }
+    return 3
+}
+// Reset parked direction and connect I2S0..2 with descriptor owner checking.
+// Peripheral requests stopped; existing descriptors/buffers remain owned.
+// Does NOT configure bursts, memory windows, descriptors, IRQs or start DMA.
+// 1 ready,2 invalid/unowned,3 not parked/pending command,4 reset deassert,
+// 5 owner check,6 trigger,7 RX memory-transfer disable readback failure.
+trusted fun esp32p4AhbGdmaPrepareI2sOwned(channel: int,transmit: bool,port: int,exclusive: bool): int {
+    val base=esp32p4AhbGdmaChannelBase(channel,transmit)
+    if (!exclusive || base == 0 || port < 0 || port > 2) return 2
+    val link=p4AhbGdmaRead(base+16)
+    if ((link & (if (transmit) 15 else 30)) != (if (transmit) 8 else 16)) return 3
+    // Reset is a pulse: only deassertion has a meaningful final readback.
+    p4AhbGdmaWrite(base,p4AhbGdmaRead(base)|1)
+    p4AhbGdmaWrite(base,p4AhbGdmaRead(base)&0xfffffffe)
+    if ((p4AhbGdmaRead(base)&1) != 0) return 4
+    if (!p4AhbGdmaField(base+4,4096,4096)) return 5
+    if (!p4AhbGdmaField(base+48,63,3+port)) return 6
+    if (!transmit && !p4AhbGdmaField(base,16,0)) return 7
+    return 1
+}

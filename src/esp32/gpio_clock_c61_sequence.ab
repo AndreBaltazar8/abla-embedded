@@ -1,0 +1,58 @@
+import "abla/runtime/scalar"
+// One exclusive lease covers ALL GPIO/IOMUX consumers; serialize every PCR
+// and GPIO gate writer. The current source (XTAL/RC_FAST/PLL80) must already
+// be stable and remain pinned. No source switching, reset or LP-clock setup.
+// Gates already enabled are borrowed and never disabled. Copies are not
+// independent owners. Keep attempted ownership after a failed readback.
+// Status0closed1ready2unowned3reset4source5APBfailure6functionfailure7GPIOfailure.
+// Ownership bits8APB,9functional,10GPIO. Retain the returned scalar on close.
+type Esp32C61GpioClock = int
+fun Esp32C61GpioClock.status(): int = this&255
+fun Esp32C61GpioClock.ready(): bool = this.status() == 1
+fun Esp32C61GpioClock.ownedGates(): int = (this>>>8)&7
+trusted fun c61GpioClockField(address: int,bit: u32,enabled: bool): bool {
+    val before=c61GpioClockRead(address)
+    c61GpioClockWrite(address,if (enabled) before|bit else before&(u32(0xffffffff)^bit))
+    return ((c61GpioClockRead(address)&bit) != u32(0)) == enabled
+}
+trusted fun esp32C61GpioClockOpenOwned(exclusiveStableSource: bool): Esp32C61GpioClock {
+    if (!exclusiveStableSource) return Esp32C61GpioClock(2)
+    val apb=c61GpioClockRead(0x600960c0)
+    val functional=c61GpioClockRead(0x600960c4)
+    if ((apb&u32(2)) != u32(0)) return Esp32C61GpioClock(3)
+    if (((functional>>u32(20))&u32(3)) == u32(3)) return Esp32C61GpioClock(4)
+    val gpio=c61GpioClockRead(0x60091df8)
+    var owner=0
+    if ((apb&u32(1)) == u32(0)) {
+        owner=owner|256
+        if (!c61GpioClockField(0x600960c0,u32(1),true)) return Esp32C61GpioClock(owner|5)
+    }
+    if ((functional&u32(0x400000)) == u32(0)) {
+        owner=owner|512
+        if (!c61GpioClockField(0x600960c4,u32(0x400000),true)) return Esp32C61GpioClock(owner|6)
+    }
+    if ((gpio&u32(1)) == u32(0)) {
+        owner=owner|1024
+        if (!c61GpioClockField(0x60091df8,u32(1),true)) return Esp32C61GpioClock(owner|7)
+    }
+    return Esp32C61GpioClock(owner|1)
+}
+// Call only after every child pad/bus lease is closed and no consumer can
+// access GPIO/IOMUX. Reverse order, preserving only outstanding ownership
+// on failure. Never re-open consumers during a partial close.
+trusted fun Esp32C61GpioClock.closeOwned(exclusiveChildrenClosed: bool): Esp32C61GpioClock {
+    if (!exclusiveChildrenClosed || this < 0 || (this&~2047) != 0 || this.status() > 7) return this
+    var owner=this&1792
+    if ((owner&1024) != 0) {
+        if (!c61GpioClockField(0x60091df8,u32(1),false)) return Esp32C61GpioClock(owner|7)
+        owner=owner&~1024
+    }
+    if ((owner&512) != 0) {
+        if (!c61GpioClockField(0x600960c4,u32(0x400000),false)) return Esp32C61GpioClock(owner|6)
+        owner=owner&~512
+    }
+    if ((owner&256) != 0) {
+        if (!c61GpioClockField(0x600960c0,u32(1),false)) return Esp32C61GpioClock(owner|5)
+    }
+    return Esp32C61GpioClock(0)
+}

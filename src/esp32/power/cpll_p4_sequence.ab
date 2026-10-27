@@ -1,0 +1,100 @@
+import "../analog/register_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Prepared CPLL recalibration for sleep recovery (rtc_clk.c/clk_tree_ll.h).
+// Caller powers CPLL + its analog interface, pins analog160MHz and XTAL40,
+// parks both CPUs/consumers away from CPLL, and owns both analog masters/RCC.
+// Current CPU MUST run undivided XTAL40 throughout; retained internal RAM
+// record/code/stack and same hart across retries. Does not switch CPU clock.
+// Prepared Begin does not acquire/release power or update ROM delay metadata;
+// WakeBegin below additionally restores power. No opaque dependencies.
+//32B record: magic,next,result,detail,mhz,revision,settleCycle,hart.
+// Steps1start2ref3divider4current5END6settle10us7stop8done.
+// WakeBegin additionally runs9power10globalGate11digitalGate before step1.
+// Wake power remains on/owned; no power-down or rollback is implied.
+// Results1done2invalid3prerequisite4MMIO5analog6pending. Retain all ownership
+// on failure; retry completes the unfinished step, never restarts after END.
+// END is the SDK's hardware criterion, not independent frequency measurement.
+fun p4CpllDivider(mhz: int,revision: int): int = if (revision == 0) (if (mhz == 400) 6 else 5) else (if (mhz == 400) 10 else 9)
+trusted fun p4CpllResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun p4CpllBusXtalReady(polls: int): bool =
+    (p4CpllRead(0x50111040)&7) == 4 && (p4CpllRead(0x500e6004)&0x1ffffff0) == 0 &&
+    p4AnalogClockReady() &&
+    (p4AnalogRead(52)&1) != 0 && p4AnalogWaitIdle(0,polls) && p4AnalogWaitIdle(4,polls)
+trusted fun p4CpllReady(polls: int): bool = p4CpllBusXtalReady(polls) && (p4CpllRead(0x50111040)&0x04000000) != 0
+trusted fun p4CpllByte(index: int,value: int,polls: int): int {
+    val write=p4AnalogRegisterOwned(0x67,index,value,true,polls)
+    if ((write&255) != 1) return write&255
+    val read=p4AnalogRegisterOwned(0x67,index,0,false,polls)
+    if ((read&255) != 1) return read&255
+    return if (((read>>>8)&255) == value) 1 else 7
+}
+trusted fun esp32p4CpllContinueOwned(r: NativeBuffer,polls: int,exclusiveXtal40: bool): int {
+    if (!exclusiveXtal40 || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50344350 || r.loadU32(4) < 1 || r.loadU32(4) > 11) return 2
+    if (r.loadU32(28) != int(p4CpllHart())) return 3
+    if (r.loadU32(4) == 8) return 1
+    if (r.loadU32(4) >= 9) {
+        if (!p4CpllBusXtalReady(polls)) return p4CpllResult(r,3,0)
+        while (r.loadU32(4) >= 9) {
+            val step=r.loadU32(4)
+            if (step == 9 || step == 10) {
+                // PMU+cc is a bank of WT commands: do not RMW/echo unrelated
+                // power commands. Record progress before issuing each one.
+                r.storeU32(4,step+1)
+                p4CpllWrite(0x501150cc,if (step == 9) 0x08800000 else 0x00020000)
+                p4CpllFence()
+            } else {
+                val root=p4CpllRead(0x50111040)
+                if ((root&0x04000000) == 0) {
+                    p4CpllWrite(0x50111040,root|0x04000000)
+                    if ((p4CpllRead(0x50111040)&0x04000000) == 0) return p4CpllResult(r,4,11)
+                }
+                r.storeU32(4,1)
+            }
+        }
+    }
+    if (!p4CpllReady(polls)) return p4CpllResult(r,3,0)
+    while (r.loadU32(4) < 8) {
+        val step=r.loadU32(4)
+        if (step == 1 || step == 7) {
+            val value=if (step == 1) 0 else 8
+            p4CpllWrite(0x500e60bc,(p4CpllRead(0x500e60bc)&0xfffffff7)|value)
+            if ((p4CpllRead(0x500e60bc)&8) != value) return p4CpllResult(r,4,step)
+        } else if (step >= 2 && step <= 4) {
+            val result=p4CpllByte(if (step == 4) 6 else step,if (step == 2) 0x50 else if (step == 3) p4CpllDivider(r.loadU32(16),r.loadU32(20)) else 0x73,polls)
+            if (result != 1) return p4CpllResult(r,5,result)
+        } else if (step == 5) {
+            var remaining=polls
+            while ((p4CpllRead(0x500e60bc)&4) == 0) {
+                remaining=remaining-1
+                if (remaining == 0) return p4CpllResult(r,6,5)
+            }
+            r.storeU32(24,int(p4CpllCycle()))
+        } else if (step == 6) {
+            var remaining=polls
+            while (p4CpllCycle()-u32(r.loadU32(24)) < u32(400)) {
+                remaining=remaining-1
+                if (remaining == 0) return p4CpllResult(r,6,6)
+            }
+        }
+        r.storeU32(4,step+1)
+    }
+    return p4CpllResult(r,1,0)
+}
+trusted fun p4CpllBegin(r: NativeBuffer,mhz: int,revision: int,polls: int,exclusiveXtal40: bool,wake: bool): int {
+    if (!exclusiveXtal40 || (mhz != 360 && mhz != 400) || revision < 0 || revision > 399 || polls < 1 || polls > 1000000 ||
+        !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || p4CpllHart() > u32(1)) return 2
+    if (!(if (wake) p4CpllBusXtalReady(polls) else p4CpllReady(polls))) return 3
+    r.storeU32(0,0x50344350);r.storeU32(4,if (wake) 9 else 1);r.storeU32(8,0);r.storeU32(12,0)
+    r.storeU32(16,mhz);r.storeU32(20,revision);r.storeU32(24,0);r.storeU32(28,int(p4CpllHart()))
+    return esp32p4CpllContinueOwned(r,polls,true)
+}
+trusted fun esp32p4CpllBeginOwned(r: NativeBuffer,mhz: int,revision: int,polls: int,exclusiveXtal40: bool): int = p4CpllBegin(r,mhz,revision,polls,exclusiveXtal40,false)
+// Warm recovery enables CPLL analog power and both global/digital gates,
+// then runs the same verified calibration. Analog160MHz/root bus are pinned
+// caller prerequisites, not powered/reset by this API. WT acceptance is a
+// hardware boundary; success still requires analog readback, END and settle.
+trusted fun esp32p4CpllWakeBeginOwned(r: NativeBuffer,mhz: int,revision: int,polls: int,exclusiveXtal40: bool): int = p4CpllBegin(r,mhz,revision,polls,exclusiveXtal40,true)

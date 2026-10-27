@@ -1,0 +1,102 @@
+import "../../peripheral_gate.ab"
+import "../../spi/buffer_gate.ab"
+import "./phases_logic.ab"
+// Cooperative FIFO; caller serializes submit/service/take (not an ISR/SMP
+// queue). All requests use one initialized bus/profile and canonical gate.
+// Storage128+64*capacity; payloads pinned until completion is taken, including
+// queued TX. One hardware poll per service; no allocation/spin/callback.
+// Header: activeContext64, count64,head68,capacity72,tag76,gate80,owner84,
+// peripheral88,pins92,active96,fault100. Fault never auto-clears. Recovery
+// requires explicit external hardware recovery and released-storage reinit.
+// Entry: command0,bits4,address8,bits12,dummy16,dir20,data24,bytes28,
+// tickBudget32,CS36,token40,state44,result48,setupTicks52,holdTicks56.
+// State1queued2active3completed; timing units match caller now/budget.
+// Completion must be taken before the next request starts (backpressure).
+trusted fun spiQueueValid(queue: NativeBuffer): bool = queue.hasAddressRange(0,128) && queue.loadU32(76) == 0x53515131 &&
+    queue.loadU32(72) >= 1 && queue.loadU32(72) <= 64 && queue.hasAddressRange(0,128+queue.loadU32(72)*64) &&
+    queue.loadU32(64) <= queue.loadU32(72) && queue.loadU32(68) < queue.loadU32(72)
+trusted fun esp32s3SpiQueueInitialize(queue: NativeBuffer,capacity: int,gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,releasedQueue: bool): bool {
+    if (!releasedQueue || capacity < 1 || capacity > 64 || !peripheralOwnerValid(owner) ||
+        !esp32s3SpiMemoryRangeValid(peripheral,queue,128+capacity*64) || gate.word().address() <= 0 || gate.word().address() > 4294967292 ||
+        !gate.bufferDisjoint(queue,128+capacity*64)) return false
+    var offset=0
+    while (offset < 128+capacity*64) { queue.store(offset,0); offset=offset+1 }
+    queue.storeU32(72,capacity); queue.storeU32(76,0x53515131); queue.storeU32(80,gate.word().address()); queue.storeU32(84,int(owner))
+    queue.storeU32(88,peripheral); queue.storeU32(92,pins|0)
+    return true
+}
+trusted fun spiQueueEntry(queue: NativeBuffer,index: int): NativeBuffer = nativeBufferAt(queue.addressValue()+128+index*64,64)
+// 1accepted2full3invalid4halted. Tokens are caller-chosen nonzero u32 and
+// unique among outstanding requests; payloads cannot alias any live request.
+trusted fun esp32s3SpiQueueSubmit(queue: NativeBuffer,token: u32,select: Pin,command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,budget: u32,setupTicks: int = 0,holdTicks: int = 0): int {
+    if (!spiQueueValid(queue) || token == u32(0) || budget == u32(0) || budget > u32(0x7fffffff) ||
+        setupTicks < 0 || setupTicks > 65535 || holdTicks < 0 || holdTicks > 65535 || u32(setupTicks) >= budget ||
+        !spiPhasesValid(command,commandBits,address,addressBits,dummy,direction,bytes) ||
+        !esp32s3SpiBufferRangeValid(queue.loadU32(88),data,bytes) || !esp32s3SpiMasterPinsValid(queue.loadU32(88),SpiPins(queue.loadU32(92)),select)) return 3
+    if (queue.loadU32(100) != 0) return 4
+    val capacity=queue.loadU32(72)
+    val count=queue.loadU32(64)
+    if (count == capacity) return 2
+    if (!peripheralGateAt(queue.loadU32(80)).bufferDisjoint(data,bytes) || (bytes > 0 && data.addressValue() < queue.addressValue()+128+capacity*64 && queue.addressValue() < data.addressValue()+bytes)) return 3
+    var i=0
+    while (i < count) {
+        val entry=spiQueueEntry(queue,int((u32(queue.loadU32(68))+u32(i))%u32(capacity)))
+        if (entry.loadU32(40) == int(token) || (bytes > 0 && entry.loadU32(28) > 0 && data.addressValue() < entry.loadU32(24)+entry.loadU32(28) && entry.loadU32(24) < data.addressValue()+bytes)) return 3
+        i=i+1
+    }
+    val entry=spiQueueEntry(queue,int((u32(queue.loadU32(68))+u32(count))%u32(capacity)))
+    entry.storeU32(0,command); entry.storeU32(4,commandBits); entry.storeU32(8,address); entry.storeU32(12,addressBits); entry.storeU32(16,dummy)
+    entry.storeU32(20,direction); entry.storeU32(24,data.addressValue()); entry.storeU32(28,bytes); entry.storeU32(32,int(budget)); entry.storeU32(36,select|0)
+    entry.storeU32(40,int(token)); entry.storeU32(44,1); entry.storeU32(48,0)
+    entry.storeU32(52,setupTicks); entry.storeU32(56,holdTicks)
+    queue.storeU32(64,count+1); return 1
+}
+// 1completion available2pending3invalid4empty5waiting for gate6halted.
+trusted fun esp32s3SpiQueueService(queue: NativeBuffer,now: u32): int {
+    if (!spiQueueValid(queue)) return 3
+    if (queue.loadU32(64) == 0) return if (queue.loadU32(100) != 0) 6 else 4
+    val entry=spiQueueEntry(queue,queue.loadU32(68))
+    if (entry.loadU32(44) == 3) return 1
+    if (queue.loadU32(100) != 0) return 6
+    val context=nativeBufferAt(queue.addressValue(),64)
+    var result=0
+    if (queue.loadU32(96) == 0) {
+        result=esp32s3SpiAsyncTransactionBegin(context,peripheralGateAt(queue.loadU32(80)),u32(queue.loadU32(84)),queue.loadU32(88),SpiPins(queue.loadU32(92)),Pin(entry.loadU32(36)),entry.loadU32(0),entry.loadU32(4),entry.loadU32(8),entry.loadU32(12),entry.loadU32(16),entry.loadU32(20),nativeBufferAt(entry.loadU32(24),entry.loadU32(28)),entry.loadU32(28),now,u32(entry.loadU32(32)),true,entry.loadU32(52),entry.loadU32(56))
+        if (result == 4) return 5
+        if (result == 2) { queue.storeU32(96,1); entry.storeU32(44,2); return 2 }
+    } else result=esp32s3SpiAsyncTransactionPoll(context,now)
+    if (result == 2) return 2
+    queue.storeU32(96,0); entry.storeU32(44,3); entry.storeU32(48,result)
+    if (result != 1) queue.storeU32(100,result)
+    return 1
+}
+// Zero=no completion; otherwise token32 in high word, transaction status low.
+// Failed completion is removable but the queue stays halted. The active
+// context's hardware/CS recovery evidence remains at20/48/52 after take.
+// Taking a failure does NOT prove hardware stopped or release recovery-owned
+// storage/pads; queued payloads remain owned until cancellation or recovery.
+trusted fun esp32s3SpiQueueTake(queue: NativeBuffer): int {
+    if (!spiQueueValid(queue) || queue.loadU32(64) == 0) return 0
+    val entry=spiQueueEntry(queue,queue.loadU32(68))
+    if (entry.loadU32(44) != 3) return 0
+    val result=(entry.loadU32(40)<<32)|entry.loadU32(48)
+    entry.storeU32(44,0); queue.storeU32(64,queue.loadU32(64)-1)
+    queue.storeU32(68,int((u32(queue.loadU32(68))+u32(1))%u32(queue.loadU32(72))))
+    return result
+}
+// Cancel only the newest request that has NOT started. No register, CS or
+// gate access. This releases that payload even on a faulted queue, but does
+// not clear the fault or discard active/completed diagnostics. Repeat from
+// newest to oldest to withdraw multiple queued requests safely.
+// 1cancelled2empty3invalid4token-not-tail5already-started/completed.
+trusted fun esp32s3SpiQueueCancelTail(queue: NativeBuffer,token: u32): int {
+    if (!spiQueueValid(queue) || token == u32(0)) return 3
+    val count=queue.loadU32(64)
+    if (count == 0) return 2
+    val index=int((u32(queue.loadU32(68))+u32(count)-u32(1))%u32(queue.loadU32(72)))
+    val entry=spiQueueEntry(queue,index)
+    if (entry.loadU32(40) != int(token)) return 4
+    if (entry.loadU32(44) != 1) return 5
+    entry.storeU32(44,0); queue.storeU32(64,count-1)
+    return 1
+}

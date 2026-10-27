@@ -1,0 +1,148 @@
+import "../clic_p4_sequence.ab"
+import "../interrupt_route_p4_sequence.ab"
+import "../irq_dispatch_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Peer IPC binding on receiving hart.64B owner:
+// magic,step,last,detail,core,layout,line,priority,table,payload,handler,
+// oldAttribute,oldPriority,source,rearmDisabled,reserved. CPU2/3 source IDs81/82.
+// Own a dedicated line16..47, unused dispatch slot (callback+context zero)
+// and disconnected source. Global nlbits3 and raw trap/vector/dispatch table
+// publication already installed. MIEoff, no in-flight callbacks, IPC source
+// quiescent. Does not replace any existing route/handler or global IRQ setup.
+// Configure CLIC -> publish handler -> route -> enable LAST.
+// Close after all rounds/IRQs joined: disable -> disconnect -> unpublish ->
+// restore only owned attribute/priority bits. Pending byte never written.
+// Payload848B remains pinned across rounds and until close/IRQ completion.
+// Partial failure retains owner; Continue/Close retry from confirmed progress.
+// Steps1..4open5ready6..10close11closed; results1ready2invalid3busy/conflict
+// 4childfailure5closed. Caller holds the source/line/table/RMW locks throughout.
+fun p4PeerBindingOverlap(a: int,asize: int,b: int,bsize: int): bool = a < b+bsize && b < a+asize
+trusted fun p4PeerBindingRecord(r: NativeBuffer): bool = r.hasAddressRange(0,64) && (r.addressValue()&3) == 0
+trusted fun p4PeerBindingReport(r: NativeBuffer,result: int,detail: int): int { r.storeU32(8,result);r.storeU32(12,detail);return result }
+trusted fun esp32p4SleepPeerBindingContinueOwned(r: NativeBuffer,exclusiveQuiesced: bool): int {
+    if (!exclusiveQuiesced || !p4PeerBindingRecord(r) || r.loadU32(0) != 0x50344249 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 11) return 2
+    val core=r.loadU32(16)
+    val table=p4IrqDispatchAt(nativeBufferAt(r.loadU32(32),272))
+    if (p4DispatchCore() != core || !p4DispatchMasked() || !table.valid() ||
+        table.buffer().loadU32(4) != core || table.buffer().loadU32(8) != 0 ||
+        (p4PeerBindingSource(core)&u32(1)) != u32(0)) return 3
+    val line=r.loadU32(24)
+    val slot=16+(line-16)*8
+    val address=p4ClicLineAddress(line)
+    while (true) {
+        val step=r.loadU32(4)
+        if (step == 5) return p4PeerBindingReport(r,1,0)
+        if (step == 11) return p4PeerBindingReport(r,5,0)
+        var result=1
+        if (step == 1) result=esp32P4ClicConfigureOwned(line,r.loadU32(28),0,false)
+        else if (step == 2) {
+            if (table.buffer().loadU32(slot) != r.loadU32(40) || table.buffer().loadU32(slot+4) != r.loadU32(36)) {
+                if (table.buffer().loadU32(slot) != 0 || table.buffer().loadU32(slot+4) != 0) return p4PeerBindingReport(r,3,2)
+                result=table.setOwned(line,0,r.loadU32(40),r.loadU32(36))
+            }
+        } else if (step == 3 || step == 7) {
+            val target=if (step == 3) line else 0
+            val previous=if (step == 3) 0 else line
+            val current=esp32P4InterruptRouteReadOwned(r.loadU32(20),core,r.loadU32(52))
+            if (current != target) result=esp32P4InterruptRouteOwned(r.loadU32(20),core,r.loadU32(52),previous,target)
+        } else if (step == 4 || step == 6) result=esp32P4ClicEnableOwned(line,step == 4)
+        else if (step == 8) {
+            val callback=table.buffer().loadU32(slot)
+            val context=table.buffer().loadU32(slot+4)
+            if (callback != 0 || context != 0) {
+                if (callback != r.loadU32(40) || context != r.loadU32(36)) return p4PeerBindingReport(r,3,8)
+                result=table.setOwned(line,r.loadU32(40),0,0)
+            }
+        } else if (step == 9 || step == 10) {
+            val offset=if (step == 9) 2 else 3
+            val mask=if (step == 9) 7 else 224
+            val original=r.loadU32(if (step == 9) 44 else 48)&mask
+            val before=p4ClicReadByte(address+offset)
+            if ((before&mask) != original) p4ClicWriteByte(address+offset,(before&(~mask))|original)
+            if ((p4ClicReadByte(address+offset)&mask) != original) result=4
+        }
+        if (result != 1) return p4PeerBindingReport(r,4,result)
+        r.storeU32(4,step+1)
+    }
+    return 2
+}
+trusted fun esp32p4SleepPeerBindingOpenOwned(r: NativeBuffer,table: P4IrqDispatch,payload: NativeBuffer,layout: int,line: int,priority: int,exclusiveQuiesced: bool): int {
+    if (!exclusiveQuiesced || !p4PeerBindingRecord(r) || r.loadU32(0) != 0 || !table.valid() ||
+        !payload.hasAddressRange(0,848) || (payload.addressValue()&15) != 0 ||
+        (layout != 1 && layout != 3) || !p4ClicLineValid(line) || priority < 1 || priority > 7 ||
+        p4PeerBindingOverlap(r.addressValue(),64,table.buffer().addressValue(),272) ||
+        p4PeerBindingOverlap(r.addressValue(),64,payload.addressValue(),848) ||
+        p4PeerBindingOverlap(table.buffer().addressValue(),272,payload.addressValue(),848)) return 2
+    val core=table.buffer().loadU32(4)
+    val address=p4ClicLineAddress(line)
+    val slot=16+(line-16)*8
+    if (p4DispatchCore() != core || !p4DispatchMasked() || table.buffer().loadU32(8) != 0 ||
+        table.buffer().loadU32(slot) != 0 || table.buffer().loadU32(slot+4) != 0 ||
+        (p4ClicReadByte(address+1)&1) != 0 || (p4ClicReadByte(address)&1) != 0 ||
+        ((p4ClicReadConfig()>>>1)&15) != 3 || (p4PeerBindingSource(core)&u32(1)) != u32(0) ||
+        esp32P4InterruptRouteReadOwned(layout,core,81+core) != 0) return 3
+    val handler=p4PeerBindingHandlerAddress()
+    if (handler <= 0 || handler > 4294967294 || (handler&1) != 0) return 2
+    r.storeU32(0,0x50344249);r.storeU32(4,1);r.storeU32(8,0);r.storeU32(12,0)
+    r.storeU32(16,core);r.storeU32(20,layout);r.storeU32(24,line);r.storeU32(28,priority)
+    r.storeU32(32,table.buffer().addressValue());r.storeU32(36,payload.addressValue());r.storeU32(40,handler)
+    r.storeU32(44,p4ClicReadByte(address+2));r.storeU32(48,p4ClicReadByte(address+3))
+    r.storeU32(52,81+core);r.storeU32(56,0);r.storeU32(60,0)
+    return esp32p4SleepPeerBindingContinueOwned(r,true)
+}
+trusted fun esp32p4SleepPeerBindingCloseOwned(r: NativeBuffer,exclusiveJoined: bool): int {
+    if (!exclusiveJoined || !p4PeerBindingRecord(r) || r.loadU32(0) != 0x50344249 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 11) return 2
+    if (p4DispatchCore() != r.loadU32(16) || !p4DispatchMasked()) return 3
+    if (r.loadU32(4) < 6) r.storeU32(4,6)
+    return esp32p4SleepPeerBindingContinueOwned(r,true)
+}
+// Reuse only on the RECEIVING hart after disabling this CLIC line, MIEoff,
+// and excluding all new rounds/IPC writers. A remote SMP-idle observation
+// alone is insufficient: the callback can still be returning on this hart.
+// Leaves line disabled and binding installed; caller re-enables before notify.
+// Results1rearmed2invalid3busy4foreign/uncertain generation. No code/table free.
+trusted fun esp32p4SleepPeerPayloadRearmOwned(r: NativeBuffer,exclusiveNoNewRounds: bool): int {
+    if (!exclusiveNoNewRounds || !p4PeerBindingRecord(r) || r.loadU32(0) != 0x50344249 || r.loadU32(4) != 5) return 2
+    val core=r.loadU32(16);val line=r.loadU32(24)
+    val table=p4IrqDispatchAt(nativeBufferAt(r.loadU32(32),272))
+    if (p4DispatchCore() != core || !p4DispatchMasked() || !table.valid() || table.buffer().loadU32(4) != core ||
+        table.buffer().loadU32(8) != 0 || !p4ClicLineValid(line) || (p4ClicReadByte(p4ClicLineAddress(line)+1)&1) != 0 ||
+        (p4PeerBindingSource(core)&u32(1)) != u32(0)) return 3
+    val payload=nativeBufferAt(r.loadU32(36),848);val slot=16+(line-16)*8
+    if (!payload.hasAddressRange(0,848) || (payload.addressValue()&15) != 0 ||
+        table.buffer().loadU32(slot) != r.loadU32(40) || table.buffer().loadU32(slot+4) != payload.addressValue()) return 4
+    if (payload.loadU32(0) == 0) { r.storeU32(56,1);p4DispatchFence();return 1 }
+    if (payload.loadU32(0) != 0x50344950 || payload.loadU32(24) != core ||
+        (payload.loadU32(4) != 1 && payload.loadU32(4) != 11)) return 4
+    val shared=nativeBufferAt(payload.loadU32(16),4)
+    if (!shared.hasAddressRange(0,4) || (shared.addressValue()&3) != 0) return 4
+    val word=p4PeerBindingSharedLoad(shared.addressValue())
+    if ((word>>>u32(16)) != u32(payload.loadU32(20)) || (word&u32(0xeff)) != u32(0) ||
+        (payload.loadU32(4) == 1 && (word&u32(4096)) != u32(0))) return 4
+    var offset=0
+    while (offset < 848) { payload.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(56,1);p4DispatchFence();return 1
+}
+// Completes rearm on the receiving hart. Publish fresh payload before enabling
+// delivery, clear rearmDisabled only after successful hardware readback. A
+// dropped enable retains the gate and is retryable; never fabricate readiness.
+trusted fun esp32p4SleepPeerPayloadEnableOwned(r: NativeBuffer,exclusiveFresh: bool): int {
+    if (!exclusiveFresh || !p4PeerBindingRecord(r) || r.loadU32(0) != 0x50344249 || r.loadU32(4) != 5) return 2
+    val core=r.loadU32(16);val line=r.loadU32(24)
+    val table=p4IrqDispatchAt(nativeBufferAt(r.loadU32(32),272))
+    if (p4DispatchCore() != core || !p4DispatchMasked() || !table.valid() || table.buffer().loadU32(4) != core ||
+        table.buffer().loadU32(8) != 0 || !p4ClicLineValid(line) || (p4PeerBindingSource(core)&u32(1)) != u32(0) ||
+        (p4ClicReadByte(p4ClicLineAddress(line))&1) != 0) return 3
+    val payload=nativeBufferAt(r.loadU32(36),848);val slot=16+(line-16)*8
+    if (!payload.hasAddressRange(0,848) || (payload.addressValue()&15) != 0 || payload.loadU32(0) != 0 ||
+        table.buffer().loadU32(slot) != r.loadU32(40) || table.buffer().loadU32(slot+4) != payload.addressValue()) return 4
+    if (r.loadU32(56) == 0) return if ((p4ClicReadByte(p4ClicLineAddress(line)+1)&1) != 0) 1 else 3
+    if (r.loadU32(56) != 1) return 4
+    p4DispatchFence()
+    val enabled=esp32P4ClicEnableOwned(line,true)
+    if (enabled != 1) return 4
+    r.storeU32(56,0);p4DispatchFence();return 1
+}

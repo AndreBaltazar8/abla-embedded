@@ -1,0 +1,77 @@
+// S3 ADC2 session. Caller owns/quiesces ADC2/PWDET configuration and pad,
+// excludes ULP/DMA/touch/sleep, pins RTC_FAST/APB clocks, and satisfies shared
+// power/bus/arbiter upstream-or-exclusive contracts. Replace sole owner value.
+// Compact lease FLAGS (not transient statuses) retain every original setting:
+// power14..18,bus19..23,arbiter24..37; channel8..11,atten12..13,raw38..49;
+// detach50,pending51,ready52,rawvalid53,unverifiedconfig54. Statuslow8:
+// 0closed1success2invalid3power4bus5arbiter6pad7config8analog9loststate
+// 10start11pending12badraw13unselected14preempted15datafailure
+// 16detach17arbiterclose18busclose19powerclose.
+type Esp32S3Adc2Session = int
+fun Esp32S3Adc2Session.bits(): int = this
+fun Esp32S3Adc2Session.status(): int = this&255
+fun Esp32S3Adc2Session.channel(): int = (this>>8)&15
+fun Esp32S3Adc2Session.attenuation(): int = (this>>12)&3
+fun Esp32S3Adc2Session.pending(): bool = (this&(1<<51)) != 0
+fun Esp32S3Adc2Session.ready(): bool = (this&((1<<51)|(1<<52))) == (1<<52)
+fun Esp32S3Adc2Session.raw(): int = if ((this&(1<<53)) != 0) (this>>38)&4095 else -1
+trusted fun esp32S3Adc2SessionOpenOwned(channel: int,calibration: Esp32S3AdcCalibration,exclusivePower: bool,exclusiveBus: bool,exclusiveArbiter: bool,arbiterMode: int,apbHertz: int): Esp32S3Adc2Session {
+    if (channel < 0 || channel > 9 || !calibration.valid() || calibration.unit() != 2 || arbiterMode < 0 || arbiterMode > 1 || apbHertz < 1 || apbHertz > 80000000 || (arbiterMode == 0 && apbHertz < 8000000)) return Esp32S3Adc2Session(2)
+    var flags=(channel<<8)|(calibration.attenuation()<<12)
+    val power=esp32S3AdcPowerOpenOwned(exclusivePower)
+    flags=flags|(((power.bits()>>8)&31)<<14)
+    if (!power.powered()) return Esp32S3Adc2Session(flags|3)
+    val bus=esp32S3AdcBusOpenOwned(exclusiveBus)
+    flags=flags|(((bus.bits()>>8)&31)<<19)
+    if (!bus.ready()) return Esp32S3Adc2Session(flags|4)
+    val arbiter=esp32S3Adc2ArbiterOpenOwned(arbiterMode,exclusiveArbiter,apbHertz)
+    flags=flags|(((arbiter.bits()>>8)&16383)<<24)
+    if (!arbiter.ready()) return Esp32S3Adc2Session(flags|5)
+    if (esp32S3Adc2PadConfigureOwned(channel) != 1) return Esp32S3Adc2Session(flags|6)
+    val configured=esp32S3Adc2ConfigureOwned(channel,calibration.attenuation())
+    if (configured == 1 || configured == 1029) flags=flags|(1<<50)
+    if (configured == 1029) flags=flags|(1<<54)
+    if (configured != 1) return Esp32S3Adc2Session(flags|7)
+    if (esp32S3AdcAnalogConfigureOwned(calibration) != 1) return Esp32S3Adc2Session(flags|8)
+    return Esp32S3Adc2Session(flags|(1<<52)|1)
+}
+trusted fun Esp32S3Adc2Session.startAfterSettlingOwned(): Esp32S3Adc2Session {
+    var flags=this&(-256)
+    if (!this.ready()) return Esp32S3Adc2Session(flags|2)
+    flags=flags&(-1^((4095<<38)|(1<<53)))
+    if (!esp32S3Adc2SessionHardwareMatches(this.channel(),this.attenuation(),(this>>37)&1)) return Esp32S3Adc2Session(flags|9)
+    val result=esp32S3Adc2StartOwned(this.channel())
+    if ((result&256) != 0) flags=flags|(1<<51)
+    return Esp32S3Adc2Session(flags|(if ((result&255) == 1) 1 else 10))
+}
+trusted fun Esp32S3Adc2Session.pollOwned(polls: int): Esp32S3Adc2Session {
+    val flags=this&(-256)
+    if (!this.pending() || polls < 1 || polls > 1000000) return Esp32S3Adc2Session(flags|2)
+    if (!esp32S3Adc2SessionHardwareMatches(this.channel(),this.attenuation(),(this>>37)&1)) return Esp32S3Adc2Session(flags|9)
+    val result=esp32S3Adc2FinishOwned(this.channel(),polls)
+    if ((result&255) == 1) return Esp32S3Adc2Session((flags&(-1^(1<<51)))|(1<<53)|(((result>>8)&4095)<<38)|1)
+    if (result >= 7 && result <= 10) return Esp32S3Adc2Session((flags&(-1^(1<<51)))|(result+5))
+    return Esp32S3Adc2Session(flags|11)
+}
+trusted fun Esp32S3Adc2Session.closeOwned(polls: int): Esp32S3Adc2Session {
+    var flags=this&(-256)
+    if (polls < 1 || polls > 1000000) return Esp32S3Adc2Session(flags|2)
+    if ((flags&(1<<54)) != 0) {
+        if (esp32S3Adc2ConfigureOwned(this.channel(),this.attenuation()) != 1) return Esp32S3Adc2Session(flags|16)
+        flags=flags&(-1^(1<<54))
+    }
+    if ((flags&(1<<50)) != 0 && esp32S3Adc2ReleaseOwned(this.channel(),polls) != 1) return Esp32S3Adc2Session(flags|16)
+    flags=flags&((1<<38)-256)
+    val arbiter=Esp32S3Adc2Arbiter(((flags>>24)&16383)<<8).closeOwned()
+    flags=(flags&(-1^(16383<<24)))|(((arbiter.bits()>>8)&16383)<<24)
+    if (arbiter.status() != 0) return Esp32S3Adc2Session(flags|17)
+    val bus=Esp32S3AdcBus(((flags>>19)&31)<<8).closeOwned()
+    flags=(flags&(-1^(31<<19)))|(((bus.bits()>>8)&31)<<19)
+    if (bus.status() != 0) return Esp32S3Adc2Session(flags|18)
+    val power=Esp32S3AdcPower(((flags>>14)&31)<<8).closeOwned()
+    flags=(flags&(-1^(31<<14)))|(((power.bits()>>8)&31)<<14)
+    return if (power.status() == 0) Esp32S3Adc2Session(0) else Esp32S3Adc2Session(flags|19)
+}
+// Pass the same immutable calibration used to open; no nominal fallback.
+fun Esp32S3Adc2Session.millivolts(calibration: Esp32S3AdcCalibration): int =
+    if (this.raw() < 0 || !calibration.valid() || calibration.unit() != 2 || calibration.attenuation() != this.attenuation()) -1 else calibration.millivolts(this.raw())

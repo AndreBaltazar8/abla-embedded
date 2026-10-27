@@ -1,0 +1,46 @@
+import "../../peripheral_gate.ab"
+import "../../spi/transaction_result.ab"
+import "../../spi/buffer_gate.ab"
+import "./select_sequence_esp32s3.ab"
+
+// One gate/CS admission for0..65536 bytes, split into <=64-byte CPU transfers.
+// All clients use the same gate; caller owns initialized pins/profile/clocks.
+// There may be inter-chunk clock gaps, but CS remains asserted. The selected
+// device must permit these gaps. No DMA, receive copy, heap or automatic retry.
+// Failure may follow a transmitted prefix: never replay blindly. Result detail
+// is the final hardware operation's status, NOT a count of untransmitted bytes.
+trusted fun esp32s3SpiTransmitTransaction(gate: PeripheralGate, owner: u32,
+    peripheral: int, pins: SpiPins, select: Pin, source: NativeBuffer,
+    bytes: int, polls: int, setupMicroseconds: int = 0,
+    holdMicroseconds: int = 0): SpiTransactionResult {
+    if (bytes > 65536 || !esp32s3SpiTransmitPinsValid(peripheral, pins, select) ||
+        !esp32s3SpiMemoryRangeValid(peripheral, source, bytes) ||
+        polls < 1 || polls > 1000000 || setupMicroseconds < 0 || setupMicroseconds > 65535 ||
+        holdMicroseconds < 0 || holdMicroseconds > 65535) return SpiTransactionResult(3 << 32)
+    val gateAddress = gate.word().address()
+    if (gateAddress <= 0 || gateAddress > 4294967292 || !gate.bufferDisjoint(source, bytes))
+        return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    var detail = 1
+    if (bytes != 0) {
+        detail = esp32s3SpiExchangeReady(peripheral)
+        if (detail == 1) {
+            detail=esp32s3SpiSelectBegin(select)
+            if (detail == 1 && setupMicroseconds != 0) peripheralDelayMicroseconds(setupMicroseconds)
+            var offset = 0
+            while (offset < bytes && (detail&255) == 1) {
+                val count = if (bytes - offset < 64) bytes - offset else 64
+                detail = esp32s3SpiTransmitOwned(peripheral,
+                    nativeBufferAt(source.addressValue() + offset, count), count, polls)
+                if ((detail & 255) != 1) break
+                offset = offset + count
+            }
+            if ((detail & 255) == 1 && holdMicroseconds != 0) peripheralDelayMicroseconds(holdMicroseconds)
+            detail=esp32s3SpiSelectEnd(select,detail)
+        }
+    }
+    val healthy = (detail & 255) == 1
+    if (!gate.finish(owner, healthy)) return SpiTransactionResult((5 << 32) | detail)
+    SpiTransactionResult(((if (healthy) 1 else 6) << 32) | detail)
+}

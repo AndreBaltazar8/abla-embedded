@@ -1,0 +1,70 @@
+import "./session_record_p4.ab"
+import "./timing_p4_logic.ab"
+// Exclusive polling bus, no implicit IRQ/SMP synchronization. Caller supplies
+// a dedicated quiesced controller, safed/disconnected pads, stable source and
+// CPU clock/counter, and owns RCC, GPIO/LP clocks, holds and input routes.
+// Controller configuration is destructive and not restored for a former user.
+// Pin snapshots restore the supplied safed state; clock lease restores gates.
+// Retained72B aligned record: magic/state/primary/cleanup/clock/port/stages/0,
+// inner40B pin lease. State1ready2transferring3recovery4closed.
+// Lifecycle results1ready2invalid3clock4controller5timing6pins7cleanup8closed.
+trusted fun esp32p4I2cSessionOpenOwned(r: NativeBuffer,port: int,source: int,sourceHz: u32,busHz: u32,
+    sda: int,scl: int,filter: int,pullup: bool,layout: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,72) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        port < 0 || port > 1 || source < 0 || source > 1 || sda < 0 || sda > 54 ||
+        scl < 0 || scl > 54 || sda == scl || filter < 0 || filter > 15 || (layout != 1 && layout != 3)) return 2
+    val timing=esp32p4I2cTiming(sourceHz,busHz)
+    if (!timing.valid()) return 2
+    var i=4
+    while (i < 72) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x49324234);r.storeU32(4,3);r.storeU32(20,port)
+    // Publish each resource snapshot immediately, including partial failures.
+    val clock=p4I2cSessionClockOpen(port,source)
+    r.storeU32(16,clock)
+    if ((clock&4096) != 0) r.storeU32(24,1)
+    if ((clock&255) != 1) { r.storeU32(8,3);return 3 }
+    if (p4I2cSessionInitialize(port,filter) != 1) { r.storeU32(8,4);return 4 }
+    if (p4I2cSessionTiming(port,timing) != 1) { r.storeU32(8,5);return 5 }
+    val pins=nativeBufferAt(r.addressValue()+32,40)
+    // Stage is set BEFORE opening pins: even a failed partial route is owned.
+    r.storeU32(24,3)
+    if (p4I2cSessionPinsOpen(pins,port,sda,scl,pullup,layout) != 1) { r.storeU32(8,6);return 6 }
+    r.storeU32(4,1);return 1
+}
+trusted fun esp32p4I2cSessionCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !p4I2cSessionValid(r)) return 2
+    val state=r.loadU32(4)
+    if (state == 4) return 8
+    if (state != 1 && state != 3) return 2
+    r.storeU32(4,3)
+    val pins=nativeBufferAt(r.addressValue()+32,40)
+    if ((r.loadU32(24)&2) != 0) {
+        // Zero inner magic means capture rejected before any pad mutation.
+        if (pins.loadU32(0) != 0 && p4I2cSessionPinsClose(pins) != 2) { r.storeU32(12,6);return 7 }
+        r.storeU32(24,r.loadU32(24)&1)
+    }
+    if ((r.loadU32(24)&1) != 0) {
+        val clock=p4I2cSessionClockClose(r.loadU32(16))
+        r.storeU32(16,clock)
+        if ((clock&255) != 6) { r.storeU32(12,3);return 7 }
+        r.storeU32(24,0)
+    }
+    r.storeU32(12,0);r.storeU32(4,4);return 8
+}
+trusted fun p4I2cSessionOverlap(r: NativeBuffer,data: NativeBuffer,count: int): bool =
+    count > 0 && data.addressValue() < r.addressValue()+72 && r.addressValue() < data.addressValue()+count
+// Transfer results are streaming results; validation rejects without changing
+// live state. Errors latch recovery: do not replay partially consumed buffers.
+// Recovery/close never fabricates STOP after arbitration or resets a live bus.
+trusted fun esp32p4I2cSessionTransferOwned(r: NativeBuffer,address: int,output: NativeBuffer,written: int,
+    input: NativeBuffer,read: int,budget: u32,exclusive: bool,prefix: int = -1): int {
+    if (!exclusive || !p4I2cSessionValid(r) || r.loadU32(4) != 1 || address < 0 || address > 127 ||
+        !output.hasAddressRange(0,written) || !input.hasAddressRange(0,read) ||
+        p4I2cSessionOverlap(r,output,written) || p4I2cSessionOverlap(r,input,read) ||
+        budget == u32(0) || budget > u32(0x7fffffff) || prefix < -1 || prefix > 255) return 7
+    r.storeU32(4,2)
+    val result=p4I2cSessionTransfer(r.loadU32(20),address,output,written,input,read,budget,prefix)
+    r.storeU32(8,result)
+    r.storeU32(4,if (result == 1) 1 else 3)
+    return result
+}

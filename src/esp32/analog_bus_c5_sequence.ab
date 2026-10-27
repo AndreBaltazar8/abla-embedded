@@ -1,0 +1,55 @@
+// C5 esp_rom_hp_regi2c_esp32c5.c MMIO replacement. No ROM/library calls.
+// Physical blocks:61 ULP calibration,66 BBPLL,69 SAR,6a bias,6d digital.
+// Caller owns BOTH masters and selector, keeps analog master clock/power on,
+// and excludes modem/PHY/interrupt analog accesses through completion.
+// Entire closure/stack retained if used during cache-off clock transitions.
+@section(".iram1.abla.c5AnalogIndex")
+fun c5AnalogBlockIndex(block: int): int {
+    if (block < 0x60 || block > 0x6f) return -1
+    // Packed nibble index+1 (zero=unsupported), avoiding a flash lookup table:
+    //60..67:61->3,66->2; 68..6f:69->4,6a->1,6d->5.
+    val indices=if (block < 0x68) u32(0x02000030) else u32(0x00500140)
+    int((indices>>u32((block&7)*4))&u32(15))-1
+}
+@section(".iram1.abla.c5AnalogComplete")
+trusted fun c5AnalogComplete(control: int): int {
+    var value=c5AnalogRead(control)
+    while ((value&0x2000000) != 0) value=c5AnalogRead(control)
+    value
+}
+// value=-1 reads a field; value>=0 updates a field, returns requested field
+// value (controller completion, not independent device readback). Full bytes
+// use lsb0/msb7. host_id is intentionally absent: upstream ignores it and
+// selects master from CONF2, with a SET selection bit meaning master ZERO.
+// Errors:-1invalid,-2clock off,-3initial busy budget,-4selector readback failure,
+// -5completed control register does not contain the submitted block/address.
+// No timeout after submitting a command: caller must not reuse a pending bus.
+// Leaves CONF1 slave selector configured as upstream, does not gate/reset bus.
+@section(".iram1.abla.c5AnalogTransfer")
+trusted fun esp32C5AnalogFieldOwned(block: int,reg: int,lsb: int,msb: int,value: int,exclusive: bool,readLimit: int = 64): int {
+    val index=c5AnalogBlockIndex(block)
+    if (!exclusive || index < 0 || reg < 0 || reg > 255 || lsb < 0 || msb > 7 || msb < lsb || value < -1 || readLimit < 1 || readLimit > 1000000) return -1
+    val mask=int((u32(1)<<u32(msb-lsb+1))-u32(1))
+    if (value > mask) return -1
+    if ((c5AnalogRead(0x600af018)&4) == 0) return -2
+    val selection=int(u32(1)<<u32(index+8))
+    val control=if ((c5AnalogRead(0x600af820)&selection) != 0) 0x600af800 else 0x600af804
+    var tries=0
+    while ((c5AnalogRead(control)&0x2000000) != 0) { tries=tries+1;if (tries >= readLimit) return -3 }
+    val enabled=0xffffff&~int(u32(1)<<u32(index+6))
+    c5AnalogWrite(0x600af81c,enabled)
+    if ((c5AnalogRead(0x600af81c)&0xffffff) != enabled) return -4
+    val command=block|(reg<<8)
+    if (value == -1 || mask != 255) {
+        c5AnalogWrite(control,command)
+        val response=c5AnalogComplete(control)
+        if ((response&65535) != command) return -5
+        val original=(response>>16)&255
+        if (value == -1) return int((u32(original)>>u32(lsb))&u32(mask))
+        val shiftedMask=int(u32(mask)<<u32(lsb))
+        val updated=(original&~shiftedMask)|int(u32(value)<<u32(lsb))
+        c5AnalogWrite(control,command|0x1000000|(updated<<16))
+    } else c5AnalogWrite(control,command|0x1000000|(value<<16))
+    if ((c5AnalogComplete(control)&65535) != command) return -5
+    value
+}

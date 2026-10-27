@@ -1,0 +1,49 @@
+import "abla/runtime/scalar"
+// Caller holds RCC exclusion across both shared clock register banks.
+trusted fun p4I2sControlField(address: int, mask: int, value: int): bool {
+    p4I2sControlWrite(address,(p4I2sControlRead(address) & (0xffffffff ^ mask)) | value)
+    return (p4I2sControlRead(address) & mask) == value
+}
+fun p4I2sBusMask(port: int): int = int(u32(1) << u32(14+port))
+// Enable only: no implicit reset or disabling clocks belonging to another user.
+// Own port, pads and all clock consumers before enabling its MCLK pad gate.
+// 1 ready, 2 invalid/unowned, 3 APB readback, 4 pad-gate readback.
+trusted fun esp32p4I2sEnableBusOwned(port: int, exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 2) return 2
+    val bus=p4I2sBusMask(port)
+    if (!p4I2sControlField(0x500e601c,bus,bus)) return 3
+    val pad=int(u32(1) << u32(12-port))
+    if (!p4I2sControlField(0x50111040,pad,pad)) return 4
+    return 1
+}
+// Clock source encodings: 0 XTAL, 1 APLL, 2 external, 3 PLL160M (rev>=300).
+// revision uses Espressif major*100+minor numbering; caller supplies actual
+// detected silicon revision, not a guessed board revision. No PLL startup here.
+// Source must be stable; APB bus enabled; own BOTH stopped directions, MCLK
+// consumers and shared RCC registers. Stopped channels do not prove codec safety.
+// Divider must be configured separately. No pin routing or config latch/start.
+// 1 ready, 2 invalid/unowned, 3 bus off, 4 active/reset/update,
+// 5 disable readback, 6 source, 7 BCLK, 8 MCLK binding, 9 enable readback.
+// Failure leaves partial state; retain ownership and keep consumers quiescent.
+trusted fun esp32p4I2sConfigureClockOwned(port: int, transmit: bool, source: int,
+    revision: int, bclkDivider: int, exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 2 || source < 0 || source > 3 ||
+        revision < 0 || (source == 3 && revision < 300) || bclkDivider < 1 || bclkDivider > 64) return 2
+    if ((p4I2sControlRead(0x500e601c) & p4I2sBusMask(port)) == 0) return 3
+    val base=0x500c6000+port*4096
+    if (((p4I2sControlRead(base+32) | p4I2sControlRead(base+36)) & 263) != 0) return 4
+    val offset=if (port == 0) (if (transmit) 76 else 68) else
+        if (port == 1) (if (transmit) 84 else 80) else (if (transmit) 96 else 92)
+    val shift=if (port == 0) (if (transmit) 10 else 24) else
+        if (port == 1) (if (transmit) 28 else 20) else (if (transmit) 19 else 11)
+    val clock=0x500e6000+offset
+    val enable=int(u32(1) << u32(shift))
+    if (!p4I2sControlField(clock,enable,0)) return 5
+    if (!p4I2sControlField(clock,int(u32(3) << u32(shift+1)),int(u32(source) << u32(shift+1)))) return 6
+    if (!p4I2sControlField(base+(if (transmit) 36 else 32),0x07e00000,(bclkDivider-1) << 21)) return 7
+    val master=0x500e6000+(if (port == 0) 80 else if (port == 1) 92 else 100)
+    val select=if (port == 0) 0x80000 else if (port == 1) 0x400 else 0x10000000
+    if (!p4I2sControlField(master,select,if (transmit) select else 0)) return 8
+    if (!p4I2sControlField(clock,enable,enable)) return 9
+    return 1
+}

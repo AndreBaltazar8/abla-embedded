@@ -1,0 +1,70 @@
+import "./audio_setup_c5_sequence.ab"
+import "./bootstrap_c5_sequence.ab"
+import "./stream_session_c5_sequence.ab"
+// Prepared setup176B plus stream160B:tag0,phase4,bootstrap8,bound setup12,
+// primary16,session140@20. Phases1active4error5closing6closed.
+// Exact pair exclusively owned. Setup must be ready, root/GPIO clocks pinned,
+// TX data initialized and codec prepared. Begin explicitly discards old FIFO
+// contents; close releases reset/transfer BEFORE pins/config/clocks.
+fun c5AudioStreamStorage(r: NativeBuffer): bool = r.hasAddressRange(0,160) && (r.addressValue()&3) == 0 && (r.addressValue()+160 <= 0x60000000 || r.addressValue() >= 0x60100000)
+fun c5AudioStreamRecordsValid(setup: NativeBuffer,r: NativeBuffer): bool = c5AudioSetupStorage(setup) && c5AudioStreamStorage(r) &&
+    (setup.addressValue()+176 <= r.addressValue() || r.addressValue()+160 <= setup.addressValue())
+trusted fun c5AudioStreamPairValid(setup: NativeBuffer,r: NativeBuffer): bool = c5AudioStreamRecordsValid(setup,r) &&
+    setup.loadU32(0) == 0x43354155 && r.loadU32(0) == 0x43354156 && r.loadU32(12) == setup.addressValue()
+trusted fun c5AudioStreamBeginOwned(setup: NativeBuffer,r: NativeBuffer,descriptors: int,count: int,buffers: int,stride: int,bytes: int,polls: int,exclusive: bool,discard: bool): int {
+    if (!exclusive || !discard || !c5AudioStreamRecordsValid(setup,r) || setup.loadU32(0) != 0x43354155 || setup.loadU32(4) != 2 || r.loadU32(0) != 0 || polls < 1 || polls > 1000000 || !c5AhbGdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    val a=setup.addressValue();val b=r.addressValue()
+    if ((a < descriptors+count*12 && descriptors < a+176) || (a < buffers+(count-1)*stride+bytes && buffers < a+176) ||
+        (b < descriptors+count*12 && descriptors < b+160) || (b < buffers+(count-1)*stride+bytes && buffers < b+160)) return 2
+    val dma=setup.loadU32(72)|(setup.loadU32(76)<<32)
+    if ((dma&(1<<50)) == 0 || (dma&255) != 1 || ((dma>>>47)&3) > 2) return 2
+    var at=0
+    while (at < 160) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43354156);r.storeU32(4,4);r.storeU32(12,a)
+    val channel=(dma>>>47)&3;val tx=(dma&(1<<49)) != 0
+    val bootstrap=c5I2sBootstrapOwned(channel,tx,true,true)
+    r.storeU32(8,bootstrap|0)
+    if (bootstrap.status() != 1) { r.storeU32(16,0x10000|bootstrap.status());return 4 }
+    val result=c5I2sStreamSessionBeginOwned(nativeBufferAt(b+20,140),channel,tx,descriptors,count,buffers,stride,bytes,polls,true)
+    if (result != 1 && result != 5) { r.storeU32(16,0x20000|result);return 4 }
+    r.storeU32(4,1);return result
+}
+//1held (index120,bytes124),2invalid,4error,5pending; rearm only after the
+// caller consumes RX/fills TX. Begin result1 means started, NOT block held.
+trusted fun c5AudioStreamPollOwned(setup: NativeBuffer,r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioStreamPairValid(setup,r) || setup.loadU32(4) != 2) return 2
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) != 1) return 2
+    val result=c5I2sStreamSessionPollOwned(nativeBufferAt(r.addressValue()+20,140),polls,true)
+    if (result == 4) { r.storeU32(16,0x30000|r.loadU32(28));r.storeU32(4,4) }
+    return result
+}
+trusted fun c5AudioStreamRearmOwned(setup: NativeBuffer,r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c5AudioStreamPairValid(setup,r) || setup.loadU32(4) != 2) return 2
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) != 1) return 2
+    val result=c5I2sStreamSessionRearmOwned(nativeBufferAt(r.addressValue()+20,140),true)
+    if (result == 4) { r.storeU32(16,0x40000|r.loadU32(28));r.storeU32(4,4) }
+    return result
+}
+//1stopped/released,2invalid,4cleanup error,5pending,8FIFO needs discard.
+// Never promotes a saved primary error to successful audio. Retry close only;
+// once closing begins poll/rearm cannot resume the stream.
+trusted fun c5AudioStreamCloseOwned(setup: NativeBuffer,r: NativeBuffer,polls: int,exclusive: bool,discard: bool): int {
+    if (!exclusive || !c5AudioStreamPairValid(setup,r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 6) return 1
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 4 && r.loadU32(4) != 5) return 2
+    r.storeU32(4,5)
+    val bootstrap=C5I2sBootstrap(r.loadU32(8))
+    if ((bootstrap&8192) != 0 && bootstrap.status() != 1 && bootstrap.status() != 6) {
+        val released=bootstrap.releaseOwned(true);r.storeU32(8,released|0)
+        if (released.status() != 6) return 4
+    }
+    if (r.loadU32(20) != 0) {
+        val stopped=c5I2sStreamSessionStopOwned(nativeBufferAt(r.addressValue()+20,140),polls,true,discard)
+        if (stopped != 1) return stopped
+    }
+    val closed=c5AudioSetupCloseOwned(setup,polls,true)
+    if (closed != 6) return closed
+    r.storeU32(4,6);return 1
+}

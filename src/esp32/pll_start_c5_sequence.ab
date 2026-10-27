@@ -1,0 +1,138 @@
+import "./analog_bus_c5_sequence.ab"
+import "./sdk/raw_buffer.ab"
+import "abla/unsafe/mmio"
+// Aligned local record access, used only after full admission.
+@section(".iram1.abla.c5PllRecordRead")
+trusted fun c5PllRecordRead(base: int,offset: int): int = mmioLoadU32(base+offset)
+@section(".iram1.abla.c5PllRecordWrite")
+trusted fun c5PllRecordWrite(base: int,offset: int,value: int): void { mmioStoreU32(base+offset,value);return }
+// C5 rtc_clk_bbpll_enable/configure, fixed480MHz PLL from XTAL40/48.
+//32B:tag0,status4,original parent gate8/master gate12/selector16,XTAL20,
+// next stage24,reserved28.1ready2invalid3partial4calibrating.
+// Caller owns PLL plus BOTH analog masters/selector and reference gates;
+// CPU on stable XTAL, no PLL consumers (including active PVT), proper supply,
+// retained closure/stack/record, calibrated ROM delays. No CPU switch here.
+// WT PLL power requests are irreversible here, no rollback or force-success.
+// Retry the SAME record; status4 retains gates and ownership. Leave PLL powered
+// on success, restore initial transport gates/selector. No physical lock proof
+// beyond hardware CAL_DONE and upstream10us stabilization sequence.
+@section(".iram1.abla.c5PllField")
+trusted fun c5PllField(address: int,mask: int,value: int): bool {
+    c5PllWrite(address,(c5PllRead(address)&~mask)|(value&mask))
+    (c5PllRead(address)&mask) == (value&mask)
+}
+@section(".iram1.abla.c5PllAnalogField")
+trusted fun c5PllAnalogField(reg: int,lsb: int,msb: int,value: int): bool {
+    if (esp32C5AnalogFieldOwned(0x66,reg,lsb,msb,value,true) != value) return false
+    esp32C5AnalogFieldOwned(0x66,reg,lsb,msb,-1,true) == value
+}
+@section(".iram1.abla.c5PllStart")
+trusted fun esp32C5PllStartOwned(record: NativeBuffer,exclusive: bool,readLimit: int = 64): int {
+    if (!exclusive || !record.hasAddressRange(0,32) || (record.addressValue()&3) != 0 || readLimit < 1 || readLimit > 1000000) return 2
+    val base=record.addressValue()
+    // Caller initializes only a fresh record's tag to zero; retries keep it.
+    if (c5PllRecordRead(base,0) != 0 && c5PllRecordRead(base,0) != 0x43504c31) return 2
+    if (c5PllRecordRead(base,0) == 0x43504c31 && c5PllRecordRead(base,4) == 1) return 1
+    val sys=c5PllRead(0x60096110);val xtal=(sys>>24)&127
+    if ((sys&0x30000) != 0 || (xtal != 40 && xtal != 48) || (c5PllRead(0x60096144)&1) != 0) return 2
+    if (c5PllRecordRead(base,0) != 0x43504c31) {
+        c5PllRecordWrite(base,0,0x43504c31);c5PllRecordWrite(base,4,3)
+        c5PllRecordWrite(base,8,c5PllRead(0x60096128)&2)
+        c5PllRecordWrite(base,12,0);c5PllRecordWrite(base,16,0);c5PllRecordWrite(base,20,xtal)
+        c5PllRecordWrite(base,24,0);c5PllRecordWrite(base,28,0)
+    }
+    val status=c5PllRecordRead(base,4);val stage=c5PllRecordRead(base,24)
+    if ((status != 3 && status != 4) || stage >= 21 || c5PllRecordRead(base,20) != xtal) return 2
+    c5PllRecordWrite(base,4,3)
+    if (stage <= 0) {
+        c5PllWrite(0x600b00cc,0x70000000)
+        c5PllRecordWrite(base,24,1)
+    }
+    if (stage <= 1) {
+        c5PllWrite(0x600b00cc,0x02000000)
+        c5PllRecordWrite(base,24,2)
+    }
+    if (stage <= 2) {
+        if (!c5PllField(0x60096128,2,2)) return 3
+        c5PllRecordWrite(base,24,3)
+    }
+    if (stage <= 3) {
+        c5PllRecordWrite(base,12,c5PllRead(0x600af018)&4)
+        if (!c5PllField(0x600af018,4,4)) return 3
+        c5PllRecordWrite(base,24,4)
+    }
+    if (stage <= 4) {
+        c5PllRecordWrite(base,16,c5PllRead(0x600af81c)&0xffffff)
+        c5PllRecordWrite(base,24,5)
+    }
+    if (stage <= 5) {
+        if (!c5PllField(0x600af818,4,0)) return 3
+        c5PllRecordWrite(base,24,6)
+    }
+    if (stage <= 6) {
+        if (!c5PllField(0x600af818,8,8)) return 3
+        c5PllRecordWrite(base,24,7)
+    }
+    if (stage <= 7) {
+        if (!c5PllAnalogField(2,0,7,0x51)) return 3
+        c5PllRecordWrite(base,24,8)
+    }
+    if (stage <= 8) {
+        if (!c5PllAnalogField(3,0,7,if (xtal == 48) 10 else 12)) return 3
+        c5PllRecordWrite(base,24,9)
+    }
+    if (stage <= 9) {
+        if (!c5PllAnalogField(5,0,2,if (xtal == 48) 1 else 0)) return 3
+        c5PllRecordWrite(base,24,10)
+    }
+    if (stage <= 10) {
+        if (!c5PllAnalogField(5,4,6,if (xtal == 48) 1 else 0)) return 3
+        c5PllRecordWrite(base,24,11)
+    }
+    if (stage <= 11) {
+        if (!c5PllAnalogField(6,6,7,1)) return 3
+        c5PllRecordWrite(base,24,12)
+    }
+    if (stage <= 12) {
+        if (!c5PllAnalogField(6,4,5,3)) return 3
+        c5PllRecordWrite(base,24,13)
+    }
+    if (stage <= 13) {
+        if (!c5PllAnalogField(9,0,1,3)) return 3
+        c5PllRecordWrite(base,24,14)
+    }
+    if (stage <= 14) {
+        var polls=0
+        while ((c5PllRead(0x600af818)&0x1000000) == 0) {
+            polls=polls+1
+            if (polls >= readLimit) { c5PllRecordWrite(base,4,4);return 4 }
+        }
+        c5PllRecordWrite(base,24,15)
+    }
+    if (stage <= 15) {
+        c5PllDelay(10)
+        c5PllRecordWrite(base,24,16)
+    }
+    if (stage <= 16) {
+        if (!c5PllField(0x600af818,8,0)) return 3
+        c5PllRecordWrite(base,24,17)
+    }
+    if (stage <= 17) {
+        if (!c5PllField(0x600af818,4,4)) return 3
+        c5PllRecordWrite(base,24,18)
+    }
+    if (stage <= 18) {
+        if (!c5PllField(0x600af81c,0xffffff,c5PllRecordRead(base,16))) return 3
+        c5PllRecordWrite(base,24,19)
+    }
+    if (stage <= 19) {
+        if (!c5PllField(0x600af018,4,c5PllRecordRead(base,12))) return 3
+        c5PllRecordWrite(base,24,20)
+    }
+    if (stage <= 20) {
+        if (!c5PllField(0x60096128,2,c5PllRecordRead(base,8))) return 3
+        c5PllRecordWrite(base,24,21)
+    }
+    c5PllRecordWrite(base,4,1)
+    1
+}

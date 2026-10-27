@@ -1,0 +1,58 @@
+import "../../i2c/software_lines.ab"
+// Unique owner of two prepared GPIO pads. Caller serializes lifecycle/transfers,
+// owns the pad leases, releases prior mux/hold users and pins GPIO/IOMUX clocks.
+// Copies are not independent owners. External pullups and calibrated delay are
+// required. Closing only releases these pads; shared clocks are never gated.
+type Esp32P4SoftwareI2cBus = int
+fun Esp32P4SoftwareI2cBus.lines(): SoftwareI2cLines = SoftwareI2cLines(this&70368744177663)
+fun Esp32P4SoftwareI2cBus.status(): int = (this>>>48)&255
+fun Esp32P4SoftwareI2cBus.ownsSda(): bool = (this&72057594037927936) != 0
+fun Esp32P4SoftwareI2cBus.ownsScl(): bool = (this&144115188075855872) != 0
+fun Esp32P4SoftwareI2cBus.ready(): bool = this.status() == 1 && this.ownsSda() && this.ownsScl()
+// Status0closed,1ready,2invalid,3preexistingoutput,4SDAsetup,5SCLsetup,
+// 6busnotidle,7SDAreleasefailure,8SCLreleasefailure,9devicePoolCloseFailure,
+// 10recoveryClockTimeout. Partialsetup owns any pad
+// whose configuration was attempted, including a failed readback.
+trusted fun esp32P4SoftwareI2cOpenOwned(sda: int,scl: int,halfPeriodUs: int,stretchPolls: int): Esp32P4SoftwareI2cBus {
+    val lines=softwareI2cLines(sda,scl,halfPeriodUs,stretchPolls)
+    if (!lines.valid() || sda > 54 || scl > 54) return Esp32P4SoftwareI2cBus(562949953421312)
+    if (p4SoftwareI2cOutputEnabled(sda) || p4SoftwareI2cOutputEnabled(scl)) return Esp32P4SoftwareI2cBus((lines|0)|(3<<48))
+    var state=(lines|0)|72057594037927936
+    if (!p4SoftwareI2cConfigurePad(sda,true)) return Esp32P4SoftwareI2cBus(state|(4<<48))
+    state=state|144115188075855872
+    if (!p4SoftwareI2cConfigurePad(scl,true)) return Esp32P4SoftwareI2cBus(state|(5<<48))
+    // Observe idle, not merely the output latch; never issue recovery clocks.
+    var remaining=stretchPolls
+    while (remaining > 0) {
+        if (softwareI2cSample(scl) && softwareI2cSample(sda)) return Esp32P4SoftwareI2cBus(state|(1<<48))
+        softwareI2cDelay(1); remaining=remaining-1
+    }
+    return Esp32P4SoftwareI2cBus(state|(6<<48))
+}
+trusted fun Esp32P4SoftwareI2cBus.closeOwned(): Esp32P4SoftwareI2cBus {
+    var state=this&(70368744177663|(1<<56)|(1<<57)) // preserve pins/ownership, clear status
+    if (this.ownsSda()) {
+        if (!p4SoftwareI2cConfigurePad(this.lines().sda(),false)) return Esp32P4SoftwareI2cBus(state|(7<<48))
+        state=state&(-72057594037927937)
+    }
+    if (this.ownsScl()) {
+        if (!p4SoftwareI2cConfigurePad(this.lines().scl(),false)) return Esp32P4SoftwareI2cBus(state|(8<<48))
+        state=state&(-144115188075855873)
+    }
+    return Esp32P4SoftwareI2cBus(0)
+}
+// Retain the returned value: successful recovery reopens transfer admission.
+// Only fully configured pad leases can recover. Failed setup/partial teardown
+// must close, not drive pads with unverified configuration. No reconfiguration
+// or clock gating occurs. Failure retains both pads for retry/close.
+// Caller excludes every other master and transaction; clearStuck explicitly
+// authorizes up to nine slave clocks plus STOP. Default is passive release.
+// Never automatically invoke this after arbitration loss.
+trusted fun Esp32P4SoftwareI2cBus.recoverOwned(clearStuck: bool = false): Esp32P4SoftwareI2cBus {
+    if (!this.ownsSda() || !this.ownsScl() || !this.lines().valid() ||
+        this.lines().sda() > 54 || this.lines().scl() > 54 ||
+        (this.status() != 1 && this.status() != 6 && this.status() != 10)) return this
+    val result=this.lines().recoverOwned(clearStuck)
+    val state=this&(70368744177663|(1<<56)|(1<<57))
+    return Esp32P4SoftwareI2cBus(state|((if (result == 1) 1 else if (result == 3) 10 else 6)<<48))
+}

@@ -1,0 +1,57 @@
+import "./probe_esp32_sequence.ab"
+// Exclusive40B fresh record. Reuses classic probe topology/RTC hold checks;
+// saves full output route, latch and open-drain in addition to mux/RTC/OE.
+// Only output-capable pads; input-only pads keep the existing probe API.
+// Caller stops every digital/RTC/analog peripheral owner, prevents sleep/hold
+// changes and serializes shared register RMW throughout acquisition/restore.
+// Never use on executing flash/PSRAM/boot-power pins without board ownership.
+// No global input-matrix signals are changed or saved by this lease.
+trusted fun esp32GpioLeaseRecord(r: NativeBuffer): bool = r.hasAddressRange(0,40) && (r.addressValue()&3) == 0
+trusted fun esp32GpioLeaseOpenOwned(r: NativeBuffer,pin: int,output: bool,high: bool,pull: int,exclusive: bool): int {
+    if (!exclusive || !esp32GpioLeaseRecord(r) || !esp32BasicGpioOutputValid(pin) ||
+        pull < 0 || pull > 2 || r.loadU32(0) != 0) return 2
+    val opened=esp32GpioProbeOpenOwned(r,pin,pull,true)
+    if (opened != 1 && opened != 4) return opened
+    val bit=1<<(pin&31)
+    val out=if (pin < 32) 0x3FF44004 else 0x3FF44010
+    r.storeU32(32,classicProbeRead(out)&bit)
+    r.storeU32(36,classicProbeRead(0x3FF44088+pin*4)&4)
+    r.storeU32(0,0x47504c31)
+    r.storeU32(24,4)
+    if (opened != 1) return 4
+    // OE is already disabled by probe. Set the desired latch before enabling.
+    classicProbeWrite(out+(if (high) 4 else 8),bit)
+    if ((classicProbeRead(out)&bit) != (if (high) bit else 0) ||
+        !esp32ProbeField(0x3FF44088+pin*4,4,0) ||
+        !esp32ProbeField(0x3FF44530+pin*4,4095,1280)) return 4
+    val enable=if (pin < 32) 0x3FF44020 else 0x3FF4402C
+    if (output) classicProbeWrite(enable+4,bit)
+    if ((classicProbeRead(enable)&bit) != (if (output) bit else 0)) return 4
+    r.storeU32(24,1);return 1
+}
+// 1restored2admission4partial-failure. Retain the unchanged snapshots on any
+// failure and retry while all prior/current owners remain stopped. OE is
+// disabled first; original output is enabled only after its data/configuration.
+trusted fun esp32GpioLeaseCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !esp32GpioLeaseRecord(r) || r.loadU32(0) != 0x47504c31 ||
+        (r.loadU32(24) != 1 && r.loadU32(24) != 4) || !esp32BasicGpioOutputValid(r.loadU32(4))) return 2
+    val pin=r.loadU32(4);val bit=1<<(pin&31)
+    val enable=if (pin < 32) 0x3FF44020 else 0x3FF4402C
+    val out=if (pin < 32) 0x3FF44004 else 0x3FF44010
+    val route=0x3FF44530+pin*4
+    r.storeU32(24,4)
+    classicProbeWrite(enable+8,bit)
+    if ((classicProbeRead(enable)&bit) != 0 || !esp32ProbeField(route,3072,1024)) return 4
+    classicProbeWrite(out+(if (r.loadU32(32) != 0) 4 else 8),bit)
+    if ((classicProbeRead(out)&bit) != r.loadU32(32) ||
+        !esp32ProbeField(0x3FF44088+pin*4,4,r.loadU32(36))) return 4
+    val rtc=esp32ProbeRtcIndex(pin)
+    if (rtc < 18 && !esp32ProbeField(esp32ProbeRtcField(rtc,0),
+        esp32ProbeRtcField(rtc,1)|esp32ProbeRtcField(rtc,4)|esp32ProbeRtcField(rtc,5),r.loadU32(20))) return 4
+    val muxMask=0x7202|(if (rtc < 18) 0 else 0x180)
+    if (!esp32ProbeField(0x3FF49000+esp32IoMuxOffset(pin),muxMask,r.loadU32(8)) ||
+        !esp32ProbeField(route,4095,r.loadU32(12))) return 4
+    classicProbeWrite(enable+(if (r.loadU32(16) != 0) 4 else 8),bit)
+    if ((classicProbeRead(enable)&bit) != r.loadU32(16)) return 4
+    r.storeU32(24,0);r.storeU32(0,0);return 1
+}

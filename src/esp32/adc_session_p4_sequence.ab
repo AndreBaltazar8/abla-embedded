@@ -1,0 +1,105 @@
+import "./sdk/raw_buffer.ab"
+import "./adc_calibration_p4_logic.ab"
+// Retained128-byte aligned4 caller record. No heap, callbacks or hidden task.
+// Bus record0..31; magic32,state36,primary40,conversion phase44; calibration48;
+// clock56,power64,pad72,controller80,analog88 (64-bit scalar snapshots);
+// attempted resources96,raw100,raw-valid104,layout108,cleanup error112.
+// Caller owns BOTH ADCs, all analog masters/RCC/PMU/pads across cores, excludes
+// sleep/reconfiguration and pins XTAL/RTC_FAST/analog160MHz + GPIO clocks.
+// Setup does not start sources or power an external sensor. This same caller
+// retains record and ownership until close succeeds, including every failure.
+// State1ready2pending3recovery4closed. Return1success2invalid3setup4start
+// 5pending6finish7release8cleanup9closed. Primary and cleanup errors are kept
+// separately; a cleanup failure never erases the failure that led to it.
+fun p4AdcSessionRange(r: NativeBuffer): bool = r.hasAddressRange(0,128) && (r.addressValue()&3) == 0
+trusted fun p4AdcSessionValid(r: NativeBuffer): bool = p4AdcSessionRange(r) && r.loadU32(32) == 0x41445334
+trusted fun p4AdcSessionLoad(r: NativeBuffer,at: int): int = r.loadU32(at)|(r.loadU32(at+4)<<32)
+trusted fun p4AdcSessionStore(r: NativeBuffer,at: int,value: int): void { r.storeU32(at,value);r.storeU32(at+4,value>>>32);return }
+trusted fun p4AdcSessionFailure(r: NativeBuffer,code: int,result: int): int {
+    r.storeU32(36,3);r.storeU32(40,code);return result
+}
+trusted fun esp32p4AdcSessionOpenOwned(r: NativeBuffer,calibration: P4AdcCalibration,layout: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4AdcSessionRange(r) || !calibration.valid() || (layout != 1 && layout != 3) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(0) != 0 || r.loadU32(32) != 0) return 2
+    // Initialize only after complete input preflight, before any acquisition.
+    var at=36
+    while (at < 128) { r.storeU32(at,0);at=at+4 }
+    p4AdcSessionStore(r,48,calibration|0)
+    r.storeU32(108,layout);r.storeU32(32,0x41445334)
+    var stage=0
+    while (stage < 6) {
+        r.storeU32(96,r.loadU32(96)|int(u32(1)<<u32(stage)))
+        val token=p4AdcSessionResourceOpen(stage,r,calibration,layout,polls)
+        if (stage != 0) p4AdcSessionStore(r,48+stage*8,token)
+        if (!p4AdcSessionResourceReady(stage,token,false)) return p4AdcSessionFailure(r,(stage<<16)|p4AdcSessionResourceStatus(stage,token),3)
+        stage=stage+1
+    }
+    r.storeU32(36,1);return 1
+}
+// Explicit caller settling boundary, as in the S3 session: analog/sensor RC
+// settling is application-specific, not a guessed universal microsecond wait.
+trusted fun esp32p4AdcSessionStartAfterSettlingOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !p4AdcSessionValid(r) || r.loadU32(36) != 1 || r.loadU32(44) != 0) return 2
+    val calibration=P4AdcCalibration(p4AdcSessionLoad(r,48))
+    r.storeU32(104,0);r.storeU32(40,0);r.storeU32(112,0)
+    if (!p4AdcSessionMatches(calibration)) return p4AdcSessionFailure(r,3,4)
+    r.storeU32(44,1) // obligation recorded BEFORE START could reach hardware
+    val result=p4AdcSessionStart(calibration)
+    if ((result&256) == 0) r.storeU32(44,0)
+    if ((result&255) != 1) return p4AdcSessionFailure(r,result,4)
+    r.storeU32(36,2);return 1
+}
+trusted fun esp32p4AdcSessionPollOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4AdcSessionValid(r) || polls < 1 || polls > 1000000 || r.loadU32(44) == 0 || r.loadU32(36) == 4) return 2
+    val calibration=P4AdcCalibration(p4AdcSessionLoad(r,48))
+    if (r.loadU32(44) == 1) {
+        val result=p4AdcSessionFinish(calibration,polls)
+        if ((result&255) == 6) return 5
+        if ((result&255) != 1 && (result&255) != 7) return p4AdcSessionFailure(r,result,6)
+        if ((result&255) == 1) { r.storeU32(100,(result>>>8)&4095);r.storeU32(104,1) }
+        else { r.storeU32(104,0);r.storeU32(40,result) }
+        r.storeU32(44,2) // result read; retry only release, never sample again
+    }
+    val released=p4AdcSessionRelease(calibration,polls)
+    if (released != 1) { r.storeU32(36,3);r.storeU32(112,released);return 7 }
+    r.storeU32(44,0);r.storeU32(112,0)
+    r.storeU32(36,if (r.loadU32(104) != 0) 1 else 3)
+    return if (r.loadU32(104) != 0) 1 else 6
+}
+trusted fun esp32p4AdcSessionRaw(r: NativeBuffer): int =
+    if (!p4AdcSessionValid(r) || r.loadU32(44) != 0 || r.loadU32(104) == 0) -1 else r.loadU32(100)
+trusted fun esp32p4AdcSessionMillivolts(r: NativeBuffer): int {
+    val raw=esp32p4AdcSessionRaw(r)
+    if (raw < 0) return -1
+    return P4AdcCalibration(p4AdcSessionLoad(r,48)).millivolts(raw)
+}
+trusted fun esp32p4AdcSessionCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4AdcSessionValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(36) == 4) return 9
+    if (r.loadU32(44) != 0) {
+        val released=p4AdcSessionRelease(P4AdcCalibration(p4AdcSessionLoad(r,48)),polls)
+        if (released != 1) { r.storeU32(36,3);r.storeU32(112,released);return 7 }
+        r.storeU32(44,0)
+    }
+    // Even a failed analog SNAPSHOT read can leave a master in flight, with
+    // no analog snapshot to close. Join it before restoring controller/pads
+    // or gating SAR power, not only when the bus is finally closed.
+    if ((r.loadU32(96)&32) != 0 && !p4AdcSessionAnalogIdle(polls)) {
+        r.storeU32(36,3);r.storeU32(112,0x50004);return 8
+    }
+    var stage=5
+    while (stage >= 0) {
+        val mask=int(u32(1)<<u32(stage))
+        if ((r.loadU32(96)&mask) != 0) {
+            val saved=if (stage == 0) 0 else p4AdcSessionLoad(r,48+stage*8)
+            val token=p4AdcSessionResourceClose(stage,r,saved,polls)
+            if (stage != 0) p4AdcSessionStore(r,48+stage*8,token)
+            if (!p4AdcSessionResourceReady(stage,token,true)) {
+                r.storeU32(36,3);r.storeU32(112,(stage<<16)|p4AdcSessionResourceStatus(stage,token));return 8
+            }
+            r.storeU32(96,r.loadU32(96)&(63^mask))
+        }
+        stage=stage-1
+    }
+    r.storeU32(36,4);r.storeU32(112,0);return 9
+}

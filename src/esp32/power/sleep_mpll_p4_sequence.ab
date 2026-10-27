@@ -1,0 +1,44 @@
+import "../psram/mpll_p4_sequence.ab"
+import "abla/runtime/scalar"
+// Live MPLL lease for light sleep. Caller has already parked PSRAM on XTAL,
+// excludes EVERY other MPLL consumer, CPUs/IRQs/REGDMA and both analog masters,
+// keeps execution/stack/token internal, and pins analog bus/root/160MHz source.
+// Unlike cold ownership, restore never releases those borrowed prerequisites.
+// Token: low32 calibration/error detail, owned31, MHz10@32.
+// 1off 2invalid 3prerequisite 4MMIO 5analog 6timeout 7frequency mismatch 8restored.
+type P4SleepMpll=int
+fun P4SleepMpll.status(): int = this&255
+fun P4SleepMpll.hasSnapshot(): bool = (this&(1<<31)) != 0
+trusted fun p4SleepMpllBusReady(polls: int): bool =
+    (p4MpllRead(0x50120000)&0x08000000) != 0 &&
+    (p4MpllRead(0x50120008)&0x04000000) == 0 &&
+    (p4MpllRead(0x50124034)&1) != 0 &&
+    p4AnalogWaitIdle(0,polls) && p4AnalogWaitIdle(4,polls)
+trusted fun esp32p4SleepMpllSuspendOwned(mhz: int,xtalMHz: int,polls: int,exclusiveInternal: bool): P4SleepMpll {
+    if (!exclusiveInternal || (mhz != 320 && mhz != 400 && mhz != 500) || xtalMHz != 40 || polls < 1 || polls > 1000000) return P4SleepMpll(2)
+    if ((p4MpllRead(0x500e6030)&0x3000) != 0 ||
+        (p4MpllRead(0x5011515c)&0x01000000) == 0 ||
+        (p4MpllRead(0x50111040)&0x10000000) == 0 ||
+        !p4SleepMpllBusReady(polls)) return P4SleepMpll(3)
+    // Verify the live divider, not just a caller-supplied software frequency.
+    val divider=p4AnalogRegisterOwned(0x63,2,0,false,polls)
+    if ((divider&255) != 1) return P4SleepMpll(5|((divider&255)<<16))
+    if (((divider>>>8)&255) != (if (mhz == 320) 121 else if (mhz == 400) 153 else 193)) return P4SleepMpll(7)
+    val token=(1<<31)|(mhz<<32)
+    // The original sleep disable clears PHY power only, NOT the root gate.
+    return P4SleepMpll(token|(if (p4MpllField(0x5011515c,0x01000000,0)) 1 else 260))
+}
+// Retry after an error only with all consumers still parked. A timed-out
+// analog transaction must finish before recalibration; never reset it away.
+// Success proves the same calibration END as IDF, not measured frequency.
+trusted fun P4SleepMpll.restoreOwned(polls: int,exclusiveInternal: bool): P4SleepMpll {
+    if (!exclusiveInternal || !this.hasSnapshot() || this.status() == 8 || polls < 1 || polls > 1000000) return this
+    val token=this&0x3ff80000000
+    val mhz=(this>>>32)&1023
+    if ((mhz != 320 && mhz != 400 && mhz != 500) ||
+        (p4MpllRead(0x500e6030)&0x3000) != 0 || !p4SleepMpllBusReady(polls)) return P4SleepMpll(token|3)
+    if (!p4MpllField(0x5011515c,0x01000000,0x01000000)) return P4SleepMpll(token|260)
+    if (!p4MpllField(0x50111040,0x10000000,0x10000000)) return P4SleepMpll(token|516)
+    val result=p4MpllCalibratePreparedOwned(mhz,polls,0)
+    return P4SleepMpll(token|(if (result.ready()) 8 else result|0))
+}

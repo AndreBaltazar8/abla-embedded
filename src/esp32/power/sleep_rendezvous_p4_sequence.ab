@@ -1,0 +1,72 @@
+import "./sleep_smp_p4_sequence.ab"
+// Starts one generation using a previously installed peer IRQ binding.
+// Owner64B: magic,step,last,detail,smp,payload,binding,generation,hart,reserved7.
+// Payload848 fresh/aligned16, binding64 ready on opposite hart, all pinned
+// and disjoint. IRQ binding/table/routes remain exclusive until handler RETURN,
+// not merely SMP idle. Caller excludes new rounds and never reuses live storage.
+// Steps1open2prepare3notify4wait-backed5handoff6cancel7restoring8restored
+// 9wait-peer10release11wait-ack12aborted. No clock/PMU/cache changes here.
+// Result1ready for RoundOpen,7pending,9failure,10aborted,4invalid.
+fun p4RendezvousOverlap(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool = a.addressValue() < b.addressValue()+bn && b.addressValue() < a.addressValue()+an
+trusted fun p4RendezvousResult(r: NativeBuffer,result: int,detail: int): int { r.storeU32(8,result);r.storeU32(12,detail);return result }
+trusted fun esp32p4SleepRendezvousOpenOwned(r: NativeBuffer,smp: NativeBuffer,payload: NativeBuffer,binding: NativeBuffer,exclusiveInstalled: bool): int {
+    if (!exclusiveInstalled || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !smp.hasAddressRange(0,4) || (smp.addressValue()&3) != 0 || !payload.hasAddressRange(0,848) ||
+        (payload.addressValue()&15) != 0 || payload.loadU32(0) != 0 || !binding.hasAddressRange(0,64) ||
+        (binding.addressValue()&3) != 0 || binding.loadU32(0) != 0x50344249 || binding.loadU32(4) != 5 || binding.loadU32(56) != 0 ||
+        p4SmpHart() > u32(1) || (p4SmpStatus()&u32(8)) != u32(0) || binding.loadU32(16) != 1-int(p4SmpHart()) ||
+        binding.loadU32(36) != payload.addressValue()) return 4
+    val table=nativeBufferAt(binding.loadU32(32),272)
+    if (!table.hasAddressRange(0,272) || (table.addressValue()&3) != 0 ||
+        p4RendezvousOverlap(r,64,table,272) || p4RendezvousOverlap(smp,4,table,272) ||
+        p4RendezvousOverlap(payload,848,table,272) || p4RendezvousOverlap(binding,64,table,272)) return 4
+    if (p4RendezvousOverlap(r,64,smp,4) || p4RendezvousOverlap(r,64,payload,848) || p4RendezvousOverlap(r,64,binding,64) ||
+        p4RendezvousOverlap(smp,4,payload,848) || p4RendezvousOverlap(smp,4,binding,64) || p4RendezvousOverlap(payload,848,binding,64)) return 4
+    var i=4
+    while (i < 64) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50345256);r.storeU32(4,1);r.storeU32(16,smp.addressValue());r.storeU32(20,payload.addressValue())
+    r.storeU32(24,binding.addressValue());r.storeU32(32,int(p4SmpHart()));return 7
+}
+trusted fun p4RendezvousValid(r: NativeBuffer): bool = r.hasAddressRange(0,64) && (r.addressValue()&3) == 0 &&
+    r.loadU32(0) == 0x50345256 && r.loadU32(4) >= 1 && r.loadU32(4) <= 12 &&
+    int(p4SmpHart()) == r.loadU32(32) && (p4SmpStatus()&u32(8)) == u32(0)
+// Only before handing generation to RoundOpen; excludes concurrent round entry.
+trusted fun esp32p4SleepRendezvousCancelOwned(r: NativeBuffer,exclusiveBeforeRound: bool): int {
+    if (!exclusiveBeforeRound || !p4RendezvousValid(r) || r.loadU32(4) > 5) return 4
+    if (r.loadU32(4) == 1) { r.storeU32(4,12);return p4RendezvousResult(r,10,0) }
+    r.storeU32(4,6);return 7
+}
+trusted fun esp32p4SleepRendezvousContinueOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4RendezvousValid(r) || polls < 1 || polls > 1000000) return 4
+    if (r.loadU32(4) == 12) return 10
+    if (r.loadU32(4) == 5) return 1
+    val smp=nativeBufferAt(r.loadU32(16),4);val peer=1-r.loadU32(32)
+    val step=r.loadU32(4);val generation=r.loadU32(28)
+    if (step == 1) {
+        val opened=esp32p4SleepSmpAdvanceOwned(smp,0,0,polls,true)
+        if (opened.status() != 1) return p4RendezvousResult(r,if (opened.status() == 3) 7 else 9,opened.status())
+        r.storeU32(28,opened.generation())
+    } else if (step == 2 || step == 3) {
+        val result=if (step == 2) p4RendezvousPrepare(nativeBufferAt(r.loadU32(20),848),smp,generation,peer) else p4RendezvousNotify(smp,generation,polls)
+        if (step == 3 && result == 5) return p4RendezvousResult(r,7,result)
+        if (result != 1) { r.storeU32(4,6);return p4RendezvousResult(r,9,result) }
+    } else {
+        val state=esp32p4SleepSmpObserve(smp,generation)
+        if (step == 11 && state.status() == 5) { r.storeU32(4,12);return 10 }
+        if (state.status() != 1) return p4RendezvousResult(r,9,state.status())
+        if (step == 4) {
+            if (state.stage() == 4) { r.storeU32(4,6);return 7 }
+            if (state.stage() != 1) return p4RendezvousResult(r,9,4)
+            if (state.phase(peer) != 2) return 7
+        } else if (step == 6 || step == 7 || step == 8 || step == 10) {
+            if (!(step == 6 && state.stage() == 4)) {
+                val changed=esp32p4SleepSmpAdvanceOwned(smp,generation,if (step == 6) 6 else if (step == 7) 7 else if (step == 8) 8 else 9,polls,true)
+                if (changed.status() != 1) return p4RendezvousResult(r,if (changed.status() == 3) 7 else 9,changed.status())
+            }
+        } else if (step == 9) {
+            if (state.phase(peer) != 0 && state.phase(peer) != 4) return 7
+        } else if (step == 11 && state.stage() != 0) return 7
+    }
+    r.storeU32(4,step+1)
+    return p4RendezvousResult(r,if (step == 4) 1 else if (step == 11) 10 else 7,0)
+}

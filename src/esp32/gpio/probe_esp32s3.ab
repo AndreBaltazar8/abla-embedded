@@ -1,0 +1,94 @@
+import "./s3_logic.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/unsafe/mmio"
+import "abla/unsafe/native"
+
+// S3-only probe adapter. Callers must own the pins and serialize configuration.
+// Atomic set/clear registers preserve unrelated pins on both GPIO banks.
+trusted fun esp32S3GpioUpdate(address: int, mask: int, value: int): void {
+    mmioStoreU32(address, (mmioLoadU32(address) & ~mask) | (value & mask))
+    return
+}
+
+trusted fun gpio_set_level(pin: i32, level: u32): i32 {
+    val number = int(pin)
+    if (!espChipS3().gpioOutputValid(number)) return i32(258)
+    val offset = esp32S3GpioBankOffset(number)
+    mmioStoreU32(1610629120 + offset + (if (level != u32(0)) 8 else 12), 1 << (number & 31))
+    i32(0)
+}
+
+trusted fun gpio_get_level(pin: i32): i32 {
+    val number = int(pin)
+    if (!espChipS3().gpioValid(number)) return i32(0)
+    val address = if (number < 32) 1610629180 else 1610629184
+    i32(if ((mmioLoadU32(address) & (1 << (number & 31))) != 0) 1 else 0)
+}
+
+trusted fun gpio_set_pull_mode(pin: i32, mode: i32): i32 {
+    val address = esp32S3GpioMuxAddress(int(pin))
+    if (address == 0 || mode < i32(0) || mode > i32(3)) return i32(258)
+    val bits = (if (mode == i32(0) || mode == i32(2)) 256 else 0) |
+        (if (mode == i32(1) || mode == i32(2)) 128 else 0)
+    esp32S3GpioUpdate(address, 384, bits)
+    i32(0)
+}
+
+trusted fun gpio_set_drive_capability(pin: i32, drive: i32): i32 {
+    val number = int(pin)
+    val address = esp32S3GpioMuxAddress(number)
+    if (address == 0 || drive < i32(0) || drive > i32(3)) return i32(258)
+    esp32S3GpioUpdate(address, 3072, esp32S3GpioDriveBits(number, int(drive)) << 10)
+    i32(0)
+}
+
+trusted fun gpio_set_direction(pin: i32, mode: i32): i32 {
+    val number = int(pin)
+    val address = esp32S3GpioMuxAddress(number)
+    val direction = int(mode)
+    if (address == 0 || direction < 0 || direction > 7) return i32(258)
+    // Disable before changing OD: clearing OD on an enabled, released I2C
+    // output would otherwise briefly drive the bus high in push-pull mode.
+    if ((direction & 2) == 0) mmioStoreU32(
+        1610629120 + esp32S3GpioBankOffset(number) + 40,
+        1 << (number & 31)
+    )
+    esp32S3GpioUpdate(address, 512, if ((direction & 1) != 0) 512 else 0)
+    esp32S3GpioUpdate(1610629236 + number * 4, 4, if ((direction & 4) != 0) 4 else 0)
+    // S3 gpio_ll_output_enable/disable only touch the enable latch. Preserve
+    // matrix routing and inversion so a probe can restore its captured state.
+    if ((direction & 2) != 0) mmioStoreU32(
+        1610629120 + esp32S3GpioBankOffset(number) + 36,
+        1 << (number & 31)
+    )
+    i32(0)
+}
+
+trusted fun gpio_get_io_config(pin: i32, configuration: i64*): i32 {
+    val number = int(pin)
+    val muxAddress = esp32S3GpioMuxAddress(number)
+    val target = nativePointerAddress(configuration)
+    if (muxAddress == 0 || target == 0) return i32(258)
+    val mux = mmioLoadU32(muxAddress)
+    val route = mmioLoadU32(1610630484 + number * 4)
+    val enabled = mmioLoadU32(if (number < 32) 1610629152 else 1610629164)
+    // All 20 bytes are assigned below, including every boolean field.
+    nativeAddressStoreU32(target, 0, (mux >>> 12) & 7)
+    nativeAddressStoreU32(target, 4, route & 511)
+    nativeAddressStoreU32(target, 8, esp32S3GpioDriveBits(number, (mux >>> 10) & 3))
+    nativeAddressStoreU8(target, 12, (mux >>> 8) & 1)
+    nativeAddressStoreU8(target, 13, (mux >>> 7) & 1)
+    nativeAddressStoreU8(target, 14, (mux >>> 9) & 1)
+    nativeAddressStoreU8(target, 15, (enabled >>> (number & 31)) & 1)
+    nativeAddressStoreU8(target, 16, if ((route & 1024) == 0) 1 else 0)
+    nativeAddressStoreU8(target, 17, (route >>> 11) & 1)
+    nativeAddressStoreU8(target, 18, (mmioLoadU32(1610629236 + number * 4) >>> 2) & 1)
+    nativeAddressStoreU8(target, 19, (mux >>> 1) & 1)
+    i32(0)
+}
+
+// ets_delay_us is a permitted hardware-ROM boundary, not a linked library.
+trusted fun esp_rom_delay_us(microseconds: u32): void {
+    callNativeVoidI32(1073743360, int(microseconds))
+    return
+}

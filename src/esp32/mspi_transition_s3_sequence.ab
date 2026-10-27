@@ -1,0 +1,80 @@
+import "./sdk/raw_buffer.ab"
+
+// Caller-owned 56-byte, 4-byte-aligned INTERNAL RAM record, initially zero.
+// Layout: magic/config u32; clock,DINflash,DINram,dummyflash,dummyram,ROM u64.
+// Exclusive MSPI/cache/other-core/interrupt ownership remains caller's duty.
+// Code, literals, stack and record must remain accessible with caches frozen.
+// Runtime SPI1 command timing is deliberately untouched (IDF sleep policy).
+// Status0 invalid/busy record;1 success;2..5 cache failure (freeze status+1);
+// 6 low-speed setup failed and rolled back;7 restore failed, caches LEFT FROZEN.
+@section(".iram1.abla.s3MspiRestoreFrozen")
+trusted fun esp32S3MspiRestoreFrozenOwned(address: int): bool {
+    val config=esp32S3MspiStateRead(address+4)
+    val withRam=(config & 4) != 0
+    var ok=esp32S3MspiClockRestoreOwned(Esp32S3MspiClockState(esp32S3MspiStateLoad64(address+8)))
+    if (!esp32S3MspiDinRestoreOwned(Esp32S3MspiDin(esp32S3MspiStateLoad64(address+16)),false)) ok=false
+    if (withRam && !esp32S3MspiDinRestoreOwned(Esp32S3MspiDin(esp32S3MspiStateLoad64(address+24)),true)) ok=false
+    val rom=Esp32S3RomDummyChange(esp32S3MspiStateLoad64(address+48))
+    if ((config & 1) == 0 && rom.valid()) {
+        if (!esp32S3QuadFlashDummyRestoreOwned(rom)) ok=false
+    } else if (!esp32S3MspiDummyRestoreOwned(Esp32S3MspiDummy(esp32S3MspiStateLoad64(address+32)))) ok=false
+    if (withRam && !esp32S3MspiDummyRestoreOwned(Esp32S3MspiDummy(esp32S3MspiStateLoad64(address+40)))) ok=false
+    ok
+}
+
+@section(".iram1.abla.s3MspiLowBegin")
+trusted fun esp32S3MspiLowBeginOwned(saved: NativeBuffer,flashOctal: bool,ramKind: int,protocolEncoded: int,romBaseline: int,idlePolls: int): int {
+    if (!saved.hasAddressRange(0,56) || (saved.addressValue() & 3) != 0 ||
+        ramKind < -1 || ramKind > 3 || ramKind == 0 || ramKind == 1 ||
+        protocolEncoded < 0 || protocolEncoded > 63 || romBaseline < 0 || romBaseline > 63 ||
+        protocolEncoded+romBaseline > 63 || (flashOctal && (protocolEncoded != 0 || romBaseline != 0)) ||
+        idlePolls <= 0 || idlePolls > 0x7FFFFFFF) return 0
+    val address=saved.addressValue()
+    if (esp32S3MspiStateRead(address) != 0) return 0
+    val frozen=esp32S3CachesFreezeOwned(idlePolls)
+    if (frozen != 1) return frozen+1
+    val withRam=ramKind != -1
+    esp32S3MspiStateWrite(address+4,(if (flashOctal) 1 else 0) | (if (withRam) 4 | (if (ramKind == 3) 2 else 0) else 0))
+    esp32S3MspiStateStore64(address+8,esp32S3MspiClockCaptureOwned(withRam) | 0)
+    esp32S3MspiStateStore64(address+16,esp32S3MspiDinCaptureOwned(false) | 0)
+    esp32S3MspiStateStore64(address+24,if (withRam) esp32S3MspiDinCaptureOwned(true) | 0 else 0)
+    esp32S3MspiStateStore64(address+32,esp32S3MspiDummyCaptureOwned(if (flashOctal) 1 else 0,0) | 0)
+    esp32S3MspiStateStore64(address+40,if (withRam) esp32S3MspiDummyCaptureOwned(ramKind,0) | 0 else 0)
+    esp32S3MspiStateStore64(address+48,0)
+    // Establish a recoverable record before the first timing mutation.
+    esp32S3MspiStateWrite(address,0x4D535049)
+    var ok=esp32S3MspiClocksOwned(80,20,if (withRam) 20 else 0,false)
+    if (ok) {
+        ok=esp32S3MspiDinSetOwned(false,0,0)
+        if (withRam && !esp32S3MspiDinSetOwned(true,0,0)) ok=false
+        if (flashOctal) {
+            if (!esp32S3MspiDummySetOwned(1,0,0,0)) ok=false
+        } else {
+            val change=esp32S3QuadFlashDummyApplyOwned(0,protocolEncoded,romBaseline,0)
+            esp32S3MspiStateStore64(address+48,change | 0)
+            if (!change.valid()) ok=false
+        }
+        if (withRam && !esp32S3MspiDummySetOwned(ramKind,0,if (ramKind == 2) 5 else 0,0)) ok=false
+    }
+    if (!ok) {
+        if (!esp32S3MspiRestoreFrozenOwned(address)) return 7
+        esp32S3MspiStateWrite(address,0)
+    }
+    esp32S3CachesUnfreezeOwned()
+    if (ok) 1 else 6
+}
+
+// CPU/PLL must be back on a source compatible with saved clocks BEFORE this.
+// Cache-acquisition failure leaves record active for retry. Never discard it.
+@section(".iram1.abla.s3MspiLowEnd")
+trusted fun esp32S3MspiLowEndOwned(saved: NativeBuffer,idlePolls: int): int {
+    if (!saved.hasAddressRange(0,56) || (saved.addressValue() & 3) != 0 || idlePolls <= 0 || idlePolls > 0x7FFFFFFF) return 0
+    val address=saved.addressValue()
+    if (esp32S3MspiStateRead(address) != 0x4D535049) return 0
+    val frozen=esp32S3CachesFreezeOwned(idlePolls)
+    if (frozen != 1) return frozen+1
+    if (!esp32S3MspiRestoreFrozenOwned(address)) return 7
+    esp32S3MspiStateWrite(address,0)
+    esp32S3CachesUnfreezeOwned()
+    1
+}

@@ -1,0 +1,85 @@
+import "./cpu_clock_c5_sequence.ab"
+import "./sdk/raw_buffer.ab"
+import "abla/unsafe/mmio"
+// Clock restoration after retained-CPU sleep: conditional PLL calibration,
+// required reference gates, optional PVT restart, then CPU/AHB publication.
+//64B:tag0,status4,next stage8,immutable packed plan/PVT/peripheralPLL flags12,
+// private PLL32@16,PVT16@48.1restored2invalid3partial4calibrating.
+// Caller supplies pre-sleep plan and whether PVT was in use; remains on XTAL
+// until last stage. Owns PLL, analog masters, reference gates, PVT and CPU;
+// calibrated manual voltage, ROM ticks, retained closure/data/stack required.
+// No automatic rollback: retain record/exclusion and retry after failure.
+// Gates needed by the restored CPU/PVT intentionally remain enabled; caller
+// releases them only after switching away and parking PVT. No MSPI/cache or
+// scheduler restoration here, so success alone is not complete sleep recovery.
+// XTAL/RC_FAST plans avoid PLL unless PVT or a declared peripheral requires it.
+// peripheralPll requests PLL480 calibration even when CPU/PVT do not use PLL;
+// it does NOT enable a CPU160/240 reference gate or any MSPI consumer gate.
+// The owner must keep peripheral consumers quiescent through calibration.
+// RC_FAST
+// power/gate stay enabled after restoration; sleep-profile cleanup must not
+// subsequently disable this live CPU source. ROM ticks initially match XTAL.
+@section(".iram1.abla.c5ResumeRcFast")
+trusted fun c5ClockResumeRcFast(): bool {
+    c5ClockResumeWrite(0x600b00ac,c5ClockResumeRead(0x600b00ac)|0x40000000)
+    if ((c5ClockResumeRead(0x600b00ac)&0x40000000) == 0) return false
+    c5ClockResumeDelay(50)
+    c5ClockResumeWrite(0x600b0420,c5ClockResumeRead(0x600b0420)|0x80000000)
+    if ((c5ClockResumeRead(0x600b0420)&0x80000000) == 0) return false
+    c5ClockResumeDelay(5)
+    true
+}
+@section(".iram1.abla.c5ResumeReadRecord")
+trusted fun c5ResumeReadRecord(base: int,offset: int): int = mmioLoadU32(base+offset)
+@section(".iram1.abla.c5ResumeWriteRecord")
+trusted fun c5ResumeWriteRecord(base: int,offset: int,value: int): void { mmioStoreU32(base+offset,value);return }
+@section(".iram1.abla.c5ClockResume")
+trusted fun esp32C5ClockResumeOwned(record: NativeBuffer,plan: C5CpuClock,usePvt: bool,exclusive: bool,readLimit: int = 64,peripheralPll: bool = false): int {
+    if (!exclusive || !record.hasAddressRange(0,64) || (record.addressValue()&3) != 0 || !c5CpuClockValid(plan) ||
+        readLimit < 1 || readLimit > 1000000) return 2
+    val base=record.addressValue();val policy=(plan|0)|(if (usePvt) 0x2000000 else 0)|(if (peripheralPll) 0x4000000 else 0)
+    // Never overwrite a different live session. Fresh records have tag zero.
+    if (c5ResumeReadRecord(base,0) != 0 && c5ResumeReadRecord(base,0) != 0x43525331) return 2
+    if (c5ResumeReadRecord(base,0) == 0x43525331) {
+        if (c5ResumeReadRecord(base,12) != policy) return 2
+        if (c5ResumeReadRecord(base,4) == 1) return 1
+        if ((c5ResumeReadRecord(base,4) != 3 && c5ResumeReadRecord(base,4) != 4) || c5ResumeReadRecord(base,8) > 3) return 2
+    } else {
+        val current=c5CpuClockRead(0x110)
+        if ((current&0x30000) != 0 || ((current>>24)&127) != ((plan>>18)&127) || (c5CpuClockRead(0x144)&1) != 0) return 2
+        if (usePvt) {
+            val rev=c5ClockResumeRead(0x600b484c)
+            if (((rev>>11)&3)*100+((rev>>8)&7) < 2 || (c5ClockResumeRead(0x600b0028)&0x4000) == 0) return 2
+        }
+        c5ResumeWriteRecord(base,0,0x43525331);c5ResumeWriteRecord(base,4,3);c5ResumeWriteRecord(base,8,0);c5ResumeWriteRecord(base,12,policy)
+        c5ResumeWriteRecord(base,16,0);c5ResumeWriteRecord(base,48,0)
+    }
+    val stage=c5ResumeReadRecord(base,8)
+    c5ResumeWriteRecord(base,4,3)
+    if (stage <= 0) {
+        if ((plan&3) >= 2 || usePvt || peripheralPll) {
+            val result=c5ClockResumePll(nativeBufferAt(base+16,32),readLimit)
+            if (result != 1) {
+                if (result == 4) { c5ResumeWriteRecord(base,4,4);return 4 }
+                return 3
+            }
+        }
+        c5ResumeWriteRecord(base,8,1)
+    }
+    if (stage <= 1) {
+        val gates=(if ((plan&3) == 3) 1 else if ((plan&3) == 2) 2 else 0)|(if (usePvt) 2 else 0)
+        if (gates != 0) {
+            c5CpuClockWrite(0x128,c5CpuClockRead(0x128)|gates)
+            if ((c5CpuClockRead(0x128)&gates) != gates) return 3
+        }
+        c5ResumeWriteRecord(base,8,2)
+    }
+    if (stage <= 2) {
+        if (usePvt && c5ClockResumePvt(nativeBufferAt(base+48,16)) != 1) return 3
+        c5ResumeWriteRecord(base,8,3)
+    }
+    if ((plan&3) == 1 && !c5ClockResumeRcFast()) return 3
+    if (esp32C5CpuClockApplyOwned(plan,true) != 1) return 3
+    c5ResumeWriteRecord(base,4,1)
+    1
+}

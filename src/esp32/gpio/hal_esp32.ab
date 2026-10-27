@@ -1,0 +1,181 @@
+import "abla/unsafe/memory"
+import "../../xtensa/assembly.ab"
+import "../rom/gpio_esp32.ab"
+
+// Typed ESP32 GPIO HAL. The former implementation embedded recovered Xtensa
+// functions as string literals, which made their complete control/data flow
+// opaque to LLVM. These functions preserve the IDF ABI while exposing every
+// ordinary load, branch, mask, and register address to optimization.
+
+val esp32GpioIoMuxBase = u32(0x3ff49000)
+
+@inline
+trusted fun esp32GpioHalDevice(context: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(context))))
+
+// GPIO IOMUX registers are irregularly ordered. Pack the 40 one-byte offsets
+// into five scalar constants instead of retaining an opaque native data table.
+// Constant pin numbers fold to one immediate; dynamic pins remain one indexed
+// selection followed by a shift. This is 16 bytes smaller in the complete
+// firmware than ten native-width groups because the 64-bit helper is already
+// used elsewhere in the monolithic source graph.
+@inline
+fun esp32GpioIoMuxOffset(gpio: u32): u32 {
+    val packed = if (gpio < u32(8)) u64(0x64606c4884408844) else
+        if (gpio < u32(16)) u64(0x3c3038345c585468) else
+        if (gpio < u32(24)) u64(0x8c807c787470504c) else
+        if (gpio < u32(32)) u64(0xffffffff2c2824ff) else
+        u64(0x100c08041814201c)
+    return u32(packed >> (u64(gpio & u32(7)) << u64(3))) & u32(255)
+}
+
+@inline
+fun esp32GpioIoMuxAddress(gpio: u32): u32 =
+    esp32GpioIoMuxBase + esp32GpioIoMuxOffset(gpio)
+
+@inline
+trusted fun esp32GpioUpdateRegister(
+    address: u32,
+    clearMask: u32,
+    setMask: u32
+): void {
+    val value = xtensaDeviceLoadU32(address)
+    xtensaDeviceStoreU32(address, (value & ~clearMask) | setMask)
+}
+
+@inline
+trusted fun esp32GpioClearInterruptStatus(device: u32, gpio: u32): void {
+    val mask = u32(1) << (gpio & u32(31))
+    if (gpio < u32(32)) {
+        xtensaDeviceStoreU32(device + u32(76), mask)
+    } else {
+        // status1_w1tc.intr_st is the low eight-bit field.
+        esp32GpioUpdateRegister(device + u32(88), u32(255), mask & u32(255))
+    }
+}
+
+@inline
+trusted fun esp32GpioConfigureInterrupt(
+    device: u32,
+    gpio: u32,
+    enableMask: u32
+): void {
+    val pinRegister = device + ((gpio + u32(34)) << u32(2))
+    // gpio_pin_reg_t.int_ena occupies bits 13..17.
+    esp32GpioUpdateRegister(pinRegister, u32(0x0003e000), enableMask)
+}
+
+@inline
+trusted fun esp32GpioEnableInput(gpio: u32): void =
+    esp32GpioUpdateRegister(esp32GpioIoMuxAddress(gpio), u32(0), u32(1) << u32(9))
+
+@inline
+trusted fun esp32GpioSelectFunction(gpio: u32, function: u32): void =
+    esp32GpioUpdateRegister(
+        esp32GpioIoMuxAddress(gpio),
+        u32(7) << u32(12),
+        (function & u32(7)) << u32(12)
+    )
+
+trusted fun esp32RomGpioPadSelectGpioValue(gpio: u32): u32 {
+    esp32GpioSelectFunction(gpio, u32(2))
+    u32(0)
+}
+
+// ROM gpio_pad_pullup clears FUN_PD and sets FUN_PU in the selected pad's
+// IO_MUX register. Keep it as an ordinary read-modify-write so constant GPIOs
+// fold to one register address in the monolithic firmware.
+trusted fun esp32RomGpioPadPullupOnlyValue(gpio: u32): u32 {
+    esp32GpioUpdateRegister(
+        esp32GpioIoMuxAddress(gpio),
+        u32(1) << u32(7),
+        u32(1) << u32(8)
+    )
+    u32(0)
+}
+
+// Original ABI symbol: gpio_hal_intr_enable_on_core.
+trusted fun esp32RecoveredGpioHalIntrEnableOnCore(
+    context: u32,
+    gpio: u32,
+    core: u32
+): void {
+    val device = esp32GpioHalDevice(context)
+    esp32GpioClearInterruptStatus(device, gpio)
+    val enableMask = if (core == u32(0)) u32(1) << u32(15) else
+        u32(1) << u32(13)
+    esp32GpioConfigureInterrupt(device, gpio, enableMask)
+}
+
+// Original ABI symbol: gpio_hal_intr_disable.
+trusted fun esp32RecoveredGpioHalIntrDisable(context: u32, gpio: u32): void {
+    val device = esp32GpioHalDevice(context)
+    esp32GpioConfigureInterrupt(device, gpio, u32(0))
+    esp32GpioClearInterruptStatus(device, gpio)
+}
+
+// Original ABI symbol: gpio_hal_iomux_in.
+trusted fun esp32RecoveredGpioHalIomuxIn(
+    context: u32,
+    gpio: u32,
+    function: u32,
+    signal: u32
+): void {
+    val device = esp32GpioHalDevice(context)
+    val inputSelection = device + ((signal + u32(76)) << u32(2))
+    esp32GpioUpdateRegister(inputSelection, u32(1) << u32(7), u32(0))
+    esp32GpioEnableInput(gpio)
+    esp32GpioSelectFunction(gpio, function)
+}
+
+// Original ABI symbol: gpio_hal_iomux_out.
+trusted fun esp32RecoveredGpioHalIomuxOut(
+    context: u32,
+    gpio: u32,
+    function: u32
+): void {
+    esp32GpioSelectFunction(gpio, function)
+}
+
+// Original ABI symbol: gpio_hal_matrix_in.
+trusted fun esp32RecoveredGpioHalMatrixIn(
+    context: u32,
+    gpio: u32,
+    signal: u32,
+    inverted: u32
+): void {
+    if (gpio < u32(40)) esp32GpioEnableInput(gpio)
+    esp32RomGpioConnectInSignal(gpio, signal, inverted & u32(255))
+}
+
+// Original ABI symbol: gpio_hal_matrix_out.
+trusted fun esp32RecoveredGpioHalMatrixOut(
+    context: u32,
+    gpio: u32,
+    signal: u32,
+    outputInverted: u32,
+    outputEnableInverted: u32
+): void {
+    esp32GpioSelectFunction(gpio, u32(2))
+    esp32RomGpioConnectOutSignal(
+        gpio,
+        signal,
+        outputInverted & u32(255),
+        outputEnableInverted & u32(255)
+    )
+}
+
+// Original ABI symbol: gpio_hal_isolate_in_sleep.
+trusted fun esp32RecoveredGpioHalIsolateInSleep(
+    context: u32,
+    gpio: u32
+): void {
+    // SLP_IE, SLP_OE, SLP_PU and SLP_PD are cleared and SLP_SEL is set. One
+    // visible read-modify-write is sufficient; the five recovered operations
+    // touched the same register consecutively with no observable intermediate.
+    if (gpio < u32(40)) esp32GpioUpdateRegister(
+        esp32GpioIoMuxAddress(gpio),
+        u32(29),
+        u32(2)
+    )
+}

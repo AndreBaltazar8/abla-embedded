@@ -1,0 +1,69 @@
+import "./sleep_smp_p4_sequence.ab"
+// Actual IDF P4 CPU2/3 software interrupt sources: HP_SYSTEM+18/+1c,
+// directed to hart0/1 by caller-owned matrix+CLIC+handler setup.
+// Caller owns both IPC channels, retained payload lifetimes, routing and IRQ
+// handler; they must be installed before notification. No ROM/framework IRQ
+// library dependency. Current hart MIEoff, per-hart ownership excludes races.
+// Notify's successful atomic claim is NOT join/backup completion. Claim before
+// issuing source, release fence publishes payload. No readback==1 test: the
+// peer can acknowledge before the sender reads. Never reissue claimed notify.
+// Results1issued/acknowledged/released2invalid3state/stale4MMIO5CAS-pending.
+trusted fun p4SleepPeerMasked(): bool = p4SmpHart() <= u32(1) && (p4SmpStatus()&u32(8)) == u32(0)
+trusted fun esp32p4SleepPeerNotifyOwned(smp: NativeBuffer,generation: int,polls: int,exclusiveRoutes: bool): int {
+    if (!exclusiveRoutes || polls < 1 || polls > 1000000 || !p4SleepPeerMasked()) return 2
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    val hart=int(p4SmpHart())
+    if (state.status() != 1 || state.coordinator() != hart || state.stage() != 1 ||
+        state.phase(1-hart) != 0 || (state.control()&4096) != 0) return 3
+    val address=0x500e5018+(1-hart)*4
+    if ((p4SleepPeerRead(address)&u32(1)) != u32(0)) return 3
+    val claim=esp32p4SleepSmpAdvanceOwned(smp,generation,11,polls,true)
+    if (claim.status() != 1) return if (claim.status() == 3) 5 else 3
+    p4SleepPeerFence()
+    p4SleepPeerWrite(address,u32(1))
+    p4SleepPeerFence()
+    return 1
+}
+// Called on the receiving hart BEFORE join/snapshot, including canceled rounds.
+// Clear the level source BEFORE publishing ack. Cancellation cannot release
+// the generation while an issued notification has not been acknowledged.
+trusted fun esp32p4SleepPeerAcknowledgeOwned(smp: NativeBuffer,generation: int,polls: int,exclusiveHandler: bool): int {
+    if (!exclusiveHandler || polls < 1 || polls > 1000000 || !p4SleepPeerMasked()) return 2
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    val hart=int(p4SmpHart())
+    if (state.status() != 1 || state.coordinator() == hart ||
+        (state.stage() != 1 && state.stage() != 4) || state.phase(hart) != 0 ||
+        (state.control()&4096) == 0) return 3
+    if ((state.control()&8192) != 0) return 1
+    val address=0x500e5018+hart*4
+    p4SleepPeerWrite(address,u32(0))
+    p4SleepPeerFence()
+    if ((p4SleepPeerRead(address)&u32(1)) != u32(0)) return 4
+    val ack=esp32p4SleepSmpAdvanceOwned(smp,generation,12,polls,true)
+    return if (ack.status() == 1) 1 else if (ack.status() == 3) 5 else 3
+}
+// SDK sleep_cpu.c: only resumed core0 ungates core1 then releases its global
+// reset. Does NOT assert reset, cold-boot core1, or claim peer execution done.
+// Even with coordinator1, core0 must do this while stage2 is still outstanding
+// so coordinator1 can wake and report the event. Core0's actual boundary
+// phase3 is mandatory; caller pins ROM route, both retained frames/code/stack,
+// power rails and RCC ownership. Sources/clocks/cache remain separate owners.
+trusted fun esp32p4SleepPeerResumeOwned(core: NativeBuffer,smp: NativeBuffer,generation: int,exclusiveRecovered: bool): int {
+    if (!exclusiveRecovered || !p4SleepPeerMasked() || p4SmpHart() != u32(0) ||
+        !core.hasAddressRange(0,144) || (core.addressValue()&15) != 0) return 2
+    if (core.loadU32(0) != 0x50344358 || core.loadU32(4) != 3 || core.loadU32(8) != 0) return 3
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    if (state.status() != 1 || (state.stage() != 2 && state.stage() != 3) ||
+        state.phase(0) < 2 || state.phase(0) > 4 || state.phase(1) < 2 || state.phase(1) > 4) return 3
+    val clock=p4SleepPeerRead(0x500e6014)
+    if ((clock&u32(16)) == u32(0)) {
+        p4SleepPeerWrite(0x500e6014,clock|u32(16));p4SleepPeerFence()
+        if ((p4SleepPeerRead(0x500e6014)&u32(16)) == u32(0)) return 4
+    }
+    val reset=p4SleepPeerRead(0x500e60c0)
+    if ((reset&u32(256)) != u32(0)) {
+        p4SleepPeerWrite(0x500e60c0,reset&u32(0xfffffeff));p4SleepPeerFence()
+        if ((p4SleepPeerRead(0x500e60c0)&u32(256)) != u32(0)) return 4
+    }
+    return 1
+}

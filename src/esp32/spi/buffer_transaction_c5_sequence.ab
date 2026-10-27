@@ -1,0 +1,45 @@
+import "./transaction_c5_sequence.ab"
+import "../../spi/buffer_result.ab"
+fun c5SpiLargeBufferValid(buffer: NativeBuffer,bytes: int): bool =
+    bytes >= 1 && bytes <= 65535 && buffer.hasAddressRange(0,bytes) &&
+    (buffer.addressValue()+bytes <= 0x60000000 || buffer.addressValue() >= 0x60100000)
+// Bounded1..65535-byte transfer, one gate acquisition and one continuous CS.
+// Chunks use the actual64B CPU FIFO, no DMA/heap/temporary copy. Exact-base
+// in-place works; other TX/RX overlaps could destroy future TX and are refused.
+// Each FIFO operation has its own bounded poll budget. A failure stops further
+// chunks and faults the gate. Completed-byte count remains meaningful on error.
+trusted fun Esp32C5SpiMaster.transferBuffer(gate: PeripheralGate,owner: u32,
+    tx: NativeBuffer,rx: NativeBuffer,bytes: int,polls: int,receive: bool = true): SpiBufferResult {
+    if (!this.ready() || this.pins().pinAt(1) >= 29 || (receive && this.pins().pinAt(2) >= 29) ||
+        !c5SpiGateValid(gate) || !c5SpiLargeBufferValid(tx,bytes) ||
+        (receive && !c5SpiLargeBufferValid(rx,bytes)) || !gate.bufferDisjoint(tx,bytes) ||
+        (receive && !gate.bufferDisjoint(rx,bytes)) || polls < 1 || polls > 1000000) return SpiBufferResult(3<<56)
+    if (receive && tx.addressValue() != rx.addressValue() &&
+        tx.addressValue() < rx.addressValue()+bytes && rx.addressValue() < tx.addressValue()+bytes) return SpiBufferResult(3<<56)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiBufferResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<56)
+    val cs=this.pins().pinAt(3)
+    var report=13
+    var completed=0
+    var healthy=false
+    if (c5SpiMasterDataReady(this,receive)) {
+        if (!c5SpiSelectLevel(cs,false)) report=11
+        else {
+            report=257
+            while (completed < bytes && report == 257) {
+                val remaining=bytes-completed
+                val count=if (remaining > 64) 64 else remaining
+                report=esp32C5SpiTransferOwned(nativeBufferAt(tx.addressValue()+completed,count),
+                    if (receive) nativeBufferAt(rx.addressValue()+completed,count) else NativeBuffer(0),count,polls,receive)
+                if (report == 257) completed=completed+count
+            }
+        }
+        if (esp32C5SpiCpuIdleOwned()) {
+            if (!c5SpiSelectLevel(cs,true)) report=report|(12<<16)|(1<<24)
+            else healthy=report == 257 && completed == bytes
+        } else report=report|(1<<24)
+    }
+    val status=if (!gate.finish(owner,healthy)) 5 else if (healthy) 1 else 6
+    return SpiBufferResult((status<<56)|(completed<<32)|report)
+}
+

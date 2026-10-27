@@ -1,0 +1,70 @@
+import "./peer_handler_s3_sequence.ab"
+import "./interrupt_install_s3_sequence.ab"
+import "./intercore_s3_sequence.ab"
+import "abla/runtime/scalar"
+// Destination-core setup, exclusively owned channel on BOTH cores and an
+// initially disabled/unshared native IRQ line. Existing vectors/dispatcher and
+// scheduler-safe handler context are required. Producers remain stopped until
+// Open returns1. Record64, mailbox and dispatcher storage must be internal.
+// Layout: magic,state,table,mailbox,core,channel,line,route,routeOwned,
+// handlerOwned,reserved8,previous8@48,context8@56.
+// Results1ready,2cleanup-required/pending,3invalid,4closed. Failed opening can
+// own resources: always Close a published record, never blindly reopen it.
+fun s3PeerBindingOverlap(a: int,n: int,b: int,m: int): bool = a < b+m && b < a+n
+fun s3PeerBindingBuffers(r: NativeBuffer,table: NativeBuffer,mailbox: NativeBuffer): bool =
+    r.hasAddressRange(0,64) && table.hasAddressRange(0,512) && mailbox.hasAddressRange(0,4) &&
+    ((r.addressValue()|table.addressValue()|mailbox.addressValue())&3) == 0 &&
+    !s3PeerBindingOverlap(r.addressValue(),64,table.addressValue(),512) &&
+    !s3PeerBindingOverlap(r.addressValue(),64,mailbox.addressValue(),4) &&
+    !s3PeerBindingOverlap(table.addressValue(),512,mailbox.addressValue(),4)
+trusted fun esp32S3PeerBindingOpenOwned(r: NativeBuffer,table: NativeBuffer,mailbox: NativeBuffer,channel: int,line: int,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !s3PeerBindingBuffers(r,table,mailbox) || r.loadU32(0) != 0 ||
+        channel < 0 || channel > 3 || !esp32S3InterruptExternalLevel(line) || !esp32S3InterruptSupportsNativeHandler(line) ||
+        ((esp32S3InterruptInstallEnabled()>>>line)&1) != 0 || (esp32S3IntercoreRead(0x600C0030+channel*4)&1) != 0) return 3
+    val word=xtensaPeerParkCas(mailbox.addressValue(),0,0)
+    if (word != 0 && (word&7) != 4 && (word&7) != 5) return 3
+    var i=4
+    while (i < 64) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x53335042);r.storeU32(4,2);r.storeU32(8,table.addressValue());r.storeU32(12,mailbox.addressValue())
+    r.storeU32(16,esp32S3InterruptInstallCore());r.storeU32(20,channel);r.storeU32(24,line)
+    if (!esp32S3PeerHandlerInstallOwned(table,nativeBufferAt(r.addressValue()+48,8),nativeBufferAt(r.addressValue()+56,8),mailbox,channel,line)) return 2
+    r.storeU32(36,1)
+    val route=esp32S3IntercoreRouteOwned(channel,r.loadU32(16),line)
+    if (!route.valid()) return 2
+    r.storeU32(28,route|0);r.storeU32(32,1)
+    val map=0x600C213C+channel*4
+    if ((esp32S3IntercoreRead(map+r.loadU32(16)*2048)&31) != line ||
+        (esp32S3IntercoreRead(map+(1-r.loadU32(16))*2048)&31) != 16) return 2
+    if (!esp32S3PeerBindingEnable(line,true)) return 2
+    r.storeU32(4,1);return 1
+}
+// Must execute on destination core outside the handler, with producers stopped
+// and no live park request. Pending cancelled notifications are acknowledged
+// only after disabling the line. Unrelated INTENABLE bits stay untouched.
+trusted fun esp32S3PeerBindingCloseOwned(r: NativeBuffer,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x53335042 || r.loadU32(16) != esp32S3InterruptInstallCore()) return 3
+    if (r.loadU32(4) == 3) return 4
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 2) return 3
+    val table=nativeBufferAt(r.loadU32(8),512);val mailbox=nativeBufferAt(r.loadU32(12),4)
+    if (!s3PeerBindingBuffers(r,table,mailbox)) return 3
+    val channel=r.loadU32(20);val line=r.loadU32(24)
+    val word=xtensaPeerParkCas(mailbox.addressValue(),0,0)
+    if (word != 0 && (word&7) != 4 && (word&7) != 5) return 2
+    r.storeU32(4,2)
+    if (!esp32S3PeerBindingEnable(line,false)) return 2
+    esp32S3IntercoreSignalOwned(channel,false)
+    if ((esp32S3IntercoreRead(0x600C0030+channel*4)&1) != 0) return 2
+    if (r.loadU32(36) == 1) {
+        if (!esp32S3PeerHandlerRemoveOwned(table,nativeBufferAt(r.addressValue()+48,8),nativeBufferAt(r.addressValue()+56,8),line)) return 2
+        r.storeU32(36,0)
+    }
+    if (r.loadU32(32) == 1) {
+        val route=Esp32S3IntercoreRoute(r.loadU32(28))
+        if (!esp32S3IntercoreRestoreOwned(route)) return 2
+        val map=0x600C213C+channel*4
+        if ((esp32S3IntercoreRead(map)&31) != ((route|0)&31) || (esp32S3IntercoreRead(map+2048)&31) != (((route|0)>>>5)&31)) return 2
+        r.storeU32(32,0)
+    }
+    r.storeU32(4,3);return 4
+}

@@ -1,0 +1,37 @@
+import "./dsi_fifo_p4_sequence.ab"
+// Result: status low4, enqueued bit4, ST0 bits8..28, ST1 bits32..51.
+// Status1 host complete,2 invalid,3 preflight timeout,4 preexisting error,
+// 5 completion timeout,6 completion error. Never retry enqueued results
+// blindly: even a timeout may have delivered the command to the panel.
+type DsiCommandResult = int
+fun DsiCommandResult.status(): int = this&15
+fun DsiCommandResult.enqueued(): bool = (this&16) != 0
+// Long writes set bit5 after staging any payload, even before header enqueue.
+fun DsiCommandResult.payloadStaged(): bool = (this&32) != 0
+fun DsiCommandResult.returnSizeEnqueued(): bool = (this&64) != 0
+fun DsiCommandResult.hostComplete(): bool = this.status() == 1
+fun DsiCommandResult.errors0(): int = (this>>>8)&2097151
+fun DsiCommandResult.errors1(): int = (this>>>32)&532479
+// Caller owns status observation too; don't race an ISR reading these status
+// registers. Snapshot both banks once, mask defined bits, never write-to-clear
+// a register documented RO. ECC single correction is reported, not discarded.
+trusted fun esp32P4DsiErrorSnapshotOwned(): int {
+    val first=p4DsiRead(188)&u32(2097151)
+    val second=p4DsiRead(192)&u32(532479)
+    (int(first)<<8)|(int(second)<<32)
+}
+// DCS no-parameter/one-parameter writes. Host must already have configured
+// PHY, command mode/LP policy and ACK policy. Completion here is FIFO/host
+// completion plus no observed errors, not proof of visible panel behavior.
+trusted fun esp32P4DsiDcsShortOwned(channel: int,command: int,parameter: int,polls: int): DsiCommandResult {
+    if (channel < 0 || channel > 3 || command < 0 || command > 255 || parameter < -1 || parameter > 255 ||
+        polls < 1 || polls > 1000000) return DsiCommandResult(2)
+    if (!esp32P4DsiWaitIdleOwned(polls)) return DsiCommandResult(3)
+    val before=esp32P4DsiErrorSnapshotOwned()
+    if (before != 0) return DsiCommandResult(before|4)
+    val header=dsiPacketHeader(channel,if (parameter == -1) 5 else 21,command,if (parameter == -1) 0 else parameter)
+    if (esp32P4DsiSubmitHeaderOwned(header,polls) != 1) return DsiCommandResult(3)
+    val complete=esp32P4DsiWaitIdleOwned(polls)
+    val errors=esp32P4DsiErrorSnapshotOwned()
+    DsiCommandResult(errors|16|(if (!complete) 5 else if (errors != 0) 6 else 1))
+}

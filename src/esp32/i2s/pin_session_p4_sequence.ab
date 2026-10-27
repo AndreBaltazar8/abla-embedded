@@ -1,0 +1,73 @@
+import "./pins_p4_sequence.ab"
+import "../gpio/snapshot_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Caller-owned aligned64B record: magic/state/count/error, four 64-bit pad
+// snapshots, four input-route snapshots. No heap. All former/current users,
+// both I2S directions and DMA must be stopped before capture or close. Keep
+// clocks pinned, holds released, and exclusive pad/global-input ownership.
+// 0invalid,1ready/captured,2closed,3partial: retain record/ownership and retry.
+trusted fun esp32p4I2sPinSessionValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,64) && (r.addressValue()&3) == 0 &&
+    r.loadU32(0) == 0x49325034 && (r.loadU32(8) == 3 || r.loadU32(8) == 4)
+trusted fun p4I2sSavedPad(r: NativeBuffer,index: int): P4GpioSnapshot =
+    P4GpioSnapshot(r.loadU32(16+index*8)|(r.loadU32(20+index*8) << 32))
+trusted fun esp32p4I2sPinsCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !esp32p4I2sPinSessionValid(r)) return 0
+    if (r.loadU32(4) == 2) return 2
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 0
+    val count=r.loadU32(8)
+    var index=0
+    while (index < count) {
+        val saved=p4I2sSavedPad(r,index)
+        val route=r.loadU32(48+index*4)
+        if (!saved.valid() || (route != 0 &&
+            ((route&0xffff0000) != 0x10000 || ((route >>> 8)&255) < 25 || ((route >>> 8)&255) > 42))) return 0
+        index=index+1
+    }
+    r.storeU32(4,3)
+    // Restore input consumers before pad output/mux restoration. Every user
+    // stays stopped until ALL fields restore; partial close is not release.
+    index=0
+    while (index < count) {
+        val route=r.loadU32(48+index*4)
+        if (route != 0 && !p4I2sPinField(344+((route >>> 8)&255)*4,u32(255),u32(route&255))) {
+            r.storeU32(12,16+index);return 3
+        }
+        index=index+1
+    }
+    index=0
+    while (index < count) {
+        if (p4I2sSavedPad(r,index).restoreOwned(true) != 1) { r.storeU32(12,32+index);return 3 }
+        index=index+1
+    }
+    r.storeU32(12,0);r.storeU32(4,2);return 2
+}
+trusted fun esp32p4I2sPinsCaptureOwned(r: NativeBuffer,port: int,transmit: bool,mclk: int,
+    bclk: int,ws: int,data: int,flags: int,layout: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 ||
+        (layout != 1 && layout != 3) || !esp32p4I2sPinsValid(port,mclk,bclk,ws,data,flags)) return 0
+    if (r.loadU32(0) != 0 && (!esp32p4I2sPinSessionValid(r) || r.loadU32(4) != 2)) return 0
+    val count=if (mclk == -1) 3 else 4
+    var index=0
+    while (index < count) {
+        val pin=if (index == 0) data else if (index == 1) ws else if (index == 2) bclk else mclk
+        val saved=esp32p4GpioSnapshotOwned(pin,layout,true)
+        if (!saved.valid()) return 0
+        r.storeU32(16+index*8,(saved|0)&0xffffffff)
+        r.storeU32(20+index*8,(saved|0) >>> 32)
+        val input=if (index == 0) !transmit else if (index == 3) (flags&2) != 0 else (flags&1) != 0
+        val signal=esp32p4I2sPinSignal(port,transmit,index)
+        r.storeU32(48+index*4,if (input) 0x10000|(signal << 8)|int(p4I2sPinRead(344+signal*4)&u32(255)) else 0)
+        index=index+1
+    }
+    if (count == 3) { r.storeU32(40,0);r.storeU32(44,0);r.storeU32(60,0) }
+    r.storeU32(0,0x49325034);r.storeU32(4,3);r.storeU32(8,count);r.storeU32(12,0)
+    return 1
+}
+trusted fun esp32p4I2sPinsOpenOwned(r: NativeBuffer,port: int,transmit: bool,mclk: int,
+    bclk: int,ws: int,data: int,flags: int,layout: int,exclusive: bool): int {
+    if (esp32p4I2sPinsCaptureOwned(r,port,transmit,mclk,bclk,ws,data,flags,layout,exclusive) != 1) return 0
+    val routed=esp32p4I2sRoutePinsOwned(port,transmit,mclk,bclk,ws,data,flags,true)
+    if (routed != 1) { r.storeU32(12,routed);return 3 }
+    r.storeU32(4,1);return 1
+}

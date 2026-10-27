@@ -1,0 +1,70 @@
+import "./sleep_record_c5.ab"
+import "./sleep_power_c5_sequence.ab"
+import "./sleep_digital_c5_sequence.ab"
+import "./sleep_analog_apply_c5_sequence.ab"
+import "./sleep_timing_apply_c5_sequence.ab"
+import "./sleep_calibration_c5_sequence.ab"
+//304B owned configuration: header16, power48@16,digital32@64,
+// analog48@96,timing48@144,analog plan56@192,timing plan56@248.
+// header tag0,status4,cleanup stage8,failed child status12.
+//1configured2invalid3partial4closed. Exclude ALL PMU/sleep entry writers;
+// retain record and ownership until close succeeds. Does NOT enter sleep,
+// prepare retention, stop CPUs, or certify wake/domain/clock dependencies.
+@section(".iram1.abla.c5SleepConfigChild")
+trusted fun c5SleepConfigChild(record: NativeBuffer,stage: int): NativeBuffer =
+    nativeBufferAt(record.addressValue()+(if (stage == 1) 16 else if (stage == 2) 64 else if (stage == 3) 96 else 144),if (stage == 2) 32 else 48)
+@section(".iram1.abla.esp32C5SleepConfigStatus")
+trusted fun esp32C5SleepConfigStatus(record: NativeBuffer): int =
+    if (!record.hasAddressRange(0,304) || c5SleepRecordRead(record,0) != 0x43434631) 2 else c5SleepRecordRead(record,4)
+trusted fun esp32C5SleepConfigApplyOwned(record: NativeBuffer,policy: C5SleepPower,clocks: u32,
+    deep: bool,xtalFast: bool,lpFast: bool,calibration: C5SleepCalibration,
+    slowPeriod: int,fastPeriod: int,inrush: bool,exclusive: bool,
+    modemCycles: int = -1,pvtBias: int = -1,minimumPeriod: int = 0): int {
+    if (!exclusive || !record.hasAddressRange(0,304) || (record.addressValue()&3) != 0 ||
+        !policy.valid() || !calibration.valid() || modemCycles < -1 || modemCycles > 1048575 || pvtBias < -1 || pvtBias > 31) return 2
+    if (c5SleepRecordRead(record,0) == 0x43434631 && c5SleepRecordRead(record,4) != 4) return 2
+    val analogPlan=nativeBufferAt(record.addressValue()+192,56)
+    val timingPlan=nativeBufferAt(record.addressValue()+248,56)
+    val xtalDown=(policy&32) != 0
+    if (!esp32C5SleepTimingCalibrated(timingPlan,slowPeriod,fastPeriod,deep,!xtalDown || xtalFast,minimumPeriod)) return 2
+    if (!calibration.analog(analogPlan,deep,xtalDown,(policy&512) != 0,xtalFast,lpFast)) return 2
+    // Plans admitted before hardware access; inactive child records are private.
+    var stage=1;while (stage <= 4) { c5SleepConfigChild(record,stage).storeU32(0,0);stage=stage+1 }
+    c5SleepRecordWrite(record,0,0x43434631);c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,12,0)
+    stage=1
+    while (stage <= 4) {
+        c5SleepRecordWrite(record,8,stage)
+        val child=c5SleepConfigChild(record,stage)
+        val result=if (stage == 1) esp32C5SleepPowerApplyOwned(child,policy,true,xtalFast) else
+            if (stage == 2) esp32C5SleepDigitalApplyOwned(child,if (deep) u32(0) else clocks,deep,(policy&16) != 0,true) else
+            if (stage == 3) esp32C5SleepAnalogApplyOwned(child,analogPlan,true,pvtBias) else
+                esp32C5SleepTimingApplyOwned(child,timingPlan,inrush,true,modemCycles)
+        if (result != 1) { c5SleepRecordWrite(record,12,result);return 3 }
+        stage=stage+1
+    }
+    c5SleepRecordWrite(record,4,1)
+    1
+}
+// Restore this profile BEFORE final CPU-source restoration: the power child
+// owns PMU HP_SLEEP_LP_CK_POWER (+0xac), whose FOSC bit is also used by the
+// RC_FAST source manager. Closing after switching CPU to RC_FAST can overwrite
+// its newly enabled source. This general configuration API does not establish
+// retained closure placement or clock-transition safety for its caller.
+@section(".iram1.abla.esp32C5SleepConfigCloseOwned")
+trusted fun esp32C5SleepConfigCloseOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive) return 2
+    val status=esp32C5SleepConfigStatus(record)
+    if (status == 2 || status == 4) return status
+    var stage=c5SleepRecordRead(record,8)
+    if (stage > 4) return 2
+    while (stage > 0) {
+        val child=c5SleepConfigChild(record,stage)
+        val result=if (stage == 4) esp32C5SleepTimingCloseOwned(child,true) else
+            if (stage == 3) esp32C5SleepAnalogCloseOwned(child,true) else
+            if (stage == 2) esp32C5SleepDigitalCloseOwned(child,true) else esp32C5SleepPowerCloseOwned(child,true)
+        if (result != 4) { c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,12,result);return 3 }
+        stage=stage-1;c5SleepRecordWrite(record,8,stage)
+    }
+    c5SleepRecordWrite(record,4,4)
+    4
+}

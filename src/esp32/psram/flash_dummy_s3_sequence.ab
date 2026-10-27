@@ -1,0 +1,66 @@
+import "./cs_s3_sequence.ab"
+// Flash-specific extra dummy handling from IDF6 s_set_flash_extra_dummy.
+// Caller selects the actual flash protocol and supplies its verified encoded
+// base (cycles-1; includes any vendor HPM policy). Standard bases: QIO5,
+// QOUT/DOUT/FAST7,DIO3,SLOW0. Do not infer a vendor's HPM base from these.
+// Quad original additions MUST be captured before any tuning and reused, not
+// read back after adding a previous calibration value.
+fun s3FlashLegacyPointerValid(p: int): bool = p >= 0x3fc88000 && p <= 0x3fd00000-28 && (p&3) == 0
+@section(".iram1.abla.s3FlashDummyBaseline")
+trusted fun s3FlashDummyBaselineOwned(exclusiveInternal: bool): int {
+    if (!exclusiveInternal) return -1
+    val p=s3FlashLegacyPointer()
+    if (!s3FlashLegacyPointerValid(p)) return -1
+    return s3FlashDummyByteRead(p+24)|(s3FlashDummyByteRead(p+25)<<8)
+}
+// Applies both ports under cache/MSPI/peer/IRQ/DMA exclusion, internal-only
+// continuation. Octal uses dedicated calibration fields, leaving ROM bytes
+// alone. Quad clears stale OPI calibration, then writes original+extra ROM
+// bytes and USER/USER1. OPI PSRAM commands may have left calibration enabled
+// even when the flash chip is quad; low-speed entry must not inherit it.
+// Preserves
+// other fields. 1done,2invalid/proof,3busy,4partial write/readback failure.
+@section(".iram1.abla.s3FlashDummy")
+trusted fun s3FlashDummyOwned(octal: bool,base: int,original0: int,original1: int,extra: int,exclusiveInternal: bool): int {
+    return s3FlashDummyPortsOwned(-1,octal,base,original0,original1,extra,exclusiveInternal)
+}
+// ports=-1 both;0 SPI0 only;1 SPI1 only. Candidate PSRAM tuning must only
+// change SPI1 flash-dummy fields, NOT SPI0's independently tuned flash path.
+@section(".iram1.abla.s3FlashDummyPorts")
+trusted fun s3FlashDummyPortsOwned(ports: int,octal: bool,base: int,original0: int,original1: int,extra: int,exclusiveInternal: bool): int {
+    if (ports < -1 || ports > 1) return 2
+    if (!exclusiveInternal || extra < 0 || extra > 7 || base < 0 || base > 63 ||
+        original0 < 0 || original0 > 255 || original1 < 0 || original1 > 255 ||
+        (!octal && (base+original0+extra > 63 || base+original1+extra > 63))) return 2
+    var legacy=0
+    if (!octal) { legacy=s3FlashLegacyPointer();if (!s3FlashLegacyPointerValid(legacy)) return 2 }
+    if ((s3PsramCsRead(0x60002000)&0xfffe0000) != 0 || (s3PsramCsRead(0x60003000)&0xfffe0000) != 0) return 3
+    var port=if (ports == -1) 0 else ports
+    val limit=if (ports == -1) 2 else ports+1
+    while (port < limit) {
+        val registers=0x60003000-port*4096
+        if (octal) {
+            var value=(s3PsramCsRead(registers+168)&0xfffffffd)|(if (extra == 0) 0 else 2)
+            s3PsramCsWrite(registers+168,value)
+            if (s3PsramCsRead(registers+168) != value) return 4
+            value=(s3PsramCsRead(registers+168)&0xffffffe3)|(extra<<2)
+            s3PsramCsWrite(registers+168,value)
+            if (s3PsramCsRead(registers+168) != value) return 4
+        } else {
+            val calibration=s3PsramCsRead(registers+168)&0xffffffe1
+            s3PsramCsWrite(registers+168,calibration)
+            if (s3PsramCsRead(registers+168) != calibration) return 4
+            val addition=(if (port == 0) original0 else original1)+extra
+            s3FlashDummyByteWrite(legacy+24+port,addition)
+            if (s3FlashDummyByteRead(legacy+24+port) != addition) return 4
+            val user=s3PsramCsRead(registers+24)|0x20000000
+            s3PsramCsWrite(registers+24,user)
+            if (s3PsramCsRead(registers+24) != user) return 4
+            val user1=(s3PsramCsRead(registers+28)&0xffffffc0)|(base+addition)
+            s3PsramCsWrite(registers+28,user1)
+            if (s3PsramCsRead(registers+28) != user1) return 4
+        }
+        port=port+1
+    }
+    return 1
+}

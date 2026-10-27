@@ -1,0 +1,387 @@
+import "../runtime/libc_heap_esp32.ab"
+import "../freertos/port_esp32.ab"
+import "../gpio/driver_esp32.ab"
+import "tree_hal_esp32.ab"
+import "abla/unsafe/memory"
+
+// ESP32 clock-output ownership and GPIO mapping, implemented as ordinary
+// Abla. The classic ESP32 exposes CLK_OUT1/2/3 through the IO mux on GPIO
+// 0/3/1 respectively. Keeping the state in this module lets LLVM see and
+// prune the complete implementation with its callers.
+
+val esp32ClockOutputOk = u32(0)
+val esp32ClockOutputNoMemory = u32(257)
+val esp32ClockOutputInvalidArgument = u32(258)
+val esp32ClockOutputInvalidState = u32(259)
+val esp32ClockOutputUnlocked = u32(0xb33fffff)
+val esp32ClockOutputNoClock = u32(255)
+
+val esp32ClockOutputChannelSize = u32(32)
+val esp32ClockOutputChannelMappedOffset = u32(0)
+val esp32ClockOutputChannelClockOffset = u32(4)
+val esp32ClockOutputChannelIdOffset = u32(8)
+val esp32ClockOutputChannelReferencesOffset = u32(12)
+val esp32ClockOutputChannelPinsOffset = u32(16)
+val esp32ClockOutputChannelLockOffset = u32(24)
+val esp32ClockOutputMappingSize = u32(24)
+val esp32ClockOutputMappingPinOffset = u32(0)
+val esp32ClockOutputMappingChannelOffset = u32(4)
+val esp32ClockOutputMappingReferencesOffset = u32(8)
+val esp32ClockOutputMappingLockOffset = u32(12)
+val esp32ClockOutputMappingNextOffset = u32(20)
+
+val esp32ClockOutputChannelsStorage = nativeStaticMutableU32s([
+    0, 0, 0, 0, 0, 0, 0xb33fffff, 0,
+    0, 0, 0, 0, 0, 0, 0xb33fffff, 0,
+    0, 0, 0, 0, 0, 0, 0xb33fffff, 0
+])
+val esp32ClockOutputChannels = u32(esp32ClockOutputChannelsStorage)
+val esp32ClockOutputMappingsStorage = nativeStaticAllocate(4)
+val esp32ClockOutputMappings = u32(esp32ClockOutputMappingsStorage)
+val esp32ClockOutputChannelListLockStorage = nativeStaticMutableU32s([
+    0xb33fffff, 0
+])
+val esp32ClockOutputChannelListLock =
+    u32(esp32ClockOutputChannelListLockStorage)
+val esp32ClockOutputHardwareLockStorage = nativeStaticMutableU32s([
+    0xb33fffff, 0
+])
+val esp32ClockOutputHardwareLock = u32(esp32ClockOutputHardwareLockStorage)
+
+@inline
+trusted fun esp32ClockOutputLoadU32(address: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32ClockOutputStoreU32(address: u32, value: u32): void {
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+@inline
+trusted fun esp32ClockOutputLoadU8(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32ClockOutputStoreU8(address: u32, value: u32): void {
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+@inline
+trusted fun esp32ClockOutputLock(lock: u32): void {
+    esp32RecoveredXPortEnterCriticalTimeout(lock, u32(0xffffffff))
+    return
+}
+
+@inline
+trusted fun esp32ClockOutputUnlock(lock: u32): void {
+    esp32RecoveredVPortExitCriticalValue(lock)
+    return
+}
+
+@inline
+fun esp32ClockOutputChannelForPin(gpio: u32): i32 {
+    if (gpio == u32(0)) return i32(0)
+    if (gpio == u32(3)) return i32(1)
+    if (gpio == u32(1)) return i32(2)
+    return i32(-1)
+}
+
+@inline
+fun esp32ClockOutputChannelAddress(channel: u32): u32 =
+    esp32ClockOutputChannels + channel * esp32ClockOutputChannelSize
+
+trusted fun esp32ClockOutputSetupHardware(clock: u32, channel: u32): void {
+    esp32ClockOutputLock(esp32ClockOutputHardwareLock)
+    esp32ClockHalBindOutput(clock, channel)
+    esp32ClockOutputUnlock(esp32ClockOutputHardwareLock)
+    return
+}
+
+trusted fun esp32ClockOutputTeardownHardware(channel: u32): void {
+    esp32ClockOutputLock(esp32ClockOutputHardwareLock)
+    esp32ClockHalBindOutput(u32(0), channel)
+    esp32ClockOutputUnlock(esp32ClockOutputHardwareLock)
+    return
+}
+
+trusted fun esp32ClockOutputAllocateChannel(clock: u32, gpio: u32): u32 {
+    val channelNumber = esp32ClockOutputChannelForPin(gpio)
+    if (channelNumber < i32(0)) return u32(0)
+    val channel = esp32ClockOutputChannelAddress(u32(channelNumber))
+    val lock = channel + esp32ClockOutputChannelLockOffset
+    val pinBit = u32(1) << gpio
+    var allocated = false
+
+    esp32ClockOutputLock(lock)
+    if (esp32ClockOutputLoadU8(
+        channel + esp32ClockOutputChannelMappedOffset
+    ) == u32(0)) {
+        esp32ClockOutputStoreU8(
+            channel + esp32ClockOutputChannelMappedOffset, u32(1)
+        )
+        allocated = true
+    } else if (
+        (esp32ClockOutputLoadU32(
+            channel + esp32ClockOutputChannelPinsOffset
+        ) & pinBit) != u32(0) &&
+        esp32ClockOutputLoadU32(
+            channel + esp32ClockOutputChannelClockOffset
+        ) == clock
+    ) allocated = true
+    if (allocated) esp32ClockOutputStoreU32(
+        channel + esp32ClockOutputChannelIdOffset, u32(channelNumber)
+    )
+    esp32ClockOutputUnlock(lock)
+    if (!allocated) return u32(0)
+
+    esp32ClockOutputLock(lock)
+    esp32ClockOutputStoreU32(
+        channel + esp32ClockOutputChannelPinsOffset,
+        esp32ClockOutputLoadU32(
+            channel + esp32ClockOutputChannelPinsOffset
+        ) | pinBit
+    )
+    esp32ClockOutputStoreU32(
+        channel + esp32ClockOutputChannelClockOffset, clock
+    )
+    val references = esp32ClockOutputLoadU8(
+        channel + esp32ClockOutputChannelReferencesOffset
+    ) + u32(1)
+    esp32ClockOutputStoreU8(
+        channel + esp32ClockOutputChannelReferencesOffset, references
+    )
+    if (references == u32(1))
+        esp32ClockOutputSetupHardware(clock, u32(channelNumber))
+    esp32ClockOutputUnlock(lock)
+    return channel
+}
+
+trusted fun esp32ClockOutputFindMapping(channel: u32, gpio: u32): u32 {
+    var mapping = esp32ClockOutputLoadU32(esp32ClockOutputMappings)
+    while (mapping != u32(0)) {
+        if (
+            esp32ClockOutputLoadU32(
+                mapping + esp32ClockOutputMappingChannelOffset
+            ) == channel &&
+            esp32ClockOutputLoadU32(
+                mapping + esp32ClockOutputMappingPinOffset
+            ) == gpio
+        ) return mapping
+        mapping = esp32ClockOutputLoadU32(
+            mapping + esp32ClockOutputMappingNextOffset
+        )
+    }
+    return u32(0)
+}
+
+trusted fun esp32ClockOutputAllocateMapping(channel: u32, gpio: u32): u32 {
+    esp32ClockOutputLock(esp32ClockOutputChannelListLock)
+    var mapping = esp32ClockOutputFindMapping(channel, gpio)
+    esp32ClockOutputUnlock(esp32ClockOutputChannelListLock)
+
+    if (mapping == u32(0)) {
+        mapping = esp32LibcMalloc(esp32ClockOutputMappingSize)
+        if (mapping == u32(0)) return u32(0)
+        esp32ClockOutputStoreU32(
+            mapping + esp32ClockOutputMappingPinOffset, gpio
+        )
+        esp32ClockOutputStoreU32(
+            mapping + esp32ClockOutputMappingChannelOffset, channel
+        )
+        esp32ClockOutputStoreU8(
+            mapping + esp32ClockOutputMappingReferencesOffset, u32(0)
+        )
+        esp32ClockOutputStoreU32(
+            mapping + esp32ClockOutputMappingLockOffset,
+            esp32ClockOutputUnlocked
+        )
+        esp32ClockOutputStoreU32(
+            mapping + esp32ClockOutputMappingLockOffset + u32(4), u32(0)
+        )
+        esp32ClockOutputLock(esp32ClockOutputChannelListLock)
+        esp32ClockOutputStoreU32(
+            mapping + esp32ClockOutputMappingNextOffset,
+            esp32ClockOutputLoadU32(esp32ClockOutputMappings)
+        )
+        esp32ClockOutputStoreU32(esp32ClockOutputMappings, mapping)
+        esp32ClockOutputUnlock(esp32ClockOutputChannelListLock)
+    }
+
+    val lock = mapping + esp32ClockOutputMappingLockOffset
+    esp32ClockOutputLock(lock)
+    val references = esp32ClockOutputLoadU8(
+        mapping + esp32ClockOutputMappingReferencesOffset
+    ) + u32(1)
+    esp32ClockOutputStoreU8(
+        mapping + esp32ClockOutputMappingReferencesOffset, references
+    )
+    if (references == u32(1)) esp32RecoveredGpioIomuxOutput(
+        gpio, u32(1), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32ClockOutputUnlock(lock)
+    return mapping
+}
+
+trusted fun esp32ClockOutputFreeChannel(channel: u32): void {
+    val lock = channel + esp32ClockOutputChannelLockOffset
+    esp32ClockOutputLock(lock)
+    val references = esp32ClockOutputLoadU8(
+        channel + esp32ClockOutputChannelReferencesOffset
+    ) - u32(1)
+    esp32ClockOutputStoreU8(
+        channel + esp32ClockOutputChannelReferencesOffset, references
+    )
+    if (references == u32(0)) {
+        esp32ClockOutputTeardownHardware(esp32ClockOutputLoadU32(
+            channel + esp32ClockOutputChannelIdOffset
+        ))
+        esp32ClockOutputStoreU32(
+            channel + esp32ClockOutputChannelClockOffset,
+            esp32ClockOutputNoClock
+        )
+        esp32ClockOutputStoreU8(
+            channel + esp32ClockOutputChannelMappedOffset, u32(0)
+        )
+    }
+    esp32ClockOutputUnlock(lock)
+    return
+}
+
+trusted fun esp32ClockOutputRemoveMappingFromList(mapping: u32): void {
+    val first = esp32ClockOutputLoadU32(esp32ClockOutputMappings)
+    if (first == mapping) {
+        esp32ClockOutputStoreU32(
+            esp32ClockOutputMappings,
+            esp32ClockOutputLoadU32(
+                mapping + esp32ClockOutputMappingNextOffset
+            )
+        )
+        return
+    }
+    var previous = first
+    while (previous != u32(0)) {
+        val next = esp32ClockOutputLoadU32(
+            previous + esp32ClockOutputMappingNextOffset
+        )
+        if (next == mapping) {
+            esp32ClockOutputStoreU32(
+                previous + esp32ClockOutputMappingNextOffset,
+                esp32ClockOutputLoadU32(
+                    mapping + esp32ClockOutputMappingNextOffset
+                )
+            )
+            return
+        }
+        previous = next
+    }
+    return
+}
+
+trusted fun esp32ClockOutputFreeMapping(mapping: u32): void {
+    val lock = mapping + esp32ClockOutputMappingLockOffset
+    esp32ClockOutputLock(lock)
+    val channel = esp32ClockOutputLoadU32(
+        mapping + esp32ClockOutputMappingChannelOffset
+    )
+    val gpio = esp32ClockOutputLoadU32(
+        mapping + esp32ClockOutputMappingPinOffset
+    )
+    esp32ClockOutputFreeChannel(channel)
+    val references = esp32ClockOutputLoadU8(
+        mapping + esp32ClockOutputMappingReferencesOffset
+    ) - u32(1)
+    esp32ClockOutputStoreU8(
+        mapping + esp32ClockOutputMappingReferencesOffset, references
+    )
+    val shouldFree = references == u32(0)
+    if (shouldFree) {
+        esp32GpioOutput(gpio, false)
+        val channelLock = channel + esp32ClockOutputChannelLockOffset
+        esp32ClockOutputLock(channelLock)
+        esp32ClockOutputStoreU32(
+            channel + esp32ClockOutputChannelPinsOffset,
+            esp32ClockOutputLoadU32(
+                channel + esp32ClockOutputChannelPinsOffset
+            ) & ~(u32(1) << gpio)
+        )
+        esp32ClockOutputUnlock(channelLock)
+        esp32ClockOutputLock(esp32ClockOutputChannelListLock)
+        esp32ClockOutputRemoveMappingFromList(mapping)
+        esp32ClockOutputUnlock(esp32ClockOutputChannelListLock)
+    }
+    esp32ClockOutputUnlock(lock)
+    if (shouldFree) esp32LibcFree(mapping)
+    return
+}
+
+trusted fun esp32ClockOutputStart(clock: u32, gpio: u32, output: u32): u32 {
+    if (output == u32(0)) return esp32ClockOutputInvalidArgument
+    if (esp32ClockOutputChannelForPin(gpio) < i32(0))
+        return esp32ClockOutputInvalidArgument
+
+    var mapping = esp32ClockOutputLoadU32(esp32ClockOutputMappings)
+    while (mapping != u32(0)) {
+        if (esp32ClockOutputLoadU32(
+            mapping + esp32ClockOutputMappingPinOffset
+        ) == gpio) {
+            val mappedChannel = esp32ClockOutputLoadU32(
+                mapping + esp32ClockOutputMappingChannelOffset
+            )
+            if (esp32ClockOutputLoadU32(
+                mappedChannel + esp32ClockOutputChannelClockOffset
+            ) != clock) return esp32ClockOutputInvalidArgument
+        }
+        mapping = esp32ClockOutputLoadU32(
+            mapping + esp32ClockOutputMappingNextOffset
+        )
+    }
+
+    val channel = esp32ClockOutputAllocateChannel(clock, gpio)
+    if (channel == u32(0)) return esp32ClockOutputInvalidArgument
+    val allocatedMapping = esp32ClockOutputAllocateMapping(channel, gpio)
+    if (allocatedMapping == u32(0)) {
+        esp32ClockOutputFreeChannel(channel)
+        return esp32ClockOutputNoMemory
+    }
+    esp32ClockOutputStoreU32(output, allocatedMapping)
+    return esp32ClockOutputOk
+}
+
+trusted fun esp32ClockOutputStop(mapping: u32): u32 {
+    if (mapping == u32(0)) return esp32ClockOutputInvalidArgument
+    if (esp32ClockOutputLoadU8(
+        mapping + esp32ClockOutputMappingReferencesOffset
+    ) == u32(0)) return esp32ClockOutputInvalidState
+    esp32ClockOutputFreeMapping(mapping)
+    return esp32ClockOutputOk
+}
+
+// Due to the classic ESP32 PIN_CTRL selector bug, zero must be written rather
+// than leaving the reset value 0xf in each output-channel field.
+trusted fun esp32ClockOutputInitializePinControl(): u32 {
+    esp32ClockHalBindOutput(u32(0), u32(0))
+    esp32ClockHalBindOutput(u32(0), u32(1))
+    esp32ClockHalBindOutput(u32(0), u32(2))
+    return u32(0)
+}
+
+val esp32ClockOutputPinControlInitialized =
+    esp32ClockOutputInitializePinControl()
+
+// Temporary compatibility roots for recovered I2S callers. They are ordinary
+// Abla and can be inlined away; no assembly or opaque object remains here.
+trusted fun esp32RecoveredEspClockOutputStart(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockOutputStart(a2, a3, a4)
+
+trusted fun esp32RecoveredEspClockOutputStop(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockOutputStop(a2)

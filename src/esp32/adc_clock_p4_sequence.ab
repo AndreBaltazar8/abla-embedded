@@ -1,0 +1,61 @@
+// ESP-IDF6.0.2 esp32p4 adc_ll.h and hw_ver1/hw_ver3 register definitions.
+// One exclusive lease covers BOTH ADCs and shared HP/LP clock registers.
+// Caller serializes RCC RMW across cores, stops all ADC/DMA/LP/PWDET users,
+// pins the selected source and excludes reset/sleep for the entire lifetime.
+// This is not a reference counter; do not nest leases or copy live tokens.
+// No reset is pulsed and no oscillator/PLL is started here.
+type P4AdcClock=int
+fun P4AdcClock.status(): int = this&255
+fun P4AdcClock.hasSnapshot(): bool = (this&(1<<39)) != 0
+// 1ready2invalid/unowned3reset asserted4partial/readback5closed.
+// Snapshot31bits at8; ownership39. Failures retain the original snapshot.
+trusted fun p4AdcField(address: int,mask: u32,value: u32): bool {
+    val before=p4AdcRead(address)
+    val desired=(before^(before&mask))|(value&mask)
+    if (desired != before) p4AdcWrite(address,desired)
+    return (p4AdcRead(address)&mask) == (value&mask)
+}
+// Source0 XTAL,1 RC_FAST,2 PLL_F80M; source must already be stable/pinned.
+// Divider = integer+1+numerator/denominator. Hardware fraction fields are
+// eight bits on P4 (the generic LL comment describing six bits is stale).
+trusted fun esp32p4AdcClockOpenOwned(source: int,integer: int,numerator: int,denominator: int,exclusive: bool): P4AdcClock {
+    if (!exclusive || source < 0 || source > 2 || integer < 0 || integer > 255 ||
+        denominator < 1 || denominator > 255 || numerator < 0 || numerator >= denominator) return P4AdcClock(2)
+    if ((p4AdcRead(0x500e60c8)&u32(1024)) != u32(0)) return P4AdcClock(3)
+    val apb=(p4AdcRead(0x500e601c)>>u32(5))&u32(1)
+    val divider=p4AdcRead(0x500e60a0)&u32(0x1ffffff)
+    val src=p4AdcRead(0x500e609c)>>u32(30)
+    val force=(p4AdcRead(0x500e60b4)>>u32(15))&u32(3)
+    val lp=(p4AdcRead(0x50120000)>>u32(23))&u32(1)
+    val saved=int(apb)|(int(divider)<<1)|(int(src)<<26)|(int(force)<<28)|(int(lp)<<30)
+    val token=(saved<<8)|(1<<39)
+    if (!p4AdcField(0x500e601c,u32(32),u32(32)) ||
+        !p4AdcField(0x500e60a0,u32(1),u32(0)) ||
+        !p4AdcField(0x500e60a0,u32(0x1fffffe),u32((integer<<1)|(numerator<<9)|(denominator<<17))) ||
+        !p4AdcField(0x500e609c,u32(0xc0000000),u32(source)<<u32(30)) ||
+        !p4AdcField(0x500e60b4,u32(0x18000),u32(0x18000)) ||
+        !p4AdcField(0x500e60a0,u32(1),u32(1)) ||
+        !p4AdcField(0x50120000,u32(0x800000),u32(0x800000))) return P4AdcClock(token|4)
+    return P4AdcClock(token|1)
+}
+// All dependent power/controller/pad leases and conversions must be closed
+// first. No register reads can establish exclusion of another core/LP user.
+// A failed restore is retryable; never release RCC ownership on status4.
+trusted fun P4AdcClock.closeOwned(exclusive: bool): P4AdcClock {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 5) return this
+    val token=this&(0xffffffffff^255)
+    val saved=(this>>>8)&0x7fffffff
+    if (!p4AdcField(0x500e60a0,u32(1),u32(0)) ||
+        !p4AdcField(0x500e609c,u32(0xc0000000),u32(saved>>>26)<<u32(30)) ||
+        !p4AdcField(0x500e60a0,u32(0x1fffffe),u32(saved>>>1)&u32(0x1fffffe)) ||
+        !p4AdcField(0x500e60b4,u32(0x18000),(u32(saved>>>28)&u32(3))<<u32(15)) ||
+        !p4AdcField(0x50120000,u32(0x800000),(u32(saved>>>30)&u32(1))<<u32(23)) ||
+        !p4AdcField(0x500e60a0,u32(1),u32(saved>>>1)&u32(1)) ||
+        !p4AdcField(0x500e601c,u32(32),(u32(saved)&u32(1))<<u32(5))) return P4AdcClock(token|4)
+    return P4AdcClock(token|5)
+}
+trusted fun esp32p4AdcClocksReady(): bool =
+    (p4AdcRead(0x500e60c8)&u32(1024)) == u32(0) &&
+    (p4AdcRead(0x500e601c)&u32(32)) != u32(0) &&
+    (p4AdcRead(0x500e60a0)&u32(1)) != u32(0) &&
+    (p4AdcRead(0x50120000)&u32(0x800000)) != u32(0)

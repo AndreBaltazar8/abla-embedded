@@ -1,0 +1,366 @@
+import "../dport_esp32.ab"
+import "../rom/system_esp32.ab"
+import "rtc_esp32.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
+
+// Classic ESP32 RTC slow-clock calibration and time conversion implemented in
+// structured Abla from the documented timer-group and RTC register interface.
+
+val esp32RtcCalibrationConfig = u32(0x3ff5f068)
+val esp32RtcCalibrationResult = u32(0x3ff5f06c)
+val esp32RtcClockConfiguration = u32(0x3ff48070)
+val esp32RtcCalibrationStart = u32(1) << u32(31)
+val esp32RtcCalibrationMaximumMask = u32(0x7fff) << u32(16)
+val esp32RtcCalibrationReady = u32(1) << u32(15)
+val esp32RtcCalibrationSourceMask = u32(3) << u32(13)
+val esp32RtcCalibrationCycling = u32(1) << u32(12)
+val esp32RtcCalibrationValueMask = u32(0x01ffffff)
+val esp32RtcDigitalFastDiv256Enable = u32(1) << u32(9)
+val esp32RtcDigitalXtal32kEnable = u32(1) << u32(8)
+val esp32RtcCalibrationFraction = u64(19)
+val esp32RtcCalibrationClockSlow = u32(0)
+val esp32RtcCalibrationClockFastDiv256 = u32(1)
+val esp32RtcCalibrationClockXtal32k = u32(2)
+
+@inline
+trusted fun esp32RtcTimeLoad(address: u32): u32 {
+    xtensaMemoryBarrier()
+    return u32(ablaUnsafeVolatileLoadU32(int(address)))
+}
+
+@inline
+trusted fun esp32RtcTimeStore(address: u32, value: u32): void {
+    xtensaMemoryBarrier()
+    ablaUnsafeVolatileStoreU32(int(address), int(value))
+    return
+}
+
+@inline
+trusted fun esp32RtcTimeUpdate(
+    address: u32,
+    clearMask: u32,
+    setMask: u32
+): void {
+    esp32RtcTimeStore(
+        address, (esp32RtcTimeLoad(address) & ~clearMask) | setMask
+    )
+    return
+}
+
+@inline
+fun esp32RtcExpectedCalibrationFrequency(source: u32): u32 {
+    val slowSource = esp32RecoveredRtcClkSlowSrcGet()
+    if (source == esp32RtcCalibrationClockXtal32k ||
+        (source == esp32RtcCalibrationClockSlow && slowSource == u32(1)))
+        return u32(32768)
+    if (source == esp32RtcCalibrationClockFastDiv256 ||
+        (source == esp32RtcCalibrationClockSlow && slowSource == u32(2)))
+        return u32(33203)
+    return u32(150000)
+}
+
+@inline
+trusted fun esp32RtcDigitalXtal32kEnabled(): bool =
+    (esp32RtcTimeLoad(esp32RtcClockConfiguration) &
+        esp32RtcDigitalXtal32kEnable) != u32(0)
+
+@inline
+trusted fun esp32RtcSetDigitalXtal32k(enabled: bool): void {
+    esp32RtcTimeUpdate(
+        esp32RtcClockConfiguration,
+        if (enabled) u32(0) else esp32RtcDigitalXtal32kEnable,
+        if (enabled) esp32RtcDigitalXtal32kEnable else u32(0)
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcSetDigitalFastDiv256(enabled: bool): void {
+    esp32RtcTimeUpdate(
+        esp32RtcClockConfiguration,
+        if (enabled) u32(0) else esp32RtcDigitalFastDiv256Enable,
+        if (enabled) esp32RtcDigitalFastDiv256Enable else u32(0)
+    )
+    return
+}
+
+trusted fun esp32RtcClockCalibrationCycles(
+    source: u32,
+    slowClockCycles: u32
+): u32 {
+    if (slowClockCycles >= u32(32767)) ablaRuntimeTrap()
+    if (source > esp32RtcCalibrationClockXtal32k) ablaRuntimeTrap()
+
+    val xtal32kWasEnabled = esp32RtcDigitalXtal32kEnabled()
+    if (source == esp32RtcCalibrationClockXtal32k &&
+        !xtal32kWasEnabled) esp32RtcSetDigitalXtal32k(true)
+
+    val fastClockWasEnabled = esp32RecoveredRtcClk8mEnabled(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)
+    val fastDiv256WasEnabled = esp32RecoveredRtcClk8md256Enabled(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)
+    if (source == esp32RtcCalibrationClockFastDiv256) {
+        esp32RecoveredRtcClk8mEnable(
+            u32(1), u32(1), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        esp32RtcSetDigitalFastDiv256(true)
+    }
+
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig,
+        esp32RtcCalibrationSourceMask,
+        (source & u32(3)) << u32(13)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig, esp32RtcCalibrationCycling, u32(0)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig,
+        esp32RtcCalibrationMaximumMask,
+        (slowClockCycles & u32(0x7fff)) << u32(16)
+    )
+
+    val expectedFrequency = esp32RtcExpectedCalibrationFrequency(source)
+    val estimatedMicroseconds = u32(
+        u64(slowClockCycles) * u64(1000000) / u64(expectedFrequency)
+    )
+    var xtalFrequency = esp32RecoveredRtcClkXtalFreqGet(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (xtalFrequency == u32(0)) xtalFrequency = u32(40)
+    val timerMaximum = esp32RtcCalibrationValueMask / xtalFrequency
+    if (estimatedMicroseconds >= timerMaximum) {
+        if (source == esp32RtcCalibrationClockXtal32k &&
+            !xtal32kWasEnabled) esp32RtcSetDigitalXtal32k(false)
+        if (source == esp32RtcCalibrationClockFastDiv256) {
+            esp32RtcSetDigitalFastDiv256(false)
+            esp32RecoveredRtcClk8mEnable(
+                if (fastClockWasEnabled) u32(1) else u32(0),
+                if (fastDiv256WasEnabled) u32(1) else u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0)
+            )
+        }
+        return u32(0)
+    }
+
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig, esp32RtcCalibrationStart, u32(0)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig, u32(0), esp32RtcCalibrationStart
+    )
+    esp32RomDelayUsValue(estimatedMicroseconds)
+    var remaining = estimatedMicroseconds
+    while ((esp32RtcTimeLoad(esp32RtcCalibrationConfig) &
+        esp32RtcCalibrationReady) == u32(0) && remaining != u32(0)) {
+        remaining = remaining - u32(1)
+        esp32RomDelayUsValue(u32(1))
+    }
+
+    if (source == esp32RtcCalibrationClockXtal32k &&
+        !xtal32kWasEnabled) esp32RtcSetDigitalXtal32k(false)
+    if (source == esp32RtcCalibrationClockFastDiv256) {
+        esp32RtcSetDigitalFastDiv256(false)
+        esp32RecoveredRtcClk8mEnable(
+            if (fastClockWasEnabled) u32(1) else u32(0),
+            if (fastDiv256WasEnabled) u32(1) else u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    if (remaining == u32(0)) return u32(0)
+    return (esp32RtcTimeLoad(esp32RtcCalibrationResult) >>> u32(7)) &
+        esp32RtcCalibrationValueMask
+}
+
+trusted fun esp32RtcClockCalibrationRatio(
+    source: u32,
+    slowClockCycles: u32
+): u32 {
+    if (slowClockCycles == u32(0)) ablaRuntimeTrap()
+    val xtalCycles = esp32RtcClockCalibrationCycles(
+        source, slowClockCycles
+    )
+    return u32((u64(xtalCycles) << esp32RtcCalibrationFraction) /
+        u64(slowClockCycles))
+}
+
+@inline
+fun esp32RtcXtal32kCalibrationValid(
+    xtalFrequencyMegahertz: u32,
+    slowClockCycles: u32,
+    actualXtalCycles: u32
+): bool {
+    val expected = (u64(xtalFrequencyMegahertz) * u64(1000000) *
+        u64(slowClockCycles)) >>> u64(15)
+    val tolerance = expected / u64(2000)
+    return u64(actualXtalCycles) >= expected - tolerance &&
+        u64(actualXtalCycles) <= expected + tolerance
+}
+
+trusted fun esp32RtcClockCalibrate(
+    source: u32,
+    slowClockCycles: u32
+): u32 {
+    if (slowClockCycles == u32(0)) ablaRuntimeTrap()
+    val xtalFrequency = esp32RecoveredRtcClkXtalFreqGet(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    val xtalCycles = esp32RtcClockCalibrationCycles(
+        source, slowClockCycles
+    )
+    if (source == esp32RtcCalibrationClockXtal32k &&
+        !esp32RtcXtal32kCalibrationValid(
+            xtalFrequency, slowClockCycles, xtalCycles
+        )) return u32(0)
+    val divider = u64(xtalFrequency) * u64(slowClockCycles)
+    if (divider == u64(0)) return u32(0)
+    return u32(((u64(xtalCycles) << esp32RtcCalibrationFraction) +
+        divider / u64(2) - u64(1)) / divider)
+}
+
+trusted fun esp32RtcMicrosecondsToSlowTicks(
+    microseconds: u64,
+    period: u32
+): u64 {
+    if (period == u32(0)) ablaRuntimeTrap()
+    if (microseconds > (u64(0xffffffffffffffff) >>>
+        esp32RtcCalibrationFraction)) {
+        return ((microseconds / u64(period)) <<
+            esp32RtcCalibrationFraction) +
+            (((microseconds % u64(period)) <<
+                esp32RtcCalibrationFraction) / u64(period))
+    }
+    return (microseconds << esp32RtcCalibrationFraction) / u64(period)
+}
+
+@inline
+fun esp32RtcSlowTicksToMicroseconds(ticks: u64, period: u32): u64 =
+    (ticks * u64(period)) >>> esp32RtcCalibrationFraction
+
+@inline
+trusted fun esp32RtcTimeGet(): u64 = esp32ClockRtcTicks()
+
+trusted fun esp32RtcWaitForSlowClockCycle(): void {
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig,
+        esp32RtcCalibrationCycling | esp32RtcCalibrationStart,
+        u32(0)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig, esp32RtcCalibrationReady, u32(0)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig,
+        esp32RtcCalibrationSourceMask | esp32RtcCalibrationMaximumMask,
+        u32(0)
+    )
+    esp32RtcTimeUpdate(
+        esp32RtcCalibrationConfig, u32(0), esp32RtcCalibrationStart
+    )
+    esp32RomDelayUsValue(u32(1))
+    while ((esp32RtcTimeLoad(esp32RtcCalibrationConfig) &
+        esp32RtcCalibrationReady) == u32(0)) esp32RomDelayUsValue(u32(1))
+    return
+}
+
+@inline
+fun esp32RtcClockFrequencyFromCalibration(calibration: u32): u32 {
+    if (calibration == u32(0)) return u32(0)
+    return u32((u64(1000000) << esp32RtcCalibrationFraction) /
+        u64(calibration))
+}
+
+// This constructor replaces PERIPH_RCC_ACQUIRE_ATOMIC for the single startup
+// acquisition performed by rtc_time.c: enable and reset TIMG0, then clear the
+// watchdog flash-boot mode bit.
+trusted fun esp32RtcEnableCalibrationTimer(): u32 {
+    esp32RtcTimeStore(
+        u32(0x3ff000c0), esp32DportRead(u32(0x3ff000c0)) | u32(0x2000)
+    )
+    esp32RtcTimeStore(u32(0x3ff000c4), u32(0x2000))
+    esp32RtcTimeStore(u32(0x3ff000c4), u32(0))
+    esp32RtcTimeUpdate(u32(0x3ff5f048), u32(0x4000), u32(0))
+    return u32(0)
+}
+
+// Startup already acquires and resets TIMG0 before the non-OS ESP timer
+// initializer. Running this again from Abla's later module-initialization pass
+// resets the live LAC counter, discarding its enable and level-interrupt bits.
+// Keep the source entry available, but make hardware initialization explicit
+// through esp32RtcCalibrationTimerInitialize in the RTC clock startup path.
+val esp32RtcCalibrationTimerInitialized = u32(0)
+
+// Temporary wide-signature wrappers for lifted callers. Foreign u64 ABI names
+// are mapped to the typed functions below in rtc_time_link_esp32.ab.
+trusted fun esp32RecoveredRtcClkCalRatio(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcClockCalibrationRatio(a2, a3)
+
+trusted fun esp32RecoveredRtcClkCal(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcClockCalibrate(a2, a3)
+
+trusted fun esp32RecoveredRtcTimeUsToSlowclk(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = u32(esp32RtcMicrosecondsToSlowTicks(
+    u64(a2) | (u64(a3) << u64(32)), a4
+))
+
+trusted fun esp32RecoveredRtcTimeSlowclkToUs(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = u32(esp32RtcSlowTicksToMicroseconds(
+    u64(a2) | (u64(a3) << u64(32)), a4
+))
+
+trusted fun esp32RecoveredRtcTimeGet(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = u32(esp32RtcTimeGet())
+
+trusted fun esp32RecoveredRtcClkWaitForSlowCycle(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32RtcWaitForSlowClockCycle()
+    return a2
+}
+
+trusted fun esp32RecoveredRtcClkFreqCal(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcClockFrequencyFromCalibration(a2)
+
+trusted fun esp32RecoveredRtcClkFreqToPeriod(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcClockFrequencyFromCalibration(a2)

@@ -1,0 +1,49 @@
+import "./dma_start_c5_sequence.ab"
+import "../ahb_gdma_buffer_c5_sequence.ab"
+// Circular SRAM stream cursor,28B:tag0,state4,bound start8,index12,
+// held bytes16,event evidence20,last acquire status24. States5waiting1held3error.
+// Caller exclusively owns immutable start/ring layout and this cursor; exactly
+// one cursor per ring. Poll acquires one block; consume RX or fill TX before
+// rearm. No automatic overwrite, event ack, restart, stop or recovery bypass.
+// Late service can exhaust the ring: errors latch, caller uses ordered stop.
+fun c5I2sDmaStreamStorage(q: NativeBuffer): bool = q.hasAddressRange(0,28) && (q.addressValue()&3) == 0 && (q.addressValue()+28 <= 0x60000000 || q.addressValue() >= 0x60100000)
+trusted fun c5I2sDmaStreamPairValid(r: NativeBuffer,q: NativeBuffer): bool {
+    if (!c5I2sDmaStartStorage(r) || r.loadU32(0) != 0x43354944 || r.loadU32(4) != 1 || r.loadU32(40) != 1 || !c5I2sDmaStreamStorage(q)) return false
+    val count=r.loadU32(24);val descriptors=r.loadU32(20);val buffers=r.loadU32(28);val stride=r.loadU32(32);val bytes=r.loadU32(36)
+    if (!c5AhbGdmaRingValid(descriptors,count,buffers,stride,bytes)) return false
+    val address=q.addressValue()
+    return !(address < r.addressValue()+72 && r.addressValue() < address+28) &&
+        !(address < descriptors+count*12 && descriptors < address+28) &&
+        !(address < buffers+(count-1)*stride+bytes && buffers < address+28)
+}
+// 1block held,2invalid,3latched failure,5DMA still owns next block. Repeated
+// poll while held returns the same block; it never advances or reacquires it.
+trusted fun c5I2sDmaStreamPollOwned(r: NativeBuffer,q: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c5I2sDmaStreamPairValid(r,q)) return 2
+    if (q.loadU32(0) == 0) {
+        q.storeU32(0,0x43354952);q.storeU32(4,5);q.storeU32(8,r.addressValue());q.storeU32(12,0);q.storeU32(16,0);q.storeU32(20,0);q.storeU32(24,0)
+    } else if (q.loadU32(0) != 0x43354952 || q.loadU32(8) != r.addressValue()) return 2
+    if (q.loadU32(12) >= r.loadU32(24)) return 2
+    if (q.loadU32(4) == 1 || q.loadU32(4) == 3) return q.loadU32(4)
+    if (q.loadU32(4) != 5) return 2
+    val acquired=c5AhbGdmaAcquireOwned(r.loadU32(12),r.loadU32(16) != 0,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),q.loadU32(12),true,true)
+    q.storeU32(20,q.loadU32(20)|acquired.events());q.storeU32(24,acquired.status())
+    if (acquired.status() == 5) return 5
+    if (acquired.status() != 1) { q.storeU32(4,3);return 3 }
+    q.storeU32(16,acquired.bytes());q.storeU32(4,1);return 1
+}
+// 1ownership published,2invalid,3latched failure. Successful publication
+// advances once, even if DMA immediately consumes the descriptor. A caller
+// must not access that payload after success until a later poll acquires it.
+trusted fun c5I2sDmaStreamRearmOwned(r: NativeBuffer,q: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c5I2sDmaStreamPairValid(r,q) || q.loadU32(0) != 0x43354952 || q.loadU32(8) != r.addressValue() || q.loadU32(12) >= r.loadU32(24)) return 2
+    if (q.loadU32(4) == 3) return 3
+    if (q.loadU32(4) != 1) return 2
+    val result=c5AhbGdmaRearmOwned(r.loadU32(12),r.loadU32(16) != 0,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),q.loadU32(12),true,true)
+    if (result != 65537) {
+        val acquired=C5AhbGdmaBuffer(result)
+        q.storeU32(20,q.loadU32(20)|acquired.events());q.storeU32(24,acquired.status());q.storeU32(4,3);return 3
+    }
+    val next=q.loadU32(12)+1
+    q.storeU32(12,if (next == r.loadU32(24)) 0 else next);q.storeU32(16,0);q.storeU32(4,5);return 1
+}

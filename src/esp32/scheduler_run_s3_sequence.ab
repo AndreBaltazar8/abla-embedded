@@ -1,0 +1,48 @@
+import "./sdk/raw_buffer.ab"
+import "../xtensa/interrupt_guard_logic.ab"
+// Per-core caller-owned44-byte context, initialized before publication:
+// lock0,queueAddress4,queueBytes8,taskTable12,taskBytes16,runningIDs20,
+// currentBindings24,CPowners28,pending32,lastResult36,core40. Pointer/config
+// fields immutable while installed; all storage internal and pairwise disjoint
+// (including ISR/task stacks and CP records). Pending/result start0.
+// Only owning core writes pending (timer ISR or local task). Remote wakeups
+// must deliver an intercore interrupt rather than writing this flag directly.
+@inline
+fun esp32S3SchedulerRunRange(buffer: NativeBuffer,size: int): bool = buffer.hasAddressRange(0,size) &&
+    buffer.addressValue() >= 0x3FC88000 && buffer.addressValue()+size <= 0x3FD00000 && (buffer.addressValue() & 3) == 0
+@section(".iram1.abla.s3SchedulerRequest")
+trusted fun esp32S3SchedulerRequestOwned(context: NativeBuffer): bool {
+    if (!esp32S3SchedulerRunRange(context,44) || esp32S3SchedulerRunRead(context.addressValue()+40) != esp32S3SchedulerRunCore()) return false
+    esp32S3SchedulerRunWrite(context.addressValue()+32,1)
+    true
+}
+// Post-drain only, outer IRQ depth1, CPdisabled and PS WOE+INTLEVEL15,!EXCM.
+// 0 no work/empty queue,1 switched,2 lock busy (pending remains set),negative
+// error. Lock acquired at15 is released at15; NEVER restore task IRQ level.
+// Failed selection keeps pending. Caller must treat negative results explicitly;
+// -4 (switch rollback) and -7 (unlock) forbid any ordinary interrupt return.
+@section(".iram1.abla.s3SchedulerRun")
+trusted fun esp32S3SchedulerRunOwned(context: NativeBuffer,frame: NativeBuffer,core: int,level: int): int {
+    if (core < 0 || core > 1 || level < 1 || level > 3 || esp32S3SchedulerRunCore() != core ||
+        (esp32S3SchedulerRunStatus() & 0x4001F) != 0x4000F || !esp32S3SchedulerRunRange(context,44)) return -6
+    val base=context.addressValue()
+    if (esp32S3SchedulerRunRead(base+40) != core) return -6
+    if (esp32S3SchedulerRunRead(base+32) == 0) return 0
+    val lock=nativeBufferAt(esp32S3SchedulerRunRead(base),4)
+    if (!esp32S3SchedulerRunRange(lock,4)) return -6
+    val guard=esp32S3SchedulerRunLock(lock)
+    if (!guard.valid()) return 2
+    val result=esp32S3SchedulerRunSelect(
+        nativeBufferAt(esp32S3SchedulerRunRead(base+4),esp32S3SchedulerRunRead(base+8)),
+        nativeBufferAt(esp32S3SchedulerRunRead(base+12),esp32S3SchedulerRunRead(base+16)),
+        nativeBufferAt(esp32S3SchedulerRunRead(base+20),8),
+        nativeBufferAt(esp32S3SchedulerRunRead(base+24),8),
+        nativeBufferAt(esp32S3SchedulerRunRead(base+28),16),frame,core,level)
+    esp32S3SchedulerRunWrite(base+36,result & 0xFFFFFFFF)
+    if (result == 0 || result == 1) esp32S3SchedulerRunWrite(base+32,0)
+    if (!esp32S3SchedulerRunUnlock(lock,guard)) {
+        esp32S3SchedulerRunWrite(base+36,0xFFFFFFF9)
+        return -7
+    }
+    return result
+}

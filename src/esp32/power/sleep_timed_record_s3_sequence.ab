@@ -1,0 +1,45 @@
+import "../sdk/raw_buffer.ab"
+// Timed light-sleep entry for the retained128byte record. The caller has
+// prepared clocks/retention/peripherals and owns the main RTC timer. Optional
+// non-timer wake sources must already be configured by their owners.
+// Runs with caches ENABLED until the inner retained entry suspends them.
+// Return -4: no writes, invalid config; -5: setup failed, record still owned.
+// Every return still requires retained-record resume, including cancellation.
+// Digital-peripheral and flash power-down are deliberately refused until their
+// separate register-retention and flash-ready delays are integrated. Deep sleep
+// requires a reset/wake-stub path and is not a light-sleep record operation.
+trusted fun esp32S3SleepArmedPolicyValid(record: NativeBuffer,flags: int,periodQ19: int,extraWake: int,reject: int): bool {
+    if (!record.hasAddressRange(0,128) || (record.addressValue() & 3) != 0) return false
+    if ((flags & (1 | 32 | 512)) != 0 || extraWake < 0 || extraWake > 0x1FFFF || reject < 0 || reject > 0x3FFFF) return false
+    // EXT0 cannot wake with its RTC peripheral domain powered down.
+    if ((extraWake & 1) != 0 && (flags & 2) != 0) return false
+    val policy=esp32S3SleepPolicy(flags)
+    if (!policy.valid() || esp32S3SleepTimingBits(periodQ19,false) < 0) return false
+    val base=record.addressValue()
+    if (esp32S3MspiStateRead(base) != 0x53504C50 || esp32S3MspiStateRead(base+4) != 9 || esp32S3MspiStateRead(base+104) != 1) return false
+    val peripherals=esp32S3MspiStateRead(base+108)
+    val sar=(peripherals>>>8) & 255
+    if ((peripherals & ~65535) != 0 || !Esp32S3SleepUsbSerial(peripherals & 255).valid()) return false
+    // Policy monitor bias must agree with the SAR decision already captured.
+    if (sar != (if ((flags & 0x20000) != 0) 4 else 5)) return false
+    true
+}
+trusted fun esp32S3SleepTimedRecordEnterOwned(record: NativeBuffer,flags: int,periodQ19: int,microseconds: int,extraWake: int,reject: int): int {
+    if (!esp32S3SleepArmedPolicyValid(record,flags,periodQ19,extraWake,reject)) return -4
+    val ticks=esp32S3RtcTicksForMicroseconds(microseconds,periodQ19)
+    if (ticks <= 0) return -4
+    if (!esp32S3SleepRegistersPrepareOwned(flags,periodQ19)) return -5
+    // Take the time AFTER power/timing setup so that work does not shorten the
+    // requested duration. Deadline wraps in the hardware48bit counter domain.
+    val deadline=(esp32S3RtcCyclesOwned()+ticks) & 0xFFFFFFFFFFFF
+    if (!esp32S3RtcSetAlarmOwned(deadline)) return -5
+    esp32S3SleepRetainedRecordEnterOwned(record,extraWake | 8,reject)
+}
+// External wake only: do not touch the RTC timer alarm or add its trigger.
+// At least one non-timer wake source is mandatory; every return still needs
+// retained-record restoration. The external-wake-record wrapper checks pads.
+trusted fun esp32S3SleepExternalOnlyRecordEnterOwned(record: NativeBuffer,flags: int,periodQ19: int,wake: int,reject: int): int {
+    if (wake <= 0 || (wake & 8) != 0 || !esp32S3SleepArmedPolicyValid(record,flags,periodQ19,wake,reject)) return -4
+    if (!esp32S3SleepRegistersPrepareOwned(flags,periodQ19)) return -5
+    esp32S3SleepRetainedRecordEnterOwned(record,wake,reject)
+}

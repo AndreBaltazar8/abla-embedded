@@ -1,0 +1,62 @@
+import "./rtc_retention_tag_buffer_s3_sequence.ab"
+// Complete CPU+tag transaction. All memory must be retained internal DMA
+// memory, with no overlap with active stack or the caller's sleep record.
+// Caller serializes RTC/cache access and keeps peers and producers quiescent.
+@inline
+fun esp32S3RetentionBuffersValid(cpu: NativeBuffer,tags: NativeBuffer,i: Esp32S3TagPlan,d: Esp32S3TagPlan): bool {
+    val size=esp32S3TagBufferBytes(i,d)
+    if (size < 32 || size > 65536 || !cpu.hasAddressRange(0,8800) || !tags.hasAddressRange(0,size)) return false
+    val a=cpu.addressValue()
+    val b=tags.addressValue()
+    if (((a | b) & 15) != 0) return false
+    a+8800 <= b || b+size <= a
+}
+@section(".iram1.abla.s3RetentionInit")
+trusted fun esp32S3RetentionInitOwned(cpu: NativeBuffer,tags: NativeBuffer,i: Esp32S3TagPlan,d: Esp32S3TagPlan): bool {
+    if (!esp32S3RetentionBuffersValid(cpu,tags,i,d)) return false
+    if ((esp32S3RetentionRead(0x60008140) & 0x01008000) != 0) return false
+    if (!esp32S3CpuRetentionBufferInitOwned(cpu)) return false
+    esp32S3TagBufferInitOwned(tags,i,d)
+}
+//0 invalid/owned elsewhere,1 armed,2 CPU arm refused,3 tag arm refused and
+// CPU arm cancelled. Failure must NOT use wake invalidation: no sleep occurred
+// and dirty D-cache contents may still exist when tag retention was intended.
+@section(".iram1.abla.s3RetentionArm")
+trusted fun esp32S3RetentionArmOwned(cpu: NativeBuffer,tags: NativeBuffer,i: Esp32S3TagPlan,d: Esp32S3TagPlan,small: bool): int {
+    if (!esp32S3RetentionBuffersValid(cpu,tags,i,d) || d.logical16K() != small || (small && !d.enabled())) return 0
+    if ((esp32S3RetentionRead(0x60008140) & 0x01008000) != 0) return 0
+    if ((esp32S3TagRead(0x600260BC) & 0x80000000) != 0 || (esp32S3TagRead(0x600260C0) & 0x80000000) != 0) return 0
+    if (!esp32S3CpuRetentionEnableOwned(cpu,d.enabled(),small)) return 2
+    if (!esp32S3TagRetentionEnableOwned(tags.addressValue(),i.enabled(),i.start(),i.validBlocks(),i.sizeBlocks(),d.enabled(),d.start(),d.validBlocks(),d.sizeBlocks())) {
+        esp32S3RetentionUpdate(0x60008140,0x01000000,0)
+        return 3
+    }
+    1
+}
+//0 ownership mismatch,1 complete,2 CPU disable refused,3 tag disable refused.
+// Cancel ONLY before sleep entry (or a preflight rejection). No cache discard.
+@section(".iram1.abla.s3RetentionCancel")
+trusted fun esp32S3RetentionCancelOwned(i: Esp32S3TagPlan,d: Esp32S3TagPlan): bool {
+    if (!i.valid() || i.dataCache() || !d.valid() || !d.dataCache()) return false
+    if ((esp32S3RetentionRead(0x60008140) & 0x8000) == 0) return false
+    if (((esp32S3TagRead(0x600260BC) & 0x80000000) != 0) != i.enabled()) return false
+    if (((esp32S3TagRead(0x600260C0) & 0x80000000) != 0) != d.enabled()) return false
+    esp32S3RetentionUpdate(0x60008140,0x01000000,0)
+    esp32S3TagRetentionDisableOwned(i.enabled(),d.enabled())
+}
+//0 ownership mismatch,1 complete,2 CPU disable refused,3 tag disable refused.
+// A retry after3 skips CPU invalidation already completed. Call ONLY after
+// actual wake, once execution is safely back in internal code/data/stack.
+@section(".iram1.abla.s3RetentionFinish")
+trusted fun esp32S3RetentionFinishOwned(i: Esp32S3TagPlan,d: Esp32S3TagPlan): int {
+    if (!i.valid() || i.dataCache() || !d.valid() || !d.dataCache()) return 0
+    val control=esp32S3RetentionRead(0x60008140)
+    if ((control & 0x8000) == 0) return 0
+    if (((esp32S3TagRead(0x600260BC) & 0x80000000) != 0) != i.enabled()) return 0
+    if (((esp32S3TagRead(0x600260C0) & 0x80000000) != 0) != d.enabled()) return 0
+    if ((control & 0x01000000) != 0) {
+        if (!esp32S3CpuRetentionDisableOwned(i.enabled(),d.enabled())) return 2
+    }
+    if (!esp32S3TagRetentionDisableOwned(i.enabled(),d.enabled())) return 3
+    1
+}

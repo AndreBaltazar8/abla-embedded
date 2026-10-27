@@ -1,0 +1,44 @@
+// Classic ESP32 touch v1. Exclusive caller has configured/powered the
+// controller and RTC pads, pinned clocks, stopped continuous scanning and
+// disabled touch interrupts. No concurrent scan/configuration/sleep users.
+// Scalar is a borrowed scan token, not an independently copyable lease.
+// Pending scans retain ownership; a caller deadline is NOT hardware stop.
+type Esp32TouchScan = int
+fun Esp32TouchScan.status(): int = this&7
+fun Esp32TouchScan.channels(): int = (this>>3)&1023
+fun Esp32TouchScan.valid(): bool = this >= 8 && this <= 8191 && this.channels() != 0 && (this.status() == 1 || this.status() == 2)
+fun esp32TouchScanHardwareMask(mask: int): int = (mask&255)|((mask&256)<<1)|((mask&512)>>1)
+// Status0invalid/no writes,1pending,2complete,3controller not prepared.
+// Caller must not begin while holding a pending token. Actual work mask must
+// match exactly; touch v1 software trigger scans the whole hardware work set.
+trusted fun esp32TouchScanBeginOwned(channels: int,exclusiveIdle: bool): Esp32TouchScan {
+    if (!exclusiveIdle || channels <= 0 || channels > 1023) return Esp32TouchScan(0)
+    val ctrl=touchScanRead(0x3FF48884)
+    if ((ctrl & u32(0x3800)) != u32(0x2800) ||
+        (touchScanRead(0x3FF4888C)&u32(1023)) != u32(esp32TouchScanHardwareMask(channels)) ||
+        (touchScanRead(0x3FF48018)&u32(0x800000)) != u32(0) ||
+        (touchScanRead(0x3FF4803C)&u32(64)) != u32(0)) return Esp32TouchScan(3)
+    // START_EN pulse, same sequence as touch_ll_trigger_oneshot_measurement.
+    // Never replay the W1C active-status-clear bit (bit30) from a read.
+    val base=ctrl & u32(0xBFFFFBFF)
+    touchScanWrite(0x3FF48884,base|u32(0x1000))
+    // START_EN is R/W (not self-clearing). Verify the rising edge latched:
+    // otherwise a prior scan's DONE bit could masquerade as new completion.
+    val latched=(touchScanRead(0x3FF48884)&u32(0x1000)) != u32(0)
+    touchScanWrite(0x3FF48884,base)
+    if (!latched) return Esp32TouchScan(3)
+    Esp32TouchScan((channels<<3)|1)
+}
+trusted fun Esp32TouchScan.pollOwned(): Esp32TouchScan {
+    if (!this.valid() || this.status() == 2) return this
+    if ((touchScanRead(0x3FF48884)&u32(0x400)) != u32(0)) Esp32TouchScan((this.channels()<<3)|2) else this
+}
+// RAW16-bit measurement, not software-filtered/smoothed data. Zero is valid.
+// -1 invalid/not complete/not scanned; no register access on refusal.
+// Keep controller ownership until every desired channel has been read.
+trusted fun Esp32TouchScan.readRawOwned(channel: int): int {
+    if (!this.valid() || this.status() != 2 || channel < 0 || channel > 9 || (this.channels()&(1<<channel)) == 0) return -1
+    val hardware=if (channel == 8) 9 else if (channel == 9) 8 else channel
+    val word=touchScanRead(0x3FF48870+(hardware>>1)*4)
+    int((word>>u32(if ((hardware&1) == 0) 16 else 0))&u32(65535))
+}

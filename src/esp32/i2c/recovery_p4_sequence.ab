@@ -1,0 +1,55 @@
+import "./poll_p4_sequence.ab"
+// Explicit recovery of this owner's controller. No clock/reset/pin takeover,
+// no automatic replay and no bus-clear clock pulses. Idle recovery waits for
+// controller idle AND actual SCL/SDA high before discarding stale FIFO state.
+// stopAfterNack additionally authorizes one STOP ONLY with current NACK and
+// no arbitration-loss flag. Caller must exclude every other bus master and
+// retain this failed transaction's ownership, not merely a software mutex.
+// Same result family as polling,1 recovered. Failure retains all resources.
+trusted fun esp32p4I2cRecoverOwned(port: int,sda: int,scl: int,budget: u32,exclusive: bool,stopAfterNack: bool = false): int {
+    if (!exclusive || port < 0 || port > 1 || sda < 0 || sda > 54 || scl < 0 || scl > 54 || sda == scl ||
+        budget == u32(0) || budget > u32(0x7fffffff)) return 7
+    val started=p4I2cCounter()
+    val base=p4I2cBase(port)
+    // A previous partial recovery can leave FIFO reset asserted. Accept that
+    // owned state here; only re-clear it after the idle/line checks below.
+    if (!esp32p4I2cClockReady(port) || (p4I2cRead(base+4)&u32(0x113)) != u32(0x110) ||
+        (p4I2cRead(base+24)&u32(0x4c00)) != u32(0x4000) || (p4I2cRead(base+40)&u32(0x7ffff)) != u32(0)) return 7
+    if (stopAfterNack && !p4I2cIdle(port)) {
+        val raw=p4I2cRead(base+32)
+        if ((raw&u32(32)) != u32(0)) return 4
+        if ((raw&u32(1024)) == u32(0)) return 7
+        if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+        if (esp32p4I2cWriteCommandOwned(port,0,esp32S3I2cCommand(2,0),true) != 1) return 6
+        // Residual TX bytes are intentionally not consumed by a STOP command.
+        p4I2cWrite(base+36,u32(0x7ffff))
+        p4I2cWrite(base+4,p4I2cRead(base+4)|u32(2048))
+        p4I2cWrite(base+4,p4I2cRead(base+4)|u32(32))
+        var stopped=false
+        while (!stopped) {
+            val result=esp32S3I2cPollResult(p4I2cRead(base+32),true)
+            if (result >= 3) return result
+            stopped=result == 1 && (p4I2cRead(base+88)&u32(0x80000000)) != u32(0)
+            if (!stopped && esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+        }
+    }
+    while (!p4I2cIdle(port) || !p4I2cRecoveryLinesHigh(sda,scl)) {
+        if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+    }
+    if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+    // Only now may stale payload be discarded. Never run full controller init
+    // here: its disconnected-pad contract does not apply to a routed bus.
+    if (!p4I2cField(base+24,u32(0x3000),u32(0x3000)) ||
+        !p4I2cField(base+24,u32(0x3000),u32(0))) return 6
+    val status=p4I2cRead(base+8)
+    if (esp32S3I2cTxCount(status) != 0 || esp32S3I2cRxCount(status) != 0) return 6
+    var i=0
+    while (i < 8) {
+        if (esp32p4I2cWriteCommandOwned(port,i,esp32S3I2cCommand(4,0),true) != 1) return 6
+        i=i+1
+    }
+    p4I2cWrite(base+36,u32(0x7ffff))
+    p4I2cWrite(base+4,p4I2cRead(base+4)|u32(2048))
+    if (!p4I2cIdle(port) || !p4I2cRecoveryLinesHigh(sda,scl)) return 8
+    return if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) 5 else 1
+}

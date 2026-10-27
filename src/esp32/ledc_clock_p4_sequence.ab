@@ -1,0 +1,63 @@
+import "./ledc_p4_sequence.ab"
+// Single authoritative peripheral lease; copies are not independent owners.
+// Caller serializes RCC/lifecycle across cores, excludes LEDC ETM/IRQ activity,
+// and pins the selected source (0 XTAL, 1 calibrated RC_FAST, 2 PLL_DIV).
+// No adoption of preexisting clocked/reset hardware and no global source switch
+// while channels may run. Return/retain the updated owner on every operation.
+type Esp32P4LedcClock = int
+fun Esp32P4LedcClock.bits(): int = this
+fun Esp32P4LedcClock.status(): int = this&255
+fun Esp32P4LedcClock.ownsClocks(): bool = (this&256) != 0
+// status 0 closed, 1 ready, 2 invalid, 3 preexisting/busy, 4 RCC readback,
+// 5 lost clock/reset/source state, 6 peripheral readback.
+// bit8 lease, bit9 quiesced/closing, bits12..13 selected, bits14..15 original.
+trusted fun p4LedcClockField(offset: int,mask: int,value: int): bool {
+    p4LedcClockWrite(offset,(p4LedcClockRead(offset)&(0xffffffff^mask))|value)
+    return (p4LedcClockRead(offset)&mask) == value
+}
+trusted fun esp32P4LedcClockOpenOwned(source: int): Esp32P4LedcClock {
+    if (source < 0 || source > 2) return Esp32P4LedcClock(2)
+    val clock=p4LedcClockRead(156)
+    if ((p4LedcClockRead(32)&1) != 0 || (clock&4) != 0 || (p4LedcClockRead(196)&0x20000000) != 0) return Esp32P4LedcClock(3)
+    val flags=256|512|(source<<12)|((clock&3)<<14)
+    // Track the lease before any effect; partial opens are safely closeable.
+    // Reset the stopped peripheral before enabling its functional clock.
+    if (!p4LedcClockField(32,1,1) ||
+        !p4LedcClockField(196,0x20000000,0x20000000) ||
+        !p4LedcClockField(156,3,source) ||
+        !p4LedcClockField(196,0x20000000,0) ||
+        !p4LedcClockField(156,4,4)) return Esp32P4LedcClock(flags|4)
+    return Esp32P4LedcClock((flags&0xfffffdff)|1)
+}
+trusted fun Esp32P4LedcClock.closeOwned(): Esp32P4LedcClock {
+    var flags=this&0xf300
+    if (!this.ownsClocks()) return Esp32P4LedcClock(0)
+    if ((flags&512) == 0) {
+        if ((p4LedcClockRead(32)&1) == 0 || (p4LedcClockRead(156)&7) != (4|((flags>>12)&3)) ||
+            (p4LedcClockRead(196)&0x20000000) != 0) return Esp32P4LedcClock(flags|5)
+        // Do not stop someone else's live output or in-flight duty update.
+        var channel=0
+        while (channel < 8) {
+            if ((p4LedcRead(channel*20)&0x8014) != 0 || (p4LedcRead(channel*20+12)&0x80000000) != 0) return Esp32P4LedcClock(flags|3)
+            channel=channel+1
+        }
+        var timer=0
+        while (timer < 4) {
+            if ((p4LedcRead(160+timer*8)&0x4000000) != 0) return Esp32P4LedcClock(flags|3)
+            timer=timer+1
+        }
+        timer=0
+        while (timer < 4) {
+            if (p4LedcTimerPauseOwned(timer) != 1) return Esp32P4LedcClock(flags|6)
+            timer=timer+1
+        }
+        flags=flags|512
+    }
+    // Once quiesced, retries access RCC only, including partial failed opens.
+    // Restore the original selector only after the functional clock is off.
+    if (!p4LedcClockField(156,4,0) ||
+        !p4LedcClockField(196,0x20000000,0) ||
+        !p4LedcClockField(156,3,(flags>>14)&3) ||
+        !p4LedcClockField(32,1,0)) return Esp32P4LedcClock(flags|4)
+    return Esp32P4LedcClock(0)
+}

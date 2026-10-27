@@ -1,0 +1,68 @@
+// Caller exclusively owns all four autoload workers, keeps clocks pinned,
+// excludes demand traffic/peers/IRQ/DMA and preserves worker configuration.
+// No preload cancellation, dirty writeback, cache resizing or MMU changes.
+// Scalar retains original enabled workers across partial suspend/restore.
+// low8:0restored1suspended2invalid3disable readback4drain timeout5restore failure.
+// bits8..11 pending original enables; bit20 restoring; bit24 lifetime marker.
+// Restore ONLY when mappings/memory/configuration are safe for renewed fetches.
+type P4CacheAutoloadOwner = int
+fun P4CacheAutoloadOwner.status(): int = this&255
+fun p4CacheAutoloadOffset(index: int): int = if (index == 0) 228 else if (index == 1) 248 else if (index == 2) 308 else 692
+fun p4CacheAutoloadFlag(index: int): int = if (index == 0) 256 else if (index == 1) 512 else if (index == 2) 1024 else 2048
+fun P4CacheAutoloadOwner.valid(): bool = (this&0x1000000) != 0 && (this&(0x1100fff^(-1))) == 0 && this.status() <= 5
+trusted fun P4CacheAutoloadOwner.suspendOwned(polls: int): P4CacheAutoloadOwner {
+    if (!this.valid() || (this&0x100000) != 0 || polls < 1 || polls > 1000000) return this
+    val state=(this|0)&(-256)
+    var index=0
+    while (index < 4) {
+        val offset=p4CacheAutoloadOffset(index)
+        val prior=p4CacheAutoloadRead(offset)
+        if ((prior&1) != 0) {
+            // A newly enabled worker absent from the snapshot means exclusion
+            // was violated. Do not silently acquire/disable somebody else's work.
+            if ((state&p4CacheAutoloadFlag(index)) == 0) return P4CacheAutoloadOwner(state|3)
+            p4CacheAutoloadWrite(offset,prior&4294967294)
+            if ((p4CacheAutoloadRead(offset)&1) != 0) return P4CacheAutoloadOwner(state|3)
+        }
+        var remaining=polls; var done=false
+        while (remaining > 0 && !done) { done=(p4CacheAutoloadRead(offset)&3) == 2; remaining=remaining-1 }
+        if (!done) return P4CacheAutoloadOwner(state|4)
+        index=index+1
+    }
+    p4CacheAutoloadFence(); return P4CacheAutoloadOwner(state|1)
+}
+trusted fun p4CacheAutoloadSuspendOwned(polls: int): P4CacheAutoloadOwner {
+    if (polls < 1 || polls > 1000000) return P4CacheAutoloadOwner(2)
+    var state=0x1000000; var index=0
+    // Snapshot EVERY worker before the first modification.
+    while (index < 4) {
+        if ((p4CacheAutoloadRead(p4CacheAutoloadOffset(index))&1) != 0) state=state|p4CacheAutoloadFlag(index)
+        index=index+1
+    }
+    p4CacheAutoloadFence()
+    return P4CacheAutoloadOwner(state|1).suspendOwned(polls)
+}
+trusted fun P4CacheAutoloadOwner.restoreOwned(polls: int): P4CacheAutoloadOwner {
+    if (!this.valid() || polls < 1 || polls > 1000000) return this
+    var state=(this|0)&(-256)
+    if ((state&0x100000) == 0) {
+        // Finish a failed suspend before resuming ANY worker. No partial
+        // restore is allowed while another worker may still be draining.
+        val drained=this.suspendOwned(polls)
+        if (drained.status() != 1) return drained
+        state=((drained|0)&(-256))|0x100000
+    }
+    p4CacheAutoloadFence()
+    var index=3
+    while (index >= 0) {
+        val flag=p4CacheAutoloadFlag(index)
+        if ((state&flag) != 0) {
+            val offset=p4CacheAutoloadOffset(index)
+            p4CacheAutoloadWrite(offset,p4CacheAutoloadRead(offset)|1)
+            if ((p4CacheAutoloadRead(offset)&1) == 0) return P4CacheAutoloadOwner(state|5)
+            state=state^flag
+        }
+        index=index-1
+    }
+    p4CacheAutoloadFence(); return P4CacheAutoloadOwner(state)
+}

@@ -1,0 +1,1634 @@
+import "common_esp32.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
+import "abla/unsafe/native"
+
+// Typed ESP32 I2S driver core reconstructed from ESP-IDF 6's i2s_common.c.
+// The controller and channel layouts remain ABI-compatible with the rest of
+// the source-owned driver, while ordinary Abla control flow replaces the
+// recovered register-machine dispatchers.
+
+@inline
+trusted fun esp32I2sLoadU32(address: u32, offset: u32 = u32(0)): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address + offset))))
+
+@inline
+trusted fun esp32I2sLoadU8(address: u32, offset: u32 = u32(0)): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address + offset))))
+
+@inline
+trusted fun esp32I2sStoreU32(
+    address: u32,
+    offset: u32,
+    value: u32
+): void = ablaUnsafeStoreU32(
+    nativePointerFromAddress(int(address + offset)), int(value)
+)
+
+@inline
+trusted fun esp32I2sStoreU8(
+    address: u32,
+    offset: u32,
+    value: u32
+): void = ablaUnsafeStoreU8(
+    nativePointerFromAddress(int(address + offset)), int(value)
+)
+
+@inline
+trusted fun esp32I2sRegisterLoadU32(device: u32, offset: u32): u32 =
+    u32(ablaUnsafeVolatileLoadU32(int(device + offset)))
+
+@inline
+trusted fun esp32I2sRegisterStoreU32(device: u32, offset: u32, value: u32): void =
+    ablaUnsafeVolatileStoreU32(int(device + offset), int(value))
+
+// Only I2S register addresses use these primitives; descriptors and PCM stay RAM.
+@inline
+trusted fun esp32I2sUpdateRegister(
+    address: u32,
+    mask: u32,
+    value: u32
+): void {
+    xtensaMemoryBarrier()
+    esp32I2sRegisterStoreU32(
+        address, u32(0),
+        (esp32I2sRegisterLoadU32(address, u32(0)) & (mask ^ u32(4294967295))) |
+            (value & mask)
+    )
+    xtensaMemoryBarrier()
+}
+
+// ESP32 I2S hardware instances from soc/i2s_reg.h. The HAL context is a
+// single device pointer, so it remains an unboxed four-byte Abla value.
+trusted fun esp32I2sHalInitialize(hal: u32, port: u32): void {
+    val device = if (port == u32(0)) u32(1073016832)
+        else if (port == u32(1)) u32(1073139712)
+        else u32(0)
+    esp32I2sStoreU32(hal, u32(0), device)
+}
+
+// Abla implementation of hal_utils_calc_clk_div_frac_accurate specialized to
+// the classic ESP32 I2S divider: N is 1..255 and A/B are 6-bit values.
+trusted fun esp32I2sHalCalculateMclkDivision(
+    sourceClock: u32,
+    masterClock: u32,
+    division: u32
+): void {
+    if (masterClock == u32(0)) {
+        esp32I2sStoreU32(division, u32(0), u32(0))
+        esp32I2sStoreU32(division, u32(4), u32(0))
+        esp32I2sStoreU32(division, u32(8), u32(0))
+        return
+    }
+
+    var integerPart = sourceClock / masterClock
+    val frequencyError = sourceClock % masterClock
+    var denominator = u32(2)
+    var numerator = u32(0)
+    if (frequencyError != u32(0)) {
+        val carryThreshold = masterClock -
+            (masterClock / u32(63)) * u32(2)
+        if (frequencyError < carryThreshold) {
+            var candidate = u32(2)
+            var minimumError = u64(18446744073709551615)
+            while (minimumError != u64(0) && candidate < u32(64)) {
+                val roundedProduct = u64(candidate) * u64(frequencyError) +
+                    u64(masterClock / u32(2))
+                val candidateNumerator = esp32UnsignedDivide64Low(
+                    u32(roundedProduct),
+                    u32(roundedProduct >>> u64(32)),
+                    masterClock,
+                    u32(0)
+                )
+                val expectedProduct = u64(masterClock) *
+                    u64(candidateNumerator)
+                val actualProduct = u64(frequencyError) * u64(candidate)
+                val error = if (expectedProduct > actualProduct)
+                    expectedProduct - actualProduct
+                else actualProduct - expectedProduct
+                if (error < minimumError) {
+                    denominator = candidate
+                    numerator = candidateNumerator
+                    minimumError = error
+                }
+                candidate = candidate + u32(1)
+            }
+        } else {
+            integerPart = integerPart + u32(1)
+        }
+    }
+
+    if (integerPart == u32(0) || integerPart >= u32(256)) {
+        integerPart = u32(0)
+        denominator = u32(0)
+        numerator = u32(0)
+    }
+    esp32I2sStoreU32(division, u32(0), integerPart)
+    esp32I2sStoreU32(division, u32(4), denominator)
+    esp32I2sStoreU32(division, u32(8), numerator)
+}
+
+trusted fun esp32I2sHalSetClock(
+    hal: u32,
+    clockInformation: u32,
+    source: u32,
+    returnedDivision: u32,
+    receive: bool
+): void {
+    val device = esp32I2sLoadU32(hal)
+    val apll = if (source == u32(12)) u32(2097152) else u32(0)
+    esp32I2sUpdateRegister(device + u32(172), u32(2097152), apll)
+    if (clockInformation == u32(0)) return
+
+    val localDivision = u32(nativeStackAllocate(12))
+    val division = if (returnedDivision != u32(0)) returnedDivision
+        else localDivision
+    freestandingSet(division, 0, u32(12))
+    esp32I2sHalCalculateMclkDivision(
+        esp32I2sLoadU32(clockInformation, u32(0)),
+        esp32I2sLoadU32(clockInformation, u32(4)),
+        division
+    )
+
+    val integerPart = esp32I2sLoadU32(division, u32(0)) & u32(255)
+    val denominator = esp32I2sLoadU32(division, u32(4)) & u32(63)
+    val numerator = esp32I2sLoadU32(division, u32(8)) & u32(63)
+    esp32I2sUpdateRegister(
+        device + u32(172), u32(1048575),
+        // CLKM_DIV_B (numerator) is bits 8..13; DIV_A (denominator) 14..19.
+        integerPart | (numerator << u32(8)) | (denominator << u32(14))
+    )
+
+    val bitClockDivision = u32(ablaUnsafeLoadU16(
+        nativePointerFromAddress(int(clockInformation + u32(14)))
+    )) & u32(63)
+    val bitClockMask = if (receive) u32(4032) else u32(63)
+    val bitClockValue = if (receive) bitClockDivision << u32(6)
+        else bitClockDivision
+    esp32I2sUpdateRegister(
+        device + u32(176), bitClockMask, bitClockValue
+    )
+}
+
+trusted fun esp32I2sHalSetTransmitClock(
+    hal: u32,
+    clockInformation: u32,
+    source: u32,
+    returnedDivision: u32
+): void = esp32I2sHalSetClock(
+    hal, clockInformation, source, returnedDivision, false
+)
+
+trusted fun esp32I2sHalSetReceiveClock(
+    hal: u32,
+    clockInformation: u32,
+    source: u32,
+    returnedDivision: u32
+): void = esp32I2sHalSetClock(
+    hal, clockInformation, source, returnedDivision, true
+)
+
+trusted fun esp32I2sHalReset(device: u32, receive: bool): void {
+    val reset = if (receive) u32(2) else u32(1)
+    val dmaReset = if (receive) u32(1) else u32(2)
+    esp32I2sUpdateRegister(device + u32(8), reset, reset)
+    esp32I2sUpdateRegister(device + u32(8), reset, u32(0))
+    esp32I2sUpdateRegister(device + u32(96), dmaReset, dmaReset)
+    esp32I2sUpdateRegister(device + u32(96), dmaReset, u32(0))
+}
+
+trusted fun esp32I2sHalConfigureSampleWidth(
+    device: u32,
+    slotWidth: u32,
+    dataWidth: u32,
+    receive: bool
+): void {
+    val fifoMask = if (receive) u32(458752) else u32(57344)
+    val fifoShift = if (receive) u32(16) else u32(13)
+    val fifoMode = if (slotWidth > u32(16)) u32(2) else u32(0)
+    esp32I2sUpdateRegister(
+        device + u32(32), fifoMask, fifoMode << fifoShift
+    )
+    val sampleMask = if (receive) u32(16515072) else u32(258048)
+    val sampleShift = if (receive) u32(18) else u32(12)
+    esp32I2sUpdateRegister(
+        device + u32(176), sampleMask,
+        (dataWidth & u32(63)) << sampleShift
+    )
+}
+
+trusted fun esp32I2sHalSelectTransmitSlot(
+    device: u32,
+    slotMask: u32,
+    mono: bool
+): void {
+    var mode = u32(0)
+    if (mono) {
+        if (slotMask == u32(1)) mode = u32(3)
+        else if (slotMask == u32(2)) mode = u32(4)
+        else if (slotMask == u32(3)) mode = u32(1)
+    } else {
+        if (slotMask == u32(1)) mode = u32(1)
+        else if (slotMask == u32(2)) mode = u32(2)
+    }
+    esp32I2sUpdateRegister(device + u32(44), u32(7), mode)
+}
+
+trusted fun esp32I2sHalSelectReceiveSlot(
+    device: u32,
+    slotMask: u32,
+    msbRight: bool
+): void {
+    var mode = u32(0)
+    if (slotMask == u32(1)) mode = if (msbRight) u32(1) else u32(2)
+    else if (slotMask == u32(2)) {
+        mode = if (msbRight) u32(2) else u32(1)
+    }
+    esp32I2sUpdateRegister(device + u32(44), u32(24), mode << u32(3))
+}
+
+trusted fun esp32I2sHalSetStandardTransmitSlot(
+    hal: u32,
+    slave: bool,
+    slot: u32
+): void {
+    val device = esp32I2sLoadU32(hal)
+    val dataWidth = esp32I2sLoadU32(slot, u32(0))
+    val configuredSlotWidth = esp32I2sLoadU32(slot, u32(4))
+    val slotWidth = if (configuredSlotWidth > dataWidth)
+        configuredSlotWidth else dataWidth
+    val mono = esp32I2sLoadU32(slot, u32(8)) == u32(1)
+    esp32I2sHalReset(device, false)
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(64), if (slave) u32(64) else u32(0)
+    )
+    esp32I2sHalConfigureSampleWidth(
+        device, slotWidth, dataWidth, false
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(1024),
+        (esp32I2sLoadU8(slot, u32(21)) & u32(1)) << u32(10)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(4096),
+        if (esp32I2sLoadU32(slot, u32(16)) == u32(1))
+            u32(4096) else u32(0)
+    )
+    val fifoMode = (if (dataWidth > u32(16)) u32(2) else u32(0)) +
+        (if (mono) u32(1) else u32(0))
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(57344), fifoMode << u32(13)
+    )
+    esp32I2sHalSelectTransmitSlot(
+        device, esp32I2sLoadU32(slot, u32(12)), mono
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(65536),
+        (esp32I2sLoadU8(slot, u32(22)) & u32(1)) << u32(16)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(256),
+        (esp32I2sLoadU8(slot, u32(20)) & u32(1)) << u32(8)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(524288), u32(524288)
+    )
+}
+
+trusted fun esp32I2sHalSetStandardReceiveSlot(
+    hal: u32,
+    slave: bool,
+    slot: u32
+): void {
+    val device = esp32I2sLoadU32(hal)
+    val dataWidth = esp32I2sLoadU32(slot, u32(0))
+    val configuredSlotWidth = esp32I2sLoadU32(slot, u32(4))
+    val slotWidth = if (configuredSlotWidth > dataWidth)
+        configuredSlotWidth else dataWidth
+    val mono = esp32I2sLoadU32(slot, u32(8)) == u32(1)
+    esp32I2sHalReset(device, true)
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(128), if (slave) u32(128) else u32(0)
+    )
+    esp32I2sHalConfigureSampleWidth(
+        device, slotWidth, dataWidth, true
+    )
+    val fifoMode = (if (dataWidth > u32(16)) u32(2) else u32(0)) +
+        (if (mono) u32(1) else u32(0))
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(458752), fifoMode << u32(16)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(2048),
+        (esp32I2sLoadU8(slot, u32(21)) & u32(1)) << u32(11)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(8192),
+        if (esp32I2sLoadU32(slot, u32(16)) == u32(1))
+            u32(8192) else u32(0)
+    )
+    val msbRight = esp32I2sLoadU8(slot, u32(22)) != u32(0)
+    esp32I2sHalSelectReceiveSlot(
+        device, esp32I2sLoadU32(slot, u32(12)), msbRight
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(131072),
+        (esp32I2sLoadU8(slot, u32(22)) & u32(1)) << u32(17)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(512),
+        (esp32I2sLoadU8(slot, u32(20)) & u32(1)) << u32(9)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(1048576), u32(1048576)
+    )
+}
+
+trusted fun esp32I2sHalSetPdmReceiveSlot(
+    hal: u32,
+    slave: bool,
+    slot: u32
+): void {
+    val device = esp32I2sLoadU32(hal)
+    val dataWidth = esp32I2sLoadU32(slot, u32(0))
+    val configuredSlotWidth = esp32I2sLoadU32(slot, u32(4))
+    val slotWidth = if (configuredSlotWidth > dataWidth)
+        configuredSlotWidth else dataWidth
+    val mono = esp32I2sLoadU32(slot, u32(8)) == u32(1)
+    esp32I2sHalReset(device, true)
+    esp32I2sUpdateRegister(
+        device + u32(8), u32(128), if (slave) u32(128) else u32(0)
+    )
+    esp32I2sHalConfigureSampleWidth(
+        device, slotWidth, dataWidth, true
+    )
+    val fifoMode = (if (dataWidth > u32(16)) u32(2) else u32(0)) +
+        (if (mono) u32(1) else u32(0))
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(458752), fifoMode << u32(16)
+    )
+    var receiveMode = u32(0)
+    val slotMask = esp32I2sLoadU32(slot, u32(12))
+    if (slotMask == u32(1)) receiveMode = u32(1)
+    else if (slotMask == u32(2)) receiveMode = u32(2)
+    esp32I2sUpdateRegister(
+        device + u32(44), u32(24), receiveMode << u32(3)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(32), u32(1048576), u32(1048576)
+    )
+    esp32I2sUpdateRegister(device + u32(8), u32(131584), u32(0))
+}
+
+trusted fun esp32I2sTransmitChannelStart(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    esp32I2sUpdateRegister(device + u32(8), u32(1), u32(1))
+    esp32I2sUpdateRegister(device + u32(8), u32(1), u32(0))
+    esp32I2sUpdateRegister(device + u32(96), u32(2), u32(2))
+    esp32I2sUpdateRegister(device + u32(96), u32(2), u32(0))
+    esp32I2sUpdateRegister(device + u32(96), u32(2), u32(2))
+    esp32I2sUpdateRegister(device + u32(96), u32(2), u32(0))
+    esp32I2sUpdateRegister(device + u32(8), u32(4), u32(4))
+    esp32I2sUpdateRegister(device + u32(8), u32(4), u32(0))
+    esp32RecoveredEspIntrEnable(
+        esp32I2sLoadU32(handle, u32(16)),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sUpdateRegister(device + u32(20), u32(4096), u32(4096))
+    esp32I2sUpdateRegister(device + u32(32), u32(4096), u32(4096))
+    val firstDescriptor = esp32I2sLoadU32(
+        esp32I2sLoadU32(handle, u32(44)), u32(0)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(48), u32(1073741823),
+        (firstDescriptor & u32(1048575)) | u32(536870912)
+    )
+    if ((esp32I2sLoadU8(handle, u32(64)) & u32(2)) == u32(0)) {
+        esp32I2sUpdateRegister(device + u32(8), u32(16), u32(16))
+    }
+}
+
+trusted fun esp32I2sReceiveChannelStart(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    esp32I2sUpdateRegister(device + u32(8), u32(2), u32(2))
+    esp32I2sUpdateRegister(device + u32(8), u32(2), u32(0))
+    esp32I2sUpdateRegister(device + u32(96), u32(1), u32(1))
+    esp32I2sUpdateRegister(device + u32(96), u32(1), u32(0))
+    esp32I2sUpdateRegister(device + u32(96), u32(1), u32(1))
+    esp32I2sUpdateRegister(device + u32(96), u32(1), u32(0))
+    esp32I2sUpdateRegister(device + u32(8), u32(8), u32(8))
+    esp32I2sUpdateRegister(device + u32(8), u32(8), u32(0))
+    esp32RecoveredEspIntrEnable(
+        esp32I2sLoadU32(handle, u32(16)),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sUpdateRegister(device + u32(20), u32(512), u32(512))
+    esp32I2sUpdateRegister(device + u32(32), u32(4096), u32(4096))
+    val firstDescriptor = esp32I2sLoadU32(
+        esp32I2sLoadU32(handle, u32(44)), u32(0)
+    )
+    esp32I2sUpdateRegister(
+        device + u32(52), u32(1073741823),
+        (firstDescriptor & u32(1048575)) | u32(536870912)
+    )
+    if ((esp32I2sLoadU8(handle, u32(64)) & u32(2)) == u32(0)) {
+        esp32I2sUpdateRegister(device + u32(8), u32(32), u32(32))
+    }
+}
+
+trusted fun esp32I2sTransmitChannelStop(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    if ((esp32I2sLoadU8(handle, u32(64)) & u32(4)) == u32(0)) {
+        esp32I2sUpdateRegister(device + u32(8), u32(16), u32(0))
+    }
+    esp32I2sUpdateRegister(device + u32(48), u32(268435456), u32(268435456))
+    esp32I2sUpdateRegister(device + u32(20), u32(4096), u32(0))
+    esp32I2sUpdateRegister(device + u32(32), u32(4096), u32(0))
+    esp32RecoveredEspIntrDisable(
+        esp32I2sLoadU32(handle, u32(16)),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32I2sReceiveChannelStop(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    if ((esp32I2sLoadU8(handle, u32(64)) & u32(4)) == u32(0)) {
+        esp32I2sUpdateRegister(device + u32(8), u32(32), u32(0))
+    }
+    esp32I2sUpdateRegister(device + u32(52), u32(268435456), u32(268435456))
+    esp32I2sUpdateRegister(device + u32(20), u32(512), u32(0))
+    esp32I2sUpdateRegister(device + u32(32), u32(4096), u32(0))
+    esp32RecoveredEspIntrDisable(
+        esp32I2sLoadU32(handle, u32(16)),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32I2sPlatformSetBusClock(
+    id: u32,
+    enabled: bool
+): void {
+    val bit = if (id == u32(0)) u32(16) else u32(2097152)
+    val clockEnable = u32(1072693440)
+    val current = esp32DportRead(clockEnable)
+    xtensaMemoryBarrier()
+    esp32I2sStoreU32(
+        clockEnable, u32(0),
+        if (enabled) current | bit else current & (bit ^ u32(4294967295))
+    )
+    xtensaMemoryBarrier()
+}
+
+trusted fun esp32I2sPlatformReset(id: u32): void {
+    val bit = if (id == u32(0)) u32(16) else u32(2097152)
+    val reset = u32(1072693444)
+    var current = esp32DportRead(reset)
+    xtensaMemoryBarrier()
+    esp32I2sStoreU32(reset, u32(0), current | bit)
+    xtensaMemoryBarrier()
+    current = esp32DportRead(reset)
+    esp32I2sStoreU32(
+        reset, u32(0), current & (bit ^ u32(4294967295))
+    )
+    xtensaMemoryBarrier()
+}
+
+trusted fun esp32I2sPlatformAcquire(
+    id: u32,
+    componentName: u32
+): u32 {
+    if (id >= u32(2)) return u32(258)
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32I2sObject, u32(4294967295)
+    )
+    val controllerOffset = u32(8) + id * u32(4)
+    val componentOffset = u32(16) + id * u32(4)
+    if (esp32I2sLoadU32(esp32I2sObject, controllerOffset) != u32(0) ||
+        esp32I2sLoadU32(esp32I2sObject, componentOffset) != u32(0)) {
+        esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+        return u32(261)
+    }
+    esp32I2sStoreU32(esp32I2sObject, componentOffset, componentName)
+
+    esp32RecoveredPeriphRccEnter(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sPlatformSetBusClock(id, true)
+    esp32I2sPlatformReset(id)
+    val device = if (id == u32(0)) u32(1073016832)
+        else u32(1073139712)
+    esp32I2sUpdateRegister(
+        device + u32(172), u32(1048576), u32(1048576)
+    )
+    esp32I2sRegisterStoreU32(device, u32(168), u32(0))
+    esp32RecoveredPeriphRccExit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+    return u32(0)
+}
+
+trusted fun esp32I2sPlatformRelease(id: u32): u32 {
+    if (id >= u32(2)) return u32(258)
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32I2sObject, u32(4294967295)
+    )
+    val controllerOffset = u32(8) + id * u32(4)
+    if (esp32I2sLoadU32(esp32I2sObject, controllerOffset) != u32(0)) {
+        esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+        return u32(259)
+    }
+    esp32I2sStoreU32(
+        esp32I2sObject, u32(16) + id * u32(4), u32(0)
+    )
+
+    esp32RecoveredPeriphRccEnter(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sPlatformSetBusClock(id, false)
+    val device = if (id == u32(0)) u32(1073016832)
+        else u32(1073139712)
+    esp32I2sUpdateRegister(device + u32(172), u32(1048576), u32(0))
+    esp32RecoveredPeriphRccExit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+    return u32(0)
+}
+
+trusted fun esp32I2sAcquireController(id: u32): u32 {
+    if (id >= u32(2)) return u32(0)
+
+    val allocated = esp32HeapCapsCallocate(u32(1), u32(36), u32(4096))
+    if (allocated == u32(0)) return u32(0)
+
+    esp32I2sStoreU32(allocated, u32(0), id)
+    esp32I2sHalInitialize(allocated + u32(4), id)
+    esp32I2sStoreU8(allocated, u32(12), u32(0))
+    esp32I2sStoreU32(allocated, u32(16), u32(0))
+    esp32I2sStoreU32(allocated, u32(20), u32(0))
+    esp32I2sStoreU32(allocated, u32(28), u32(4294967295))
+
+    val occupation = esp32I2sPlatformAcquire(
+        id,
+        esp32Data_Labla_recovered_esp32_i2s_common_data_rodata_i2s_acquire_controller_obj_str1_4_d55f49cd4c
+    )
+    if (occupation == u32(0)) {
+        esp32RecoveredXPortEnterCriticalTimeout(
+            esp32I2sObject, u32(4294967295)
+        )
+        esp32I2sStoreU32(
+            esp32I2sObject, u32(8) + id * u32(4), allocated
+        )
+        esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+
+        if (id == u32(0)) {
+            val sarControl = u32(1073111040)
+            val control = esp32I2sLoadU32(sarControl, u32(16))
+            esp32I2sStoreU32(
+                sarControl, u32(16), control & u32(4227858431)
+            )
+        }
+        return allocated
+    }
+
+    esp32LibcFreeValue(allocated)
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32I2sObject, u32(4294967295)
+    )
+    val existing = esp32I2sLoadU32(
+        esp32I2sObject, u32(8) + id * u32(4)
+    )
+    esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+    return existing
+}
+
+trusted fun esp32I2sTakeAvailableChannel(
+    controller: u32,
+    searchMask: u32
+): bool {
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32I2sObject, u32(4294967295)
+    )
+    val occupied = esp32I2sLoadU32(controller, u32(8))
+    val available = (occupied & searchMask) == u32(0)
+    if (available) {
+        esp32I2sStoreU32(
+            controller, u32(8), occupied | searchMask
+        )
+    }
+    esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+    return available
+}
+
+trusted fun esp32I2sChangePort(handle: u32, id: u32): u32 {
+    if (handle == u32(0) || id >= u32(2)) return u32(258)
+    val oldController = esp32I2sLoadU32(handle, u32(0))
+    if (oldController == u32(0)) return u32(258)
+    if (esp32I2sLoadU32(oldController, u32(0)) == id) return u32(0)
+
+    val direction = esp32I2sLoadU32(handle, u32(12))
+    val newController = esp32I2sAcquireController(id)
+    if (newController == u32(0) ||
+        !esp32I2sTakeAvailableChannel(newController, direction)) {
+        return u32(261)
+    }
+
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32I2sObject, u32(4294967295)
+    )
+    val channelOffset = if (direction == u32(2)) u32(16) else u32(20)
+    esp32I2sStoreU32(newController, channelOffset, handle)
+    esp32I2sStoreU32(
+        newController, u32(8),
+        esp32I2sLoadU32(newController, u32(8)) | direction
+    )
+    esp32I2sStoreU32(oldController, channelOffset, u32(0))
+    esp32I2sStoreU8(oldController, u32(12), u32(0))
+    esp32I2sStoreU32(
+        oldController, u32(8),
+        esp32I2sLoadU32(oldController, u32(8)) & ~direction
+    )
+    esp32I2sStoreU32(handle, u32(0), newController)
+    esp32RecoveredVPortExitCriticalValue(esp32I2sObject)
+    return u32(0)
+}
+
+trusted fun esp32I2sDestroyControllerCell(cell: u32): u32 {
+    if (cell == u32(0)) return u32(258)
+    val controller = esp32I2sLoadU32(cell)
+    if (controller == u32(0)) return u32(258)
+    if (esp32I2sLoadU32(controller, u32(16)) != u32(0) ||
+        esp32I2sLoadU32(controller, u32(20)) != u32(0)) return u32(259)
+
+    val id = esp32I2sLoadU32(controller, u32(0))
+    val clockOutput = esp32I2sLoadU32(controller, u32(32))
+    if (clockOutput != u32(0)) esp32ClockOutputStop(clockOutput)
+    val device = esp32I2sLoadU32(controller, u32(4))
+    esp32I2sRegisterStoreU32(
+        device, u32(32),
+        esp32I2sRegisterLoadU32(device, u32(32)) & u32(4294963199)
+    )
+    esp32LibcFreeValue(controller)
+    esp32I2sStoreU32(cell, u32(0), u32(0))
+    return esp32I2sPlatformRelease(id)
+}
+
+trusted fun esp32I2sSourceClockFrequency(
+    source: u32,
+    requestedMclk: u32
+): u32 {
+    // ESP32 I2S supports only PLL_F160M and APLL as module clocks. Keeping
+    // that knowledge here avoids retaining the generic recovered clock-tree
+    // dispatcher and every unrelated CPU/RTC/APB clock branch behind it.
+    if (source == u32(6)) return u32(160000000)
+    if (source != u32(12) || requestedMclk == u32(0)) return u32(0)
+
+    val frequency = u32(nativeStackAllocate(4))
+    esp32I2sStoreU32(frequency, u32(0), u32(0))
+    var divider = u32(5303031) / requestedMclk + u32(1)
+    if (divider < u32(2)) divider = u32(2)
+    val expected = requestedMclk * divider
+    if (expected > u32(125000000)) return u32(0)
+    val result = esp32ClockTreeApllFrequencySet(expected, frequency)
+    if (result == u32(258)) return u32(0)
+    return esp32I2sLoadU32(frequency)
+}
+
+trusted fun esp32I2sDeleteQueue(queue: u32): void {
+    if (queue != u32(0)) esp32RecoveredVQueueDeleteWithCaps(
+        queue,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32I2sDeleteSemaphore(semaphore: u32): void {
+    if (semaphore != u32(0)) esp32RecoveredVSemaphoreDeleteWithCaps(
+        semaphore,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32I2sGiveSemaphore(semaphore: u32): void {
+    esp32RecoveredXQueueGenericSend(
+        semaphore,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32I2sEnableChannel(handle: u32): u32 {
+    if (handle == u32(0)) return u32(258)
+    val mutex = esp32I2sLoadU32(handle, u32(96))
+    esp32RecoveredXQueueSemaphoreTake(
+        mutex, u32(4294967295),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (esp32I2sLoadU32(handle, u32(52)) != u32(1)) {
+        esp32I2sGiveSemaphore(mutex)
+        return u32(259)
+    }
+
+    val start = esp32I2sLoadU32(handle, u32(140))
+    if (start != u32(0)) ablaUnsafeCallVoidI32(int(start), int(handle))
+    esp32I2sStoreU32(handle, u32(52), u32(2))
+    if (esp32I2sLoadU32(handle, u32(12)) == u32(1)) {
+        esp32RecoveredXQueueGenericReset(
+            esp32I2sLoadU32(handle, u32(104)), u32(0),
+            u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    esp32I2sGiveSemaphore(mutex)
+    esp32I2sGiveSemaphore(esp32I2sLoadU32(handle, u32(100)))
+    return u32(0)
+}
+
+trusted fun esp32I2sDisableChannel(handle: u32): u32 {
+    if (handle == u32(0)) return u32(258)
+    val mutex = esp32I2sLoadU32(handle, u32(96))
+    esp32RecoveredXQueueSemaphoreTake(
+        mutex, u32(4294967295),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (esp32I2sLoadU32(handle, u32(52)) < u32(2)) {
+        esp32I2sGiveSemaphore(mutex)
+        return u32(259)
+    }
+
+    esp32I2sStoreU32(handle, u32(52), u32(1))
+    esp32RecoveredXQueueSemaphoreTake(
+        esp32I2sLoadU32(handle, u32(100)), u32(4294967295),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(handle, u32(40), u32(0))
+    esp32I2sStoreU32(handle, u32(36), u32(0))
+    val stop = esp32I2sLoadU32(handle, u32(144))
+    if (stop != u32(0)) ablaUnsafeCallVoidI32(int(stop), int(handle))
+    if (esp32I2sLoadU32(handle, u32(12)) == u32(2)) {
+        esp32RecoveredXQueueGenericReset(
+            esp32I2sLoadU32(handle, u32(104)), u32(0),
+            u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    esp32I2sGiveSemaphore(mutex)
+    return u32(0)
+}
+
+trusted fun esp32I2sTransfer(
+    handle: u32,
+    buffer: u32,
+    size: u32,
+    transferred: u32,
+    timeoutTicks: u32,
+    receive: bool
+): u32 {
+    if (handle == u32(0)) return u32(258)
+    val expectedDirection = if (receive) u32(1) else u32(2)
+    if (esp32I2sLoadU32(handle, u32(12)) != expectedDirection) {
+        return u32(258)
+    }
+    if (transferred != u32(0)) {
+        esp32I2sStoreU32(transferred, u32(0), u32(0))
+    }
+
+    val binary = esp32I2sLoadU32(handle, u32(100))
+    val acquired = esp32RecoveredXQueueSemaphoreTake(
+        binary, timeoutTicks,
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (acquired != u32(1)) return u32(259)
+
+    var remaining = size
+    var cursor = buffer
+    var result = u32(0)
+    while (remaining > u32(0) &&
+        esp32I2sLoadU32(handle, u32(52)) == u32(2)) {
+        val position = esp32I2sLoadU32(handle, u32(36))
+        val current = esp32I2sLoadU32(handle, u32(40))
+        val capacity = esp32I2sLoadU32(handle, u32(28))
+        val spaces = if (current == u32(0)) u32(0)
+            else esp32RecoveredUxQueueSpacesAvailable(
+                esp32I2sLoadU32(handle, u32(104)),
+                u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+        if (position == capacity || current == u32(0) || spaces <= u32(1)) {
+            val received = esp32RecoveredXQueueReceive(
+                esp32I2sLoadU32(handle, u32(104)),
+                handle + u32(40), timeoutTicks,
+                u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if (received == u32(0)) {
+                result = u32(263)
+            } else {
+                esp32I2sStoreU32(handle, u32(36), u32(0))
+            }
+        }
+
+        if (result == u32(0)) {
+            val active = esp32I2sLoadU32(handle, u32(40))
+            val offset = esp32I2sLoadU32(handle, u32(36))
+            val available = esp32I2sLoadU32(handle, u32(28)) - offset
+            val amount = if (remaining < available) remaining else available
+            if (receive) freestandingCopy(
+                cursor, active + offset, amount
+            ) else freestandingCopy(active + offset, cursor, amount)
+            cursor = cursor + amount
+            remaining = remaining - amount
+            esp32I2sStoreU32(handle, u32(36), offset + amount)
+            if (transferred != u32(0)) esp32I2sStoreU32(
+                transferred, u32(0),
+                esp32I2sLoadU32(transferred) + amount
+            )
+        }
+        if (result != u32(0)) remaining = u32(0)
+    }
+    esp32I2sGiveSemaphore(binary)
+    return result
+}
+
+trusted fun esp32I2sWrite(
+    handle: u32,
+    source: u32,
+    size: u32,
+    written: u32,
+    timeoutTicks: u32
+): u32 = esp32I2sTransfer(
+    handle, source, size, written, timeoutTicks, false
+)
+
+trusted fun esp32I2sRead(
+    handle: u32,
+    destination: u32,
+    size: u32,
+    read: u32,
+    timeoutTicks: u32
+): u32 = esp32I2sTransfer(
+    handle, destination, size, read, timeoutTicks, true
+)
+
+trusted fun esp32I2sBufferSize(
+    handle: u32,
+    dataBitWidth: u32,
+    dmaFrameCount: u32
+): u32 {
+    val bytesPerSample = ((dataBitWidth + u32(15)) / u32(16)) * u32(2)
+    val bytesPerFrame = bytesPerSample *
+        esp32I2sLoadU32(handle, u32(68))
+    if (bytesPerFrame == u32(0)) return u32(0)
+    var size = dmaFrameCount * bytesPerFrame
+    if (size > u32(4092)) {
+        size = (u32(4092) / bytesPerFrame) * bytesPerFrame
+    }
+    return size
+}
+
+trusted fun esp32I2sFreeDmaDescriptors(handle: u32): u32 {
+    if (handle == u32(0)) return u32(258)
+    esp32I2sStoreU32(handle, u32(28), u32(0))
+    val count = esp32I2sLoadU32(handle, u32(20))
+    val descriptors = esp32I2sLoadU32(handle, u32(44))
+    if (descriptors != u32(0)) {
+        var index = u32(0)
+        while (index < count) {
+            val cell = descriptors + index * u32(4)
+            val descriptor = esp32I2sLoadU32(cell)
+            if (descriptor != u32(0)) {
+                esp32LibcFreeValue(descriptor)
+                esp32I2sStoreU32(cell, u32(0), u32(0))
+            }
+            index = index + u32(1)
+        }
+        esp32LibcFreeValue(descriptors)
+        esp32I2sStoreU32(handle, u32(44), u32(0))
+    }
+
+    val buffers = esp32I2sLoadU32(handle, u32(48))
+    if (buffers != u32(0)) {
+        var index = u32(0)
+        while (index < count) {
+            val cell = buffers + index * u32(4)
+            val buffer = esp32I2sLoadU32(cell)
+            if (buffer != u32(0)) {
+                esp32LibcFreeValue(buffer)
+                esp32I2sStoreU32(cell, u32(0), u32(0))
+            }
+            index = index + u32(1)
+        }
+        esp32LibcFreeValue(buffers)
+        esp32I2sStoreU32(handle, u32(48), u32(0))
+    }
+    return u32(0)
+}
+
+trusted fun esp32I2sAllocateDmaDescriptors(
+    handle: u32,
+    bufferSize: u32
+): u32 {
+    if (handle == u32(0) || bufferSize > u32(4092)) return u32(258)
+    val count = esp32I2sLoadU32(handle, u32(20))
+    esp32I2sStoreU32(handle, u32(28), bufferSize)
+    val descriptors = esp32HeapCapsCallocate(count, u32(4), u32(4096))
+    esp32I2sStoreU32(handle, u32(44), descriptors)
+    if (descriptors == u32(0)) {
+        esp32I2sFreeDmaDescriptors(handle)
+        return u32(257)
+    }
+    val buffers = esp32HeapCapsCallocate(count, u32(4), u32(4096))
+    esp32I2sStoreU32(handle, u32(48), buffers)
+    if (buffers == u32(0)) {
+        esp32I2sFreeDmaDescriptors(handle)
+        return u32(257)
+    }
+
+    var index = u32(0)
+    var result = u32(0)
+    while (index < count && result == u32(0)) {
+        val descriptor = esp32HeapCapsAlignedCallocate(
+            u32(4), u32(1), u32(12), u32(2060)
+        )
+        esp32I2sStoreU32(
+            descriptors + index * u32(4), u32(0), descriptor
+        )
+        if (descriptor == u32(0)) {
+            result = u32(257)
+        } else {
+            esp32I2sStoreU32(
+                descriptor, u32(0),
+                u32(3221225472) |
+                    ((bufferSize & u32(4095)) << u32(12)) |
+                    (bufferSize & u32(4095))
+            )
+            val buffer = esp32HeapCapsAlignedCallocate(
+                u32(4), u32(1), bufferSize, u32(2060)
+            )
+            esp32I2sStoreU32(
+                buffers + index * u32(4), u32(0), buffer
+            )
+            if (buffer == u32(0)) result = u32(257)
+            else esp32I2sStoreU32(descriptor, u32(4), buffer)
+        }
+        index = index + u32(1)
+    }
+    if (result != u32(0)) {
+        esp32I2sFreeDmaDescriptors(handle)
+        return result
+    }
+
+    index = u32(0)
+    while (index < count) {
+        val descriptor = esp32I2sLoadU32(
+            descriptors + index * u32(4)
+        )
+        val nextIndex = if (index + u32(1) < count)
+            index + u32(1) else u32(0)
+        esp32I2sStoreU32(
+            descriptor, u32(8),
+            esp32I2sLoadU32(descriptors + nextIndex * u32(4))
+        )
+        index = index + u32(1)
+    }
+    if (esp32I2sLoadU32(handle, u32(12)) == u32(1)) {
+        val controller = esp32I2sLoadU32(handle, u32(0))
+        val device = esp32I2sLoadU32(controller, u32(4))
+        esp32I2sRegisterStoreU32(
+            device, u32(36), (bufferSize + u32(3)) / u32(4)
+        )
+    }
+    return u32(0)
+}
+
+trusted fun esp32I2sPairGpioMaskLow(handle: u32): u32 {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val pair = if (esp32I2sLoadU32(handle, u32(12)) == u32(2))
+        esp32I2sLoadU32(controller, u32(20))
+    else esp32I2sLoadU32(controller, u32(16))
+    if (pair == u32(0)) return u32(0)
+    return esp32I2sLoadU32(pair, u32(112))
+}
+
+trusted fun esp32I2sPairGpioMaskHigh(handle: u32): u32 {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val pair = if (esp32I2sLoadU32(handle, u32(12)) == u32(2))
+        esp32I2sLoadU32(controller, u32(20))
+    else esp32I2sLoadU32(controller, u32(16))
+    if (pair == u32(0)) return u32(0)
+    return esp32I2sLoadU32(pair, u32(116))
+}
+
+trusted fun esp32I2sReserveOutputGpio(handle: u32, gpio: u32): void {
+    if (gpio >= u32(64)) return
+    val low = if (gpio < u32(32))
+        u32(1) << gpio else u32(0)
+    val high = if (gpio >= u32(32))
+        u32(1) << (gpio - u32(32)) else u32(0)
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val shared = esp32I2sLoadU8(controller, u32(12)) != u32(0) &&
+        ((esp32I2sPairGpioMaskLow(handle) & low) != u32(0) ||
+         (esp32I2sPairGpioMaskHigh(handle) & high) != u32(0))
+    if (!shared) esp32RecoveredEspGpioReserve(
+        low, high,
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(
+        handle, u32(112), esp32I2sLoadU32(handle, u32(112)) | low
+    )
+    esp32I2sStoreU32(
+        handle, u32(116), esp32I2sLoadU32(handle, u32(116)) | high
+    )
+    return
+}
+
+trusted fun esp32I2sRevokeOutputGpios(
+    handle: u32,
+    lowMask: u32,
+    highMask: u32
+): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    var revokeLow = lowMask
+    var revokeHigh = highMask
+    if (esp32I2sLoadU8(controller, u32(12)) != u32(0)) {
+        revokeLow = (esp32I2sPairGpioMaskLow(handle) ^ lowMask) & lowMask
+        revokeHigh = (esp32I2sPairGpioMaskHigh(handle) ^ highMask) & highMask
+    }
+    esp32RecoveredEspGpioRevoke(
+        revokeLow, revokeHigh,
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(
+        handle, u32(112), esp32I2sLoadU32(handle, u32(112)) & ~lowMask
+    )
+    esp32I2sStoreU32(
+        handle, u32(116), esp32I2sLoadU32(handle, u32(116)) & ~highMask
+    )
+    return
+}
+
+trusted fun esp32I2sConfigureGpioSignal(
+    handle: u32,
+    gpio: u32,
+    signal: u32,
+    input: u32,
+    inverted: u32
+): void {
+    if (gpio == u32(4294967295)) return
+    esp32RecoveredGpioFuncSel(
+        gpio, u32(2),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (input != u32(0)) {
+        esp32RecoveredGpioInputEnable(
+            gpio,
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        esp32RomGpioConnectInSignal(gpio, signal, inverted)
+    } else {
+        esp32I2sReserveOutputGpio(handle, gpio)
+        esp32RomGpioConnectOutSignal(gpio, signal, inverted, u32(0))
+    }
+    return
+}
+
+trusted fun esp32I2sConfigureGpioLoopback(
+    handle: u32,
+    gpio: u32,
+    outputSignal: u32,
+    inputSignal: u32
+): void {
+    if (gpio == u32(4294967295)) return
+    esp32I2sReserveOutputGpio(handle, gpio)
+    esp32RecoveredGpioFuncSel(
+        gpio, u32(2),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredGpioInputEnable(
+        gpio,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RomGpioConnectOutSignal(gpio, outputSignal, u32(0), u32(0))
+    esp32RomGpioConnectInSignal(gpio, inputSignal, u32(0))
+    return
+}
+
+trusted fun esp32I2sConfigureMasterClock(
+    handle: u32,
+    controllerId: u32,
+    gpio: u32,
+    source: u32,
+    inverted: u32
+): u32 {
+    if (gpio == u32(4294967295)) return u32(0)
+    val controller = esp32I2sLoadU32(
+        u32(esp32I2sObject), u32(8) + controllerId * u32(4)
+    )
+    if (controller == u32(0)) return u32(258)
+    if (esp32I2sLoadU32(controller, u32(32)) != u32(0)) return u32(0)
+    esp32I2sReserveOutputGpio(handle, gpio)
+    val clockSignal = if (source == u32(12)) u32(6)
+        else if (controllerId == u32(0)) u32(0) else u32(15)
+    return esp32ClockOutputStart(
+        clockSignal, gpio, controller + u32(32)
+    )
+}
+
+trusted fun esp32I2sDmaRxInterrupt(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    val status = esp32I2sRegisterLoadU32(device, u32(16))
+    esp32I2sRegisterStoreU32(device, u32(24), status)
+    if ((status & u32(512)) == u32(0)) return
+
+    val descriptor = esp32I2sRegisterLoadU32(device, u32(60))
+    if (descriptor == u32(0)) return
+    val event = u32(nativeStackAllocate(8))
+    esp32I2sStoreU32(event, u32(0), esp32I2sLoadU32(descriptor, u32(4)))
+    esp32I2sStoreU32(event, u32(4), esp32I2sLoadU32(handle, u32(28)))
+    var yieldRequested = u32(0)
+    val callback = esp32I2sLoadU32(handle, u32(120))
+    if (callback != u32(0)) yieldRequested =
+        u32(ablaUnsafeCallI32I32I32I32(
+            int(callback), int(handle), int(event),
+            int(esp32I2sLoadU32(handle, u32(136)))
+        ))
+
+    val queue = esp32I2sLoadU32(handle, u32(104))
+    val firstYield = u32(nativeStackAllocate(4))
+    val secondYield = u32(nativeStackAllocate(4))
+    esp32I2sStoreU32(firstYield, u32(0), u32(0))
+    esp32I2sStoreU32(secondYield, u32(0), u32(0))
+    if (esp32RecoveredXQueueIsQueueFullFromISR(
+        queue,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)) {
+        val discarded = u32(nativeStackAllocate(4))
+        esp32RecoveredXQueueReceiveFromISR(
+            queue, discarded, firstYield,
+            u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        val overflow = esp32I2sLoadU32(handle, u32(124))
+        if (overflow != u32(0)) {
+            esp32I2sStoreU32(event, u32(0), u32(0))
+            yieldRequested = yieldRequested | u32(
+                ablaUnsafeCallI32I32I32I32(
+                    int(overflow), int(handle), int(event),
+                    int(esp32I2sLoadU32(handle, u32(136)))
+                )
+            )
+        }
+    }
+    esp32RecoveredXQueueGenericSendFromISR(
+        queue, descriptor + u32(4), secondYield, u32(0),
+        u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if ((esp32I2sLoadU32(firstYield) |
+        esp32I2sLoadU32(secondYield) | yieldRequested) != u32(0)) {
+        esp32RecoveredFrxtSetupSwitch()
+    }
+    return
+}
+
+trusted fun esp32I2sDmaTxInterrupt(handle: u32): void {
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val device = esp32I2sLoadU32(controller, u32(4))
+    val status = esp32I2sRegisterLoadU32(device, u32(16))
+    esp32I2sRegisterStoreU32(device, u32(24), status)
+    if ((status & u32(4096)) == u32(0)) return
+
+    val descriptor = esp32I2sRegisterLoadU32(device, u32(56))
+    if (descriptor == u32(0)) return
+    val buffer = esp32I2sLoadU32(descriptor, u32(4))
+    val size = esp32I2sLoadU32(handle, u32(28))
+    val event = u32(nativeStackAllocate(8))
+    esp32I2sStoreU32(event, u32(0), buffer)
+    esp32I2sStoreU32(event, u32(4), size)
+    if (esp32I2sLoadU8(handle, u32(33)) != u32(0)) {
+        freestandingSet(buffer, 0, size)
+    }
+
+    var yieldRequested = u32(0)
+    val callback = esp32I2sLoadU32(handle, u32(128))
+    if (callback != u32(0)) yieldRequested =
+        u32(ablaUnsafeCallI32I32I32I32(
+            int(callback), int(handle), int(event),
+            int(esp32I2sLoadU32(handle, u32(136)))
+        ))
+    val queue = esp32I2sLoadU32(handle, u32(104))
+    val firstYield = u32(nativeStackAllocate(4))
+    val secondYield = u32(nativeStackAllocate(4))
+    esp32I2sStoreU32(firstYield, u32(0), u32(0))
+    esp32I2sStoreU32(secondYield, u32(0), u32(0))
+    if (esp32RecoveredXQueueIsQueueFullFromISR(
+        queue,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)) {
+        val discarded = u32(nativeStackAllocate(4))
+        esp32RecoveredXQueueReceiveFromISR(
+            queue, discarded, firstYield,
+            u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        val overflow = esp32I2sLoadU32(handle, u32(132))
+        if (overflow != u32(0)) yieldRequested = yieldRequested | u32(
+            ablaUnsafeCallI32I32I32I32(
+                int(overflow), int(handle), int(event),
+                int(esp32I2sLoadU32(handle, u32(136)))
+            )
+        )
+    }
+    if (esp32I2sLoadU8(handle, u32(32)) != u32(0)) {
+        freestandingSet(buffer, 0, size)
+    }
+    esp32RecoveredXQueueGenericSendFromISR(
+        queue, descriptor + u32(4), secondYield, u32(0),
+        u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if ((esp32I2sLoadU32(firstYield) |
+        esp32I2sLoadU32(secondYield) | yieldRequested) != u32(0)) {
+        esp32RecoveredFrxtSetupSwitch()
+    }
+    return
+}
+
+trusted fun esp32I2sRegisterChannel(
+    controller: u32,
+    direction: u32,
+    descriptorCount: u32
+): u32 {
+    if (controller == u32(0)) return u32(258)
+
+    val channel = esp32HeapCapsCallocate(u32(1), u32(152), u32(4096))
+    if (channel == u32(0)) return u32(257)
+
+    esp32I2sStoreU32(channel, u32(0), controller)
+    esp32I2sStoreU32(channel, u32(4), u32(2))
+    esp32I2sStoreU32(channel, u32(8), u32(0))
+    esp32I2sStoreU32(channel, u32(12), direction)
+    esp32I2sStoreU32(channel, u32(52), u32(0))
+    esp32I2sStoreU32(channel, u32(60), u32(0))
+
+    val queue = esp32RecoveredXQueueCreateWithCaps(
+        descriptorCount - u32(1), u32(4), u32(4096),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(channel, u32(104), queue)
+    if (queue == u32(0)) {
+        esp32LibcFreeValue(channel)
+        return u32(257)
+    }
+
+    val mutex = esp32RecoveredXSemaphoreCreateGenericWithCaps(
+        u32(0), u32(0), u32(1), u32(4096),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(channel, u32(96), mutex)
+    if (mutex == u32(0)) {
+        esp32I2sDeleteQueue(queue)
+        esp32LibcFreeValue(channel)
+        return u32(257)
+    }
+
+    val binary = esp32RecoveredXSemaphoreCreateGenericWithCaps(
+        u32(0), u32(0), u32(3), u32(4096),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32I2sStoreU32(channel, u32(100), binary)
+    if (binary == u32(0)) {
+        esp32I2sDeleteSemaphore(mutex)
+        esp32I2sDeleteQueue(queue)
+        esp32LibcFreeValue(channel)
+        return u32(257)
+    }
+
+    esp32I2sStoreU32(channel, u32(120), u32(0))
+    esp32I2sStoreU32(channel, u32(124), u32(0))
+    esp32I2sStoreU32(channel, u32(128), u32(0))
+    esp32I2sStoreU32(channel, u32(132), u32(0))
+    esp32I2sStoreU32(channel, u32(36), u32(0))
+    esp32I2sStoreU32(channel, u32(40), u32(0))
+    esp32I2sStoreU32(channel, u32(140), u32(0))
+    esp32I2sStoreU32(channel, u32(144), u32(0))
+    esp32I2sStoreU32(channel, u32(112), u32(0))
+    esp32I2sStoreU32(channel, u32(116), u32(0))
+
+    val slotOffset = if (direction == u32(2)) u32(16) else u32(20)
+    val previous = esp32I2sLoadU32(controller, slotOffset)
+    if (previous != u32(0)) esp32I2sDeleteChannel(previous)
+    esp32I2sStoreU32(controller, slotOffset, channel)
+    return u32(0)
+}
+
+trusted fun esp32I2sDeleteChannel(handle: u32): u32 {
+    if (handle == u32(0)) return u32(258)
+    if (esp32I2sLoadU32(handle, u32(52)) >= u32(2)) return u32(259)
+
+    val controller = esp32I2sLoadU32(handle, u32(0))
+    val direction = esp32I2sLoadU32(handle, u32(12))
+
+    esp32RecoveredPeriphRccEnter(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    val device = esp32I2sLoadU32(controller, u32(4))
+    esp32I2sRegisterStoreU32(
+        device, u32(172),
+        esp32I2sRegisterLoadU32(device, u32(172)) & u32(4292870143)
+    )
+    esp32RecoveredPeriphRccExit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+
+    if (esp32I2sLoadU32(handle, u32(4)) != u32(2)) {
+        esp32RecoveredEspClkTreeEnableSrc(
+            esp32I2sLoadU32(handle, u32(76)), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0)
+        )
+    }
+
+    val reservedLow = esp32I2sLoadU32(handle, u32(112))
+    val reservedHigh = esp32I2sLoadU32(handle, u32(116))
+    if ((reservedLow | reservedHigh) != u32(0)) {
+        esp32I2sRevokeOutputGpios(handle, reservedLow, reservedHigh)
+    }
+
+    val modeInformation = esp32I2sLoadU32(handle, u32(60))
+    if (modeInformation != u32(0)) esp32LibcFreeValue(modeInformation)
+    if (esp32I2sLoadU32(handle, u32(44)) != u32(0)) {
+        esp32I2sFreeDmaDescriptors(handle)
+    }
+    esp32I2sDeleteQueue(esp32I2sLoadU32(handle, u32(104)))
+    esp32I2sDeleteSemaphore(esp32I2sLoadU32(handle, u32(96)))
+    esp32I2sDeleteSemaphore(esp32I2sLoadU32(handle, u32(100)))
+    esp32I2sStoreU32(controller, u32(8), u32(0))
+
+    val dmaChannel = esp32I2sLoadU32(handle, u32(16))
+    if (dmaChannel != u32(0)) esp32RecoveredEspIntrFree(
+        dmaChannel,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+
+    var bound = true
+    val controllerChannelOffset =
+        if (direction == u32(2)) u32(16) else u32(20)
+    if (esp32I2sLoadU32(controller, controllerChannelOffset) == handle) {
+        esp32LibcFreeValue(handle)
+        esp32I2sStoreU32(controller, controllerChannelOffset, u32(0))
+        esp32I2sStoreU8(controller, u32(12), u32(0))
+    } else {
+        bound = false
+        esp32LibcFreeValue(handle)
+    }
+
+    if (bound && esp32I2sLoadU32(controller, u32(16)) == u32(0) &&
+        esp32I2sLoadU32(controller, u32(20)) == u32(0)) {
+        val id = esp32I2sLoadU32(controller, u32(0))
+        val cell = u32(esp32I2sObject) + u32(8) + id * u32(4)
+        esp32I2sDestroyControllerCell(cell)
+    }
+    return u32(0)
+}
+
+trusted fun esp32I2sCleanupEmptyController(controller: u32): void {
+    if (controller == u32(0) ||
+        esp32I2sLoadU32(controller, u32(16)) != u32(0) ||
+        esp32I2sLoadU32(controller, u32(20)) != u32(0)) return
+
+    var id = u32(0)
+    while (id < u32(2)) {
+        val cell = u32(esp32I2sObject) + u32(8) + id * u32(4)
+        if (esp32I2sLoadU32(cell) == controller) {
+            esp32I2sDestroyControllerCell(cell)
+            return
+        }
+        id = id + u32(1)
+    }
+    return
+}
+
+trusted fun esp32I2sNewChannel(
+    configuration: u32,
+    transmitHandle: u32,
+    receiveHandle: u32
+): u32 {
+    if (configuration == u32(0) ||
+        (transmitHandle == u32(0) && receiveHandle == u32(0))) {
+        return u32(258)
+    }
+
+    val requestedId = esp32I2sLoadU32(configuration, u32(0))
+    if (requestedId != u32(4294967295) && requestedId >= u32(2)) {
+        return u32(258)
+    }
+    val descriptorCount = esp32I2sLoadU32(configuration, u32(8))
+    if (descriptorCount < u32(2)) return u32(258)
+    val interruptPriority = esp32I2sLoadU32(configuration, u32(20))
+    if (interruptPriority >= u32(8)) return u32(258)
+    if (esp32I2sLoadU8(configuration, u32(18)) != u32(0)) {
+        return u32(262)
+    }
+
+    val searchMask =
+        (if (transmitHandle != u32(0)) u32(2) else u32(0)) |
+        (if (receiveHandle != u32(0)) u32(1) else u32(0))
+    var controller = u32(0)
+    var available = false
+
+    if (requestedId == u32(4294967295)) {
+        var id = u32(0)
+        while (id < u32(2) && !available) {
+            controller = esp32I2sAcquireController(id)
+            if (controller != u32(0)) {
+                available = esp32I2sTakeAvailableChannel(
+                    controller, searchMask
+                )
+            }
+            id = id + u32(1)
+        }
+    } else {
+        controller = esp32I2sAcquireController(requestedId)
+        if (controller != u32(0)) {
+            available = esp32I2sTakeAvailableChannel(
+                controller, searchMask
+            )
+        }
+    }
+    if (controller == u32(0) || !available) return u32(261)
+
+    var result = u32(0)
+    if (transmitHandle != u32(0)) {
+        result = esp32I2sRegisterChannel(
+            controller, u32(2), descriptorCount
+        )
+        if (result == u32(0)) {
+            val channel = esp32I2sLoadU32(controller, u32(16))
+            esp32I2sStoreU32(
+                channel, u32(8),
+                esp32I2sLoadU32(configuration, u32(4))
+            )
+            val autoPort =
+                if (requestedId == u32(4294967295)) u32(1) else u32(0)
+            esp32I2sStoreU8(
+                channel, u32(64),
+                (esp32I2sLoadU8(channel, u32(64)) & u32(4294967294)) |
+                    autoPort
+            )
+            val flags = if (interruptPriority == u32(0)) u32(14)
+                else u32(1) << interruptPriority
+            esp32I2sStoreU32(channel, u32(56), flags)
+            esp32I2sStoreU8(
+                channel, u32(32),
+                esp32I2sLoadU8(configuration, u32(16))
+            )
+            esp32I2sStoreU8(
+                channel, u32(33),
+                esp32I2sLoadU8(configuration, u32(17))
+            )
+            esp32I2sStoreU32(channel, u32(20), descriptorCount)
+            esp32I2sStoreU32(
+                channel, u32(24),
+                esp32I2sLoadU32(configuration, u32(12))
+            )
+            esp32I2sStoreU32(
+                channel, u32(140),
+                u32(nativeFunctionAddress(
+                    esp32I2sTransmitChannelStart
+                ))
+            )
+            esp32I2sStoreU32(
+                channel, u32(144),
+                u32(nativeFunctionAddress(
+                    esp32I2sTransmitChannelStop
+                ))
+            )
+            esp32I2sStoreU32(transmitHandle, u32(0), channel)
+        }
+    }
+
+    if (result == u32(0) && receiveHandle != u32(0)) {
+        result = esp32I2sRegisterChannel(
+            controller, u32(1), descriptorCount
+        )
+        if (result == u32(0)) {
+            val channel = esp32I2sLoadU32(controller, u32(20))
+            esp32I2sStoreU32(
+                channel, u32(8),
+                esp32I2sLoadU32(configuration, u32(4))
+            )
+            val autoPort =
+                if (requestedId == u32(4294967295)) u32(1) else u32(0)
+            esp32I2sStoreU8(
+                channel, u32(64),
+                (esp32I2sLoadU8(channel, u32(64)) & u32(4294967294)) |
+                    autoPort
+            )
+            val flags = if (interruptPriority == u32(0)) u32(14)
+                else u32(1) << interruptPriority
+            esp32I2sStoreU32(channel, u32(56), flags)
+            esp32I2sStoreU32(channel, u32(20), descriptorCount)
+            esp32I2sStoreU32(
+                channel, u32(24),
+                esp32I2sLoadU32(configuration, u32(12))
+            )
+            esp32I2sStoreU32(
+                channel, u32(140),
+                u32(nativeFunctionAddress(
+                    esp32I2sReceiveChannelStart
+                ))
+            )
+            esp32I2sStoreU32(
+                channel, u32(144),
+                u32(nativeFunctionAddress(
+                    esp32I2sReceiveChannelStop
+                ))
+            )
+            esp32I2sStoreU32(receiveHandle, u32(0), channel)
+        }
+    }
+
+    if (result == u32(0) && transmitHandle != u32(0) &&
+        receiveHandle != u32(0)) {
+        esp32I2sStoreU8(controller, u32(12), u32(1))
+    }
+    if (result != u32(0)) esp32I2sCleanupEmptyController(controller)
+    return result
+}

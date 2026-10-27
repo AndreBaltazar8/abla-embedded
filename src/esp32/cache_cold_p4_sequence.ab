@@ -1,0 +1,73 @@
+import "./cache_geometry_p4_sequence.ab"
+// Read-only refusal of autonomous/locked/frozen cache work. The DONE bit
+// matters: an enable cleared by software does not prove requests drained.
+// Zero means observed idle, otherwise the first offending register offset.
+// Still requires caller serialization and exclusion of CPU/DMA demand traffic;
+// no snapshot can establish ownership or absence of dirty/locked cache lines.
+fun p4CacheColdWorkerOffset(index: int): int =
+    if (index == 0) 168 else if (index == 1) 180 else if (index == 2) 216 else if (index == 3) 680 else
+    if (index == 4) 228 else if (index == 5) 248 else if (index == 6) 308 else 692
+trusted fun p4CacheColdBusyOffset(): int {
+    if ((p4CacheGeometryRead(136)&3) != 0) return 136
+    if ((p4CacheGeometryRead(44)&0x50055) != 0) return 44
+    if ((p4CacheGeometryRead(652)&0x500000) != 0) return 652
+    var index=0
+    while (index < 8) {
+        val offset=p4CacheColdWorkerOffset(index)
+        if ((p4CacheGeometryRead(offset)&3) != 2) return offset
+        index=index+1
+    }
+    if ((p4CacheGeometryRead(56)&3) != 0) return 56
+    if ((p4CacheGeometryRead(72)&3) != 0) return 72
+    if ((p4CacheGeometryRead(120)&3) != 0) return 120
+    if ((p4CacheGeometryRead(664)&3) != 0) return 664
+    return 0
+}
+// Conservative application SRAM windows from IDF P4 memory.ld.in. Excludes
+// bootloader/ROM reservations; layout1 places cache at TOP, layout3 at BOTTOM.
+// Live span must cover ALL code/constants/data/stack/owners used during change.
+// Caller proves the span is complete and exclusively owns newly consumed SRAM.
+fun p4CacheSramSpanSafe(layout: int,size: int,address: int,bytes: int): bool {
+    if ((size != 131072 && size != 262144 && size != 524288) || bytes < 1) return false
+    var low=0; var high=0
+    if (layout == 3) { low=0x4ff00000+size; high=0x4ffadfc0 }
+    else if (layout == 1) {
+        if (address < 0x4ff2bbd0) { low=0x4ff00000; high=0x4ff2bbd0 }
+        else { low=0x4ff40000; high=0x4ffc0000-size }
+    } else return false
+    return address >= low && address < high && bytes <= high-address
+}
+// Cold-only DESTRUCTIVE global L2 mode+tag initialization, NOT enablement.
+// Caller excludes BOTH CPUs/interrupts/flash+PSRAM requests/DMA/autoload/preload,
+// pins clocks, and has written back dirty L1/L2 data and invalidated old aliases.
+// No live external data or executable aliases may depend on retained tags.
+// No ROM/library call: rev0 ROM Cache_Set_L2_Cache_Mode writes +278/+27c;
+// Cache_Invalidate_All(map32) calls Cache_Sync_Items(0,1,32,0,0).
+// Partial failures retain global ownership; no rollback/releasing cache SRAM.
+// 1initialized2invalid/live SRAM overlap3busy4size readback5line readback
+// 6sync setup readback7timeout8autonomous/locked/frozen (offset in high bits).
+// Caller must not enable/use on any failure. No forced stop of another owner.
+trusted fun p4CacheL2InitializeColdOwned(layout: int,size: int,line: int,liveAddress: int,liveBytes: int,polls: int): int {
+    if (!p4CacheSramSpanSafe(layout,size,liveAddress,liveBytes) || (line != 64 && line != 128) || polls < 1 || polls > 1000000) return 2
+    if ((p4CacheGeometryRead(152)&15) != 0) return 3
+    val busy=p4CacheColdBusyOffset()
+    if (busy != 0) return 8|(busy<<8)
+    p4CacheColdFence()
+    val sizeField=if (size == 131072) 512 else if (size == 262144) 1024 else 2048
+    val lineField=if (line == 64) 8 else 16
+    // Same complete one-hot writes as hardware ROM, not stale bit ORs.
+    p4CacheColdWrite(632,sizeField)
+    if ((p4CacheGeometryRead(632)&8191) != sizeField) return 4
+    p4CacheColdWrite(636,lineField)
+    if ((p4CacheGeometryRead(636)&63) != lineField) return 5
+    p4CacheColdWrite(160,0); p4CacheColdWrite(164,0); p4CacheColdWrite(156,32)
+    if (p4CacheGeometryRead(160) != 0 || (p4CacheGeometryRead(164)&0x0fffffff) != 0 || (p4CacheGeometryRead(156)&63) != 32) return 6
+    // RGID0, invalidate only; hardware clears operation bit on completion.
+    p4CacheColdWrite(152,1)
+    var remaining=polls
+    while (remaining > 0) {
+        if ((p4CacheGeometryRead(152)&31) == 16) { p4CacheColdFence(); return 1 }
+        remaining=remaining-1
+    }
+    return 7
+}

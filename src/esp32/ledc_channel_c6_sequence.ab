@@ -1,0 +1,80 @@
+import "./ledc_c6_sequence.ab"
+// C6 has INDIRECT gamma RAM, unlike C5. IDF6 ledc_ll.h requires
+// address->5us->data->address->5us, and read-address->5us->read-data.
+trusted fun c6LedcGammaRangeOwned(channel: int,range: int,value: int): bool {
+    val base=256+channel*16
+    if (!c6LedcChannelField(base+4,15,range)) return false
+    c6LedcDelayMicroseconds(5)
+    c6LedcWrite(base,(c6LedcRead(base)&0x80000000)|value)
+    if (!c6LedcChannelField(base+4,15,range)) return false
+    c6LedcDelayMicroseconds(5)
+    if (!c6LedcChannelField(base+8,15,range)) return false
+    c6LedcDelayMicroseconds(5)
+    return (c6LedcRead(base+12)&0x7fffffff) == value
+}
+// Static duty updates through C6's gamma engine, matching IDF v6.0.2
+// ledc_duty_config + _ledc_update_duty. Caller owns channel/gamma RAM/IRQ/ETM
+// and a stable running timer and clock lease; GPIO routing is separate.
+// 1 applied, 2 invalid, 3 busy, 4 readback, 5 timeout, 6 timer unavailable.
+// A timeout is NOT cancellation: retain channel/clock ownership and poll again.
+// Readback failures before publication retain the previous output and partially
+// staged parameters. Never enable another channel, reset or gate clocks here.
+trusted fun c6LedcChannelField(offset: int,mask: int,value: int): bool {
+    c6LedcWrite(offset,(c6LedcRead(offset)&(0xffffffff^mask))|value)
+    return (c6LedcRead(offset)&mask) == value
+}
+trusted fun c6LedcChannelWaitOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 5 || polls < 1 || polls > 1000000) return 2
+    var remaining=polls
+    while (remaining > 0) {
+        if ((c6LedcRead(channel*20)&16) == 0 && (c6LedcRead(channel*20+12)&0x80000000) == 0) return 1
+        remaining=remaining-1
+    }
+    return 5
+}
+trusted fun c6LedcChannelSetDutyOwned(channel: int,timer: int,duty: int,hpoint: int,polls: int): int {
+    val timerOffset=c6LedcTimerOffset(timer)
+    if (channel < 0 || channel > 5 || timerOffset < 0 || duty < 0 || hpoint < 0 || hpoint > 1048575 || polls < 1 || polls > 1000000) return 2
+    val timerConfig=c6LedcRead(timerOffset)
+    val resolution=timerConfig&31
+    if ((timerConfig&0x5800000) != 0 || c6LedcTimerParameters(resolution,(timerConfig>>5)&262143) < 0) return 6
+    var limit=1; var bit=0
+    while (bit < resolution) { limit=limit*2; bit=bit+1 }
+    // Full-scale at maximum counter width may overflow the hardware counter.
+    if (duty > limit || (resolution == 20 && duty == limit) || hpoint >= limit) return 2
+    val offset=channel*20
+    val config=c6LedcRead(offset)
+    if ((config&0x8010) != 0 || (c6LedcRead(offset+12)&0x80000000) != 0 ||
+        ((config&4) != 0 && (config&3) != timer)) return 3
+    if (!c6LedcChannelField(offset+4,0xfffff,hpoint) ||
+        !c6LedcChannelField(offset+8,0x1ffffff,duty<<4)) return 4
+    // One cycle, one step, increase, zero scale: constant duty, not a ramp.
+    // Clear ALL unused ranges: IDF notes stale RAM can corrupt the waveform.
+    var range=0
+    while (range < 16) {
+        if (!c6LedcGammaRangeOwned(channel,range,if (range == 0) 0x200003 else 0)) return 4
+        range=range+1
+    }
+    // Do not replay the write-trigger gamma pause/resume fields.
+    val gamma=384+channel*4
+    c6LedcWrite(gamma,(c6LedcRead(gamma)&0xffffff80)|1)
+    if ((c6LedcRead(gamma)&31) != 1) return 4
+    val enabled=(config&0xfffeffe0)|timer|4
+    c6LedcWrite(offset,enabled)
+    if ((c6LedcRead(offset)&15) != (timer|4)) return 4
+    c6LedcWrite(offset+12,c6LedcRead(offset+12)|0x80000000)
+    c6LedcWrite(offset,enabled|16)
+    val waited=c6LedcChannelWaitOwned(channel,polls)
+    if (waited != 1) return waited
+    return if ((c6LedcRead(offset+16)&0x1ffffff) == (duty<<4)) 1 else 4
+}
+trusted fun c6LedcChannelStopOwned(channel: int,idleHigh: bool,polls: int): int {
+    if (channel < 0 || channel > 5 || polls < 1 || polls > 1000000) return 2
+    if (c6LedcChannelWaitOwned(channel,1) != 1) return 3
+    val offset=channel*20
+    val value=(c6LedcRead(offset)&0xfffeffe3)|(if (idleHigh) 8 else 0)
+    c6LedcWrite(offset,value)
+    if ((c6LedcRead(offset)&12) != (if (idleHigh) 8 else 0)) return 4
+    c6LedcWrite(offset,value|16)
+    return c6LedcChannelWaitOwned(channel,polls)
+}

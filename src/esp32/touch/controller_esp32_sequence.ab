@@ -1,0 +1,62 @@
+import "./scan_esp32_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Temporary controller configuration, not pad/clock ownership acquisition.
+// Caller owns idle touch hardware, configured RTC pads, stable clocks/power,
+// disabled IRQ and stopped repeated timer. Serialize shared register writers.
+// Record24 is exclusive aligned RAM, initialized with zero magic at offset0.
+// Never discard it before successful close. Pending scans MUST finish before
+// close; a software timeout does not establish idle hardware.
+fun esp32TouchControllerAddress(index: int): int =
+    if (index == 0) 0x3FF48858 else if (index == 1) 0x3FF48884 else if (index == 2) 0x3FF48490 else 0x3FF4888C
+trusted fun esp32TouchControllerRecordValid(record: NativeBuffer): bool = record.hasAddressRange(0,24) && (record.addressValue()&3) == 0
+// 1configured,2invalid/no change,3write failure (record retains snapshot).
+// Time arguments are actual hardware ticks, not microseconds: charge/wait
+// use RTC fast clock; interval uses RTC slow clock. high/low use IDF enums.
+trusted fun esp32TouchControllerOpenOwned(record: NativeBuffer,channels: int,waitTicks: int,chargeTicks: int,intervalTicks: int,high: int,low: int,above: bool,both: bool,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !esp32TouchControllerRecordValid(record) || channels <= 0 || channels > 1023 || waitTicks < 0 || waitTicks > 255 ||
+        chargeTicks < 1 || chargeTicks > 65535 || intervalTicks < 0 || intervalTicks > 65535 || high < 0 || high > 15 || low < 0 || low > 3) return 2
+    if (record.loadU32(0) != 0) return 2
+    if ((touchScanRead(0x3FF48018)&u32(0x800000)) != u32(0) || (touchScanRead(0x3FF4803C)&u32(64)) != u32(0) ||
+        (touchScanRead(0x3FF48884)&u32(4096)) != u32(0)) return 2
+    var index=0
+    while (index < 4) {
+        record.storeU32(8+index*4,int(touchScanRead(esp32TouchControllerAddress(index))))
+        index=index+1
+    }
+    record.storeU32(4,3)
+    record.storeU32(0,0x54434831)
+    val c1=(u32(record.loadU32(8))&u32(0xFC000000))|u32(chargeTicks|(waitTicks<<16)|(if (above) 1<<24 else 0)|(if (both) 0 else 1<<25))
+    val c2=u32((intervalTicks<<14)|0x2800)
+    val voltage=(u32(record.loadU32(16))&u32(0x81FFFFFF))|u32(((high&3)<<29)|((high>>2)<<25)|(low<<27))
+    val work=(u32(record.loadU32(20))&u32(0xFFFFFC00))|u32(esp32TouchScanHardwareMask(channels))
+    // No start pulse, interrupt acknowledgment or pad writes.
+    touchScanWrite(0x3FF48858,c1)
+    touchScanWrite(0x3FF48884,c2)
+    touchScanWrite(0x3FF48490,voltage)
+    touchScanWrite(0x3FF4888C,work)
+    if (touchScanRead(0x3FF48858) != c1 || (touchScanRead(0x3FF48884)&u32(0x3FFFF800)) != c2 ||
+        touchScanRead(0x3FF48490) != voltage || touchScanRead(0x3FF4888C) != work) return 3
+    record.storeU32(4,1)
+    return 1
+}
+// 1restored,2invalid/not idle,3restore failure (retry with record retained).
+trusted fun esp32TouchControllerCloseOwned(record: NativeBuffer,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !esp32TouchControllerRecordValid(record)) return 2
+    if (record.loadU32(0) != 0x54434831 || (record.loadU32(4) != 1 && record.loadU32(4) != 3)) return 2
+    if ((touchScanRead(0x3FF48018)&u32(0x800000)) != u32(0) || (touchScanRead(0x3FF4803C)&u32(64)) != u32(0) ||
+        (touchScanRead(0x3FF48884)&u32(4096)) != u32(0)) return 2
+    var index=3
+    var okay=true
+    while (index >= 0) {
+        val address=esp32TouchControllerAddress(index)
+        val mask=if (index == 1) u32(0x3FFFF800) else u32(0xFFFFFFFF)
+        val value=u32(record.loadU32(8+index*4))&mask
+        touchScanWrite(address,value)
+        if ((touchScanRead(address)&mask) != value) okay=false
+        index=index-1
+    }
+    if (!okay) { record.storeU32(4,3); return 3 }
+    record.storeU32(4,0)
+    record.storeU32(0,0)
+    return 1
+}

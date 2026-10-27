@@ -1,0 +1,87 @@
+import "./sdk/raw_buffer.ab"
+//176byte record: magic0, owned mask4, wake mask8, state12(0preparing,1ready,2released),
+// EXT0 child16..47, EXT1 child48..175. Outer magic initially0.
+// Single exclusive owner for RTCIO clock and all selected pads; nested child
+// snapshots are restored in reverse order. Caller owns output/analog/USB and
+// keeps this record disjoint from sleep state and retention DMA buffers.
+// Initialize a fresh or explicitly released record BEFORE beginning a sleep
+// session. This writes caller RAM only, never RTCIO. It makes cancellation
+// before wake preparation distinguishable from uninitialized memory. Do not
+// assert releasedExclusive for a record still owning any child snapshot.
+trusted fun esp32S3ExternalWakeInitializeOwned(record: NativeBuffer,releasedExclusive: bool): bool {
+    if (!releasedExclusive || !record.hasAddressRange(0,176) || (record.addressValue() & 3) != 0) return false
+    val base=record.addressValue()
+    if (esp32S3RtcWakeRead(base) != 0) return false
+    esp32S3RtcWakeWrite(base+4,0)
+    esp32S3RtcWakeWrite(base+8,0)
+    esp32S3RtcWakeWrite(base+16,0)
+    esp32S3RtcWakeWrite(base+48,0)
+    esp32S3RtcWakeWrite(base+12,2)
+    true
+}
+trusted fun esp32S3ExternalWakeRestoreOwned(record: NativeBuffer): bool {
+    if (!record.hasAddressRange(0,176) || (record.addressValue() & 3) != 0) return false
+    val base=record.addressValue()
+    if (esp32S3RtcWakeRead(base) != 0x45585453) return false
+    var owned=esp32S3RtcWakeRead(base+4)
+    if (owned < 0 || owned > 3) return false
+    esp32S3RtcWakeWrite(base+12,0)
+    if ((owned & 2) != 0) {
+        if (!esp32S3Ext1RecordRestoreOwned(nativeBufferAt(base+48,128))) return false
+        owned=owned & ~2
+        esp32S3RtcWakeWrite(base+4,owned)
+    }
+    if ((owned & 1) != 0) {
+        if (!esp32S3Ext0RecordRestoreOwned(nativeBufferAt(base+16,32))) return false
+        esp32S3RtcWakeWrite(base+4,0)
+    }
+    esp32S3RtcWakeWrite(base+12,2)
+    esp32S3RtcWakeWrite(base,0)
+    true
+}
+// Explicit completion marker, not an inference from a zero/uninitialized
+// header. Used by outer cancellation/cleanup to avoid replaying child restores.
+trusted fun esp32S3ExternalWakeReleasedOwned(record: NativeBuffer): bool {
+    if (!record.hasAddressRange(0,176) || (record.addressValue() & 3) != 0) return false
+    val base=record.addressValue()
+    if (esp32S3RtcWakeRead(base) != 0 || esp32S3RtcWakeRead(base+4) != 0 || esp32S3RtcWakeRead(base+12) != 2) return false
+    val mask=esp32S3RtcWakeRead(base+8)
+    mask >= 0 && mask <= 3
+}
+// ext0Pin=-1 and ext1Pins=0 mean disabled. Supports both with disjoint pads.
+//0invalid/busy,1ready,2prepare failed and fully undone,3cleanup requires retry.
+trusted fun esp32S3ExternalWakePrepareOwned(record: NativeBuffer,ext0Pin: int,ext0Level: int,ext1Pins: int,ext1Level: int,rtcPeriphOff: bool): int {
+    if (!record.hasAddressRange(0,176) || (record.addressValue() & 3) != 0) return 0
+    if (ext0Pin < -1 || ext0Pin > 21 || ext0Level < 0 || ext0Level > 1 || ext1Level < 0 || ext1Level > 1 || ext1Pins < 0 || (ext1Pins & ~0x3FFFFF) != 0) return 0
+    if (ext0Pin >= 0 && (rtcPeriphOff || (ext1Pins & (1<<ext0Pin)) != 0)) return 0
+    val base=record.addressValue()
+    if (esp32S3RtcWakeRead(base) != 0) return 0
+    val mask=(if (ext0Pin >= 0) 1 else 0) | (if (ext1Pins != 0) 2 else 0)
+    esp32S3RtcWakeWrite(base+4,0)
+    esp32S3RtcWakeWrite(base+8,mask)
+    esp32S3RtcWakeWrite(base+12,0)
+    esp32S3RtcWakeWrite(base+16,0)
+    esp32S3RtcWakeWrite(base+48,0)
+    esp32S3RtcWakeWrite(base,0x45585453)
+    if (ext0Pin >= 0) {
+        if (!esp32S3Ext0RecordPrepareOwned(nativeBufferAt(base+16,32),ext0Pin,ext0Level)) {
+            esp32S3RtcWakeWrite(base+12,2)
+            esp32S3RtcWakeWrite(base,0); return 2
+        }
+        esp32S3RtcWakeWrite(base+4,1)
+    }
+    if (ext1Pins != 0) {
+        if (!esp32S3Ext1RecordPrepareOwned(nativeBufferAt(base+48,128),ext1Pins,ext1Level,rtcPeriphOff)) return if (esp32S3ExternalWakeRestoreOwned(record)) 2 else 3
+        esp32S3RtcWakeWrite(base+4,mask)
+    }
+    esp32S3RtcWakeWrite(base+12,1)
+    1
+}
+trusted fun esp32S3ExternalWakeTriggersOwned(record: NativeBuffer): int {
+    if (!record.hasAddressRange(0,176) || (record.addressValue() & 3) != 0) return -1
+    val base=record.addressValue()
+    if (esp32S3RtcWakeRead(base) != 0x45585453 || esp32S3RtcWakeRead(base+12) != 1) return -1
+    val mask=esp32S3RtcWakeRead(base+8)
+    if (mask < 0 || mask > 3 || esp32S3RtcWakeRead(base+4) != mask) return -1
+    mask
+}

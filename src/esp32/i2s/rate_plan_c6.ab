@@ -1,0 +1,67 @@
+import "abla/runtime/scalar"
+// Pure C6 N+B/A, BCLK-divider planning. No source selection or MMIO.
+// Scalar32: N8, B9@8, A9@17, (BCLK-1)6@26. -1 means unrepresentable.
+// TX stereo frameBits=2*slotBits; one 32-bit buzzer word needs frameBits32.
+// Pinned root1..240MHz, requested8..192kHz. fixedBclk0 searches1..64;
+// otherwise preserve the caller's required MCLK/BCLK ratio (e.g. a codec).
+// Evaluates both neighboring fractions for every A1..511 and admissible
+// BCLK divisor, minimizing exact frequency error without floats or heap.
+// No rate clamping: a selected integer divider outside2..255 is rejected.
+type C6I2sRatePlan=int
+fun C6I2sRatePlan.integer(): int = this&255
+fun C6I2sRatePlan.numerator(): int = (this>>>8)&511
+fun C6I2sRatePlan.denominator(): int = (this>>>17)&511
+fun C6I2sRatePlan.bclk(): int = ((this>>>26)&63)+1
+fun C6I2sRatePlan.valid(): bool = this >= 0 && this <= 0xffffffff && this.integer() >= 2 && this.denominator() >= 1 && this.numerator() < this.denominator()
+fun c6I2sRateRequestValid(rootHz: int,rateHz: int,frameBits: int): bool = rootHz >= 1 && rootHz <= 240000000 && rateHz >= 8000 && rateHz <= 192000 && frameBits >= 16 && frameBits <= 64 && (frameBits&1) == 0
+fun c6I2sRatePlan(rootHz: int,rateHz: int,frameBits: int,fixedBclk: int): C6I2sRatePlan {
+    if (!c6I2sRateRequestValid(rootHz,rateHz,frameBits) || fixedBclk < 0 || fixedBclk > 64) return C6I2sRatePlan(-1)
+    val bitRate=u32(rateHz)*u32(frameBits)
+    var m=if (fixedBclk == 0) 1 else fixedBclk
+    val last=if (fixedBclk == 0) 64 else fixedBclk
+    var best=C6I2sRatePlan(-1);var bestError=0;var bestScale=1
+    while (m <= last) {
+        val target=bitRate*u32(m)
+        val n=int(u32(rootHz)/target)
+        if (n >= 2 && n <= 255) {
+            val remainder=u32(rootHz)%target
+            var residual=u32(0);var quotient=0;var a=1
+            while (a <= 511) {
+                residual=residual+remainder
+                if (residual >= target) { residual=residual-target;quotient=quotient+1 }
+                var side=0
+                while (side < 2) {
+                    val b=quotient+side
+                    val candidateN=n+(if (b == a) 1 else 0)
+                    val candidateB=if (b == a) 0 else b
+                    if (candidateN <= 255) {
+                        val divisor=candidateN*a+candidateB
+                        val signedError=rootHz*a-int(target)*divisor
+                        val error=if (signedError < 0) -signedError else signedError
+                        val scale=m*divisor
+                        if (!best.valid() || error*bestScale < bestError*scale) {
+                            best=C6I2sRatePlan(candidateN|(candidateB<<8)|(a<<17)|((m-1)<<26))
+                            bestError=error;bestScale=scale
+                            if (error == 0) return best
+                        }
+                    }
+                    side=side+1
+                }
+                a=a+1
+            }
+        }
+        m=m+1
+    }
+    return best
+}
+// Acceptance bound relative to requested rate, exact integer cross-products.
+// ppm0 requires exact frequency. Range0..10000 keeps every product in int64.
+fun C6I2sRatePlan.withinPpm(rootHz: int,rateHz: int,frameBits: int,ppm: int): bool {
+    if (!this.valid() || !c6I2sRateRequestValid(rootHz,rateHz,frameBits) || ppm < 0 || ppm > 10000) return false
+    val requested=rateHz*frameBits*this.bclk()*(this.integer()*this.denominator()+this.numerator())
+    val difference=rootHz*this.denominator()-requested
+    val error=if (difference < 0) -difference else difference
+    // Arbitrary valid tokens can be far from the request. Bound before scaling.
+    if (error*100 > requested) return false
+    return error*1000000 <= requested*ppm
+}

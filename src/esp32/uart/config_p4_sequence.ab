@@ -1,0 +1,43 @@
+import "./serial_p4_sequence.ab"
+import "../../runtime/unsigned_division64.ab"
+// Bit32valid, UART integer/fractional divider bits0..23, RCC prescaler-1 at24.
+// Wide arithmetic avoids sourceHz<<4 overflow. No source-frequency guessing.
+fun p4SerialBaudPlan(sourceHz: int,baud: int): int {
+    if (sourceHz < 1 || sourceHz > 4294967295 || baud < 1 || baud > sourceHz) return 0
+    val denominator=4095*baud
+    val prescale=int(unsignedDivide64(u64(sourceHz+denominator-1),u64(denominator)))
+    if (prescale < 1 || prescale > 256) return 0
+    val divider=int(unsignedDivide64(u64(sourceHz*16),u64(baud*prescale)))
+    if (divider < 16 || divider > 65535) return 0
+    return (1<<32)|((prescale-1)<<24)|(divider>>>4)|((divider&15)<<20)
+}
+// Caller owns stopped HP UART, RX peer quiesced, IRQ/DMA users joined, source
+// clock pinned and RCC serialization held. Clocks/pads/source selection remain
+// separate. No FIFO reset or event acknowledgement; buffered bytes are refused.
+// dataBits5..8; parity0none/1odd/2even; stop1one/2one-and-half/3two.
+// 1configured,2invalid,3busy,4partial readback failure,5update timeout.
+// Retain UART/clock ownership on4/5; do not print through partially configured UART.
+trusted fun SerialPort.configureOwned(sourceHz: int,baud: int,dataBits: int,parity: int,stop: int,polls: int): int {
+    val plan=p4SerialBaudPlan(sourceHz,baud)
+    if (!this.valid() || plan == 0 || dataBits < 5 || dataBits > 8 || parity < 0 || parity > 2 ||
+        stop < 1 || stop > 3 || polls < 1 || polls > 1000000) return 2
+    if ((p4SerialRead(this,152)&1) != 0 || p4SerialRead(this,12) != 0 ||
+        (p4SerialRead(this,28)&0x00ff00ff) != 0 || (p4SerialRead(this,112)&255) != 0) return 3
+    val divider=(p4SerialRead(this,20)&0xff0ff000)|(plan&0x00f00fff)
+    val prescale=(p4SerialClockRead(this)&0xffffff00)|((plan>>>24)&255)
+    val framing=(p4SerialRead(this,32)&0xffffffc0)|((dataBits-5)<<2)|(stop<<4)|
+        (if (parity == 1) 3 else if (parity == 2) 2 else 0)
+    p4SerialConfigWrite(this,20,divider)
+    if ((p4SerialRead(this,20)&0x00f00fff) != (divider&0x00f00fff)) return 4
+    p4SerialClockWrite(this,prescale)
+    if ((p4SerialClockRead(this)&255) != (prescale&255)) return 4
+    p4SerialConfigWrite(this,32,framing)
+    if ((p4SerialRead(this,32)&63) != (framing&63)) return 4
+    p4SerialConfigWrite(this,152,1)
+    var left=polls
+    while (left > 0) {
+        if ((p4SerialRead(this,152)&1) == 0) return 1
+        left=left-1
+    }
+    return 5
+}

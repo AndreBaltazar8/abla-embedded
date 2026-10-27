@@ -1,0 +1,3687 @@
+import "../rom/system_esp32.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../heap/capabilities_policy_esp32.ab"
+import "../freertos/port_esp32.ab"
+import "../system/assert_esp32.ab"
+import "../../runtime/freestanding_integer.ab"
+import "../../runtime/freestanding_memory.ab"
+import "abla/build"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "../runtime/picolibc_initialization_esp32.ab"
+import "../soc/interrupts_esp32.ab"
+import "interrupt_descriptors_esp32.ab"
+// Abla/LLVM implementation of the complete ESP32 interrupt vector allocator, shared ISR dispatch, reservation, IRAM classification, enable-disable, cross-core free, and diagnostic surface.
+
+// Interrupts are installed both by the system initializers and by drivers
+// after the scheduler starts.  The ordinary heap path takes a FreeRTOS-backed
+// heap lock, which is not usable while those initializers are still running.
+// Select the lock-free startup implementation only for that lifecycle phase;
+// allocations retained past startup remain normal TLSF blocks and can be
+// released through the locked path after the scheduler starts.
+@inline
+trusted fun esp32InterruptAllocatorSchedulerRunning(): bool {
+    val core = cpuCoreId()
+    return u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(
+        esp32Data_port_xSchedulerRunning_2618692451 + (core << u32(2))
+    )))) != u32(0)
+}
+
+@inline
+trusted fun esp32InterruptAllocatorAllocate(
+    size: u32,
+    capabilities: u32
+): u32 {
+    val schedulerRunning = esp32InterruptAllocatorSchedulerRunning()
+    return if (!schedulerRunning && (capabilities & u32(1)) == u32(0))
+        esp32HeapCapsAllocateInterruptStartup(size, capabilities)
+    else esp32HeapCapsMallocBase(size, capabilities)
+}
+
+@inline
+trusted fun esp32InterruptAllocatorFreeValue(memory: u32): u32 {
+    if (esp32InterruptAllocatorSchedulerRunning()) {
+        esp32HeapCapsFree(memory)
+    } else {
+        esp32HeapCapsFreeBeforeScheduler(memory)
+    }
+    return u32(0)
+}
+
+@inline
+trusted fun esp32InterruptAllocatorLoadU32(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
+
+@inline
+trusted fun esp32InterruptAllocatorStoreU32(
+    address: u32, value: u32
+): void = ablaUnsafeStoreU32(
+    nativePointerFromAddress(int(address)), int(value)
+)
+
+@inline
+trusted fun esp32InterruptVectorPacked(vector: u32): u32 =
+    esp32InterruptAllocatorLoadU32(vector)
+
+@inline
+fun esp32InterruptVectorFlags(packed: u32): u32 = packed & u32(65535)
+
+@inline
+fun esp32InterruptVectorCpu(packed: u32): u32 =
+    (packed >>> u32(16)) & u32(1)
+
+@inline
+fun esp32InterruptVectorNumber(packed: u32): u32 =
+    (packed >>> u32(17)) & u32(31)
+
+@inline
+fun esp32InterruptVectorPack(cpu: u32, interrupt: u32): u32 =
+    ((cpu & u32(1)) << u32(16)) |
+    ((interrupt & u32(31)) << u32(17))
+
+trusted fun esp32InterruptFindVector(interrupt: u32, cpu: u32): u32 {
+    var vector = esp32InterruptAllocatorLoadU32(
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    )
+    while (vector != u32(0)) {
+        val packed = esp32InterruptVectorPacked(vector)
+        if (esp32InterruptVectorCpu(packed) == cpu &&
+            esp32InterruptVectorNumber(packed) == interrupt) return vector
+        vector = esp32InterruptAllocatorLoadU32(vector + u32(12))
+    }
+    u32(0)
+}
+
+trusted fun esp32InterruptFindVectorForSource(source: u32, cpu: u32): u32 {
+    var vector = esp32InterruptAllocatorLoadU32(
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    )
+    while (vector != u32(0)) {
+        val packed = esp32InterruptVectorPacked(vector)
+        val flags = esp32InterruptVectorFlags(packed)
+        if ((flags & u32(4)) == u32(0)) {
+            val vectorSource = u32(ablaUnsafeLoadU16(
+                nativePointerFromAddress(int(vector + u32(4)))
+            ))
+            if (esp32InterruptVectorCpu(packed) == cpu &&
+                vectorSource == (source & u32(65535))) return vector
+        } else if (esp32InterruptVectorCpu(packed) == cpu) {
+            var shared = esp32InterruptAllocatorLoadU32(vector + u32(8))
+            while (shared != u32(0)) {
+                if (((esp32InterruptAllocatorLoadU32(shared) >>> u32(1)) &
+                    u32(65535)) == (source & u32(65535))) return vector
+                shared = esp32InterruptAllocatorLoadU32(shared + u32(20))
+            }
+        }
+        vector = esp32InterruptAllocatorLoadU32(vector + u32(12))
+    }
+    u32(0)
+}
+
+trusted fun esp32InterruptInsertVector(toInsert: u32): void {
+    val headAddress =
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    val target = esp32InterruptVectorPacked(toInsert)
+    val targetCpu = esp32InterruptVectorCpu(target)
+    val targetNumber = esp32InterruptVectorNumber(target)
+    var previous = u32(0)
+    var current = esp32InterruptAllocatorLoadU32(headAddress)
+    while (current != u32(0)) {
+        val packed = esp32InterruptVectorPacked(current)
+        val currentCpu = esp32InterruptVectorCpu(packed)
+        val currentNumber = esp32InterruptVectorNumber(packed)
+        if (currentCpu > targetCpu ||
+            (currentCpu == targetCpu && currentNumber >= targetNumber)) {
+            esp32InterruptAllocatorStoreU32(toInsert + u32(12), current)
+            if (previous == u32(0)) {
+                esp32InterruptAllocatorStoreU32(headAddress, toInsert)
+            } else {
+                esp32InterruptAllocatorStoreU32(previous + u32(12), toInsert)
+            }
+            return
+        }
+        previous = current
+        current = esp32InterruptAllocatorLoadU32(current + u32(12))
+    }
+    esp32InterruptAllocatorStoreU32(toInsert + u32(12), u32(0))
+    if (previous == u32(0)) {
+        esp32InterruptAllocatorStoreU32(headAddress, toInsert)
+    } else {
+        esp32InterruptAllocatorStoreU32(previous + u32(12), toInsert)
+    }
+    return
+}
+
+trusted fun esp32InterruptGetVector(interrupt: u32, cpu: u32): u32 {
+    val existing = esp32InterruptFindVector(interrupt, cpu)
+    if (existing != u32(0)) return existing
+    if (interrupt >= u32(32) || cpu >= u32(2)) return u32(0)
+    // A vector descriptor is permanent in ESP-IDF: free only marks it
+    // reusable and never releases it. Indexing a fixed pool by core/vector
+    // removes heap use from early interrupt setup and guarantees uniqueness.
+    val vector = esp32InterruptVectorPool +
+        (((cpu << u32(5)) + interrupt) << u32(4))
+    freestandingSet(vector, i32(0), u32(16))
+    esp32InterruptAllocatorStoreU32(
+        vector, esp32InterruptVectorPack(cpu, interrupt)
+    )
+    esp32InterruptInsertVector(vector)
+    vector
+}
+
+@inline
+trusted fun esp32InterruptDescriptorPriority(interrupt: u32): u32 =
+    esp32InterruptAllocatorLoadU32(
+        esp32CpuInterruptDescriptors + (interrupt << u32(4))
+    )
+
+@inline
+trusted fun esp32InterruptDescriptorType(interrupt: u32): u32 =
+    esp32InterruptAllocatorLoadU32(
+        esp32CpuInterruptDescriptors + (interrupt << u32(4)) + u32(4)
+    )
+
+@inline
+trusted fun esp32InterruptDescriptorFlags(
+    interrupt: u32, cpu: u32
+): u32 = esp32InterruptAllocatorLoadU32(
+    esp32CpuInterruptDescriptors + (interrupt << u32(4)) + u32(8) +
+        ((cpu & u32(1)) << u32(2))
+)
+
+trusted fun esp32InterruptVectorUsable(
+    packed: u32,
+    requestedFlags: u32,
+    cpu: u32,
+    force: u32
+): bool {
+    val interrupt = esp32InterruptVectorNumber(packed)
+    val descriptorFlags = esp32InterruptDescriptorFlags(interrupt, cpu)
+    if ((descriptorFlags & u32(2)) != u32(0)) return false
+    if ((descriptorFlags & u32(1)) != u32(0) &&
+        force == u32(4294967295)) return false
+    val priority = esp32InterruptDescriptorPriority(interrupt)
+    if ((requestedFlags & (u32(1) << priority)) == u32(0)) return false
+    val edgeRequested = (requestedFlags & u32(512)) != u32(0)
+    val descriptorType = esp32InterruptDescriptorType(interrupt)
+    if ((edgeRequested && descriptorType == u32(0)) ||
+        (!edgeRequested && descriptorType == u32(1))) return false
+
+    val vectorFlags = esp32InterruptVectorFlags(packed)
+    if ((vectorFlags & u32(1)) != u32(0) ||
+        (vectorFlags & u32(8)) != u32(0)) return false
+    if ((vectorFlags & u32(4)) != u32(0)) {
+        if ((requestedFlags & u32(256)) == u32(0)) return false
+        if (((vectorFlags & u32(2)) != u32(0)) !=
+            ((requestedFlags & u32(1024)) != u32(0))) return false
+    } else if (esp32RecoveredXtIntHasHandler(interrupt, cpu) != u32(0)) {
+        return false
+    }
+    true
+}
+
+trusted fun esp32InterruptAvailable(
+    requestedFlagsValue: u32,
+    cpu: u32,
+    force: u32,
+    source: u32
+): u32 {
+    var requestedFlags = requestedFlagsValue
+    if ((requestedFlags & u32(254)) == u32(0)) {
+        requestedFlags = requestedFlags | u32(14)
+    }
+    val sourceVector = esp32InterruptFindVectorForSource(source, cpu)
+    if (sourceVector != u32(0)) {
+        val packed = esp32InterruptVectorPacked(sourceVector)
+        if ((force == u32(4294967295) ||
+            force == esp32InterruptVectorNumber(packed)) &&
+            esp32InterruptVectorUsable(
+                packed, requestedFlags, cpu, force
+            )) return esp32InterruptVectorNumber(packed)
+        return u32(4294967295)
+    }
+    if (force != u32(4294967295)) {
+        val vector = esp32InterruptFindVector(force, cpu)
+        val packed = if (vector == u32(0))
+            esp32InterruptVectorPack(cpu, force)
+        else esp32InterruptVectorPacked(vector)
+        return if (esp32InterruptVectorUsable(
+            packed, requestedFlags, cpu, force
+        )) force else u32(4294967295)
+    }
+
+    var best = u32(4294967295)
+    var bestPriority = u32(9)
+    var bestSharedCount = u32(4294967295)
+    var interrupt = u32(0)
+    while (interrupt < u32(32)) {
+        val vector = esp32InterruptFindVector(interrupt, cpu)
+        val packed = if (vector == u32(0))
+            esp32InterruptVectorPack(cpu, interrupt)
+        else esp32InterruptVectorPacked(vector)
+        if (esp32InterruptVectorUsable(
+            packed, requestedFlags, cpu, force
+        )) {
+            val priority = esp32InterruptDescriptorPriority(interrupt)
+            if ((requestedFlags & u32(256)) != u32(0)) {
+                if ((esp32InterruptVectorFlags(packed) & u32(4)) != u32(0)) {
+                    var count = u32(0)
+                    var shared = esp32InterruptAllocatorLoadU32(
+                        vector + u32(8)
+                    )
+                    while (shared != u32(0)) {
+                        count = count + u32(1)
+                        shared = esp32InterruptAllocatorLoadU32(shared + u32(20))
+                    }
+                    if (count < bestSharedCount || priority < bestPriority) {
+                        best = interrupt
+                        bestSharedCount = count
+                        bestPriority = priority
+                    }
+                } else if (best == u32(4294967295) &&
+                    priority < bestPriority) {
+                    best = interrupt
+                    bestPriority = priority
+                }
+            } else if (priority < bestPriority) {
+                best = interrupt
+                bestPriority = priority
+            }
+        }
+        interrupt = interrupt + u32(1)
+    }
+    best
+}
+
+// Original ABI symbol: esp_intr_mark_shared
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_insert_vector_desc_15fd5b525c(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    r8 = r12
+    r11 = u32(0)
+    var recoveredLoopDestination1 = 5
+    while (recoveredLoopDestination1 == 5) {
+        if (r8 != u32(0)) {
+            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r9 = (r9 >>> u32(16)) & u32(1)
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r10 = (r10 >>> u32(16)) & u32(1)
+            if (r10 < r9) {
+                recoveredLoopDestination1 = 6
+            } else {
+                r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r9 = r9 ^ r10
+                if (((r9 >>> (u32(16) & u32(31))) & u32(1)) != u32(0)) {
+                    r11 = r8
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r8 + u32(12))))))
+                } else {
+                    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                    r10 = (r10 >>> u32(17)) & u32(31)
+                    r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                    r9 = (r9 >>> u32(17)) & u32(31)
+                    if (r10 >= r9) {
+                        recoveredLoopDestination1 = 6
+                    } else {
+                        r11 = r8
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r8 + u32(12))))))
+                    }
+                }
+            }
+        } else {
+            recoveredLoopDestination1 = 6
+        }
+    }
+    if (r12 == u32(0)) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r2 + u32(12)))), int(r8))
+        r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r2))
+    } else {
+        if (r11 != u32(0)) {
+            ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(12)))), int(r2))
+            ablaUnsafeStoreU32(nativePointerFromAddress(int((r2 + u32(12)))), int(r8))
+        } else {
+            ablaUnsafeStoreU32(nativePointerFromAddress(int((r2 + u32(12)))), int(r8))
+            r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+            ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r2))
+        }
+    }
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_insert_vector_desc_15fd5b525cLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_insert_vector_desc_15fd5b525c", ".Labla_recovered_esp32_interrupt_allocator_local_insert_vector_desc")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r9 = r2
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    var recoveredLoopDestination1 = 4
+    while (recoveredLoopDestination1 == 4) {
+        if (r2 != u32(0)) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r8 = (r8 >>> u32(16)) & u32(1)
+            if (r8 != r3) {
+                r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(12))))))
+            } else {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r8 = (r8 >>> u32(17)) & u32(31)
+                if (r8 == r9) {
+                    recoveredLoopDestination1 = 5
+                } else {
+                    r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(12))))))
+                }
+            }
+        } else {
+            recoveredLoopDestination1 = 5
+        }
+    }
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587aLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a", ".Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr_8d1c12252b(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(8))))))
+    r11 = u32(4294967295)
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    var recoveredLoopDestination1 = 6
+    while (recoveredLoopDestination1 == 6) {
+        if (r2 != u32(0)) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            if (!(((r8 >>> (u32(0) & u32(31))) & u32(1)) != u32(0))) {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+                if (r8 == u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(12))))))
+                    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(16))))))
+                    r10 = u32(ablaUnsafeCallI32I32I32I32I32I32I32(int(r8), int(r10), int(r11), int(r12), int(r13), int(r14), int(r15)))
+                } else {
+                    xtensaMemoryBarrier()
+                    r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(8))))))
+                    if (!((r9 & r8) == u32(0))) {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(12))))))
+                        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(16))))))
+                        r10 = u32(ablaUnsafeCallI32I32I32I32I32I32I32(int(r8), int(r10), int(r11), int(r12), int(r13), int(r14), int(r15)))
+                    }
+                }
+            }
+            r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(20))))))
+        } else {
+            recoveredLoopDestination1 = 7
+        }
+    }
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr_8d1c12252bLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr_8d1c12252b", ".Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303d(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = r2
+    r7 = r2 | r2
+    r11 = r3 | r3
+    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r2 = r10 | r10
+    if (!(r10 != u32(0))) {
+        r11 = u32(2052)
+        r10 = u32(16)
+        r10 = esp32InterruptAllocatorAllocate(r10, r11)
+        r2 = r10
+        if (!(r10 == u32(0))) {
+            r12 = u32(16)
+            r11 = u32(0)
+            r10 = freestandingSet(r10, i32(r11), r12)
+            r8 = (r7 >>> u32(0)) & u32(31)
+            r8 = r8 << u32(17)
+            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r10 = u32(4290904063)
+            r9 = r9 & r10
+            r8 = r9 | r8
+            ablaUnsafeStoreU32(nativePointerFromAddress(int(r2)), int(r8))
+            r3 = (r3 >>> u32(0)) & u32(1)
+            r3 = r3 << u32(16)
+            r9 = u32(4294901759)
+            r8 = r8 & r9
+            r8 = r8 | r3
+            ablaUnsafeStoreU32(nativePointerFromAddress(int(r2)), int(r8))
+            r10 = r2
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_insert_vector_desc_15fd5b525c(r10, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+        }
+    }
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303dLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303d", ".Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_source_2b06eb630d(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = r2
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c
+    r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    var recoveredLoopDestination1 = 15
+    while (recoveredLoopDestination1 == 15) {
+        if (!(r2 != u32(0))) {
+            return r2
+        }
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+        r9 = u32(4)
+        r8 = r8 & r9
+        r8 = u32(i32(r8 << u32(16)) >> 16)
+        if (r8 != u32(0)) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r8 = (r8 >>> u32(16)) & u32(1)
+            if (!(r8 != r3)) {
+                r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(8))))))
+                if (r9 != u32(0)) {
+                    var recoveredLoopDestination2 = 19
+                    while (recoveredLoopDestination2 == 19) {
+                        if (r9 != u32(0)) {
+                            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                            r8 = r8 << u32(15)
+                            r8 = u32(i32(r8) >> int(u32(16)))
+                            if (r8 == r10) {
+                                recoveredLoopDestination2 = 12
+                            } else {
+                                r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                            }
+                        } else {
+                            recoveredLoopDestination2 = 11
+                        }
+                    }
+                    if (recoveredLoopDestination2 == 11) {
+                        r8 = r9
+                    } else {
+                        r8 = u32(1)
+                    }
+                } else {
+                    r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                    r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675b
+                    r11 = u32(200)
+                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                    r10 = r10 + u32(12)
+                    r10 = r10 + u32(32)
+                    r10 = esp32AssertFailed(r10, r11, r12, r13)
+                    var recoveredLoopDestination3 = 8
+                    while (recoveredLoopDestination3 == 8) {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                        r8 = r8 << u32(15)
+                        r8 = u32(i32(r8) >> int(u32(16)))
+                        if (r8 == r10) {
+                            recoveredLoopDestination3 = 12
+                        } else {
+                            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                            if (!(r9 != u32(0))) {
+                                recoveredLoopDestination3 = 11
+                            }
+                        }
+                    }
+                    if (recoveredLoopDestination3 == 11) {
+                        r8 = r9
+                    } else {
+                        r8 = u32(1)
+                    }
+                }
+                if (r8 != u32(0)) {
+                    return r2
+                }
+            }
+        } else {
+            r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int((r2 + u32(4)))))))))
+            if (!(r8 != r10)) {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r8 = (r8 >>> u32(16)) & u32(1)
+                if (!(r8 != r3)) {
+                    return r2
+                }
+            }
+        }
+        r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(12))))))
+    }
+    if (recoveredLoopDestination1 == 4) {
+        return r2
+    }
+    if (recoveredLoopDestination1 == 16) {
+        return r2
+    }
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_source_2b06eb630dLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_source_2b06eb630d", ".Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_source")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(48))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r10 = r4
+    r4 = r5
+    r5 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+    r5 = (r5 >>> u32(17)) & u32(31)
+    r12 = r1 | r1
+    r11 = r5 | r5
+    r10 = esp32RecoveredEspCpuIntrGetDesc(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(8))))))
+    if (((r8 >>> (u32(1) & u32(31))) & u32(1)) == u32(0)) {
+        if (((r8 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+            if (((r3 >>> (r8 & u32(31))) & u32(1)) != u32(0)) {
+                if (((r3 >>> (u32(9) & u32(31))) & u32(1)) == u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                    if (r8 != u32(1)) {
+                        r10 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                        if (((r10 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                            r8 = u32(4)
+                            r8 = r10 & r8
+                            r8 = u32(i32(r8 << u32(16)) >> 16)
+                            r9 = (r8 >>> u32(2)) & u32(1)
+                            r11 = u32(1)
+                            r9 = r9 ^ r11
+                            r9 = (r9 >>> u32(0)) & u32(255)
+                            if (!(r9 != u32(0))) {
+                                r9 = (r10 >>> u32(3)) & u32(1)
+                                r9 = r9 ^ r11
+                                r9 = (r9 >>> u32(0)) & u32(255)
+                                if (!(r9 != u32(0))) {
+                                    r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34af
+                                    r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489
+                                    r11 = u32(309)
+                                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                                    r10 = r10 + u32(12)
+                                    r10 = r10 + u32(32)
+                                    r10 = esp32AssertFailed(r10, r11, r12, r13)
+                                }
+                            }
+                            r9 = u32(8)
+                            r9 = r10 & r9
+                            r9 = u32(i32(r9 << u32(16)) >> 16)
+                            if (r9 != u32(0)) {
+                                r2 = u32(0)
+                            } else {
+                                if (r8 == u32(0)) {
+                                    r11 = xtensaReadProcessorId()
+                                    r11 = (r11 >>> u32(13)) & u32(1)
+                                    r10 = r5
+                                    r10 = esp32RecoveredXtIntHasHandler(r10, r11)
+                                    if (r10 != u32(0)) {
+                                        r2 = u32(0)
+                                    } else {
+                                        r2 = u32(1)
+                                    }
+                                } else {
+                                    if (((r3 >>> (u32(8) & u32(31))) & u32(1)) == u32(0)) {
+                                        r2 = u32(0)
+                                    } else {
+                                        r3 = (r3 >>> u32(10)) & u32(1)
+                                        r8 = (r10 >>> u32(1)) & u32(1)
+                                        if (r3 != r8) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r2 = u32(1)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            r2 = u32(0)
+                        }
+                    } else {
+                        r2 = u32(0)
+                    }
+                } else {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                    if (r8 != u32(0)) {
+                        r10 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                        if (((r10 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                            r8 = u32(4)
+                            r8 = r10 & r8
+                            r8 = u32(i32(r8 << u32(16)) >> 16)
+                            r9 = (r8 >>> u32(2)) & u32(1)
+                            r11 = u32(1)
+                            r9 = r9 ^ r11
+                            r9 = (r9 >>> u32(0)) & u32(255)
+                            if (!(r9 != u32(0))) {
+                                r9 = (r10 >>> u32(3)) & u32(1)
+                                r9 = r9 ^ r11
+                                r9 = (r9 >>> u32(0)) & u32(255)
+                                if (!(r9 != u32(0))) {
+                                    r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34af
+                                    r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489
+                                    r11 = u32(309)
+                                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                                    r10 = r10 + u32(12)
+                                    r10 = r10 + u32(32)
+                                    r10 = esp32AssertFailed(r10, r11, r12, r13)
+                                }
+                            }
+                            r9 = u32(8)
+                            r9 = r10 & r9
+                            r9 = u32(i32(r9 << u32(16)) >> 16)
+                            if (r9 != u32(0)) {
+                                r2 = u32(0)
+                            } else {
+                                if (r8 == u32(0)) {
+                                    r11 = xtensaReadProcessorId()
+                                    r11 = (r11 >>> u32(13)) & u32(1)
+                                    r10 = r5
+                                    r10 = esp32RecoveredXtIntHasHandler(r10, r11)
+                                    if (r10 != u32(0)) {
+                                        r2 = u32(0)
+                                    } else {
+                                        r2 = u32(1)
+                                    }
+                                } else {
+                                    if (((r3 >>> (u32(8) & u32(31))) & u32(1)) == u32(0)) {
+                                        r2 = u32(0)
+                                    } else {
+                                        r3 = (r3 >>> u32(10)) & u32(1)
+                                        r8 = (r10 >>> u32(1)) & u32(1)
+                                        if (r3 != r8) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r2 = u32(1)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            r2 = u32(0)
+                        }
+                    } else {
+                        r2 = u32(0)
+                    }
+                }
+            } else {
+                r2 = u32(0)
+            }
+        } else {
+            if (r4 != u32(4294967295)) {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+                if (((r3 >>> (r8 & u32(31))) & u32(1)) != u32(0)) {
+                    if (((r3 >>> (u32(9) & u32(31))) & u32(1)) == u32(0)) {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                        if (r8 != u32(1)) {
+                            r10 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                            if (((r10 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                                r8 = u32(4)
+                                r8 = r10 & r8
+                                r8 = u32(i32(r8 << u32(16)) >> 16)
+                                r9 = (r8 >>> u32(2)) & u32(1)
+                                r11 = u32(1)
+                                r9 = r9 ^ r11
+                                r9 = (r9 >>> u32(0)) & u32(255)
+                                if (!(r9 != u32(0))) {
+                                    r9 = (r10 >>> u32(3)) & u32(1)
+                                    r9 = r9 ^ r11
+                                    r9 = (r9 >>> u32(0)) & u32(255)
+                                    if (!(r9 != u32(0))) {
+                                        r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34af
+                                        r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489
+                                        r11 = u32(309)
+                                        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                                        r10 = r10 + u32(12)
+                                        r10 = r10 + u32(32)
+                                        r10 = esp32AssertFailed(r10, r11, r12, r13)
+                                    }
+                                }
+                                r9 = u32(8)
+                                r9 = r10 & r9
+                                r9 = u32(i32(r9 << u32(16)) >> 16)
+                                if (r9 != u32(0)) {
+                                    r2 = u32(0)
+                                } else {
+                                    if (r8 == u32(0)) {
+                                        r11 = xtensaReadProcessorId()
+                                        r11 = (r11 >>> u32(13)) & u32(1)
+                                        r10 = r5
+                                        r10 = esp32RecoveredXtIntHasHandler(r10, r11)
+                                        if (r10 != u32(0)) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r2 = u32(1)
+                                        }
+                                    } else {
+                                        if (((r3 >>> (u32(8) & u32(31))) & u32(1)) == u32(0)) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r3 = (r3 >>> u32(10)) & u32(1)
+                                            r8 = (r10 >>> u32(1)) & u32(1)
+                                            if (r3 != r8) {
+                                                r2 = u32(0)
+                                            } else {
+                                                r2 = u32(1)
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                r2 = u32(0)
+                            }
+                        } else {
+                            r2 = u32(0)
+                        }
+                    } else {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                        if (r8 != u32(0)) {
+                            r10 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                            if (((r10 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                                r8 = u32(4)
+                                r8 = r10 & r8
+                                r8 = u32(i32(r8 << u32(16)) >> 16)
+                                r9 = (r8 >>> u32(2)) & u32(1)
+                                r11 = u32(1)
+                                r9 = r9 ^ r11
+                                r9 = (r9 >>> u32(0)) & u32(255)
+                                if (!(r9 != u32(0))) {
+                                    r9 = (r10 >>> u32(3)) & u32(1)
+                                    r9 = r9 ^ r11
+                                    r9 = (r9 >>> u32(0)) & u32(255)
+                                    if (!(r9 != u32(0))) {
+                                        r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34af
+                                        r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489
+                                        r11 = u32(309)
+                                        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+                                        r10 = r10 + u32(12)
+                                        r10 = r10 + u32(32)
+                                        r10 = esp32AssertFailed(r10, r11, r12, r13)
+                                    }
+                                }
+                                r9 = u32(8)
+                                r9 = r10 & r9
+                                r9 = u32(i32(r9 << u32(16)) >> 16)
+                                if (r9 != u32(0)) {
+                                    r2 = u32(0)
+                                } else {
+                                    if (r8 == u32(0)) {
+                                        r11 = xtensaReadProcessorId()
+                                        r11 = (r11 >>> u32(13)) & u32(1)
+                                        r10 = r5
+                                        r10 = esp32RecoveredXtIntHasHandler(r10, r11)
+                                        if (r10 != u32(0)) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r2 = u32(1)
+                                        }
+                                    } else {
+                                        if (((r3 >>> (u32(8) & u32(31))) & u32(1)) == u32(0)) {
+                                            r2 = u32(0)
+                                        } else {
+                                            r3 = (r3 >>> u32(10)) & u32(1)
+                                            r8 = (r10 >>> u32(1)) & u32(1)
+                                            if (r3 != r8) {
+                                                r2 = u32(0)
+                                            } else {
+                                                r2 = u32(1)
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                r2 = u32(0)
+                            }
+                        } else {
+                            r2 = u32(0)
+                        }
+                    }
+                } else {
+                    r2 = u32(0)
+                }
+            } else {
+                r2 = u32(0)
+            }
+        }
+    } else {
+        r2 = u32(0)
+    }
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4cLink = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c", ".Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_available_int_929bd5f0b1(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(80))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r7 = r4
+    r12 = u32(16)
+    r11 = u32(0)
+    r10 = r1
+    r10 = freestandingSet(r10, i32(r11), r12)
+    r8 = (r2 >>> u32(1)) & u32(127)
+    if (!(r8 != u32(0))) {
+        r8 = u32(14)
+        r2 = r2 | r8
+    }
+    r11 = r3
+    r10 = r5
+    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_source_2b06eb630d(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r6 = r10
+    if (r10 == u32(0)) {
+        if (r7 != u32(4294967295)) {
+            r11 = r3
+            r10 = r7
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            r6 = r10
+            if (!(r10 != u32(0))) {
+                r9 = (r7 >>> u32(0)) & u32(31)
+                r9 = r9 << u32(17)
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+                r10 = u32(4290904063)
+                r8 = r8 & r10
+                r8 = r8 | r9
+                ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r8))
+                r6 = r1 | r1
+            }
+            r13 = r7
+            r12 = r3
+            r11 = r2
+            r10 = r6
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            if (r10 == u32(0)) {
+                r8 = u32(4294967295)
+                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+            } else {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r6))))
+                r8 = (r8 >>> u32(17)) & u32(31)
+                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+            }
+        } else {
+            ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r7))
+            r8 = u32(2147483647)
+            ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(36)))), int(r8))
+            r6 = u32(9)
+            r4 = u32(0)
+            var recoveredLoopDestination1 = 36
+            while (recoveredLoopDestination1 == 36) {
+                r8 = u32(31)
+                if (i32(r8) < i32(r4)) {
+                    recoveredLoopDestination1 = 38
+                } else {
+                    r11 = r3
+                    r10 = r4
+                    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r5 = r10
+                    if (!(r10 != u32(0))) {
+                        r9 = (r4 >>> u32(0)) & u32(31)
+                        r9 = r9 << u32(17)
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+                        r10 = u32(4290904063)
+                        r8 = r8 & r10
+                        r8 = r8 | r9
+                        ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r8))
+                        r5 = r1 | r1
+                    }
+                    r12 = r1 + u32(16)
+                    r11 = r4
+                    r10 = r3 | r3
+                    r10 = esp32RecoveredEspCpuIntrGetDesc(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r13 = r7
+                    r12 = r3
+                    r11 = r2
+                    r10 = r5
+                    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c(r10, r11, r12, r13, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    if (!(r10 == u32(0))) {
+                        if (((r2 >>> (u32(8) & u32(31))) & u32(1)) == u32(0)) {
+                            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                            if (i32(r8) < i32(r6)) {
+                                r6 = r8
+                                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r4))
+                            }
+                        } else {
+                            r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r5)))))))
+                            r9 = u32(4)
+                            r8 = r8 & r9
+                            r8 = u32(i32(r8 << u32(16)) >> 16)
+                            if (r8 == u32(0)) {
+                                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(32))))))
+                                if (!(r8 != u32(4294967295))) {
+                                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                                    if (i32(r8) < i32(r6)) {
+                                        r6 = r8
+                                        ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r4))
+                                    }
+                                }
+                            } else {
+                                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r5 + u32(8))))))
+                                r9 = u32(0)
+                                var recoveredLoopDestination2 = 23
+                                while (recoveredLoopDestination2 == 23) {
+                                    if (r8 != u32(0)) {
+                                        r9 = r9 + u32(1)
+                                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r8 + u32(20))))))
+                                    } else {
+                                        recoveredLoopDestination2 = 24
+                                    }
+                                }
+                                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(36))))))
+                                if (i32(r9) < i32(r8)) {
+                                    r6 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(36)))), int(r9))
+                                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r4))
+                                } else {
+                                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                                    if (!(i32(r8) >= i32(r6))) {
+                                        r6 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                                        ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(36)))), int(r9))
+                                        ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r4))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    r4 = r4 + u32(1)
+                }
+            }
+        }
+    } else {
+        if (r7 == u32(4294967295)) {
+            r13 = r7
+            r12 = r3
+            r11 = r2
+            r10 = r6
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            if (r10 == u32(0)) {
+                r8 = u32(4294967295)
+                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+            } else {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r6))))
+                r8 = (r8 >>> u32(17)) & u32(31)
+                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+            }
+        } else {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r10))))
+            r8 = (r8 >>> u32(17)) & u32(31)
+            if (r8 != r7) {
+                r8 = u32(4294967295)
+                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+            } else {
+                r13 = r7
+                r12 = r3
+                r11 = r2
+                r10 = r6
+                r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_is_vect_desc_usable_ffa89f0f4c(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                if (r10 == u32(0)) {
+                    r8 = u32(4294967295)
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+                } else {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r6))))
+                    r8 = (r8 >>> u32(17)) & u32(31)
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r8))
+                }
+            }
+        }
+    }
+    r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(32))))))
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_available_int_929bd5f0b1Link = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_available_int_929bd5f0b1", ".Labla_recovered_esp32_interrupt_allocator_local_get_available_int")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu_5747f8fa91(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r11 = u32(4294967295)
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    r10 = r2
+    r10 = esp32RecoveredEspIntrDisable(r10, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+    r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r11)))))))
+    r9 = u32(4)
+    r8 = r8 & r9
+    r8 = u32(i32(r8 << u32(16)) >> 16)
+    if (r8 == u32(0)) {
+        r11 = r8
+    } else {
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r11 + u32(8))))))
+        if (r10 != u32(0)) {
+            r9 = u32(0)
+            var recoveredLoopDestination1 = 21
+            while (recoveredLoopDestination1 == 21) {
+                if (r10 != u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+                    if (r8 != r10) {
+                        r9 = r10
+                        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    } else {
+                        recoveredLoopDestination1 = 4
+                    }
+                } else {
+                    recoveredLoopDestination1 = 11
+                }
+            }
+            if (recoveredLoopDestination1 == 4) {
+                if (r9 == u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(8)))), int(r8))
+                } else {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r9 + u32(20)))), int(r8))
+                }
+                r10 = esp32InterruptAllocatorFreeValue(r10)
+            } else {
+            }
+        } else {
+            r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081
+            r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7
+            r11 = u32(807)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+            r10 = r10 + u32(12)
+            r10 = r10 + u32(32)
+            r10 = esp32AssertFailed(r10, r11, r12, r13)
+            var recoveredLoopDestination2 = 3
+            while (recoveredLoopDestination2 == 3) {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+                if (r8 != r10) {
+                    r9 = r10
+                    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    if (!(r10 != u32(0))) {
+                        recoveredLoopDestination2 = 11
+                    }
+                } else {
+                    recoveredLoopDestination2 = 4
+                }
+            }
+            if (recoveredLoopDestination2 == 4) {
+                if (r9 == u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(8)))), int(r8))
+                } else {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r10 + u32(20))))))
+                    ablaUnsafeStoreU32(nativePointerFromAddress(int((r9 + u32(20)))), int(r8))
+                }
+                r10 = esp32InterruptAllocatorFreeValue(r10)
+            } else {
+            }
+        }
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r8 + u32(8))))))
+        if (r8 == u32(0)) {
+            r11 = u32(1)
+        } else {
+            r11 = u32(0)
+        }
+    }
+    r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+    r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r9)))))))
+    r10 = u32(8)
+    r8 = r8 & r10
+    r8 = u32(i32(r8 << u32(16)) >> 16)
+    if (r8 != u32(0)) {
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+        r10 = (r10 >>> u32(17)) & u32(31)
+        r12 = r10
+        r11 = u32(0)
+        r10 = esp32RecoveredXtSetInterruptHandler(r10, r11, r12)
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r9)))))))
+        r10 = u32(4294967282)
+        r8 = r8 & r10
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r9)), int(r8))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r9 = u32(4294967197)
+        ablaUnsafeStoreU16(nativePointerFromAddress(int((r8 + u32(4)))), int(r9))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r9 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+        r10 = (r8 >>> u32(16)) & u32(1)
+        r10 = (r10 << u32(2)) + r9
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r10))))
+        r9 = (r8 >>> u32(17)) & u32(31)
+        r8 = u32(1)
+        shiftAmount = r9 & u32(31)
+        r8 = r8 << ((u32(32) - shiftAmount) & u32(31))
+        r8 = r8 & r11
+        r8 = r8 ^ r11
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r10)), int(r8))
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+        r10 = r2
+        r10 = esp32InterruptAllocatorFreeValue(r10)
+        r2 = u32(0)
+        return r2
+    }
+    if (!(r11 == u32(0))) {
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+        r10 = (r10 >>> u32(17)) & u32(31)
+        r12 = r10
+        r11 = u32(0)
+        r10 = esp32RecoveredXtSetInterruptHandler(r10, r11, r12)
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r9)))))))
+        r10 = u32(4294967282)
+        r8 = r8 & r10
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r9)), int(r8))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r9 = u32(4294967197)
+        ablaUnsafeStoreU16(nativePointerFromAddress(int((r8 + u32(4)))), int(r9))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r9 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+        r10 = (r8 >>> u32(16)) & u32(1)
+        r10 = (r10 << u32(2)) + r9
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r10))))
+        r9 = (r8 >>> u32(17)) & u32(31)
+        r8 = u32(1)
+        shiftAmount = r9 & u32(31)
+        r8 = r8 << ((u32(32) - shiftAmount) & u32(31))
+        r8 = r8 & r11
+        r8 = r8 ^ r11
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r10)), int(r8))
+    }
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    r10 = r2
+    r10 = esp32InterruptAllocatorFreeValue(r10)
+    r2 = u32(0)
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu_5747f8fa91Link = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu_5747f8fa91", ".Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu")
+
+trusted fun esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu_eb1b1cb6d3(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = r2 | r2
+    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu_5747f8fa91(r10, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    return r2
+}
+
+val esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu_eb1b1cb6d3Link = #internalFunction("esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu_eb1b1cb6d3", ".Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu")
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672cStorage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672c = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_vector_desc_head_vector_desc_head_c62583672cStorage)
+
+val esp32InterruptVectorPoolStorage = nativeStaticAllocate(1024)
+val esp32InterruptVectorPool = u32(esp32InterruptVectorPoolStorage)
+
+
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675bStorage = nativeStaticBytes(
+    "\x66\x69\x6e\x64\x5f\x64\x65\x73\x63\x5f\x66\x6f\x72\x5f\x73\x6f\x75\x72\x63\x65\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675bInitialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675bStorage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675b = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_6_func_6_4921e7675bInitialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489Storage = nativeStaticBytes(
+    "\x69\x73\x5f\x76\x65\x63\x74\x5f\x64\x65\x73\x63\x5f\x75\x73\x61\x62\x6c\x65\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_5_func_5_1e172c6489Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eafStorage = nativeStaticAllocate(8)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eafStorage)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efbStorage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efbStorage)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_non_iram_int_disabled_c73f4a57f8Storage = nativeStaticAllocate(8)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_non_iram_int_disabled_c73f4a57f8 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_non_iram_int_disabled_c73f4a57f8Storage)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4Storage = nativeStaticBytes(
+    "\x65\x73\x70\x5f\x69\x6e\x74\x72\x5f\x64\x69\x73\x61\x62\x6c\x65\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593Storage = nativeStaticBytes(
+    "\x65\x73\x70\x5f\x63\x70\x75\x5f\x69\x6e\x74\x72\x5f\x73\x65\x74\x5f\x68\x61\x6e\x64\x6c\x65\x72\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8cStorage = nativeStaticBytes(
+    "\x65\x73\x70\x5f\x63\x70\x75\x5f\x69\x6e\x74\x72\x5f\x65\x64\x67\x65\x5f\x61\x63\x00\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8cInitialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8cStorage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8c = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8cInitialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7Storage = nativeStaticBytes(
+    "\x69\x6e\x74\x72\x5f\x66\x72\x65\x65\x5f\x66\x6f\x72\x5f\x63\x75\x72\x72\x65\x6e\x74\x5f\x63\x70\x00\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_1_func_1_986a4569a7Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588Storage = nativeStaticBytes(
+    (
+        "\x69\x6e\x74\x72\x5f\x61\x6c\x6c\x6f\x63\x00\x00\x45\x20\x28\x25\x6c\x75\x29\x20\x25\x73\x3a\x20\x4e\x6f\x20\x66\x72\x65\x65\x20" +
+        "\x69\x6e\x74\x65\x72\x72\x75\x70\x74\x20\x69\x6e\x70\x75\x74\x73\x20\x66\x6f\x72\x20\x25\x73\x20\x69\x6e\x74\x65\x72\x72\x75\x70" +
+        "\x74\x20\x28\x66\x6c\x61\x67\x73\x20\x30\x78\x25\x58\x29\x0a\x00\x69\x6e\x74\x72\x5f\x6e\x75\x6d\x20\x3e\x3d\x20\x30\x20\x26\x26" +
+        "\x20\x69\x6e\x74\x72\x5f\x6e\x75\x6d\x20\x3c\x20\x53\x4f\x43\x5f\x43\x50\x55\x5f\x49\x4e\x54\x52\x5f\x4e\x55\x4d\x00\x00\x00\x00" +
+        "\x2f\x2f\x49\x44\x46\x2f\x63\x6f\x6d\x70\x6f\x6e\x65\x6e\x74\x73\x2f\x65\x73\x70\x5f\x68\x77\x5f\x73\x75\x70\x70\x6f\x72\x74\x2f" +
+        "\x69\x6e\x63\x6c\x75\x64\x65\x2f\x65\x73\x70\x5f\x63\x70\x75\x2e\x00\x00"
+    )
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2Storage = nativeStaticBytes(
+    (
+        "\x45\x64\x67\x65\x20\x00\x00\x00\x4c\x65\x76\x65\x6c\x00\x00\x00\x43\x50\x55\x20\x25\x64\x20\x69\x6e\x74\x65\x72\x72\x75\x70\x74" +
+        "\x20\x73\x74\x61\x74\x75\x73\x3a\x0a\x00\x00\x00\x20\x49\x6e\x74\x20\x20\x4c\x65\x76\x65\x6c\x20\x20\x54\x79\x70\x65\x20\x20\x20" +
+        "\x53\x74\x61\x74\x75\x73\x0a\x00\x20\x25\x32\x64\x20\x20\x00\x00\x20\x20\x20\x25\x64\x20\x20\x20\x20\x25\x73\x20\x20\x00\x00\x00" +
+        "\x52\x65\x73\x65\x72\x76\x65\x64\x00\x00\x00\x00\x43\x50\x55\x2d\x69\x6e\x74\x65\x72\x6e\x61\x6c\x00\x00\x00\x00\x46\x72\x65\x65" +
+        "\x00\x00\x00\x00\x20\x28\x6e\x6f\x74\x20\x67\x65\x6e\x65\x72\x61\x6c\x2d\x75\x73\x65\x29\x00\x00\x52\x65\x73\x65\x72\x76\x65\x64" +
+        "\x20\x28\x72\x75\x6e\x2d\x74\x69\x6d\x65\x29\x00\x55\x73\x65\x64\x3a\x20\x25\x73\x00\x00\x00\x00\x53\x68\x61\x72\x65\x64\x3a\x20" +
+        "\x00\x00\x00\x00\x25\x73\x20\x00\x55\x6e\x6b\x6e\x6f\x77\x6e\x2c\x20\x66\x6c\x61\x67\x73\x20\x3d\x20\x30\x78\x25\x78\x00\x00\x00" +
+        "\x49\x6e\x74\x65\x72\x72\x75\x70\x74\x73\x20\x61\x76\x61\x69\x6c\x61\x62\x6c\x65\x20\x66\x6f\x72\x20\x67\x65\x6e\x65\x72\x61\x6c" +
+        "\x20\x75\x73\x65\x3a\x20\x25\x64\x0a\x00\x00\x00\x53\x68\x61\x72\x65\x64\x20\x69\x6e\x74\x65\x72\x72\x75\x70\x74\x73\x3a\x20\x25" +
+        "\x00\x00\x00"
+    )
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486Storage = nativeStaticBytes(
+    (
+        "\x73\x76\x64\x20\x21\x3d\x20\x4e\x55\x4c\x4c\x00\x2f\x2f\x49\x44\x46\x2f\x63\x6f\x6d\x70\x6f\x6e\x65\x6e\x74\x73\x2f\x65\x73\x70" +
+        "\x5f\x68\x77\x5f\x73\x75\x70\x70\x6f\x72\x74\x2f\x69\x6e\x74\x72\x5f\x61\x6c\x6c\x6f\x63\x2e\x63\x00"
+    )
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081Storage = nativeStaticBytes(
+    "\x73\x76\x64\x00"
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_intr_free_for_current_cpu_str1_4_0b4758e081Initialized)
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34afStorage = nativeStaticBytes(
+    (
+        "\x21\x28\x28\x76\x64\x2d\x3e\x66\x6c\x61\x67\x73\x20\x26\x20\x56\x45\x43\x44\x45\x53\x43\x5f\x46\x4c\x5f\x53\x48\x41\x52\x45\x44" +
+        "\x29\x20\x26\x26\x20\x28\x76\x64\x2d\x3e\x66\x6c\x61\x67\x73\x20\x26\x20\x56\x45\x43\x44\x45\x53\x43\x5f\x46\x4c\x5f\x4e\x4f\x4e" +
+        "\x53\x48\x41\x52\x45\x44\x29\x29\x00"
+    )
+)
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34afInitialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34afStorage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34af = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_is_vect_desc_usable_str1_4_8819be34afInitialized)
+
+trusted fun esp32RecoveredEspIntrMarkShared(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    var compareExchangeExpected = u32(0)
+    r4 = (r4 >>> u32(0)) & u32(255)
+    r8 = u32(31)
+    if (i32(r8) < i32(r2)) {
+        r2 = u32(258)
+    } else {
+        if (i32(r3) >= i32(u32(2))) {
+            r2 = u32(258)
+        } else {
+            r11 = u32(4294967295)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+            r11 = r3
+            r10 = r2 | r2
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303d(r10, r11, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            if (r10 != u32(0)) {
+                r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r10)))))))
+                r9 = u32(4294967280)
+                r8 = r8 & r9
+                r8 = u32(i32(r8 << u32(16)) >> 16)
+                r9 = u32(4)
+                r9 = r8 | r9
+                ablaUnsafeStoreU16(nativePointerFromAddress(int(r10)), int(r9))
+                if (!(r4 == u32(0))) {
+                    r9 = u32(6)
+                    r8 = r8 | r9
+                    ablaUnsafeStoreU16(nativePointerFromAddress(int(r10)), int(r8))
+                }
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(0)
+            } else {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(257)
+            }
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_reserve
+trusted fun esp32RecoveredEspIntrReserve(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r8 = u32(31)
+    if (i32(r8) < i32(r2)) {
+        r2 = u32(258)
+    } else {
+        if (i32(r3) >= i32(u32(2))) {
+            r2 = u32(258)
+        } else {
+            r11 = u32(4294967295)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+            r11 = r3
+            r10 = r2 | r2
+            r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303d(r10, r11, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            if (r10 != u32(0)) {
+                r8 = u32(1)
+                ablaUnsafeStoreU16(nativePointerFromAddress(int(r10)), int(r8))
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(0)
+            } else {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(257)
+            }
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_ptr_in_isr_region
+trusted fun esp32RecoveredEspIntrPtrInIsrRegion(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r8 = u32(3220701184)
+    r8 = r2 + r8
+    r9 = u32(172031)
+    if (r9 >= r8) {
+        r2 = u32(1)
+    } else {
+        r8 = u32(3220439040)
+        r8 = r2 + r8
+        r9 = u32(8191)
+        if (r9 >= r8) {
+            r2 = u32(1)
+        } else {
+            r8 = u32(3221225472)
+            r2 = r2 + r8
+            r8 = u32(458751)
+            if (r8 >= r2) {
+                r2 = u32(1)
+            } else {
+                r2 = u32(0)
+            }
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_set_in_iram
+@section(".iram1.abla.esp32RecoveredEspIntrSetInIram")
+trusted fun esp32RecoveredEspIntrSetInIram(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r3 = (r3 >>> u32(0)) & u32(255)
+    if (r2 == u32(0)) {
+        r2 = u32(258)
+    } else {
+        r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+        r9 = u32(4)
+        r8 = r8 & r9
+        r8 = u32(i32(r8 << u32(16)) >> 16)
+        if (r8 != u32(0)) {
+            r2 = u32(258)
+        } else {
+            r11 = u32(4294967295)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r8 = (r8 >>> u32(17)) & u32(31)
+            r9 = u32(1)
+            shiftAmount = r8 & u32(31)
+            r9 = r9 << ((u32(32) - shiftAmount) & u32(31))
+            if (r3 == u32(0)) {
+                r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                r10 = u32(4294967293)
+                r8 = r8 & r10
+                ablaUnsafeStoreU16(nativePointerFromAddress(int(r2)), int(r8))
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+                r8 = (r8 >>> u32(16)) & u32(1)
+                r8 = (r8 << u32(2)) + r10
+                r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                r9 = r10 | r9
+                ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+            } else {
+                r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r2)))))))
+                r10 = u32(2)
+                r8 = r8 | r10
+                ablaUnsafeStoreU16(nativePointerFromAddress(int(r2)), int(r8))
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+                r8 = (r8 >>> u32(16)) & u32(1)
+                r8 = (r8 << u32(2)) + r10
+                r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                r9 = r9 & r10
+                r9 = r9 ^ r10
+                ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+            }
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            r2 = u32(0)
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_get_intno
+trusted fun esp32RecoveredEspIntrGetIntno(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    if (r2 == u32(0)) {
+        r2 = u32(4294967295)
+    } else {
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        if (r8 == u32(0)) {
+            r2 = u32(4294967295)
+        } else {
+            r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r2 = (r2 >>> u32(17)) & u32(31)
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_get_cpu
+trusted fun esp32RecoveredEspIntrGetCpu(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    if (r2 == u32(0)) {
+        r2 = u32(4294967295)
+    } else {
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        if (r8 == u32(0)) {
+            r2 = u32(4294967295)
+        } else {
+            r2 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r2 = (r2 >>> u32(16)) & u32(1)
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_noniram_disable
+@section(".iram1.4.abla.esp32RecoveredEspIntrNoniramDisable")
+trusted fun esp32RecoveredEspIntrNoniramDisable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    var compareExchangeExpected = u32(0)
+    r10 = esp32RecoveredXPortInIsrContext()
+    if (r10 == u32(0)) {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    } else {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    }
+    r7 = xtensaReadProcessorId()
+    r7 = (r7 >>> u32(13)) & u32(1)
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+    r8 = (r7 << u32(2)) + r8
+    r6 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb
+    r8 = r8 + r7
+    r8 = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(r8))))
+    if (!(r8 == u32(0))) {
+        r10 = freestandingAbortValue()
+    }
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb
+    r8 = r8 + r7
+    r9 = u32(1)
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(r8)), int(r9))
+    r5 = xtensaReadInterruptEnableRegister()
+    r10 = r6
+    r10 = esp32RecoveredXtIntsOff(r10)
+    r11 = u32(0)
+    r10 = r7
+    r10 = esp32RecoveredRtcIsrNoniramDisable(r10, r11, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r11 = u32(0)
+    r6 = r6 & r5
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_non_iram_int_disabled_c73f4a57f8
+    r7 = (r7 << u32(2)) + r8
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r7)), int(r6))
+    r10 = esp32RecoveredXPortInIsrContext()
+    if (r10 == u32(0)) {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    } else {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_noniram_enable
+@section(".iram1.5.abla.esp32RecoveredEspIntrNoniramEnable")
+trusted fun esp32RecoveredEspIntrNoniramEnable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = esp32RecoveredXPortInIsrContext()
+    if (r10 == u32(0)) {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    } else {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    }
+    r7 = xtensaReadProcessorId()
+    r7 = (r7 >>> u32(13)) & u32(1)
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_non_iram_int_disabled_c73f4a57f8
+    r8 = (r7 << u32(2)) + r8
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb
+    r8 = r8 + r7
+    r8 = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(r8))))
+    if (!(r8 != u32(0))) {
+        r10 = freestandingAbortValue()
+    }
+    r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb
+    r8 = r8 + r7
+    r9 = u32(0)
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(r8)), int(r9))
+    r10 = esp32RecoveredXtIntsOn(r10)
+    r10 = r7
+    r10 = esp32RecoveredRtcIsrNoniramEnable(r10, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r10 = esp32RecoveredXPortInIsrContext()
+    if (r10 == u32(0)) {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    } else {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    }
+    return r2
+}
+
+// The scheduler installs its own live interrupt mask. Discard the guard saved
+// by pre-scheduler startup without restoring that obsolete mask, so the first
+// application flash operation snapshots the scheduler mask normally.
+trusted fun esp32ClearStartupNonIramGuard(): void {
+    val core = (xtensaReadProcessorId() >>> u32(13)) & u32(1)
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_disabled_flag_non_iram_int_disabled_flag_8f0a285efb + core
+    )), 0)
+    return
+}
+
+// Original ABI symbol: ets_isr_unmask
+@section(".iram1.abla.esp32RecoveredEtsIsrUnmask")
+trusted fun esp32RecoveredEtsIsrUnmask(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = r2 | r2
+    r10 = esp32RecoveredXtIntsOn(r10)
+    return r2
+}
+
+// Original ABI symbol: ets_isr_mask
+@section(".iram1.abla.esp32RecoveredEtsIsrMask")
+trusted fun esp32RecoveredEtsIsrMask(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = r2 | r2
+    r10 = esp32RecoveredXtIntsOff(r10)
+    return r2
+}
+
+// Original ABI symbol: esp_intr_enable_source
+@section(".iram1.8.abla.esp32RecoveredEspIntrEnableSource")
+trusted fun esp32RecoveredEspIntrEnableSource(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = u32(1)
+    shiftAmount = r2 & u32(31)
+    r10 = r10 << ((u32(32) - shiftAmount) & u32(31))
+    r10 = esp32RecoveredXtIntsOn(r10)
+    return r2
+}
+
+// Original ABI symbol: esp_intr_enable
+@section(".iram1.2.abla.esp32RecoveredEspIntrEnable")
+trusted fun esp32RecoveredEspIntrEnable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    if (r2 == u32(0)) {
+        r2 = u32(258)
+    } else {
+        r10 = esp32RecoveredXPortInIsrContext()
+        if (r10 == u32(0)) {
+            r11 = u32(4294967295)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+        } else {
+            r11 = u32(4294967295)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+        }
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+        if (r8 == u32(0)) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r11 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int((r8 + u32(4)))))))))
+        } else {
+            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r10 = u32(4294967294)
+            r9 = r9 & r10
+            ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+            r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r11 = r11 << u32(15)
+            r11 = u32(i32(r11) >> int(u32(16)))
+        }
+        if (i32(r11) < 0) {
+            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+            r8 = (r8 >>> u32(16)) & u32(1)
+            r10 = xtensaReadProcessorId()
+            r10 = (r10 >>> u32(13)) & u32(1)
+            if (r8 == r10) {
+                r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                r10 = (r10 >>> u32(17)) & u32(31)
+                r10 = esp32RecoveredEspIntrEnableSource(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                r10 = esp32RecoveredXPortInIsrContext()
+                r2 = r10
+                if (r10 == u32(0)) {
+                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                } else {
+                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                    r2 = u32(0)
+                }
+            } else {
+                r10 = esp32RecoveredXPortInIsrContext()
+                if (r10 == u32(0)) {
+                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                } else {
+                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                }
+                r2 = u32(258)
+            }
+        } else {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r12 = (r10 >>> u32(17)) & u32(31)
+            r10 = (r10 >>> u32(16)) & u32(1)
+            r10 = esp32RomRouteInterruptMatrixValue(r10, r11, r12)
+            r10 = esp32RecoveredXPortInIsrContext()
+            r2 = r10
+            if (r10 == u32(0)) {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            } else {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(0)
+            }
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_disable_source
+@section(".iram1.9.abla.esp32RecoveredEspIntrDisableSource")
+trusted fun esp32RecoveredEspIntrDisableSource(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var shiftAmount = u32(0)
+    r10 = u32(1)
+    shiftAmount = r2 & u32(31)
+    r10 = r10 << ((u32(32) - shiftAmount) & u32(31))
+    r10 = esp32RecoveredXtIntsOff(r10)
+    return r2
+}
+
+// Original ABI symbol: esp_intr_disable
+@section(".iram1.3.abla.esp32RecoveredEspIntrDisable")
+trusted fun esp32RecoveredEspIntrDisable(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    if (r2 == u32(0)) {
+        r2 = u32(258)
+        return r2
+    }
+    r10 = esp32RecoveredXPortInIsrContext()
+    if (r10 == u32(0)) {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    } else {
+        r11 = u32(4294967295)
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    }
+    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+    if (r8 == u32(0)) {
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r11 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int((r8 + u32(4)))))))))
+        r8 = u32(1)
+    } else {
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r10 = u32(1)
+        r9 = r9 | r10
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r2 + u32(4))))))
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r10 = r10 << u32(15)
+        r10 = u32(i32(r10) >> int(u32(16)))
+        r11 = r10
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r8 + u32(8))))))
+        if (r9 != u32(0)) {
+            var recoveredLoopDestination1 = 31
+            while (recoveredLoopDestination1 == 31) {
+                if (r9 != u32(0)) {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                    r8 = r8 << u32(15)
+                    r8 = u32(i32(r8) >> int(u32(16)))
+                    if (r10 != r8) {
+                        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                    } else {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                        if (((r8 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                            recoveredLoopDestination1 = 13
+                        } else {
+                            r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                        }
+                    }
+                } else {
+                    recoveredLoopDestination1 = 11
+                }
+            }
+            if (recoveredLoopDestination1 == 11) {
+                r8 = u32(1)
+            } else {
+                r8 = u32(0)
+            }
+        } else {
+            r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+            r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_0_func_0_ba388934e4
+            r11 = u32(931)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_find_desc_for_source_str1_4_e6b8691486
+            r10 = r10 + u32(12)
+            r10 = r10 + u32(32)
+            r10 = esp32AssertFailed(r10, r11, r12, r13)
+            var recoveredLoopDestination2 = 7
+            while (recoveredLoopDestination2 == 7) {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                r8 = r8 << u32(15)
+                r8 = u32(i32(r8) >> int(u32(16)))
+                if (r10 != r8) {
+                    r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                    if (!(r9 != u32(0))) {
+                        recoveredLoopDestination2 = 11
+                    }
+                } else {
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+                    if (((r8 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                        recoveredLoopDestination2 = 13
+                    } else {
+                        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r9 + u32(20))))))
+                        if (!(r9 != u32(0))) {
+                            recoveredLoopDestination2 = 11
+                        }
+                    }
+                }
+            }
+            if (recoveredLoopDestination2 == 11) {
+                r8 = u32(1)
+            } else {
+                r8 = u32(0)
+            }
+        }
+    }
+    if (i32(r11) < 0) {
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+        r8 = (r8 >>> u32(16)) & u32(1)
+        r10 = xtensaReadProcessorId()
+        r10 = (r10 >>> u32(13)) & u32(1)
+        if (r8 == r10) {
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+            r10 = (r10 >>> u32(17)) & u32(31)
+            r10 = esp32RecoveredEspIntrDisableSource(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            r10 = esp32RecoveredXPortInIsrContext()
+            r2 = r10
+            if (r10 == u32(0)) {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            } else {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+                r2 = u32(0)
+            }
+        } else {
+            r10 = esp32RecoveredXPortInIsrContext()
+            if (r10 == u32(0)) {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            } else {
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+                r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            }
+            r2 = u32(258)
+        }
+    } else {
+        if (!(r8 == u32(0))) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r12 = u32(6)
+            r10 = (r10 >>> u32(16)) & u32(1)
+            r10 = esp32RomRouteInterruptMatrixValue(r10, r11, r12)
+        }
+        r10 = esp32RecoveredXPortInIsrContext()
+        r2 = r10
+        if (r10 == u32(0)) {
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredVPortExitCriticalValue(r10)
+        } else {
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            r2 = u32(0)
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_alloc_intrstatus_bind
+trusted fun esp32RecoveredEspIntrAllocIntrstatusBindLifted(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(80))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(24)))), int(r7))
+    r8 = u32(256)
+    r7 = r3 & r8
+    if (!((r3 & r8) == u32(0))) {
+        if (!(((r3 >>> (u32(9) & u32(31))) & u32(1)) == u32(0))) {
+            r2 = u32(258)
+            return r2
+        }
+    }
+    r8 = (r3 >>> u32(4)) & u32(15)
+    if (!(r8 == u32(0))) {
+        if (r6 != u32(0)) {
+            r2 = u32(258)
+            return r2
+        }
+    }
+    if (!(r7 == u32(0))) {
+        r8 = ablaCountLeadingZerosU32(r6)
+        r8 = r8 >>> u32(5)
+        r9 = (r2 >>> u32(31)) & u32(1)
+        r8 = r8 | r9
+        if (r8 != u32(0)) {
+            r2 = u32(258)
+            return r2
+        }
+    }
+    r9 = u32(1)
+    if (r4 == u32(0)) r9 = r4
+    r8 = ablaCountLeadingZerosU32(r5)
+    r8 = r8 >>> u32(5)
+    if (!((r9 & r8) == u32(0))) {
+        r2 = u32(258)
+        return r2
+    }
+    if (!(((r3 >>> (u32(10) & u32(31))) & u32(1)) == u32(0))) {
+        if (!(r6 == u32(0))) {
+            r10 = r6 | r6
+            r10 = esp32RecoveredEspIntrPtrInIsrRegion(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            if (r10 == u32(0)) {
+                r2 = u32(258)
+                return r2
+            }
+        }
+    }
+    r8 = stack0
+    if (!(r8 == u32(0))) {
+        if (r7 == u32(0)) {
+            r2 = u32(258)
+            return r2
+        }
+    }
+    r8 = (r3 >>> u32(1)) & u32(127)
+    if (!(r8 != u32(0))) {
+        if (r7 == u32(0)) {
+            r8 = u32(14)
+            r3 = r3 | r8
+        } else {
+            r8 = u32(2)
+            r3 = r3 | r8
+        }
+    }
+    if (r2 == u32(4294967295)) {
+        r7 = u32(6)
+        r8 = u32(4294967293)
+        if (r2 != r8) {
+            r8 = u32(4294967292)
+            if (r2 != r8) {
+                r8 = u32(4294967291)
+                if (r2 != r8) {
+                    r8 = u32(4294967290)
+                    if (!(r2 != r8)) {
+                        r7 = u32(11)
+                    }
+                } else {
+                    r7 = u32(29)
+                }
+            } else {
+                r7 = u32(7)
+                r8 = u32(4294967290)
+                if (!(r2 != r8)) {
+                    r7 = u32(11)
+                }
+            }
+        } else {
+            r7 = u32(16)
+            r8 = u32(4294967291)
+            if (r2 != r8) {
+                r8 = u32(4294967290)
+                if (!(r2 != r8)) {
+                    r7 = u32(11)
+                }
+            } else {
+                r7 = u32(29)
+            }
+        }
+    } else {
+        r8 = u32(4294967294)
+        if (r2 == r8) {
+            r7 = u32(15)
+            r8 = u32(4294967292)
+            if (r2 != r8) {
+                r8 = u32(4294967291)
+                if (r2 != r8) {
+                    r8 = u32(4294967290)
+                    if (!(r2 != r8)) {
+                        r7 = u32(11)
+                    }
+                } else {
+                    r7 = u32(29)
+                }
+            } else {
+                r7 = u32(7)
+                r8 = u32(4294967290)
+                if (!(r2 != r8)) {
+                    r7 = u32(11)
+                }
+            }
+        } else {
+            r7 = u32(4294967295)
+            r8 = u32(4294967293)
+            if (r2 != r8) {
+                r8 = u32(4294967292)
+                if (r2 != r8) {
+                    r8 = u32(4294967291)
+                    if (r2 != r8) {
+                        r8 = u32(4294967290)
+                        if (!(r2 != r8)) {
+                            r7 = u32(11)
+                        }
+                    } else {
+                        r7 = u32(29)
+                    }
+                } else {
+                    r7 = u32(7)
+                    r8 = u32(4294967290)
+                    if (!(r2 != r8)) {
+                        r7 = u32(11)
+                    }
+                }
+            } else {
+                r7 = u32(16)
+                r8 = u32(4294967291)
+                if (r2 != r8) {
+                    r8 = u32(4294967290)
+                    if (!(r2 != r8)) {
+                        r7 = u32(11)
+                    }
+                } else {
+                    r7 = u32(29)
+                }
+            }
+        }
+    }
+    r11 = u32(2052)
+    r10 = u32(8)
+    r10 = esp32InterruptAllocatorAllocate(r10, r11)
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(28)))), int(r10))
+    if (r10 == u32(0)) {
+        r2 = u32(257)
+        return r2
+    }
+    r11 = u32(4294967295)
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredXPortEnterCriticalTimeout(r10, r11)
+    r8 = xtensaReadProcessorId()
+    r8 = (r8 >>> u32(13)) & u32(1)
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(20)))), int(r8))
+    r8 = stack0
+    if (!(r8 == u32(0))) {
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        if (!(r8 != u32(0))) {
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            r2 = u32(258)
+            return r2
+        }
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r7 = (r8 >>> u32(17)) & u32(31)
+        r8 = (r8 >>> u32(16)) & u32(1)
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(20)))), int(r8))
+    }
+    r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(20))))))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(32)))), int(r11))
+    r13 = r2
+    r12 = r7
+    r10 = r3
+    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_available_int_929bd5f0b1(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(16)))), int(r10))
+    if (!(r10 != u32(4294967295))) {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+        r10 = esp32InterruptAllocatorFreeValue(r10)
+        r10 = esp32RecoveredEspLogTimestamp(r10, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+        r8 = esp32Data_esp_isr_names_c432d88415
+        r8 = (r2 << u32(2)) + r8
+        r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r3))
+        r15 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r14 = r11
+        r13 = r10
+        r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+        r10 = u32(1)
+        r10 = esp32RecoveredEspLog(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+        r2 = u32(261)
+        return r2
+    }
+    r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(20))))))
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_get_desc_for_int_098811303d(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r7 = r10
+    if (!(r10 != u32(0))) {
+        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+        r10 = esp32RecoveredVPortExitCriticalValue(r10)
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+        r10 = esp32InterruptAllocatorFreeValue(r10)
+        r2 = u32(257)
+        return r2
+    }
+    if (((r3 >>> (u32(8) & u32(31))) & u32(1)) != u32(0)) {
+        r11 = u32(2052)
+        r10 = u32(24)
+        r10 = esp32InterruptAllocatorAllocate(r10, r11)
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(36)))), int(r10))
+        if (!(r10 != u32(0))) {
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+            r10 = esp32RecoveredVPortExitCriticalValue(r10)
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+            r10 = esp32InterruptAllocatorFreeValue(r10)
+            r2 = u32(257)
+            return r2
+        }
+        r12 = u32(24)
+        r11 = u32(0)
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(36))))))
+        r10 = freestandingSet(r10, i32(r11), r12)
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(36))))))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(4)))), int(r4))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(8)))), int(r5))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(12)))), int(r6))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(24))))))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(16)))), int(r8))
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r7 + u32(8))))))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r11 + u32(20)))), int(r8))
+        r8 = (r2 >>> u32(0)) & u32(65535)
+        r9 = r8 + r8
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+        r10 = u32(4294836225)
+        r8 = r8 & r10
+        r8 = r8 | r9
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r11)), int(r8))
+        r9 = u32(4294967294)
+        r8 = r8 & r9
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r11)), int(r8))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int((r7 + u32(8)))), int(r11))
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r7)))))))
+        r9 = u32(4)
+        r8 = r8 | r9
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r7)), int(r8))
+        r8 = u32(1)
+        r9 = u32(31)
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+        if (!(r9 >= r10)) {
+            r8 = u32(0)
+        }
+        if (!(r8 != u32(0))) {
+            r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+            r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593
+            r11 = u32(435)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+            r10 = r10 + u32(256)
+            r10 = r10 - u32(128)
+            r10 = r10 + u32(40)
+            r10 = esp32AssertFailed(r10, r11, r12, r13)
+        }
+        r12 = r7
+        r11 = u32(nativeFunctionAddress(esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr_8d1c12252b))
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+        r10 = esp32RecoveredXtSetInterruptHandler(r10, r11, r12)
+    } else {
+        r8 = u32(8)
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r10)), int(r8))
+        if (!(r6 == u32(0))) {
+            r8 = u32(1)
+            r9 = u32(31)
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+            if (!(r9 >= r10)) {
+                r8 = u32(0)
+            }
+            if (!(r8 != u32(0))) {
+                r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+                r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_3_func_3_adc5bc6593
+                r11 = u32(435)
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+                r10 = r10 + u32(256)
+                r10 = r10 - u32(128)
+                r10 = r10 + u32(40)
+                r10 = esp32AssertFailed(r10, r11, r12, r13)
+            }
+            r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(24))))))
+            r11 = r6
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+            r10 = esp32RecoveredXtSetInterruptHandler(r10, r11, r12)
+        }
+        if (!(((r3 >>> (u32(9) & u32(31))) & u32(1)) == u32(0))) {
+            r8 = u32(1)
+            r9 = u32(31)
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+            if (!(r9 >= r10)) {
+                r8 = u32(0)
+            }
+            if (!(r8 != u32(0))) {
+                r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+                r12 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_func_2_func_2_eb64ce2d8c
+                r11 = u32(519)
+                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_alloc_intrstatus_bind_str1_4_748244c588
+                r10 = r10 + u32(256)
+                r10 = r10 - u32(128)
+                r10 = r10 + u32(40)
+                r10 = esp32AssertFailed(r10, r11, r12, r13)
+            }
+            r10 = u32(1)
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+            shiftAmount = r8 & u32(31)
+            r10 = r10 << ((u32(32) - shiftAmount) & u32(31))
+            esp32RecoveredXthalSetIntclear(r10)
+            r10 = u32(0)
+        }
+        ablaUnsafeStoreU16(nativePointerFromAddress(int((r7 + u32(4)))), int(r2))
+    }
+    if (((r3 >>> (u32(10) & u32(31))) & u32(1)) == u32(0)) {
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r7)))))))
+        r9 = u32(4294967293)
+        r8 = r8 & r9
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r7)), int(r8))
+        r8 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(20))))))
+        r8 = (r9 << u32(2)) + r8
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+        r10 = u32(1)
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+        shiftAmount = r11 & u32(31)
+        r10 = r10 << ((u32(32) - shiftAmount) & u32(31))
+        r9 = r9 | r10
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+    } else {
+        r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r7)))))))
+        r9 = u32(2)
+        r8 = r8 | r9
+        ablaUnsafeStoreU16(nativePointerFromAddress(int(r7)), int(r8))
+        r9 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf
+        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(20))))))
+        r9 = (r8 << u32(2)) + r9
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r9))))
+        r8 = u32(1)
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+        shiftAmount = r11 & u32(31)
+        r8 = r8 << ((u32(32) - shiftAmount) & u32(31))
+        r8 = r8 & r10
+        r8 = r8 ^ r10
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r9)), int(r8))
+    }
+    if (!(i32(r2) < 0)) {
+        r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+        r11 = r2
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(32))))))
+        r10 = esp32RomRouteInterruptMatrixValue(r10, r11, r12)
+    }
+    r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r9)), int(r7))
+    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r7 + u32(8))))))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r9 + u32(4)))), int(r8))
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+    r10 = esp32RecoveredEspIntrEnableSource(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    if (!(((r3 >>> (u32(11) & u32(31))) & u32(1)) == u32(0))) {
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+        r10 = esp32RecoveredEspIntrDisable(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    }
+    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    r10 = esp32RecoveredVPortExitCriticalValue(r10)
+    r8 = stack1
+    if (r8 == u32(0)) {
+        r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+        r10 = esp32InterruptAllocatorFreeValue(r10)
+        r2 = u32(0)
+    } else {
+        r9 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(28))))))
+        ablaUnsafeStoreU32(nativePointerFromAddress(int(r8)), int(r9))
+        r2 = u32(0)
+    }
+    return r2
+}
+
+// Compact source implementation of esp_intr_alloc_intrstatus_bind. Keeping
+// the allocator state in scalar locals avoids the lifted routine's emulated
+// register frame and exposes the complete allocation path to LLVM.
+trusted fun esp32RecoveredEspIntrAllocIntrstatusBind(
+    source: u32,
+    flagsValue: u32,
+    statusRegister: u32,
+    statusMask: u32,
+    handler: u32,
+    argument: u32,
+    sharedHandle: u32,
+    returnHandle: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var flags = flagsValue
+    val sharedRequested = (flags & u32(256)) != u32(0)
+    if ((sharedRequested && (flags & u32(512)) != u32(0)) ||
+        ((flags & u32(240)) != u32(0) && handler != u32(0)) ||
+        (sharedRequested && (handler == u32(0) || i32(source) < i32(0))) ||
+        (statusRegister != u32(0) && statusMask == u32(0)) ||
+        (sharedHandle != u32(0) && !sharedRequested)) return u32(258)
+    if ((flags & u32(1024)) != u32(0) && handler != u32(0) &&
+        esp32RecoveredEspIntrPtrInIsrRegion(
+            handler,
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        ) == u32(0)) return u32(258)
+
+    if ((flags & u32(254)) == u32(0)) {
+        flags = flags | (if (sharedRequested) u32(2) else u32(14))
+    }
+    var force = if (source == u32(4294967295)) u32(6)
+        else if (source == u32(4294967294)) u32(15)
+        else if (source == u32(4294967293)) u32(16)
+        else if (source == u32(4294967292)) u32(7)
+        else if (source == u32(4294967291)) u32(29)
+        else if (source == u32(4294967290)) u32(11)
+        else u32(4294967295)
+
+    val resultHandle = esp32InterruptAllocatorAllocate(u32(8), u32(2052))
+    if (resultHandle == u32(0)) return u32(257)
+
+    val lock =
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411
+    esp32RecoveredXPortEnterCriticalTimeout(lock, u32(4294967295))
+    var cpu = cpuCoreId()
+    if (sharedHandle != u32(0)) {
+        val sharedVector = esp32InterruptAllocatorLoadU32(sharedHandle)
+        if (sharedVector == u32(0)) {
+            esp32RecoveredVPortExitCritical(lock)
+            esp32InterruptAllocatorFreeValue(resultHandle)
+            return u32(258)
+        }
+        val packed = esp32InterruptVectorPacked(sharedVector)
+        force = esp32InterruptVectorNumber(packed)
+        cpu = esp32InterruptVectorCpu(packed)
+    }
+
+    val interrupt = esp32InterruptAvailable(flags, cpu, force, source)
+    if (interrupt == u32(4294967295)) {
+        esp32RecoveredVPortExitCritical(lock)
+        esp32InterruptAllocatorFreeValue(resultHandle)
+        return u32(261)
+    }
+    val vector = esp32InterruptGetVector(interrupt, cpu)
+    if (vector == u32(0)) {
+        esp32RecoveredVPortExitCritical(lock)
+        esp32InterruptAllocatorFreeValue(resultHandle)
+        return u32(257)
+    }
+
+    if (sharedRequested) {
+        val shared = esp32InterruptAllocatorAllocate(u32(24), u32(2052))
+        if (shared == u32(0)) {
+            esp32RecoveredVPortExitCritical(lock)
+            esp32InterruptAllocatorFreeValue(resultHandle)
+            return u32(257)
+        }
+        freestandingSet(shared, i32(0), u32(24))
+        esp32InterruptAllocatorStoreU32(
+            shared, (source & u32(65535)) << u32(1)
+        )
+        esp32InterruptAllocatorStoreU32(shared + u32(4), statusRegister)
+        esp32InterruptAllocatorStoreU32(shared + u32(8), statusMask)
+        esp32InterruptAllocatorStoreU32(shared + u32(12), handler)
+        esp32InterruptAllocatorStoreU32(shared + u32(16), argument)
+        esp32InterruptAllocatorStoreU32(
+            shared + u32(20),
+            esp32InterruptAllocatorLoadU32(vector + u32(8))
+        )
+        esp32InterruptAllocatorStoreU32(vector + u32(8), shared)
+        esp32InterruptAllocatorStoreU32(
+            vector, esp32InterruptVectorPacked(vector) | u32(4)
+        )
+        esp32RecoveredXtSetInterruptHandler(
+            interrupt,
+            u32(nativeFunctionAddress(
+                esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_shared_intr_isr_8d1c12252b
+            )),
+            vector
+        )
+    } else {
+        esp32InterruptAllocatorStoreU32(
+            vector,
+            (esp32InterruptVectorPacked(vector) & u32(4294901760)) | u32(8)
+        )
+        if (handler != u32(0)) {
+            esp32RecoveredXtSetInterruptHandler(interrupt, handler, argument)
+        }
+        if ((flags & u32(512)) != u32(0)) {
+            esp32RecoveredXthalSetIntclear(u32(1) << interrupt)
+        }
+        ablaUnsafeStoreU16(
+            nativePointerFromAddress(int(vector + u32(4))), int(source)
+        )
+    }
+
+    val mask = u32(1) << interrupt
+    val nonIramMask =
+        esp32Data_Labla_recovered_esp32_interrupt_allocator_data_bss_non_iram_int_mask_non_iram_int_mask_80fce45eaf +
+        (cpu << u32(2))
+    if ((flags & u32(1024)) != u32(0)) {
+        esp32InterruptAllocatorStoreU32(
+            vector, esp32InterruptVectorPacked(vector) | u32(2)
+        )
+        esp32InterruptAllocatorStoreU32(
+            nonIramMask,
+            esp32InterruptAllocatorLoadU32(nonIramMask) & ~mask
+        )
+    } else {
+        esp32InterruptAllocatorStoreU32(
+            vector, esp32InterruptVectorPacked(vector) & ~u32(2)
+        )
+        esp32InterruptAllocatorStoreU32(
+            nonIramMask,
+            esp32InterruptAllocatorLoadU32(nonIramMask) | mask
+        )
+    }
+    if (i32(source) >= i32(0)) {
+        esp32RomRouteInterruptMatrixValue(cpu, source, interrupt)
+    }
+
+    esp32InterruptAllocatorStoreU32(resultHandle, vector)
+    esp32InterruptAllocatorStoreU32(
+        resultHandle + u32(4),
+        esp32InterruptAllocatorLoadU32(vector + u32(8))
+    )
+    esp32RecoveredXtIntsOn(mask)
+    if ((flags & u32(2048)) != u32(0)) {
+        esp32RecoveredEspIntrDisable(
+            resultHandle,
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    esp32RecoveredVPortExitCritical(lock)
+    if (returnHandle == u32(0)) {
+        esp32InterruptAllocatorFreeValue(resultHandle)
+    } else {
+        esp32InterruptAllocatorStoreU32(returnHandle, resultHandle)
+    }
+    return u32(0)
+}
+
+// Original ABI symbol: esp_intr_alloc_intrstatus
+trusted fun esp32RecoveredEspIntrAllocIntrstatus(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    return esp32RecoveredEspIntrAllocIntrstatusBind(
+        a2, a3, a4, a5, a6, a7, u32(0), stack0,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0)
+    )
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(48))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r15 = r7
+    r10 = r2
+    r11 = r3
+    r12 = r4
+    r13 = r5
+    r14 = r6
+    r8 = stack0
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(4)))), int(r8))
+    r8 = u32(0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r8))
+    r10 = esp32RecoveredEspIntrAllocIntrstatusBind(r10, r11, r12, r13, r14, r15, freestandingLoadWord(r1 + u32(0)), freestandingLoadWord(r1 + u32(4)), freestandingLoadWord(r1 + u32(8)), freestandingLoadWord(r1 + u32(12)), freestandingLoadWord(r1 + u32(16)), freestandingLoadWord(r1 + u32(20)), freestandingLoadWord(r1 + u32(24)), freestandingLoadWord(r1 + u32(28)), freestandingLoadWord(r1 + u32(32)), freestandingLoadWord(r1 + u32(36)))
+    r2 = r10
+    return r2
+}
+
+// Original ABI symbol: esp_intr_alloc
+trusted fun esp32RecoveredEspIntrAlloc(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    return esp32RecoveredEspIntrAllocIntrstatusBind(
+        a2, a3, u32(0), u32(0), a4, a5, u32(0), a6,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0)
+    )
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(48))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r10 = r2
+    r11 = r3
+    r14 = r4
+    r15 = r5
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r6))
+    r13 = u32(0)
+    r12 = r13 | r13
+    r10 = esp32RecoveredEspIntrAllocIntrstatus(r10, r11, r12, r13, r14, r15, freestandingLoadWord(r1 + u32(0)), freestandingLoadWord(r1 + u32(4)), freestandingLoadWord(r1 + u32(8)), freestandingLoadWord(r1 + u32(12)), freestandingLoadWord(r1 + u32(16)), freestandingLoadWord(r1 + u32(20)), freestandingLoadWord(r1 + u32(24)), freestandingLoadWord(r1 + u32(28)), freestandingLoadWord(r1 + u32(32)), freestandingLoadWord(r1 + u32(36)))
+    r2 = r10
+    return r2
+}
+
+// Original ABI symbol: esp_intr_alloc_bind
+trusted fun esp32RecoveredEspIntrAllocBind(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    return esp32RecoveredEspIntrAllocIntrstatusBind(
+        a2, a3, u32(0), u32(0), a4, a5, a6, a7,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0)
+    )
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(48))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r10 = r2
+    r11 = r3
+    r14 = r4
+    r15 = r5
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(4)))), int(r7))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r1)), int(r6))
+    r13 = u32(0)
+    r12 = r13
+    r10 = esp32RecoveredEspIntrAllocIntrstatusBind(r10, r11, r12, r13, r14, r15, freestandingLoadWord(r1 + u32(0)), freestandingLoadWord(r1 + u32(4)), freestandingLoadWord(r1 + u32(8)), freestandingLoadWord(r1 + u32(12)), freestandingLoadWord(r1 + u32(16)), freestandingLoadWord(r1 + u32(20)), freestandingLoadWord(r1 + u32(24)), freestandingLoadWord(r1 + u32(28)), freestandingLoadWord(r1 + u32(32)), freestandingLoadWord(r1 + u32(36)))
+    r2 = r10
+    return r2
+}
+
+// Original ABI symbol: esp_intr_free
+trusted fun esp32RecoveredEspIntrFree(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    var r1 = u32(0)
+    var shiftAmount = u32(0)
+    if (r2 == u32(0)) {
+        r2 = u32(258)
+    } else {
+        r10 = u32(0)
+        r10 = esp32RecoveredXTaskGetCoreID(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+        r8 = u32(2147483647)
+        if (r10 == r8) {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r12 = r2
+            r11 = u32(nativeFunctionAddress(esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu_eb1b1cb6d3))
+            r10 = (r10 >>> u32(16)) & u32(1)
+            r10 = esp32RecoveredEspIpcCallBlocking(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            r2 = r10
+            if (!(r10 == u32(0))) {
+                r2 = u32(4294967295)
+            }
+        } else {
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+            r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+            r8 = (r8 >>> u32(16)) & u32(1)
+            r9 = xtensaReadProcessorId()
+            r9 = (r9 >>> u32(13)) & u32(1)
+            if (r8 == r9) {
+                r10 = r2
+                r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_current_cpu_5747f8fa91(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                r2 = r10
+            } else {
+                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r2))))
+                r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                r12 = r2
+                r11 = u32(nativeFunctionAddress(esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_intr_free_for_other_cpu_eb1b1cb6d3))
+                r10 = (r10 >>> u32(16)) & u32(1)
+                r10 = esp32RecoveredEspIpcCallBlocking(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                r2 = r10
+                if (!(r10 == u32(0))) {
+                    r2 = u32(4294967295)
+                }
+            }
+        }
+    }
+    return r2
+}
+
+// Original ABI symbol: esp_intr_dump
+trusted fun esp32RecoveredEspIntrDump(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var r2 = a2
+    var r3 = a3
+    var r4 = a4
+    var r5 = a5
+    var r6 = a6
+    var r7 = a7
+    var r8 = u32(0)
+    var r9 = u32(0)
+    var r10 = u32(0)
+    var r11 = u32(0)
+    var r12 = u32(0)
+    var r13 = u32(0)
+    var r14 = u32(0)
+    var r15 = u32(0)
+    val frameAddress = u32(nativeStackAllocate(64))
+    var r1 = frameAddress
+    var shiftAmount = u32(0)
+    r7 = r2
+    if (!(r2 != u32(0))) {
+        r8 = esp32Data_stdout_476d9ec701
+        r7 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+    }
+    r4 = u32(0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(16)))), int(r4))
+    r3 = r4
+    var recoveredLoopDestination1 = 35
+    while (recoveredLoopDestination1 == 35) {
+        if (i32(r4) >= i32(u32(2))) {
+            recoveredLoopDestination1 = 37
+        } else {
+            r12 = r4
+            r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+            r10 = r7
+            r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            r13 = r7
+            r12 = u32(27)
+            r11 = u32(1)
+            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+            r10 = esp32RecoveredFwrite(r10, r11, r12, r13, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+            r2 = u32(0)
+            var recoveredLoopDestination2 = 32
+            while (recoveredLoopDestination2 == 32) {
+                r8 = u32(31)
+                if (i32(r8) < i32(r2)) {
+                    recoveredLoopDestination2 = 34
+                } else {
+                    r12 = r2
+                    r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                    r10 = r7 | r7
+                    r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r12 = r1
+                    r11 = r2
+                    r10 = r4
+                    r10 = esp32RecoveredEspCpuIntrGetDesc(r10, r11, r12, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r11 = r4
+                    r10 = r2
+                    r10 = esp32Internal_Labla_recovered_esp32_interrupt_allocator_local_find_desc_for_int_a17c2a587a(r10, r11, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r6 = r10
+                    r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                    if (r8 != u32(1)) {
+                        r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                    } else {
+                        r13 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                    }
+                    r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                    r10 = r7 | r7
+                    r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(4))))))
+                    if (r8 != u32(0)) {
+                        r5 = u32(0)
+                    } else {
+                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))
+                        if (i32(r8) < i32(u32(4))) {
+                            r5 = u32(1)
+                        } else {
+                            r5 = u32(0)
+                        }
+                    }
+                    r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(8))))))
+                    if (((r8 >>> (u32(1) & u32(31))) & u32(1)) == u32(0)) {
+                        if (((r8 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                            if (r6 == u32(0)) {
+                                r13 = r7
+                                r12 = u32(4)
+                                r11 = u32(1)
+                                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                if (r5 == u32(0)) {
+                                    r13 = r7
+                                    r12 = u32(18)
+                                    r11 = u32(1)
+                                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                    r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                } else {
+                                    r3 = r3 + u32(1)
+                                }
+                            } else {
+                                r12 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r6)))))))
+                                r8 = u32(13)
+                                r8 = r12 & r8
+                                r8 = u32(i32(r8 << u32(16)) >> 16)
+                                if (r8 != u32(0)) {
+                                    if (((r12 >>> (u32(0) & u32(31))) & u32(1)) == u32(0)) {
+                                        r8 = u32(8)
+                                        r8 = r12 & r8
+                                        r8 = u32(i32(r8 << u32(16)) >> 16)
+                                        if (r8 == u32(0)) {
+                                            r8 = u32(4)
+                                            r8 = r12 & r8
+                                            r8 = u32(i32(r8 << u32(16)) >> 16)
+                                            if (r8 == u32(0)) {
+                                                r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                                r10 = r7
+                                                r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                            } else {
+                                                r13 = r7
+                                                r12 = u32(8)
+                                                r11 = u32(1)
+                                                r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                                r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                                r6 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r6 + u32(8))))))
+                                                var recoveredLoopDestination3 = 28
+                                                while (recoveredLoopDestination3 == 28) {
+                                                    if (r6 != u32(0)) {
+                                                        r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r6))))
+                                                        r8 = r8 << u32(15)
+                                                        r8 = u32(i32(r8) >> int(u32(16)))
+                                                        r9 = esp32Data_esp_isr_names_c432d88415
+                                                        r8 = (r8 << u32(2)) + r9
+                                                        r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                                                        r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                                        r10 = r7
+                                                        r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                                        r6 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r6 + u32(20))))))
+                                                    } else {
+                                                        recoveredLoopDestination3 = 29
+                                                    }
+                                                }
+                                                r8 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+                                                r8 = r8 + u32(1)
+                                                ablaUnsafeStoreU32(nativePointerFromAddress(int((r1 + u32(16)))), int(r8))
+                                            }
+                                        } else {
+                                            r8 = u32(i32(i16(u32(ablaUnsafeLoadU16(nativePointerFromAddress(int((r6 + u32(4)))))))))
+                                            r9 = esp32Data_esp_isr_names_c432d88415
+                                            r8 = (r8 << u32(2)) + r9
+                                            r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r8))))
+                                            r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                            r10 = r7
+                                            r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                        }
+                                    } else {
+                                        r13 = r7
+                                        r12 = u32(19)
+                                        r11 = u32(1)
+                                        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                        r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                    }
+                                } else {
+                                    r13 = r7
+                                    r12 = u32(4)
+                                    r11 = u32(1)
+                                    r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                    r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                    if (r5 == u32(0)) {
+                                        r13 = r7
+                                        r12 = u32(18)
+                                        r11 = u32(1)
+                                        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                                        r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                                    } else {
+                                        r3 = r3 + u32(1)
+                                    }
+                                }
+                            }
+                        } else {
+                            r13 = r7
+                            r12 = u32(12)
+                            r11 = u32(1)
+                            r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                            r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                        }
+                    } else {
+                        r13 = r7
+                        r12 = u32(8)
+                        r11 = u32(1)
+                        r10 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+                        r10 = esp32RecoveredFwrite(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    }
+                    r11 = r7
+                    r10 = u32(10)
+                    r10 = esp32RecoveredFputc(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+                    r2 = r2 + u32(1)
+                }
+            }
+            r4 = r4 + u32(1)
+        }
+    }
+    r12 = r3
+    r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+    r10 = r7
+    r10 = esp32RecoveredFprintf(r10, r11, r12, r13, r14, r15, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r12 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int((r1 + u32(16))))))
+    r11 = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_rodata_esp_intr_dump_str1_4_1a8bd521d2
+    r10 = r7
+    r10 = esp32RecoveredFprintf(r10, r11, r12, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0))
+    r2 = u32(0)
+    return r2
+}
+
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411Storage = nativeStaticMutableU32s([
+    3007315967,
+    0
+])
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411Initialized = esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411Storage
+val esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411 = u32(esp32Data_Labla_recovered_esp32_interrupt_allocator_data_data_spinlock_spinlock_291b65c411Initialized)

@@ -1,0 +1,43 @@
+import "./sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+type Esp32P4AhbGdmaPumpResult = int
+fun Esp32P4AhbGdmaPumpResult.status(): int = this & 255
+fun Esp32P4AhbGdmaPumpResult.detail(): int = (this >>> 8) & 255
+fun Esp32P4AhbGdmaPumpResult.cacheStatus(): int = (this >>> 29) & 7
+fun Esp32P4AhbGdmaPumpResult.copiedBytes(): int = (this >>> 16) & 4095
+fun Esp32P4AhbGdmaPumpResult.ownershipMayHaveTransferred(): bool = (this & 0x10000000) != 0
+fun Esp32P4AhbGdmaPumpResult.events(): int = (this >>> 32) & 0xffffffff
+// Circular-ring one-block pump. Caller serializes channel/ring/cache engine;
+// index advances ONLY on status1. CPU buffer must be owned and disjoint from
+// ALL descriptor cache lines and full payload slots (not only active bytes).
+// 1 copied+rearmed,2 invalid/no changes,3 DMA busy/no copy,4 acquire failure,
+// 5 copied BUT rearm failed. Status4/5 is sticky at the session layer: do not
+// call again until recovery; reacquisition can discard replacement dirty data.
+// detail holds lower stage status; cache status0..5 and raw events are retained.
+// A positive copiedBytes on failure means CPU output/input consumption occurred;
+// bit28 means DMAowner may be visible. No restart/event ack/allocation implied.
+trusted fun esp32p4AhbGdmaPumpBlockOwned(channel: int,transmit: bool,descriptors: int,
+    count: int,buffers: int,stride: int,bytes: int,index: int,cpu: NativeBuffer,
+    polls: int,exclusive: bool): Esp32P4AhbGdmaPumpResult {
+    if (!exclusive || channel < 0 || channel > 2 || index < 0 || index >= count ||
+        polls < 1 || polls > 1000000 || !esp32p4AhbGdmaRingLayoutValid(descriptors,count,buffers,stride,bytes) ||
+        !cpu.hasAddressRange(0,bytes)) return Esp32P4AhbGdmaPumpResult(2)
+    val first=cpu.addressValue()
+    val end=first+bytes
+    if ((first < descriptors+count*64 && end > descriptors) ||
+        (first < buffers+count*stride && end > buffers)) return Esp32P4AhbGdmaPumpResult(2)
+    val acquired=p4AhbPumpAcquire(channel,transmit,descriptors,count,buffers,stride,bytes,index,polls)
+    val status=acquired & 255
+    val events=acquired & 0xffffffff00000000
+    if (status == 3) return Esp32P4AhbGdmaPumpResult(3 | events)
+    if (status != 1) return Esp32P4AhbGdmaPumpResult(4 | (status << 8) | (((acquired >>> 8) & 7) << 29) | events)
+    val copied=(acquired >>> 16) & 4095
+    // Guard hook/result invariants before touching CPU storage.
+    if (copied < 1 || copied > bytes || (transmit && copied != bytes)) return Esp32P4AhbGdmaPumpResult(4 | (6 << 8) | events)
+    val payload=buffers+index*stride
+    p4AhbPumpCopy(if (transmit) payload else first,if (transmit) first else payload,copied)
+    val rearm=p4AhbPumpRearm(descriptors,count,buffers,stride,bytes,index,transmit,polls)
+    val report=events | (copied << 16) | (((rearm >>> 8) & 7) << 29) | (if ((rearm & 65536) != 0) 0x10000000 else 0)
+    if ((rearm & 255) != 1) return Esp32P4AhbGdmaPumpResult(5 | ((rearm & 255) << 8) | report)
+    return Esp32P4AhbGdmaPumpResult(1 | report)
+}

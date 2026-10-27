@@ -1,0 +1,102 @@
+import "./pad_esp32_sequence.ab"
+import "./controller_esp32_sequence.ab"
+import "../../input/capacitive_filter.ab"
+// Caller owns idle touch controller plus EVERY selected HP/RTC/analog pad,
+// stable clocks/power and shared register serialization; prevents sleep and
+// global holds. No clock/IRQ/oscillator takeover, allocation or scheduler.
+// Exclusive456-byte aligned RAM: header32, controller24, ten pad records320,
+// raw values40 and filtered values40. Fresh magic0, or closed session only.
+// Status0invalid,1ready,2pending,3sampled,4failure/cleanup required,5closed.
+// Error stage@16 (channel+1,11controller,12start,13cleanup), detail@20.
+// Never release storage/leases after timeout; poll or close will report2 until
+// hardware completes. Close retries preserve child snapshots and final samples.
+trusted fun esp32TouchSessionValid(s: NativeBuffer): bool = s.hasAddressRange(0,456) && (s.addressValue()&3) == 0 && s.loadU32(0) == 0x54535331 && s.loadU32(8) > 0 && s.loadU32(8) <= 1023 && s.loadU32(4) >= 1 && s.loadU32(4) <= 5
+trusted fun esp32TouchSessionChild(s: NativeBuffer,channel: int): NativeBuffer = nativeBufferAt(s.addressValue()+56+channel*32,32)
+trusted fun esp32TouchSessionController(s: NativeBuffer): NativeBuffer = nativeBufferAt(s.addressValue()+32,24)
+trusted fun esp32TouchSessionOpenOwned(s: NativeBuffer,channels: int,waitTicks: int,chargeTicks: int,intervalTicks: int,high: int,low: int,speed: int,voltage: int,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !s.hasAddressRange(0,456) || (s.addressValue()&3) != 0 || channels <= 0 || channels > 1023 || waitTicks < 0 || waitTicks > 255 ||
+        chargeTicks < 1 || chargeTicks > 65535 || intervalTicks < 0 || intervalTicks > 65535 || high < 0 || high > 15 || low < 0 || low > 3 || speed < 0 || speed > 7 || voltage < 0 || voltage > 2) return 0
+    if (s.loadU32(0) != 0 && (!esp32TouchSessionValid(s) || s.loadU32(4) != 5)) return 0
+    if ((touchScanRead(0x3FF48018)&u32(0x800000)) != u32(0) || (touchScanRead(0x3FF4803C)&u32(64)) != u32(0) || (touchScanRead(0x3FF48884)&u32(4096)) != u32(0)) return 0
+    var offset=4
+    while (offset < 456) { s.storeU32(offset,0); offset=offset+4 }
+    s.storeU32(8,channels); s.storeU32(4,4); s.storeU32(0,0x54535331)
+    var channel=0
+    while (channel < 10) {
+        if ((channels&(1<<channel)) != 0) {
+            val result=esp32TouchPadOpenOwned(esp32TouchSessionChild(s,channel),channel,speed,voltage,true)
+            if (result != 1) { s.storeU32(16,channel+1); s.storeU32(20,result); return 4 }
+        }
+        channel=channel+1
+    }
+    val result=esp32TouchControllerOpenOwned(esp32TouchSessionController(s),channels,waitTicks,chargeTicks,intervalTicks,high,low,false,true,true)
+    if (result != 1) { s.storeU32(16,11); s.storeU32(20,result); return 4 }
+    s.storeU32(4,1)
+    return 1
+}
+trusted fun esp32TouchSessionStartOwned(s: NativeBuffer): int {
+    if (!esp32TouchSessionValid(s) || (s.loadU32(4) != 1 && s.loadU32(4) != 3)) return 0
+    val scan=esp32TouchScanBeginOwned(s.loadU32(8),true)
+    if (scan.status() != 1) { s.storeU32(16,12); s.storeU32(20,scan.status()); s.storeU32(4,4); return 4 }
+    s.storeU32(12,scan | 0); s.storeU32(4,2)
+    return 2
+}
+trusted fun esp32TouchSessionPollOwned(s: NativeBuffer): int {
+    if (!esp32TouchSessionValid(s)) return 0
+    if (s.loadU32(4) != 2) return s.loadU32(4)
+    val prior=Esp32TouchScan(s.loadU32(12))
+    if (!prior.valid() || prior.channels() != s.loadU32(8)) return 0
+    val scan=prior.pollOwned()
+    if (scan.status() != 2) return 2
+    var channel=0
+    while (channel < 10) {
+        if ((scan.channels()&(1<<channel)) != 0) {
+            val raw=scan.readRawOwned(channel)
+            s.storeU32(376+channel*4,raw)
+            s.storeU32(416+channel*4,int(capacitiveIirHalf(u32(s.loadU32(416+channel*4)),u32(raw))))
+        }
+        channel=channel+1
+    }
+    s.storeU32(12,scan | 0); s.storeU32(24,1); s.storeU32(4,3)
+    return 3
+}
+trusted fun esp32TouchSessionRead(s: NativeBuffer,channel: int,smooth: bool): int {
+    if (!esp32TouchSessionValid(s) || channel < 0 || channel > 9 || s.loadU32(24) != 1 || (s.loadU32(8)&(1<<channel)) == 0 ||
+        (s.loadU32(4) != 3 && s.loadU32(4) != 5)) return -1
+    s.loadU32((if (smooth) 416 else 376)+channel*4)
+}
+// Poll and discard a settling scan without reading raw values or advancing
+// filter history. Returns1ready for a new scan,2still pending,0invalid state.
+// Unlike a delay/deadline, only hardware completion releases this scan.
+trusted fun esp32TouchSessionDiscardCompletedOwned(s: NativeBuffer): int {
+    if (!esp32TouchSessionValid(s) || s.loadU32(4) != 2) return 0
+    val prior=Esp32TouchScan(s.loadU32(12))
+    if (!prior.valid() || prior.channels() != s.loadU32(8)) return 0
+    if (prior.pollOwned().status() != 2) return 2
+    s.storeU32(12,0); s.storeU32(4,1)
+    return 1
+}
+trusted fun esp32TouchSessionCloseOwned(s: NativeBuffer): int {
+    if (!esp32TouchSessionValid(s)) return 0
+    if (s.loadU32(4) == 5) return 5
+    if (s.loadU32(4) == 2 && esp32TouchSessionPollOwned(s) != 3) return 2
+    s.storeU32(4,4)
+    val controller=esp32TouchSessionController(s)
+    if (controller.loadU32(0) != 0) {
+        val result=esp32TouchControllerCloseOwned(controller,true)
+        if (result != 1) { s.storeU32(16,13); s.storeU32(20,result); return 4 }
+    }
+    var channel=9
+    var okay=true
+    while (channel >= 0) {
+        val pad=esp32TouchSessionChild(s,channel)
+        if (pad.loadU32(0) != 0) {
+            val result=esp32TouchPadCloseOwned(pad,true)
+            if (result != 1) { okay=false; s.storeU32(16,13); s.storeU32(20,result) }
+        }
+        channel=channel-1
+    }
+    if (!okay) return 4
+    s.storeU32(4,5)
+    return 5
+}

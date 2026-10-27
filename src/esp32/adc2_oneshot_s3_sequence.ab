@@ -1,0 +1,67 @@
+// ESP-IDF v6.0.2 ESP32-S3 adc_ll.h RTC ADC2 conversion primitive.
+// Caller owns ADC2 RTC/pad/trim/config and pins power/clocks/analog settling,
+// excludes ULP/DMA/sleep and serializes arbiter changes. Normal arbitration
+// requires APB>=8MHz; forced RTC grant requires exclusive ADC2 ownership.
+// Does not seize the arbiter or reset/gate ADC1/WiFi/shared SAR resources.
+// Low8:1success2invalid3configuration4busy5readback6pending7invalid12bitdata
+// 8arbiter-unselected9preempted10hardware-data-failure. Start bit8=attempted.
+// Finish success raw<<8. Nonzero arbitration flags NEVER become samples.
+trusted fun esp32S3Adc2Prepared(): bool {
+    val arbiter=esp32S3Adc2ArbiterRead()
+    return ((arbiter&32) == 0 || (arbiter&60) == 40) &&
+        (esp32S3Adc2Read(36)&0x20000000) == 0 &&
+        (esp32S3Adc2Read(52)&0x80000000) == 0 &&
+        (esp32S3Adc2Read(48)&0x80040000) == 0x80040000
+}
+trusted fun esp32S3Adc2StartOwned(channel: int): int {
+    if (channel < 0 || channel > 9) return 2
+    if (!esp32S3Adc2Prepared()) return 3
+    val before=esp32S3Adc2Read(48)
+    val pads=(1<<channel)<<19
+    if ((before&0x7ff80000) != 0 && (before&0x7ff80000) != pads) return 3
+    if ((before&0x30000) == 0x20000) return 4
+    val selected=0x80040000|pads
+    esp32S3Adc2Write(48,selected)
+    if ((esp32S3Adc2Read(48)&0xfffe0000) != selected) return 261
+    esp32S3Adc2Write(48,selected|0x20000)
+    return if ((esp32S3Adc2Read(48)&0xfffe0000) == (selected|0x20000)) 257 else 261
+}
+trusted fun esp32S3Adc2FinishOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 9 || polls < 1 || polls > 1000000) return 2
+    if (!esp32S3Adc2Prepared()) return 3
+    val selected=0x80060000|((1<<channel)<<19)
+    var remaining=polls
+    while (remaining > 0) {
+        val sample=esp32S3Adc2Read(48)
+        if ((sample&0xfffe0000) != selected) return 3
+        if ((sample&0x10000) != 0) {
+            // IDF packed RTC output: flag bits15:14, reserved13, data12:0.
+            // S3 oneshot is 12bit; reject out-of-range/reserved values too.
+            val flag=(sample>>14)&3
+            if (flag != 0) return 7+flag
+            val raw=sample&16383
+            return if (raw > 4095) 7 else (raw<<8)|1
+        }
+        remaining=remaining-1
+    }
+    return 6
+}
+// Join before detaching, including failed arbitration results. Timeout leaves
+// the request intact for retry; never cancel by resetting the shared ADC.
+trusted fun esp32S3Adc2ReleaseOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 9 || polls < 1 || polls > 1000000) return 2
+    var remaining=polls
+    val selected=(1<<channel)<<19
+    while (remaining > 0) {
+        if ((esp32S3Adc2Read(52)&0x80000000) != 0) return 3
+        val sample=esp32S3Adc2Read(48)
+        val pads=sample&0x7ff80000
+        if ((sample&0x80040000) != 0x80040000 || (pads != 0 && pads != selected)) return 3
+        if ((sample&0x30000) != 0x20000) {
+            esp32S3Adc2Write(48,0x80040000)
+            return if ((esp32S3Adc2Read(48)&0xfffe0000) == 0x80040000) 1 else 5
+        }
+        remaining=remaining-1
+    }
+    return 6
+}

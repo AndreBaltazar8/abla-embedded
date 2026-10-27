@@ -1,0 +1,42 @@
+// C6 internal SRAM DMA descriptors (3 words, 4-byte aligned). External RAM
+// requires a separate cache-managed path; never silently treat it as coherent.
+// Caller owns the entire descriptor/payload ranges, a reset/parked channel,
+// stable SRAM/PMS and initialized TX bytes. This builds, never starts DMA.
+fun c6GdmaSramRange(address: int,bytes: int): bool = address >= 0x40800000 && bytes > 0 && bytes <= 0x80000 && address <= 0x40880000-bytes
+fun c6GdmaRingValid(descriptors: int,count: int,buffers: int,stride: int,bytes: int): bool {
+    if (count < 1 || count > 1024 || bytes < 4 || bytes > 4092 || stride < bytes || stride > 0x80000 ||
+        ((descriptors|buffers|stride|bytes)&3) != 0) return false
+    val descriptorBytes=count*12
+    val payloadBytes=(count-1)*stride+bytes
+    return c6GdmaSramRange(descriptors,descriptorBytes) && c6GdmaSramRange(buffers,payloadBytes) &&
+        (descriptors+descriptorBytes <= buffers || buffers+payloadBytes <= descriptors)
+}
+// Returns1built2invalid3readback. On failure retain the whole region; no
+// rollback or freeing. Rebuild only while CPU-owned and DMA never submitted.
+// OWNER is published last, after all buffer/link/control fields are complete.
+trusted fun c6GdmaRingBuildOwned(descriptors: int,count: int,buffers: int,stride: int,bytes: int,tx: bool,circular: bool,exclusive: bool): int {
+    if (!exclusive || !c6GdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    var index=0
+    while (index < count) {
+        val at=descriptors+index*12
+        val next=if (index+1 < count) at+12 else if (circular) descriptors else 0
+        // TX EOF every descriptor supports streaming; RX EOF is hardware-set.
+        val control=u32(bytes)|(if (tx) (u32(bytes)<<u32(12))|u32(0x40000000) else u32(0))
+        c6GdmaDescriptorWrite(at,control)
+        c6GdmaDescriptorWrite(at+4,u32(buffers+index*stride))
+        c6GdmaDescriptorWrite(at+8,u32(next))
+        if (c6GdmaDescriptorRead(at) != control || c6GdmaDescriptorRead(at+4) != u32(buffers+index*stride) || c6GdmaDescriptorRead(at+8) != u32(next)) return 3
+        index=index+1
+    }
+    c6GdmaDescriptorFence()
+    index=0
+    while (index < count) {
+        val at=descriptors+index*12
+        val owned=c6GdmaDescriptorRead(at)|u32(0x80000000)
+        c6GdmaDescriptorWrite(at,owned)
+        if (c6GdmaDescriptorRead(at) != owned) return 3
+        index=index+1
+    }
+    c6GdmaDescriptorFence()
+    return 1
+}

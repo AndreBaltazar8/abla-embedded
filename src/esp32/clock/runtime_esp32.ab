@@ -1,0 +1,280 @@
+import "../freertos/port_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
+
+// Typed ESP32 CPU/APB/XTAL clock queries and monotonic RTC timekeeping. This
+// is source-level Abla corresponding to esp_clk.c; no recovered register file
+// or program-counter dispatcher remains.
+
+val esp32ClockMegahertz = u32(1000000)
+val esp32ClockApbMaximum = u32(80000000)
+val esp32ClockCalibrationFractionBits = u64(19)
+val esp32ClockTicksPerMicrosecondAddress = u32(0x3ffe01e0)
+val esp32ClockSlowCalibrationAddress = u32(0x3ff48050)
+val esp32ClockRtcTimeUpdateAddress = u32(0x3ff4800c)
+val esp32ClockRtcTimeLowAddress = u32(0x3ff48010)
+val esp32ClockRtcTimeHighAddress = u32(0x3ff48014)
+val esp32ClockRtcInterruptClearAddress = u32(0x3ff48048)
+val esp32ClockRtcTimeUpdate = u32(1) << u32(31)
+val esp32ClockRtcTimeValid = u32(1) << u32(30)
+val esp32ClockRtcTimeValidInterrupt = u32(1) << u32(4)
+val esp32ClockUnlocked = u32(0xb33fffff)
+
+// retain_mem_t: rtc_time_us, rtc_last_ticks, reserve, checksum.
+val esp32ClockRetainedTimeStorage = nativeStaticAllocate(24)
+val esp32ClockRetainedTime = u32(esp32ClockRetainedTimeStorage)
+val esp32ClockFirstRtcReadStorage = nativeStaticMutableU32s([1])
+val esp32ClockFirstRtcRead = u32(esp32ClockFirstRtcReadStorage)
+val esp32ClockRtcLockStorage = nativeStaticMutableU32s([
+    0xb33fffff, 0
+])
+val esp32ClockRtcLock = u32(esp32ClockRtcLockStorage)
+
+@inline
+trusted fun esp32ClockRuntimeLoadU32(address: u32): u32 {
+    xtensaMemoryBarrier()
+    return u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+}
+
+@inline
+trusted fun esp32ClockRuntimeStoreU32(address: u32, value: u32): void {
+    xtensaMemoryBarrier()
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+@inline
+trusted fun esp32ClockRuntimeMmioLoadU32(address: u32): u32 {
+    xtensaMemoryBarrier()
+    return u32(ablaUnsafeVolatileLoadU32(int(address)))
+}
+
+@inline
+trusted fun esp32ClockRuntimeMmioStoreU32(address: u32, value: u32): void {
+    xtensaMemoryBarrier()
+    ablaUnsafeVolatileStoreU32(int(address), int(value))
+    return
+}
+
+@inline
+trusted fun esp32ClockRuntimeLoadU64(address: u32): u64 =
+    u64(esp32ClockRuntimeLoadU32(address)) |
+    (u64(esp32ClockRuntimeLoadU32(address + u32(4))) << u64(32))
+
+@inline
+trusted fun esp32ClockRuntimeStoreU64(address: u32, value: u64): void {
+    esp32ClockRuntimeStoreU32(address, u32(value))
+    esp32ClockRuntimeStoreU32(address + u32(4), u32(value >>> u64(32)))
+    return
+}
+
+@inline
+trusted fun esp32ClockRuntimeEnterCritical(): void {
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32ClockRtcLock, u32(0xffffffff)
+    )
+    return
+}
+
+@inline
+trusted fun esp32ClockRuntimeExitCritical(): void {
+    esp32RecoveredVPortExitCriticalValue(esp32ClockRtcLock)
+    return
+}
+
+trusted fun esp32ClockRetainedChecksum(): u32 {
+    var checksum = u32(0)
+    var index = u32(0)
+    while (index < u32(5)) {
+        checksum = ((checksum << u32(5)) - checksum) ^
+            esp32ClockRuntimeLoadU32(
+                esp32ClockRetainedTime + index * u32(4)
+            )
+        index = index + u32(1)
+    }
+    return checksum
+}
+
+@inline
+trusted fun esp32ClockCpuFrequency(): u32 =
+    esp32ClockRuntimeLoadU32(esp32ClockTicksPerMicrosecondAddress) *
+        esp32ClockMegahertz
+
+@inline
+trusted fun esp32ClockApbFrequency(): u32 {
+    val cpu = esp32ClockCpuFrequency()
+    return if (cpu < esp32ClockApbMaximum) cpu else esp32ClockApbMaximum
+}
+
+@inline
+trusted fun esp32ClockXtalFrequency(): u32 =
+    esp32RecoveredRtcClkXtalFreqGet(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) * esp32ClockMegahertz
+
+@inline
+trusted fun esp32ClockSlowCalibration(): u32 =
+    esp32ClockRuntimeMmioLoadU32(esp32ClockSlowCalibrationAddress)
+
+// rtc_timer_ll_get_cycle_count(0): request a coherent snapshot, wait for the
+// hardware valid flag, acknowledge it, then combine the 48-bit counter.
+trusted fun esp32ClockRtcTicks(): u64 {
+    esp32ClockRuntimeMmioStoreU32(
+        esp32ClockRtcTimeUpdateAddress,
+        esp32ClockRuntimeMmioLoadU32(esp32ClockRtcTimeUpdateAddress) |
+            esp32ClockRtcTimeUpdate
+    )
+    var attempts = u32(1000)
+    while ((esp32ClockRuntimeMmioLoadU32(esp32ClockRtcTimeUpdateAddress) &
+        esp32ClockRtcTimeValid) == u32(0)) {
+        esp32RomDelayUsValue(u32(1))
+        attempts = attempts - u32(1)
+        if (attempts == u32(0)) break
+    }
+    esp32ClockRuntimeMmioStoreU32(
+        esp32ClockRtcInterruptClearAddress,
+        esp32ClockRuntimeMmioLoadU32(esp32ClockRtcInterruptClearAddress) |
+            esp32ClockRtcTimeValidInterrupt
+    )
+    return u64(esp32ClockRuntimeMmioLoadU32(esp32ClockRtcTimeLowAddress)) |
+        (u64(esp32ClockRuntimeMmioLoadU32(esp32ClockRtcTimeHighAddress)) <<
+            u64(32))
+}
+
+@inline
+fun esp32ClockTicksToMicroseconds(ticks: u64, calibration: u32): u64 {
+    val low = ticks & u64(0xffffffff)
+    val high = ticks >>> u64(32)
+    return ((low * u64(calibration)) >>>
+        esp32ClockCalibrationFractionBits) +
+        ((high * u64(calibration)) <<
+            (u64(32) - esp32ClockCalibrationFractionBits))
+}
+
+trusted fun esp32RtcTimeMicroseconds(): u64 {
+    esp32ClockRuntimeEnterCritical()
+    val calibration = esp32ClockSlowCalibration()
+    val firstRead = esp32ClockRuntimeLoadU32(esp32ClockFirstRtcRead) != u32(0)
+    if (calibration == u32(0) || (
+        firstRead &&
+        esp32ClockRuntimeLoadU32(
+            esp32ClockRetainedTime + u32(20)
+        ) != esp32ClockRetainedChecksum()
+    )) freestandingSet(esp32ClockRetainedTime, i32(0), u32(24))
+    esp32ClockRuntimeStoreU32(esp32ClockFirstRtcRead, u32(0))
+
+    val currentTicks = esp32ClockRtcTicks()
+    val previousTicks = esp32ClockRuntimeLoadU64(
+        esp32ClockRetainedTime + u32(8)
+    )
+    val elapsedTicks = currentTicks - previousTicks
+    val elapsedMicroseconds = esp32ClockTicksToMicroseconds(
+        elapsedTicks, calibration
+    )
+    val time = esp32ClockRuntimeLoadU64(esp32ClockRetainedTime) +
+        elapsedMicroseconds
+
+    esp32ClockRuntimeStoreU64(esp32ClockRetainedTime, time)
+    esp32ClockRuntimeStoreU64(
+        esp32ClockRetainedTime + u32(8), currentTicks
+    )
+    esp32ClockRuntimeStoreU32(
+        esp32ClockRetainedTime + u32(20),
+        esp32ClockRetainedChecksum()
+    )
+    esp32ClockRuntimeExitCritical()
+    return time
+}
+
+trusted fun esp32ClockSetSlowCalibration(calibration: u32): void {
+    // Fold elapsed ticks using the old calibration before changing it so the
+    // returned time remains monotonic.
+    val ignoredCurrentTime = esp32RtcTimeMicroseconds()
+    esp32ClockRuntimeMmioStoreU32(esp32ClockSlowCalibrationAddress, calibration)
+    return
+}
+
+@inline
+trusted fun esp32ClockRtcTime(): u64 = esp32RtcTimeMicroseconds()
+
+trusted fun esp32ClockPrivateLock(): void {
+    esp32ClockRuntimeEnterCritical()
+    return
+}
+
+trusted fun esp32ClockPrivateUnlock(): void {
+    esp32ClockRuntimeExitCritical()
+    return
+}
+
+// Compatibility entry points for recovered callers. The actual external u64
+// ABI roots are mapped directly to esp32RtcTimeMicroseconds and
+// esp32ClockRtcTime in runtime_link_esp32.ab.
+@section(".iram1.1.abla.esp32RecoveredEspClkCpuFreq")
+trusted fun esp32RecoveredEspClkCpuFreq(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockCpuFrequency()
+
+@section(".iram1.2.abla.esp32RecoveredEspClkApbFreq")
+trusted fun esp32RecoveredEspClkApbFreq(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockApbFrequency()
+
+@section(".iram1.abla.esp32RecoveredEspClkXtalFreq")
+trusted fun esp32RecoveredEspClkXtalFreq(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockXtalFrequency()
+
+trusted fun esp32RecoveredEspClkSlowclkCalGet(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32ClockSlowCalibration()
+
+trusted fun esp32RecoveredEspRtcGetTimeUs(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = u32(esp32RtcTimeMicroseconds())
+
+trusted fun esp32RecoveredEspClkSlowclkCalSet(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32ClockSetSlowCalibration(a2)
+    return a2
+}
+
+trusted fun esp32RecoveredEspClkRtcTime(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = u32(esp32ClockRtcTime())
+
+trusted fun esp32RecoveredEspClkPrivateLock(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32ClockPrivateLock()
+    return a2
+}
+
+trusted fun esp32RecoveredEspClkPrivateUnlock(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32ClockPrivateUnlock()
+    return a2
+}

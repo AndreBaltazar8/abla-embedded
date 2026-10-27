@@ -1,0 +1,156 @@
+import "../../runtime/freestanding_memory.ab"
+import "../../runtime/freestanding_integer.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "../runtime/optional_weak_abi_esp32.ab"
+import "../system/interrupt_watchdog_esp32.ab"
+import "../system/ipc_esp32.ab"
+import "../cpu/interrupt_allocator_esp32.ab"
+import "port_esp32.ab"
+
+// Pure-Abla ESP32 FreeRTOS application startup. These functions deliberately
+// use typed state and ordinary control flow rather than preserving the Xtensa
+// register file and program-counter dispatcher recovered from the IDF image.
+
+fun esp32DefaultApplicationMain(): void {
+    return
+}
+
+// The application entry remains a typed Abla callable. Firmware installs its
+// top-level function during module initialization, avoiding an exported
+// app_main ABI root while retaining a reusable startup component.
+var esp32ApplicationMain: Fn() -> void = esp32DefaultApplicationMain
+val esp32ApplicationMainTaskNameStorage = nativeStaticBytes("main\x00")
+val esp32ApplicationMainTaskName =
+    u32(esp32ApplicationMainTaskNameStorage)
+
+fun esp32ConfigureApplicationMain(callback: Fn() -> void): bool {
+    esp32ApplicationMain = callback
+    true
+}
+
+trusted fun esp32WaitForAllCoresReady(): void {
+    var allReady = false
+    while (!allReady) {
+        var core = u32(0)
+        allReady = true
+        while (core < u32(2)) {
+            xtensaMemoryBarrier()
+            val ready = u32(ablaUnsafeVolatileLoadU32(int(
+                esp32Data_port_uxCoreStartupDone_cd9c7f39be +
+                    core * u32(4)
+            )))
+            if (ready == u32(0)) allReady = false
+            core = core + u32(1)
+        }
+    }
+    return
+}
+
+trusted fun esp32ReclaimStartupStacks(): void {
+    esp32WaitForAllCoresReady()
+    esp32RecoveredHeapCapsEnableNonosStackHeaps(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+// FreeRTOS invokes task entries with one pointer-sized argument. Keeping that
+// ABI explicit lets nativeFunctionAddress point directly at this Abla body.
+trusted fun esp32ApplicationMainTask(context: u32): void {
+    esp32ReclaimStartupStacks()
+
+    // esp_task_wdt_config_t: timeout_ms, idle_core_mask, trigger_panic. Match
+    // the IDF startup defaults while keeping the temporary configuration on
+    // this task's stack.
+    val watchdogConfiguration = u32(nativeStackAllocate(12))
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(watchdogConfiguration)), 5000
+    )
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(watchdogConfiguration + u32(4))), 3
+    )
+    ablaUnsafeStoreU8(
+        nativePointerFromAddress(int(watchdogConfiguration + u32(8))), 1
+    )
+    val watchdogResult = esp32RecoveredEspTaskWdtInit(
+        watchdogConfiguration,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (watchdogResult != u32(0)) freestandingAbortValue()
+
+    esp32ClearStartupNonIramGuard()
+    esp32ApplicationMain()
+    esp32RecoveredVTaskDelete(
+        context,
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+trusted fun esp32StartApplication(): void {
+    esp32InterruptWatchdogInitialize()
+    esp32InterruptWatchdogInitializeCurrentCpu()
+    esp32RecoveredEspCrosscoreIntInit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32InitializeIpc()
+
+    val created = esp32FreertosCreateTaskPinnedToCoreBeforeScheduler(
+        u32(nativeFunctionAddress(esp32ApplicationMainTask)),
+        esp32ApplicationMainTaskName,
+        u32(33280),
+        u32(1),
+        u32(0),
+        u32(0)
+    )
+    if (created != u32(1)) freestandingAbortValue()
+
+    esp32DefaultPortStartAppHook(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredVTaskStartScheduler(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    freestandingAbortValue()
+    return
+}
+
+trusted fun esp32StartApplicationOtherCore(): void {
+    val core = (xtensaReadProcessorId() >>> u32(13)) & u32(1)
+    if (core >= u32(2)) freestandingAbortValue()
+
+    var schedulerStarted = false
+    while (!schedulerStarted) {
+        // Core 0 publishes this after its scheduler state is complete. Keep
+        // the load inside the polling loop: this is an inter-core handshake,
+        // not ordinary immutable memory.
+        xtensaMemoryBarrier()
+        schedulerStarted = u32(ablaUnsafeVolatileLoadU32(int(
+            esp32Data_port_xSchedulerRunning_2618692451
+        ))) != u32(0)
+    }
+
+    esp32InterruptWatchdogInitializeCurrentCpu()
+    esp32RecoveredEspCrosscoreIntInit(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredXPortStartScheduler()
+    freestandingAbortValue()
+    return
+}

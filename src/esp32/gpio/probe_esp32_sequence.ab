@@ -1,0 +1,77 @@
+import "../gpio_esp32_logic.ab"
+import "./rtc_descriptor_data_esp32.ab"
+import "../sdk/raw_buffer.ab"
+// Classic ESP32 only. Caller owns stopped HP/RTC/analog users of the pad,
+// clocks and shared register serialization, and prevents sleep/global holds.
+// Fresh exclusive32-byte record with zero magic; never discard failed setup.
+// Uses the recovered source RTC descriptor table, not a linked SDK object.
+trusted fun esp32ProbeRtcIndex(pin: int): int = nativeBufferAt(int(esp32Data_rtc_io_num_map_8f1a03bb74),40).load(pin)
+trusted fun esp32ProbeRtcField(index: int,field: int): int = nativeBufferAt(int(esp32Data_rtc_io_desc_605f052479),1008).loadU32(index*56+field*4)
+fun esp32ProbeDigitalHold(pin: int): int =
+    if (pin == 1) 2 else if (pin == 3) 1 else if (pin == 5) 256 else if (pin >= 6 && pin <= 11) 1<<(pin-4)
+    else if (pin >= 16 && pin <= 19) 1<<(pin-7) else if (pin >= 21 && pin <= 23) 1<<(pin-7) else 0
+trusted fun esp32ProbeField(address: int,mask: int,value: int): bool {
+    classicProbeWrite(address,(classicProbeRead(address)&~mask)|(value&mask))
+    (classicProbeRead(address)&mask) == (value&mask)
+}
+trusted fun esp32ProbeRecordValid(r: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0
+// 1ready,2invalid/no writes,3held/crystal active,4partial setup/restore.
+trusted fun esp32GpioProbeOpenOwned(r: NativeBuffer,pin: int,pull: int,exclusive: bool): int {
+    if (!exclusive || !esp32ProbeRecordValid(r) || !esp32BasicGpioValid(pin) || pull < 0 || pull > 2 || (pin >= 34 && pull != 0)) return 2
+    if (r.loadU32(0) != 0) return 2
+    val rtc=esp32ProbeRtcIndex(pin)
+    var rtcValue=0
+    if (rtc < 18) {
+        rtcValue=classicProbeRead(esp32ProbeRtcField(rtc,0))
+        if ((rtcValue&esp32ProbeRtcField(rtc,9)) != 0 || (classicProbeRead(0x3FF480C8)&esp32ProbeRtcField(rtc,10)) != 0 ||
+            ((pin == 32 || pin == 33) && (rtcValue&0x80000) != 0)) return 3
+    } else if ((classicProbeRead(0x3FF48474)&esp32ProbeDigitalHold(pin)) != 0) return 3
+    val mux=0x3FF49000+esp32IoMuxOffset(pin)
+    val route=0x3FF44530+pin*4
+    val enable=if (pin < 32) 0x3FF44020 else 0x3FF4402C
+    val bit=1<<(pin&31)
+    r.storeU32(4,pin); r.storeU32(8,classicProbeRead(mux)); r.storeU32(12,classicProbeRead(route))
+    r.storeU32(16,classicProbeRead(enable)&bit); r.storeU32(20,rtcValue); r.storeU32(24,4); r.storeU32(28,0)
+    r.storeU32(0,0x47505231)
+    classicProbeWrite(enable+8,bit)
+    if ((classicProbeRead(enable)&bit) != 0 || !esp32ProbeField(route,0xC00,0x400) || !esp32ProbeField(mux,0x7202,0x2200)) return 4
+    if (rtc < 18 && !esp32ProbeField(esp32ProbeRtcField(rtc,0),esp32ProbeRtcField(rtc,1),0)) return 4
+    r.storeU32(24,1)
+    return esp32GpioProbePullOwned(r,pull)
+}
+// pull0none/1up/2down. RTC-capable pins use RTC pulls (ESP32 erratum),
+// while digital-only pins use IO_MUX. Input-only34..39 never request pulls.
+trusted fun esp32GpioProbePullOwned(r: NativeBuffer,pull: int): int {
+    if (!esp32ProbeRecordValid(r) || r.loadU32(0) != 0x47505231 || r.loadU32(24) != 1 || pull < 0 || pull > 2) return 2
+    val pin=r.loadU32(4)
+    if (!esp32BasicGpioValid(pin) || (pin >= 34 && pull != 0)) return 2
+    val rtc=esp32ProbeRtcIndex(pin)
+    val address=if (rtc < 18) esp32ProbeRtcField(rtc,0) else 0x3FF49000+esp32IoMuxOffset(pin)
+    val up=if (rtc < 18) esp32ProbeRtcField(rtc,4) else 256
+    val down=if (rtc < 18) esp32ProbeRtcField(rtc,5) else 128
+    if (!esp32ProbeField(address,up|down,if (pull == 1) up else if (pull == 2) down else 0)) { r.storeU32(24,4); return 4 }
+    return 1
+}
+trusted fun esp32GpioProbeReadOwned(r: NativeBuffer): int {
+    if (!esp32ProbeRecordValid(r) || r.loadU32(0) != 0x47505231 || r.loadU32(24) != 1 || !esp32BasicGpioValid(r.loadU32(4))) return -1
+    val pin=r.loadU32(4)
+    (classicProbeRead(if (pin < 32) 0x3FF4403C else 0x3FF44040)>>(pin&31))&1
+}
+trusted fun esp32GpioProbeCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !esp32ProbeRecordValid(r) || r.loadU32(0) != 0x47505231 || (r.loadU32(24) != 1 && r.loadU32(24) != 4)) return 2
+    val pin=r.loadU32(4)
+    if (!esp32BasicGpioValid(pin)) return 2
+    val rtc=esp32ProbeRtcIndex(pin)
+    var okay=true
+    if (rtc < 18 && !esp32ProbeField(esp32ProbeRtcField(rtc,0),esp32ProbeRtcField(rtc,1)|esp32ProbeRtcField(rtc,4)|esp32ProbeRtcField(rtc,5),r.loadU32(20))) okay=false
+    val muxMask=0x7202|(if (rtc < 18) 0 else 0x180)
+    if (!esp32ProbeField(0x3FF49000+esp32IoMuxOffset(pin),muxMask,r.loadU32(8))) okay=false
+    if (!esp32ProbeField(0x3FF44530+pin*4,0xC00,r.loadU32(12))) okay=false
+    val enable=if (pin < 32) 0x3FF44020 else 0x3FF4402C
+    val bit=1<<(pin&31)
+    classicProbeWrite(enable+(if (r.loadU32(16) != 0) 4 else 8),bit)
+    if ((classicProbeRead(enable)&bit) != r.loadU32(16)) okay=false
+    if (!okay) { r.storeU32(24,4); return 4 }
+    r.storeU32(24,0); r.storeU32(0,0)
+    return 1
+}

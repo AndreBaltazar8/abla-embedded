@@ -1,0 +1,49 @@
+import "./software_provider_c61.ab"
+import "../gpio_clock_c61_sequence.ab"
+import "../delay_clock_c61_sequence.ab"
+// Retained, exclusive owner of the singleton provider AND GPIO clock gates.
+// Copies are not independent owners. Caller serializes this entire lifetime,
+// excludes all other GPIO gate consumers/writers and pins calibrated sources.
+// Drivers may borrow bus/device handles; do not independently reopen provider.
+// ROM timing is global configuration, not rolled back. No implicit bus clear.
+// Status0closed1ready2invalid/admission3timing4clocks5bus6busclose7clockclose8stale.
+// Clock lease11bits@8; bus epoch24bits@24; pending bus lease bit48.
+type Esp32C61I2cSession=int
+fun Esp32C61I2cSession.status(): int = this&255
+fun Esp32C61I2cSession.ready(): bool = this.status() == 1
+fun Esp32C61I2cSession.clocks(): Esp32C61GpioClock = Esp32C61GpioClock((this>>>8)&2047)
+fun Esp32C61I2cSession.bus(): I2cBus = I2cBus(if (this.ready()) (this>>>24)&16777215 else 0)
+trusted fun esp32C61I2cSessionOpenOwned(sda: int,scl: int,xtalHz: int,rcFastHz: int,exclusive: bool,halfPeriodUs: int = 5,stretchPolls: int = 2000): Esp32C61I2cSession {
+    if (!exclusive || !softwareI2cProviderPinsValid(sda,scl) ||
+        !softwareI2cLines(sda,scl,halfPeriodUs,stretchPolls).valid() ||
+        softwareI2cProviderLoad(24) != 0 || softwareI2cProviderLoad(4) >= 16777215 ||
+        softwareI2cProviderLoad(0) != 0) return Esp32C61I2cSession(2)
+    val timing=esp32C61DelayClockConfigureOwned(xtalHz,rcFastHz,true)
+    if (!timing.ready()) return Esp32C61I2cSession(3)
+    val clocks=esp32C61GpioClockOpenOwned(true)
+    if (!clocks.ready()) return Esp32C61I2cSession((clocks<<8)|4)
+    val previous=softwareI2cProviderLoad(4)
+    val bus=i2cSoftwareMaster(sda,scl,halfPeriodUs,stretchPolls)
+    val epoch=softwareI2cProviderLoad(4)
+    // A refused provider lock consumes no epoch and confers no pad ownership.
+    val lease=if (epoch != previous) (epoch<<24)|(1<<48) else 0
+    return Esp32C61I2cSession((clocks<<8)|lease|(if (bus.valid()) 1 else 5))
+}
+trusted fun Esp32C61I2cSession.closeOwned(exclusiveChildrenQuiesced: bool): Esp32C61I2cSession {
+    if (!exclusiveChildrenQuiesced) return this
+    var state=this&~255
+    if ((state&(1<<48)) != 0) {
+        val epoch=(state>>>24)&16777215
+        // Never disable clocks underneath another owner's newer bus.
+        if (epoch != softwareI2cProviderLoad(4)) return Esp32C61I2cSession(state|8)
+        if (softwareI2cProviderLoad(24) != 0) {
+            val closed=if (softwareI2cProviderLoad(28) == 1) I2cBus(epoch).close() else i2cSoftwareAbortSetup()
+            if (!closed) return Esp32C61I2cSession(state|6)
+        }
+        state=state&~((16777215<<24)|(1<<48))
+    }
+    if (softwareI2cProviderLoad(24) != 0 || softwareI2cProviderLoad(0) != 0) return Esp32C61I2cSession(state|8)
+    val clocks=Esp32C61GpioClock((state>>>8)&2047).closeOwned(true)
+    if (clocks.status() != 0) return Esp32C61I2cSession((clocks<<8)|7)
+    return Esp32C61I2cSession(0)
+}

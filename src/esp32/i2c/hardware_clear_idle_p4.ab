@@ -1,0 +1,51 @@
+import "./hardware_provider_p4.ab"
+// Explicit single-master authorization to clock slaves on an idle controller.
+// Retain the initially-zero, aligned40B record until restoration completes;
+// retries MUST use the same address. All ordinary operations (including close
+// and passive recovery) remain excluded across restore failures, not only
+// during this call. No automatic retry or replay of application transfers.
+// Returns native clear results:1ready2invalid3admission4restore5setup6SDAheld
+// 7SCLtimeout8controllerCleanup;9provider busy/stale/pending different record.
+// timeoutMilliseconds bounds controller cleanup in CPU cycles; stretching is
+// separately bounded to at most1000 one-microsecond polls per clock.
+trusted fun I2cBus.clearIdleStatus(record: NativeBuffer,timeoutMilliseconds: int = 1000): int =
+    this.clearOperationOwned(record,timeoutMilliseconds,false)
+// Stronger opt-in: abort this session's FAILED transaction, then clear slaves.
+// Reset and controller-cleanup each have the given bounded cycle budget.
+// Initial ready/setup/closing sessions are rejected without aborting them.
+// 0x100|resetStatus identifies abort refusal/failure; no slave clocks follow.
+// Restore-only retries never repeat abort, even through this entrypoint.
+trusted fun I2cBus.abortAndClearStatus(record: NativeBuffer,timeoutMilliseconds: int = 1000): int =
+    this.clearOperationOwned(record,timeoutMilliseconds,true)
+trusted fun I2cBus.clearOperationOwned(record: NativeBuffer,timeoutMilliseconds: int,abortFailed: bool): int {
+    if (!this.valid() || !record.hasAddressRange(0,40) || (record.addressValue()&3) != 0 ||
+        timeoutMilliseconds < 1 || timeoutMilliseconds > 1000000) return 2
+    if (!p4HardwareEnter()) return 9
+    var result=9
+    val phase=p4HardwareLoad(20)
+    if (this == p4HardwareLoad(4) && (phase == 1 || phase == 3)) {
+        val pending=p4HardwareLoad(32)
+        if (!p4HardwareCoreSafe(record,40)) result=2
+        else if ((phase == 1 && pending == 0 && record.loadU32(0) == 0) ||
+            (phase == 3 && pending == record.addressValue())) {
+            val perMs=(u32(p4HardwareLoad(16))+u32(999))/u32(1000)
+            result=2
+            val session=p4HardwareSession()
+            if (u32(timeoutMilliseconds) <= u32(2147483647)/perMs &&
+                (!abortFailed || phase == 3 || (session.loadU32(4) == 3 && session.loadU32(24) == 3))) {
+                p4HardwareStore(32,record.addressValue());p4HardwareStore(20,3)
+                val budget=perMs*u32(timeoutMilliseconds)
+                val aborted=if (abortFailed && phase == 1) p4HardwareAbortFailed(session,budget) else 1
+                result=if (aborted == 1) p4HardwareClearIdle(record,session,budget) else 0x100|aborted
+                // Only a published restoration stage retains the reservation.
+                // Invalid/refused admission never changed the pins.
+                if ((record.loadU32(0) == 0x4932434c && record.loadU32(4) == 3) ||
+                    (phase == 1 && record.loadU32(0) == 0)) {
+                    p4HardwareStore(32,0);p4HardwareStore(20,1)
+                }
+            }
+        }
+    }
+    if (!p4HardwareLeave()) return 9
+    return result
+}

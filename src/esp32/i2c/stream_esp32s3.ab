@@ -1,0 +1,86 @@
+import "./poll_esp32s3.ab"
+import "./stream_s3_logic.ab"
+
+// Caller owns a configured polling controller and stable CPU/source clocks.
+// One deadline covers ALL chunks; timeout never starts over at FIFO boundaries.
+// Errors propagate and require owner-driven recovery, as with SmallTransfer.
+// No STOP is inserted between chunks or between the write and read phases.
+trusted fun esp32S3I2cTransferOwned(port: int, address: int,
+    output: NativeBuffer, written: int, input: NativeBuffer, read: int,
+    budget: u32, registerPrefix: int = -1): int {
+    val base = esp32S3I2cControllerAddress(port)
+    if (base == 0 || address < 0 || address > 127 ||
+        !output.hasAddressRange(0, written) || !input.hasAddressRange(0, read) ||
+        budget == u32(0) || budget > u32(0x7fffffff) || registerPrefix < -1 || registerPrefix > 255) return 7
+    val status = u32(mmioLoadU32(base + 8))
+    if ((status & u32(16)) != u32(0)) return 8
+    if (esp32S3I2cTxCount(status) != 0 || esp32S3I2cRxCount(status) != 0) return 7
+    val started = esp32S3I2cReadCounter()
+    var continued = false
+    if (written > 0 || read == 0 || registerPrefix >= 0) {
+        var offset = 0
+        var first = true
+        while (first || offset < written) {
+            val prefix = if (first) registerPrefix else -1
+            val available = esp32S3I2cStreamPayloadCapacity(first, prefix)
+            val count = if (written - offset < available) written - offset else available
+            val finish = offset + count == written && read == 0
+            val result = esp32S3I2cStreamChunkOwned(port, address,
+                nativeBufferAt(output.addressValue() + offset, count), count,
+                false, first, finish, continued, started, budget, prefix)
+            if (result != (if (finish) 1 else 2)) return if (result <= 2) 6 else result
+            offset = offset + count
+            first = false
+            continued = true
+        }
+    }
+    var offset = 0
+    while (offset < read) {
+        val count = if (read - offset < 32) read - offset else 32
+        val finish = offset + count == read
+        val result = esp32S3I2cStreamChunkOwned(port, address,
+            nativeBufferAt(input.addressValue() + offset, count), count,
+            true, offset == 0, finish, continued, started, budget)
+        if (result != (if (finish) 1 else 2)) return if (result <= 2) 6 else result
+        offset = offset + count
+        continued = true
+    }
+    1
+}
+
+// Implementation boundary for TransferOwned; same exclusive-owner contract.
+trusted fun esp32S3I2cStreamChunkOwned(port: int, address: int,
+    data: NativeBuffer, count: int, reading: bool, first: bool, finish: bool,
+    continued: bool, started: u32, budget: u32, registerPrefix: int = -1,nackLast: bool = false): int {
+    val base = esp32S3I2cControllerAddress(port)
+    if (count < 0 || count > 32 || registerPrefix < -1 || registerPrefix > 255 ||
+        (registerPrefix >= 0 && (reading || !first))) return 7
+    val commandCount = count + (if (registerPrefix >= 0) 1 else 0)
+    val last = esp32S3I2cStreamLast(reading, first, finish, commandCount,nackLast)
+    if (base == 0 || address < 0 || address > 127 || last < 0 ||
+        !data.hasAddressRange(0, count) || budget == u32(0) ||
+        budget > u32(0x7fffffff)) return 7
+    var elapsed = esp32S3I2cReadCounter() - started
+    if (elapsed >= budget) return 5
+    val status = u32(mmioLoadU32(base + 8))
+    if (!continued && (status & u32(16)) != u32(0)) return 8
+    if (esp32S3I2cTxCount(status) != 0 || esp32S3I2cRxCount(status) != 0) return 6
+    var index = u32(0)
+    while (index <= u32(last)) {
+        if (!esp32S3I2cWriteCommand(port, int(index),
+            esp32S3I2cStreamCommand(reading, first, finish, commandCount, int(index),nackLast))) return 7
+        index = index + u32(1)
+    }
+    if (first) mmioStoreU32(base + 0x1c, (address << 1) | (if (reading) 1 else 0))
+    if (registerPrefix >= 0) mmioStoreU32(base + 0x1c, registerPrefix)
+    if (!reading && !esp32S3I2cWriteFifo(port, data, count)) return 6
+    elapsed = esp32S3I2cReadCounter() - started
+    if (elapsed >= budget) return 5
+    val result = esp32S3I2cRunBatch(port, last, budget - elapsed, continued)
+    if (result != (if (finish) 1 else 2)) return result
+    val completed = u32(mmioLoadU32(base + 8))
+    if (esp32S3I2cTxCount(completed) != 0 ||
+        esp32S3I2cRxCount(completed) != (if (reading) count else 0)) return 6
+    if (reading && !esp32S3I2cReadFifo(port, data, count)) return 6
+    result
+}

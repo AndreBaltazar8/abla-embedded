@@ -1,0 +1,80 @@
+import "../sdk/raw_buffer.ab"
+// Exclusive, DATA-ONLY, reserved 64KB page lifecycle. Caller owns the entire
+// controller, MMU slot and physical page, pins all clocks, has configured the
+// caches and trained chip, and invalidated all old aliases before opening.
+// No executable aliases, other mappings/users, CPU peers or DMA are allowed.
+// Code/stack/record remain internal. Does not initialize caches or cold PSRAM.
+// Internal48B record: magic0,phase4,address8,entry12,line16,error20,stage24,
+// reserved28, verification report32..47. Initialize only a fresh owned record.
+// phase0fresh,1map attempted,2AXI attempted,3active,4verified,5draining,
+// 6unmapping,7closed. Failed operations retain phase/ownership for close retry.
+// Return1done2invalid3state4subsystem. No auto-cleanup hides the original error.
+fun p4PsramPageStorage(record: NativeBuffer): bool = record.hasAddressRange(0,48) && (record.addressValue()&3) == 0 && p4PsramCommandStorageSafe(record.addressValue(),48)
+trusted fun p4PsramPageInitializeOwned(record: NativeBuffer): bool {
+    if (!p4PsramPageStorage(record)) return false
+    var offset=0
+    while (offset < 48) { record.storeU32(offset,0); offset=offset+4 }
+    record.storeU32(0,0x50345047)
+    return true
+}
+trusted fun p4PsramPageFailure(record: NativeBuffer,stage: int,error: int): int {
+    record.storeU32(20,error); record.storeU32(24,stage); return 4
+}
+trusted fun p4PsramPageOpenOwned(record: NativeBuffer,address: int,physical: int,capacity: int,line: int,readDummy: int,writeDummy: int,hex16: bool,polls: int): int {
+    if (!p4PsramPageStorage(record) || p4PsramMmuIndex(address) < 0 || capacity < 65536 || capacity > 67108864 ||
+        physical < 0 || physical > capacity-65536 || (physical&65535) != 0 || (line != 64 && line != 128) ||
+        !p4PsramMappedProfileValid(readDummy,writeDummy,polls)) return 2
+    if (record.loadU32(0) != 0x50345047 || record.loadU32(4) != 0) return 3
+    if (!p4CacheL2GeometryMatches(line)) return p4PsramPageFailure(record,9,3)
+    val prior=p4PsramMmuReadOwned(address,polls)
+    if (prior != 1) return p4PsramPageFailure(record,1,if ((prior&255) == 1) 6 else prior&255)
+    record.storeU32(8,address); record.storeU32(16,line)
+    record.storeU32(12,(physical>>>16)|0xc00|(if (p4PsramMmuEncryptionEnabled()) 0x1000 else 0))
+    record.storeU32(4,1)
+    val mapped=p4PsramMmuMapOwned(address,physical,capacity,0,polls)
+    if ((mapped&255) != 1) return p4PsramPageFailure(record,2,mapped&255)
+    record.storeU32(12,mapped>>>8)
+    record.storeU32(4,2)
+    val started=p4PsramMappedStartOwned(readDummy,writeDummy,hex16,polls)
+    if (started != 1) return p4PsramPageFailure(record,3,started)
+    p4PsramVerifyFence()
+    record.storeU32(4,3); record.storeU32(20,0); record.storeU32(24,0)
+    return 1
+}
+// Destructive verification of the ENTIRE owned page, not only a cached sample.
+trusted fun p4PsramPageVerifyOwned(record: NativeBuffer,polls: int): int {
+    if (!p4PsramPageStorage(record) || polls < 1 || polls > 1000000) return 2
+    if (record.loadU32(0) != 0x50345047 || record.loadU32(4) != 3) return 3
+    val result=p4PsramMappedVerifyOwned(nativeBufferAt(record.loadU32(8),65536),65536,record.loadU32(16),nativeBufferAt(record.addressValue()+32,16),polls)
+    if (result != 1) return p4PsramPageFailure(record,4,result)
+    record.storeU32(4,4); record.storeU32(20,0); record.storeU32(24,0); return 1
+}
+// Caller excludes all users before close. Dirty data must reach PSRAM before
+// AXI closes. Never gate clocks or erase an unexpected MMU entry on failure.
+trusted fun p4PsramPageCloseOwned(record: NativeBuffer,polls: int): int {
+    if (!p4PsramPageStorage(record) || polls < 1 || polls > 1000000) return 2
+    if (record.loadU32(0) != 0x50345047 || record.loadU32(4) > 7) return 3
+    val phase=record.loadU32(4)
+    if (phase == 0 || phase == 7) { record.storeU32(4,7); return 1 }
+    if (phase == 3 || phase == 4) {
+        if (!p4CacheL2GeometryMatches(record.loadU32(16))) return p4PsramPageFailure(record,9,3)
+        p4PsramVerifyFence()
+        val flushed=p4PsramVerifyFlush(nativeBufferAt(record.loadU32(8),65536),65536,record.loadU32(16),polls)
+        if (flushed != 1) return p4PsramPageFailure(record,5,flushed)
+        p4PsramVerifyFence(); record.storeU32(4,5)
+    }
+    if (record.loadU32(4) == 2 || record.loadU32(4) == 5) {
+        val stopped=p4PsramMappedStopOwned(polls)
+        if (stopped != 1) return p4PsramPageFailure(record,6,stopped)
+        p4PsramVerifyFence(); record.storeU32(4,6)
+    }
+    val observed=p4PsramMmuReadOwned(record.loadU32(8),polls)
+    if ((observed&255) != 1) return p4PsramPageFailure(record,7,observed&255)
+    if ((observed>>>8) != 0) {
+        if ((observed>>>8) != record.loadU32(12)) return p4PsramPageFailure(record,7,6)
+        val unmapped=p4PsramMmuUnmapOwned(record.loadU32(8),record.loadU32(12),polls)
+        if ((unmapped&255) != 1) return p4PsramPageFailure(record,8,unmapped&255)
+    }
+    p4PsramVerifyFence(); record.storeU32(4,7)
+    record.storeU32(20,0); record.storeU32(24,0); return 1
+}

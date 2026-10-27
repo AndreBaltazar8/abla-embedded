@@ -1,0 +1,113 @@
+// P4 SYSTIMER, both layouts: two52bit counters and three26bit-period alarms.
+// Caller owns selected resources and serializes shared CONF/IRQ writes, pins
+// bus/source clocks, and excludes counter loads/ETM and other-core snapshots.
+// No module reset, source switch, IRQ routing or CPU enable is implicit.
+// Mutable operations:1applied/command issued,2invalid,3busy,4readback failure.
+// Partial writes retain ownership. LOAD/W1C commands have no completion bit;
+// callers verify counter value/event behavior separately when required.
+type P4SystemCounter = int
+fun p4SystemCounter(unit: int = 0): P4SystemCounter = P4SystemCounter(unit)
+fun P4SystemCounter.valid(): bool = this >= 0 && this <= 1
+fun p4SystemTimerBit(bit: int): int = int(u32(1)<<u32(bit))
+trusted fun p4SystemTimerField(offset: int,mask: int,value: int): bool {
+    val next=(p4SystemTimerRead(offset)&(4294967295^mask))|value
+    p4SystemTimerWrite(offset,next)
+    return p4SystemTimerRead(offset) == next
+}
+trusted fun P4SystemCounter.hasActiveAlarm(): bool {
+    val config=p4SystemTimerRead(0)
+    var alarm=0
+    while (alarm < 3) {
+        if ((config&p4SystemTimerBit(24-alarm)) != 0 && ((p4SystemTimerRead(52+alarm*4)>>>31)&1) == this) return true
+        alarm=alarm+1
+    }
+    return false
+}
+// Snapshot result0..2^52-1, -1invalid, -2bounded timeout. Reads LO/HI/LO
+// to reject a torn snapshot if a same-core ISR has refreshed it mid-read.
+// A stopped counter is readable; this does not prove clock progress.
+trusted fun P4SystemCounter.tryTicks(polls: int = 64): int {
+    if (!this.valid() || polls < 1 || polls > 1000000) return -1
+    val op=4+this*4
+    // UPDATE WT and VALUE_VALID WTC: clear old valid when requesting refresh.
+    p4SystemTimerWrite(op,0x60000000)
+    var remaining=polls
+    while (remaining > 0) {
+        remaining=remaining-1
+        if ((p4SystemTimerRead(op)&0x20000000) != 0) {
+            val low=p4SystemTimerRead(68+this*8)
+            val high=p4SystemTimerRead(64+this*8)&0xfffff
+            val again=p4SystemTimerRead(68+this*8)
+            if (low == again) return (high<<32)|low
+        }
+    }
+    return -2
+}
+// Preserves independent counter, ETM, global clock and alarm state. Stalling
+// changes affect monotonic wall time; explicitly choose both false for that.
+trusted fun P4SystemCounter.configureOwned(enabled: bool,stallCpu0: bool,stallCpu1: bool): int {
+    if (!this.valid()) return 2
+    if (this.hasActiveAlarm()) return 3
+    val work=p4SystemTimerBit(30-this)
+    val stall0=p4SystemTimerBit(28-this*2)
+    val stall1=p4SystemTimerBit(27-this*2)
+    val value=(if (enabled) work else 0)|(if (stallCpu0) stall0 else 0)|(if (stallCpu1) stall1 else 0)
+    return if (p4SystemTimerField(0,work|stall0|stall1,value)) 1 else 4
+}
+trusted fun P4SystemCounter.loadOwned(ticks: int): int {
+    if (!this.valid() || ticks < 0 || ticks > 4503599627370495) return 2
+    if ((p4SystemTimerRead(0)&p4SystemTimerBit(30-this)) != 0 || this.hasActiveAlarm()) return 3
+    val high=12+this*8
+    if (!p4SystemTimerField(high,0xfffff,ticks>>>32)) return 4
+    p4SystemTimerWrite(high+4,int(u32(ticks)))
+    if (p4SystemTimerRead(high+4) != int(u32(ticks))) return 4
+    p4SystemTimerWrite(92+this*4,1)
+    return 1
+}
+// Elapsed52bit ticks, caller guarantees <=one wrap/no counter reload.
+fun p4SystemTimerElapsed(before: int,after: int): int {
+    if (before < 0 || after < 0 || before > 4503599627370495 || after > 4503599627370495) return -1
+    return (after-before)&4503599627370495
+}
+// For verified40MHz XTAL source only: hardware fractional divider2.5 ->16MHz.
+// RC_FAST/FPGA require their actual calibration; no invented constant there.
+fun p4SystemTimerXtalMicroseconds(ticks: int): int = if (ticks < 0 || ticks > 4503599627370495) -1 else ticks>>>4
+// period0=one-shot absolute52bit target; period1..2^26-1=periodic ticks.
+// Refuses an enabled alarm, enabled IRQ or unacknowledged event. Target and
+// configuration written/read back BEFORE apply. Does not arm or clear events.
+trusted fun p4SystemAlarmConfigureOwned(alarm: int,unit: int,target: int,period: int): int {
+    if (alarm < 0 || alarm > 2 || unit < 0 || unit > 1 || target < 0 || target > 4503599627370495 || period < 0 || period > 67108863) return 2
+    val bit=p4SystemTimerBit(alarm)
+    if ((p4SystemTimerRead(0)&p4SystemTimerBit(24-alarm)) != 0 || ((p4SystemTimerRead(100)|p4SystemTimerRead(104))&bit) != 0) return 3
+    val high=28+alarm*8
+    if (!p4SystemTimerField(high,0xfffff,target>>>32)) return 4
+    p4SystemTimerWrite(high+4,int(u32(target)))
+    if (p4SystemTimerRead(high+4) != int(u32(target))) return 4
+    val value=(unit<<31)|(if (period != 0) 0x40000000 else 0)|period
+    if (!p4SystemTimerField(52+alarm*4,0xc3ffffff,value)) return 4
+    p4SystemTimerWrite(80+alarm*4,1)
+    return 1
+}
+// Arm only after configuration/counter start and (if requested) IRQ handler
+// installation. IRQ enable is separate, allowing polled alarms.
+trusted fun p4SystemAlarmEnableOwned(alarm: int,enabled: bool): int {
+    if (alarm < 0 || alarm > 2) return 2
+    if (enabled) {
+        val unit=(p4SystemTimerRead(52+alarm*4)>>>31)&1
+        if ((p4SystemTimerRead(0)&p4SystemTimerBit(30-unit)) == 0 || (p4SystemTimerRead(104)&p4SystemTimerBit(alarm)) != 0) return 3
+    }
+    val bit=p4SystemTimerBit(24-alarm)
+    return if (p4SystemTimerField(0,bit,if (enabled) bit else 0)) 1 else 4
+}
+trusted fun p4SystemAlarmInterruptEnableOwned(alarm: int,enabled: bool): int {
+    if (alarm < 0 || alarm > 2) return 2
+    val bit=p4SystemTimerBit(alarm)
+    return if (p4SystemTimerField(100,bit,if (enabled) bit else 0)) 1 else 4
+}
+trusted fun p4SystemAlarmPending(): int = p4SystemTimerRead(104)&7
+trusted fun p4SystemAlarmAcknowledgeOwned(alarm: int): int {
+    if (alarm < 0 || alarm > 2) return 2
+    // Direct W1C, never read/modify/write potentially acknowledging peers.
+    p4SystemTimerWrite(108,p4SystemTimerBit(alarm))
+    return 1
+}

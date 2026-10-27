@@ -1,0 +1,118 @@
+import "../cpu_clock_c5_sequence.ab"
+import "./sleep_record_c5.ab"
+//128B recovery record: tag0,status4,stage8,profile address12,alarm address16,
+// CPU plan20,PVT/flash flags24,sleep result28,startupUs32,cache token36/40,
+// UART token44,child result48,optional entry-session52/time-session56/MSPI448B60,
+// private clock resume64@64. Entry-session cleanup precedes stage0profile.
+//1complete2invalid3pending. stage0profile1clock2alarm3cache4UART5time6complete.
+// Transfers exclusive ownership of live profile304B, optional alarm24B and
+// cache/UART tokens. All records/stack/code retained; no copies or concurrent
+// access. Caller has returned from retained-CPU sleep/rejection on stable XTAL,
+// restored pins/flash power and any TOP retention, excluded interrupts,
+// PMU wake routing and all users, and supplies calibrated manual voltage/ticks.
+// This is recovery, NOT preparation/entry, scheduler alarm dispatch, or
+// evidence that arbitrary TOP/CPU-powerdown sleep is safe. On failure keep
+// every outstanding resource owned and retry Continue, never Begin again.
+// Accept entry errors -1/-2/-3 as well as wake0/reject1. Preserve the original
+// signed32 result at28; negative entry errors never issued sleep, so only the
+// cache power-up-delay decision treats them like rejection. Recovery success
+// does NOT turn failed sleep into successful sleep: caller inspects result28.
+// Optional prepared time session runs LAST. Scheduler/timer observers remain
+// excluded until complete, even after cache and UART hardware have resumed.
+// With no memory lease, caller supplies restored MSPI. A transferred lease
+// requests independent PLL480 restart during clock recovery, even for XTAL or
+// RC_FAST CPU plans; memory-aware Continue then restores MSPI before caches.
+// All other PLL consumers must remain quiescent throughout recalibration.
+@section(".iram1.abla.c5SleepRecoveryContinue")
+trusted fun esp32C5SleepRecoveryContinueOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,128)) return 2
+    if (c5SleepRecordRead(record,0) != 0x43524331) return 2
+    if (c5SleepRecordRead(record,4) == 1) return 1
+    if (c5SleepRecordRead(record,4) != 3 || c5SleepRecordRead(record,8) > 5) return 2
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        val entry=c5SleepRecordRead(record,52)
+        if (entry != 0) {
+            val closed=c5SleepRecoveryEntry(nativeBufferAt(entry,32))
+            c5SleepRecordWrite(record,48,closed)
+            if (closed != 4) return 3
+            c5SleepRecordWrite(record,52,0)
+        }
+        val result=c5SleepRecoveryProfile(nativeBufferAt(c5SleepRecordRead(record,12),304))
+        c5SleepRecordWrite(record,48,result)
+        if (result != 4) return 3
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        // A transferred MSPI lease uses PLL480 independently of CPU/PVT.
+        // Its pointer remains immutable until stage3 memory cleanup completes.
+        val result=c5SleepRecoveryClock(nativeBufferAt(record.addressValue()+64,64),C5CpuClock(c5SleepRecordRead(record,20)),(c5SleepRecordRead(record,24)&1) != 0,c5SleepRecordRead(record,60) != 0)
+        c5SleepRecordWrite(record,48,result)
+        if (result != 1) return 3
+        c5SleepRecordWrite(record,8,2)
+    }
+    if (stage <= 2) {
+        val address=c5SleepRecordRead(record,16)
+        if (address != 0) {
+            val result=c5SleepRecoveryAlarm(nativeBufferAt(address,24))
+            c5SleepRecordWrite(record,48,result)
+            if (result != 6) return 3
+        }
+        c5SleepRecordWrite(record,8,3)
+    }
+    if (stage <= 3) {
+        // A transferred memory lease must close after CPU restoration but
+        // before any cache/UART/time observers resume. Only the MSPI recovery
+        // composition clears this fence after checked, complete restoration.
+        if (c5SleepRecordRead(record,60) != 0) return 3
+        val token=c5SleepRecordRead(record,36)|(c5SleepRecordRead(record,40)<<32)
+        val flashResult=if (c5SleepRecordRead(record,28) == 0) 0 else 1
+        if (!c5SleepRecoveryCache(token,flashResult,(c5SleepRecordRead(record,24)&2) != 0,c5SleepRecordRead(record,32))) { c5SleepRecordWrite(record,48,0);return 3 }
+        c5SleepRecordWrite(record,8,4)
+    }
+    if (stage <= 4) {
+        val remaining=c5SleepRecoveryUarts(c5SleepRecordRead(record,44))
+        c5SleepRecordWrite(record,44,remaining);c5SleepRecordWrite(record,48,remaining)
+        if ((remaining&0x300) != 0) return 3
+        c5SleepRecordWrite(record,8,5)
+    }
+    val timeAddress=c5SleepRecordRead(record,56)
+    if (timeAddress != 0) {
+        val result=c5SleepRecoveryTime(nativeBufferAt(timeAddress,40),int(i32(c5SleepRecordRead(record,28))))
+        c5SleepRecordWrite(record,48,result)
+        if (result != 1) return 3
+        c5SleepRecordWrite(record,56,0)
+    }
+    c5SleepRecordWrite(record,8,6);c5SleepRecordWrite(record,4,1)
+    1
+}
+@section(".iram1.abla.c5SleepRecoveryBegin")
+trusted fun esp32C5SleepRecoveryBeginOwned(record: NativeBuffer,profile: NativeBuffer,alarmAddress: int,plan: C5CpuClock,usePvt: bool,sleepResult: int,flashDown: bool,startupUs: int,cacheToken: int,uartToken: int,exclusiveReady: bool,entryAddress: int = 0,timeAddress: int = 0,memoryAddress: int = 0): int {
+    if (!exclusiveReady || !record.hasAddressRange(0,128) || !profile.hasAddressRange(0,304) || (record.addressValue()&3) != 0 || (profile.addressValue()&3) != 0 || !c5CpuClockValid(plan) || sleepResult < -3 || sleepResult > 1 || startupUs < 0 || startupUs > 0xffffffff || (flashDown && startupUs == 0) || uartToken < 0 || (uartToken&~0x303ff) != 0 || alarmAddress < 0 || alarmAddress > 0xffffffe7 || (alarmAddress&3) != 0) return 2
+    val base=record.addressValue();val p=profile.addressValue()
+    if (entryAddress < 0 || entryAddress > 0xffffffdf || (entryAddress&3) != 0) return 2
+    if (timeAddress < 0 || timeAddress > 0xffffffd7 || (timeAddress&3) != 0) return 2
+    if (base < p+304 && p < base+128) return 2
+    if (alarmAddress != 0 && ((base < alarmAddress+24 && alarmAddress < base+128) || (p < alarmAddress+24 && alarmAddress < p+304))) return 2
+    if (entryAddress != 0 && ((base < entryAddress+32 && entryAddress < base+128) || (p < entryAddress+32 && entryAddress < p+304) || (alarmAddress != 0 && alarmAddress < entryAddress+32 && entryAddress < alarmAddress+24))) return 2
+    if (timeAddress != 0 && ((base < timeAddress+40 && timeAddress < base+128) || (p < timeAddress+40 && timeAddress < p+304) || (alarmAddress != 0 && alarmAddress < timeAddress+40 && timeAddress < alarmAddress+24) || (entryAddress != 0 && entryAddress < timeAddress+40 && timeAddress < entryAddress+32))) return 2
+    if (c5SleepRecordRead(record,0) != 0) return 2
+    if (memoryAddress < 0 || memoryAddress > 0xfffffe3f || (memoryAddress&3) != 0) return 2
+    if (memoryAddress != 0) {
+        if ((base < memoryAddress+448 && memoryAddress < base+128) ||
+            (p < memoryAddress+448 && memoryAddress < p+304) ||
+            (alarmAddress != 0 && alarmAddress < memoryAddress+448 && memoryAddress < alarmAddress+24) ||
+            (entryAddress != 0 && entryAddress < memoryAddress+448 && memoryAddress < entryAddress+32) ||
+            (timeAddress != 0 && timeAddress < memoryAddress+448 && memoryAddress < timeAddress+40)) return 2
+        val memory=nativeBufferAt(memoryAddress,448)
+        if (c5SleepRecordRead(memory,0) != 0x434d5831) return 2
+        val state=c5SleepRecordRead(memory,4)
+        if (state != 1 && state != 3 && state != 5 && state != 4) return 2
+    }
+    c5SleepRecordWrite(record,60,memoryAddress)
+    c5SleepRecordWrite(record,12,p);c5SleepRecordWrite(record,16,alarmAddress);c5SleepRecordWrite(record,20,plan|0)
+    c5SleepRecordWrite(record,24,(if (usePvt) 1 else 0)|(if (flashDown) 2 else 0));c5SleepRecordWrite(record,28,sleepResult);c5SleepRecordWrite(record,32,startupUs)
+    c5SleepRecordWrite(record,36,cacheToken&0xffffffff);c5SleepRecordWrite(record,40,(cacheToken>>>32)&0xffffffff);c5SleepRecordWrite(record,44,uartToken)
+    c5SleepRecordWrite(record,48,0);c5SleepRecordWrite(record,52,entryAddress);c5SleepRecordWrite(record,56,timeAddress);c5SleepRecordWrite(record,64,0);c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x43524331)
+    esp32C5SleepRecoveryContinueOwned(record,true)
+}

@@ -1,0 +1,110 @@
+import "./power/sleep_record_c5.ab"
+// C5 IDF6 mspi_ll: unlike the S3 helper, odd dividers use (div-1)/2 for H.
+// -1 invalid; hardware supports an eight-bit N field, including divide256.
+@section(".iram1.abla.c5MspiDivider")
+fun esp32C5MspiDividerBits(divider: int): int {
+    if (divider < 1 || divider > 256) return -1
+    if (divider == 1) return 0x80000000
+    val n=divider-1
+    n|((n>>>1)<<8)|(n<<16)
+}
+@section(".iram1.abla.c5MspiFrequency")
+fun esp32C5MspiFrequencyBits(coreMHz: int,targetMHz: int): int {
+    if ((coreMHz != 80 && coreMHz != 120) || targetMHz < 1 || targetMHz > coreMHz) return -1
+    val divider=int(u32(coreMHz)/u32(targetMHz))
+    if (divider*targetMHz != coreMHz) return -1
+    esp32C5MspiDividerBits(divider)
+}
+// DIG-498 C5 constraint: CPU MHz*8 >= actual PSRAM MHz. Compare as a ratio
+// without truncating core/divider. This is NOT PSRAM timing calibration.
+@section(".iram1.abla.c5PsramCpuSafe")
+fun esp32C5PsramCpuSafe(coreMHz: int,psramDivider: int,cpuMHz: int): bool =
+    (coreMHz == 80 || coreMHz == 120) && psramDivider >= 1 && psramDivider <= 256 &&
+    cpuMHz >= 1 && cpuMHz <= 240 && cpuMHz*8*psramDivider >= coreMHz
+@section(".iram1.abla.c5MspiField")
+trusted fun c5MspiField(address: int,mask: int,value: int): bool {
+    c5MspiWrite(address,(c5MspiRead(address)&~mask)|(value&mask))
+    (c5MspiRead(address)&mask) == (value&mask)
+}
+@section(".iram1.abla.c5MspiReady")
+trusted fun c5MspiReady(): bool =
+    (c5MspiRead(0x60096018)&15) == 13 && (c5MspiRead(0x6009601c)&0xf00) == 0x600
+//48B owned clock lease:tag0,status4,apply stage8,core12,flash bits16,
+// PSRAM bits20,flags24(SPI1 bit0/PSRAM bit1),saved core28,flash0/1 32/36,
+// PSRAM40,reverse stage44.1applied2invalid3partial4closed; internal5closing
+// prevents returning to apply after cancellation has begun.
+// Only PLL480-derived80/120MHz configurations supported by the C5 IDF LL.
+// No reset, source-mux change, PLL enable, timing/dummy adjustment or cache IO.
+// Caller owns shared SPI0/SPI1/PSRAM clock consumers, has stable PLL480 and
+// quiescent controllers/DMA, suspended caches and retained closure/data/stack.
+// psramMHz=0 explicitly means NO live PSRAM consumer, not "keep its speed":
+// changing the shared divider changes PSRAM too. Configure its speed otherwise.
+// All writes are checked but not atomic; keep exclusion/cache-off on partial,
+// retry same immutable plan or Close. Complete timing/mode changes separately
+// before enabling cache; clock success alone does not make memory safe.
+@section(".iram1.abla.c5MspiClocks")
+trusted fun esp32C5MspiClocksOwned(record: NativeBuffer,coreMHz: int,flashMHz: int,psramMHz: int,controlSpi1: bool,exclusiveCacheOff: bool): int {
+    if (!exclusiveCacheOff || !record.hasAddressRange(0,48) || (record.addressValue()&3) != 0) return 2
+    val flash=esp32C5MspiFrequencyBits(coreMHz,flashMHz)
+    val psram=if (psramMHz == 0) 0 else esp32C5MspiFrequencyBits(coreMHz,psramMHz)
+    if (flash < 0 || psram < 0) return 2
+    val flags=(if (controlSpi1) 1 else 0)|(if (psramMHz != 0) 2 else 0)
+    val tag=c5SleepRecordRead(record,0)
+    if (tag != 0 && tag != 0x434d5331) return 2
+    if (tag != 0) {
+        if (c5SleepRecordRead(record,12) != coreMHz || c5SleepRecordRead(record,16) != flash ||
+            c5SleepRecordRead(record,20) != psram || c5SleepRecordRead(record,24) != flags) return 2
+        if (c5SleepRecordRead(record,4) == 1) return 1
+        if (c5SleepRecordRead(record,4) != 3 || c5SleepRecordRead(record,8) > 3 || c5SleepRecordRead(record,44) != 0) return 2
+    }
+    if (!c5MspiReady()) return if (tag == 0) 2 else 3
+    if (tag == 0) {
+        c5SleepRecordWrite(record,12,coreMHz);c5SleepRecordWrite(record,16,flash);c5SleepRecordWrite(record,20,psram);c5SleepRecordWrite(record,24,flags)
+        c5SleepRecordWrite(record,28,c5MspiRead(0x6009601c)&255)
+        c5SleepRecordWrite(record,32,c5MspiRead(0x60002014)&0x80ffffff)
+        c5SleepRecordWrite(record,36,if (controlSpi1) c5MspiRead(0x60003014)&0x80ffffff else 0)
+        c5SleepRecordWrite(record,40,if (psramMHz != 0) c5MspiRead(0x60002050)&0x80ffffff else 0)
+        c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,44,0);c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x434d5331)
+    }
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        if (!c5MspiField(0x6009601c,255,if (coreMHz == 80) 5 else 3)) return 3
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        if (!c5MspiField(0x60002014,0x80ffffff,flash)) return 3
+        c5SleepRecordWrite(record,8,2)
+    }
+    if (stage <= 2) {
+        if (controlSpi1 && !c5MspiField(0x60003014,0x80ffffff,flash)) return 3
+        c5SleepRecordWrite(record,8,3)
+    }
+    if (psramMHz != 0 && !c5MspiField(0x60002050,0x80ffffff,psram)) return 3
+    c5SleepRecordWrite(record,8,4);c5SleepRecordWrite(record,4,1)
+    1
+}
+@section(".iram1.abla.c5MspiClocksClose")
+trusted fun esp32C5MspiClocksCloseOwned(record: NativeBuffer,exclusiveCacheOff: bool): int {
+    if (!exclusiveCacheOff || !record.hasAddressRange(0,48) || (record.addressValue()&3) != 0 || c5SleepRecordRead(record,0) != 0x434d5331) return 2
+    val state=c5SleepRecordRead(record,4)
+    if (state == 4) return 4
+    if ((state != 1 && state != 3 && state != 5) || c5SleepRecordRead(record,44) > 3) return 2
+    c5SleepRecordWrite(record,4,5)
+    if (!c5MspiReady()) return 3
+    val stage=c5SleepRecordRead(record,44);val flags=c5SleepRecordRead(record,24)
+    if (stage <= 0) {
+        if ((flags&2) != 0 && !c5MspiField(0x60002050,0x80ffffff,c5SleepRecordRead(record,40))) return 3
+        c5SleepRecordWrite(record,44,1)
+    }
+    if (stage <= 1) {
+        if ((flags&1) != 0 && !c5MspiField(0x60003014,0x80ffffff,c5SleepRecordRead(record,36))) return 3
+        c5SleepRecordWrite(record,44,2)
+    }
+    if (stage <= 2) {
+        if (!c5MspiField(0x60002014,0x80ffffff,c5SleepRecordRead(record,32))) return 3
+        c5SleepRecordWrite(record,44,3)
+    }
+    if (!c5MspiField(0x6009601c,255,c5SleepRecordRead(record,28))) return 3
+    c5SleepRecordWrite(record,44,4);c5SleepRecordWrite(record,4,4)
+    4
+}

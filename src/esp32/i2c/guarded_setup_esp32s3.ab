@@ -1,0 +1,34 @@
+import "./guarded_recovery_esp32s3.ab"
+
+// Initialize a controller before publishing it to transfer users, or retry
+// setup on the SAME owned pins after a failure. This does not acquire pads,
+// disconnect previously routed pins, or release RTC/USB ownership. The board
+// must establish those prerequisites; it must not use this to remap live pins.
+// Gate and RCC words are canonical and distinct, in initialized atomic RAM.
+// A failed setup latches fault so transfer admission cannot proceed.
+// 1=ready,7=invalid,9=claim/reset unavailable,10=bus held,11=owner violation.
+trusted fun esp32S3I2cSetupGuarded(gate: PeripheralGate, rcc: AtomicU32,
+    owner: u32, port: int, sda: int, scl: int, xtalHz: u32, busHz: u32,
+    internalPulls: bool = true, filter: int = 7): int {
+    if (!gate.word().valid() || !rcc.valid() || gate.word().address() == rcc.address() ||
+        !peripheralOwnerValid(owner) ||
+        !espChipS3().i2cMasterConfigurationValid(port, sda, scl) ||
+        !esp32S3I2cTiming(xtalHz, busHz).valid() || filter < 0 || filter > 15) return 7
+    val admission = gate.tryBegin(owner)
+    val recovering = admission == 2
+    if (admission == 1) return 9
+    if (admission == 3) return 7
+    if (recovering && !gate.tryBeginRecovery(owner)) return 9
+    var result = 9
+    if (esp32S3I2cResetWithRccLock(port, rcc, owner, false)) {
+        result = 7
+        // RCC is released before pad configuration and external bus checks.
+        if (esp32S3I2cSetupMaster(port, sda, scl, xtalHz, busHz, internalPulls, filter)) {
+            result = if (esp32S3I2cBusReleased(port, sda, scl)) 1 else 10
+        }
+    }
+    val released = if (recovering) gate.finishRecovery(owner, result == 1)
+        else gate.finish(owner, result == 1)
+    if (!released) return 11
+    result
+}

@@ -1,0 +1,92 @@
+import "../../peripheral_gate.ab"
+import "../../spi/buffer_gate.ab"
+import "./phases_logic.ab"
+// context64: low-level request32, wrappertag/status32,gate36,owner40,CS44,
+// low-level result48 (bit24 deselect failure, bit25 assertion failure),
+// selected52 (possibly asserted until verified high),preflight detail56,
+// setup/hold16-bit ticks60. Low-level hardware evidence remains at20.
+// Low-level reserved24/28 hold timing timestamp/state. Caller serializes begin/poll
+// on this context and pins it plus payload throughout request/recovery.
+// Caller supplies setup/hold in the same ticks as now/budget. Setup consumes
+// the transfer deadline; successful hold is additional and never shortened.
+// Timing starts on a subsequent poll to avoid counting time before CS/DONE.
+// Error deassertion is immediate, as with the blocking API. Failed GPIO
+// writes fault the gate and retain recovery evidence, never auto-retry.
+// Poll cadence can lengthen, never shorten, requested delays.
+// 1done2pending3invalid4gatebusy5faulted6ownershiplost7controllerfailure.
+trusted fun spiAsyncTransactionStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,64) || (context.loadU32(32)&0xffffff00) != 0x53544700) return 3
+    return context.load(32)
+}
+trusted fun spiAsyncTransactionFinish(context: NativeBuffer,result: int): int {
+    val gate=peripheralGateAt(context.loadU32(36))
+    val owner=u32(context.loadU32(40))
+    context.storeU32(48,result)
+    // Wrong owner must not be overwritten, nor its hardware manipulated.
+    if (gate.word().compareExchange(owner,owner) != owner) { context.store(32,6); return 6 }
+    var finished=result
+    if (context.loadU32(52) != 0) {
+        if (Pin(context.loadU32(44)).writeLevelOwned(true)) context.storeU32(52,0)
+        else finished=finished|(1<<24)
+    }
+    context.storeU32(48,finished)
+    if (!gate.finish(owner,finished == 1)) { context.store(32,6); return 6 }
+    val status=if (finished == 1) 1 else 7
+    context.store(32,status); return status
+}
+trusted fun esp32s3SpiAsyncTransactionBegin(context: NativeBuffer,gate: PeripheralGate,owner: u32,peripheral: int,pins: SpiPins,select: Pin,
+    command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,now: u32,budget: u32,releasedContext: bool,setupTicks: int = 0,holdTicks: int = 0): int {
+    if (!releasedContext || !context.hasAddressRange(0,64) || !esp32s3SpiMemoryRangeValid(peripheral,context,64) ||
+        !spiPhasesValid(command,commandBits,address,addressBits,dummy,direction,bytes) || !esp32s3SpiBufferRangeValid(peripheral,data,bytes) ||
+        !esp32s3SpiMasterPinsValid(peripheral,pins,select) || budget == u32(0) || budget > u32(0x7fffffff) ||
+        setupTicks < 0 || setupTicks > 65535 || holdTicks < 0 || holdTicks > 65535 || u32(setupTicks) >= budget ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292 || !gate.bufferDisjoint(context,64) || !gate.bufferDisjoint(data,bytes) ||
+        (bytes > 0 && context.addressValue() < data.addressValue()+bytes && data.addressValue() < context.addressValue()+64)) return 3
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return if (admitted == 1) 4 else if (admitted == 2) 5 else 3
+    // A preflight/CS failure must not expose a previous request's low-level
+    // tag, FIFO evidence or payload as though this request had started.
+    var clear=0
+    while (clear < 32) { context.storeU32(clear,0);clear=clear+4 }
+    context.storeU32(32,0x53544702); context.storeU32(36,gate.word().address()); context.storeU32(40,int(owner)); context.storeU32(44,select|0)
+    context.storeU32(48,0); context.storeU32(52,0); context.storeU32(56,0); context.storeU32(60,0)
+    val ready=esp32s3SpiExchangeReady(peripheral)
+    context.storeU32(56,ready)
+    if (ready != 1) return spiAsyncTransactionFinish(context,4)
+    context.storeU32(52,1)
+    if (!select.writeLevelOwned(false)) return spiAsyncTransactionFinish(context,4|(1<<25))
+    val result=esp32s3SpiPhasesBeginOwned(nativeBufferAt(context.addressValue(),32),peripheral,command,commandBits,address,addressBits,dummy,direction,data,bytes,now,budget,true)
+    if (result != 2) return spiAsyncTransactionFinish(context,result)
+    context.storeU32(60,setupTicks|(holdTicks<<16)); context.storeU32(24,0)
+    context.storeU32(28,if (setupTicks == 0) 3 else 0)
+    return 2
+}
+trusted fun esp32s3SpiAsyncTransactionPoll(context: NativeBuffer,now: u32): int {
+    val status=spiAsyncTransactionStatus(context)
+    if (status != 2) return status
+    val gate=peripheralGateAt(context.loadU32(36))
+    val owner=u32(context.loadU32(40))
+    if (gate.word().compareExchange(owner,owner) != owner) { context.store(32,6); return 6 }
+    val timing=context.loadU32(28)
+    // A late first/setup poll must not extend the transfer deadline merely
+    // by arming or waiting for the minimum CS delay. Low-level timeout keeps
+    // hardware evidence and never launches START once the budget has expired.
+    if ((timing == 0 || timing == 1) && now-u32(context.loadU32(12)) >= u32(context.loadU32(16))) {
+        val expired=esp32s3SpiPhasesPollOwned(nativeBufferAt(context.addressValue(),32),now)
+        return spiAsyncTransactionFinish(context,expired)
+    }
+    if (timing == 0 || timing == 4) {
+        context.storeU32(24,int(now)); context.storeU32(28,if (timing == 0) 1 else 2); return 2
+    }
+    if (timing == 1) {
+        if (now-u32(context.loadU32(24)) < u32(context.loadU32(60)&65535)) return 2
+        context.storeU32(28,3)
+    } else if (timing == 2) {
+        if (now-u32(context.loadU32(24)) < u32(context.loadU32(60)>>16)) return 2
+        return spiAsyncTransactionFinish(context,1)
+    } else if (timing != 3) return spiAsyncTransactionFinish(context,3)
+    val result=esp32s3SpiPhasesPollOwned(nativeBufferAt(context.addressValue(),32),now)
+    if (result == 2) return 2
+    if (result == 1 && (context.loadU32(60)>>16) != 0) { context.storeU32(28,4); return 2 }
+    return spiAsyncTransactionFinish(context,result)
+}

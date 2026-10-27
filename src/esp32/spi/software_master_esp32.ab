@@ -1,0 +1,273 @@
+import "../gpio.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../rom/system_esp32.ab"
+import "../peripheral_delay_1khz.ab"
+import "../../spi/software_bits.ab"
+import "../../atomic.ab"
+import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
+
+// Synchronous software SPI backend for the public ESP-IDF-shaped Abla API.
+// It supports modes 0-3, full/half duplex, explicit bus acquisition, optional
+// chip select, and keep-CS-active transactions without an opaque SPI archive.
+
+val esp32SoftwareSpiMagic = u32(0x41425350)
+val esp32SoftwareSpiOk = i32(0)
+val esp32SoftwareSpiNoMemory = i32(257)
+val esp32SoftwareSpiInvalidArgument = i32(258)
+val esp32SoftwareSpiInvalidState = i32(259)
+val esp32SoftwareSpiTimeout = i32(263)
+
+val esp32SoftwareSpiBus1Storage = nativeStaticMutableU32s([
+    0, 0xffffffff, 0xffffffff, 0xffffffff, 0, 0
+])
+val esp32SoftwareSpiBus1 = u32(esp32SoftwareSpiBus1Storage)
+val esp32SoftwareSpiBus2Storage = nativeStaticMutableU32s([
+    0, 0xffffffff, 0xffffffff, 0xffffffff, 0, 0
+])
+val esp32SoftwareSpiBus2 = u32(esp32SoftwareSpiBus2Storage)
+
+@inline
+trusted fun esp32SoftwareSpiLoad(address: u32, offset: u32 = u32(0)): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address + offset))))
+
+@inline
+trusted fun esp32SoftwareSpiStore(address: u32, offset: u32, value: u32): void {
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address + offset)), int(value))
+    return
+}
+
+@inline
+fun esp32SoftwareSpiBus(host: i32): u32 =
+    if (host == i32(1)) esp32SoftwareSpiBus1 else esp32SoftwareSpiBus2
+
+@inline
+trusted fun esp32SoftwareSpiDeviceValid(device: u32): bool =
+    device != u32(0) && esp32SoftwareSpiLoad(device) == esp32SoftwareSpiMagic
+
+trusted fun esp32SoftwareSpiAcquire(device: u32, wait: u32): bool {
+    val bus = esp32SoftwareSpiLoad(device, u32(4))
+    if (esp32SoftwareSpiLoad(device, u32(28)) != u32(0)) return true
+    val lock = atomicU32At(int(bus + u32(20)))
+    val start = xtensaReadCycleCount()
+    var acquired = lock.compareSetRelaxed(u32(0), device)
+    while (!acquired) {
+        if (wait != u32(0xffffffff)) {
+            val elapsed = xtensaReadCycleCount() - start
+            if (elapsed >= wait * u32(1000) * esp32RomGetCpuTicksPerUs())
+                return false
+        }
+        acquired = lock.compareSetRelaxed(u32(0), device)
+    }
+    atomicMemoryFence()
+    return true
+}
+
+trusted fun esp32SoftwareSpiRelease(device: u32): void {
+    if (esp32SoftwareSpiLoad(device, u32(28)) != u32(0)) return
+    atomicMemoryFence()
+    val bus = esp32SoftwareSpiLoad(device, u32(4))
+    esp32SoftwareSpiStore(bus, u32(20), u32(0))
+    return
+}
+
+@inline
+trusted fun esp32SoftwareSpiChipSelect(device: u32, active: bool): void {
+    val number = i32(esp32SoftwareSpiLoad(device, u32(8)))
+    if (number >= i32(0)) pin(int(number)).write(!active)
+    return
+}
+
+trusted fun esp32SoftwareSpiTransferBits(
+    device: u32, transmit: u32, transmitBits: u32,
+    receive: u32, receiveBits: u32
+): void {
+    val bus = esp32SoftwareSpiLoad(device, u32(4))
+    val mosiNumber = i32(esp32SoftwareSpiLoad(bus, u32(4)))
+    val misoNumber = i32(esp32SoftwareSpiLoad(bus, u32(8)))
+    val clock = pin(int(i32(esp32SoftwareSpiLoad(bus, u32(12)))))
+    val mosi = pin(int(mosiNumber))
+    val miso = pin(int(misoNumber))
+    val mode = esp32SoftwareSpiLoad(device, u32(20))
+    val halfPeriod = softwareSpiHalfPeriodMicroseconds(esp32SoftwareSpiLoad(device, u32(16)))
+    val totalBits = if (transmitBits > receiveBits) transmitBits else receiveBits
+    var bitIndex = u32(0)
+    while (bitIndex < totalBits) {
+        val transmitBit = if (bitIndex < transmitBits && transmit != u32(0)) {
+            val byte = u32(ablaUnsafeLoadU8(nativePointerFromAddress(
+                int(transmit + (bitIndex >>> u32(3)))
+            )))
+            (byte & (u32(1) << (u32(7) - (bitIndex & u32(7))))) != u32(0)
+        } else false
+        val sample = softwareSpiExchangeBit(clock, mosi,
+            if (bitIndex < receiveBits && receive != u32(0)) miso else pin(-1),
+            transmitBit, int(mode), halfPeriod)
+        if (bitIndex < receiveBits && receive != u32(0) && misoNumber >= i32(0)) {
+            val address = receive + (bitIndex >>> u32(3))
+            val old = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+            val mask = u32(1) << (u32(7) - (bitIndex & u32(7)))
+            val value = if (sample) old | mask else old & ~mask
+            ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), int(value))
+        }
+        bitIndex = bitIndex + u32(1)
+    }
+    return
+}
+
+trusted noescape fun spi_bus_initialize(
+    host: i32, configurationPointer: i64*, dmaChannel: i32
+): i32 {
+    val configuration = u32(nativePointerAddress(configurationPointer))
+    if ((host != i32(1) && host != i32(2)) || configuration == u32(0))
+        return esp32SoftwareSpiInvalidArgument
+    val bus = esp32SoftwareSpiBus(host)
+    if (esp32SoftwareSpiLoad(bus) != u32(0))
+        return esp32SoftwareSpiInvalidState
+    val mosi = i32(esp32SoftwareSpiLoad(configuration))
+    val miso = i32(esp32SoftwareSpiLoad(configuration, u32(4)))
+    val clock = i32(esp32SoftwareSpiLoad(configuration, u32(8)))
+    if (!pin(int(clock)).outputCapable() || mosi < i32(-1) || miso < i32(-1) ||
+        (mosi >= i32(0) && !pin(int(mosi)).outputCapable()) ||
+        (miso >= i32(0) && !pin(int(miso)).valid()) || clock == mosi || clock == miso ||
+        (mosi >= i32(0) && mosi == miso))
+        return esp32SoftwareSpiInvalidArgument
+    esp32SoftwareSpiStore(bus, u32(0), u32(1))
+    esp32SoftwareSpiStore(bus, u32(4), u32(mosi))
+    esp32SoftwareSpiStore(bus, u32(8), u32(miso))
+    esp32SoftwareSpiStore(bus, u32(12), u32(clock))
+    esp32SoftwareSpiStore(bus, u32(16), u32(0))
+    esp32SoftwareSpiStore(bus, u32(20), u32(0))
+    pin(int(clock)).write(false)
+    pin(int(clock)).output()
+    if (mosi >= i32(0)) pin(int(mosi)).output()
+    if (miso >= i32(0)) pin(int(miso)).input()
+    return esp32SoftwareSpiOk
+}
+
+trusted noescape fun spi_bus_free(host: i32): i32 {
+    if (host != i32(1) && host != i32(2))
+        return esp32SoftwareSpiInvalidArgument
+    val bus = esp32SoftwareSpiBus(host)
+    if (esp32SoftwareSpiLoad(bus) == u32(0))
+        return esp32SoftwareSpiInvalidState
+    if (esp32SoftwareSpiLoad(bus, u32(16)) != u32(0))
+        return esp32SoftwareSpiInvalidState
+    esp32SoftwareSpiStore(bus, u32(0), u32(0))
+    return esp32SoftwareSpiOk
+}
+
+trusted noescape fun spi_bus_add_device(
+    host: i32, configurationPointer: i64*, outputPointer: i64*
+): i32 {
+    val configuration = u32(nativePointerAddress(configurationPointer))
+    val output = u32(nativePointerAddress(outputPointer))
+    if ((host != i32(1) && host != i32(2)) ||
+        configuration == u32(0) || output == u32(0))
+        return esp32SoftwareSpiInvalidArgument
+    val bus = esp32SoftwareSpiBus(host)
+    if (esp32SoftwareSpiLoad(bus) == u32(0))
+        return esp32SoftwareSpiInvalidState
+    val frequency = esp32SoftwareSpiLoad(configuration, u32(16))
+    val chipSelect = i32(esp32SoftwareSpiLoad(configuration, u32(28)))
+    val mode = u32(ablaUnsafeLoadU8(nativePointerFromAddress(
+        int(configuration + u32(3))
+    ))) & u32(3)
+    if (frequency == u32(0) || chipSelect < i32(-1) ||
+        (chipSelect >= i32(0) && !esp32BasicGpioOutputValid(int(chipSelect))))
+        return esp32SoftwareSpiInvalidArgument
+    val device = esp32LibcMalloc(u32(32))
+    if (device == u32(0)) return esp32SoftwareSpiNoMemory
+    esp32SoftwareSpiStore(device, u32(0), esp32SoftwareSpiMagic)
+    esp32SoftwareSpiStore(device, u32(4), bus)
+    esp32SoftwareSpiStore(device, u32(8), u32(chipSelect))
+    esp32SoftwareSpiStore(device, u32(12), u32(host))
+    esp32SoftwareSpiStore(device, u32(16), frequency)
+    esp32SoftwareSpiStore(device, u32(20), mode)
+    esp32SoftwareSpiStore(device, u32(24),
+        esp32SoftwareSpiLoad(configuration, u32(32)))
+    esp32SoftwareSpiStore(device, u32(28), u32(0))
+    esp32SoftwareSpiStore(bus, u32(16),
+        esp32SoftwareSpiLoad(bus, u32(16)) + u32(1))
+    val clock = pin(int(i32(esp32SoftwareSpiLoad(bus, u32(12)))))
+    clock.write((mode & u32(2)) != u32(0))
+    if (chipSelect >= i32(0)) {
+        pin(int(chipSelect)).write(true)
+        pin(int(chipSelect)).output()
+    }
+    esp32SoftwareSpiStore(output, u32(0), device)
+    return esp32SoftwareSpiOk
+}
+
+trusted noescape fun spi_bus_remove_device(devicePointer: i64*): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    if (!esp32SoftwareSpiDeviceValid(device))
+        return esp32SoftwareSpiInvalidArgument
+    if (esp32SoftwareSpiLoad(device, u32(28)) != u32(0))
+        return esp32SoftwareSpiInvalidState
+    val bus = esp32SoftwareSpiLoad(device, u32(4))
+    val count = esp32SoftwareSpiLoad(bus, u32(16))
+    esp32SoftwareSpiStore(bus, u32(16), if (count == u32(0)) u32(0) else count - u32(1))
+    esp32SoftwareSpiStore(device, u32(0), u32(0))
+    esp32LibcFree(device)
+    return esp32SoftwareSpiOk
+}
+
+trusted noescape fun spi_device_acquire_bus(
+    devicePointer: i64*, wait: u32
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    if (!esp32SoftwareSpiDeviceValid(device))
+        return esp32SoftwareSpiInvalidArgument
+    if (esp32SoftwareSpiLoad(device, u32(28)) != u32(0))
+        return esp32SoftwareSpiInvalidState
+    if (!esp32SoftwareSpiAcquire(device, wait))
+        return esp32SoftwareSpiTimeout
+    esp32SoftwareSpiStore(device, u32(28), u32(1))
+    return esp32SoftwareSpiOk
+}
+
+trusted noescape fun spi_device_release_bus(devicePointer: i64*): void {
+    val device = u32(nativePointerAddress(devicePointer))
+    if (!esp32SoftwareSpiDeviceValid(device) ||
+        esp32SoftwareSpiLoad(device, u32(28)) == u32(0)) return
+    esp32SoftwareSpiStore(device, u32(28), u32(0))
+    val bus = esp32SoftwareSpiLoad(device, u32(4))
+    atomicMemoryFence()
+    esp32SoftwareSpiStore(bus, u32(20), u32(0))
+    return
+}
+
+trusted noescape fun spi_device_transmit(
+    devicePointer: i64*, transactionPointer: i64*
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    val transaction = u32(nativePointerAddress(transactionPointer))
+    if (!esp32SoftwareSpiDeviceValid(device) || transaction == u32(0))
+        return esp32SoftwareSpiInvalidArgument
+    val alreadyAcquired = esp32SoftwareSpiLoad(device, u32(28)) != u32(0)
+    if (!alreadyAcquired && !esp32SoftwareSpiAcquire(device, u32(0xffffffff)))
+        return esp32SoftwareSpiTimeout
+    val flags = esp32SoftwareSpiLoad(transaction)
+    val transmitBits = esp32SoftwareSpiLoad(transaction, u32(16))
+    val receiveBits = esp32SoftwareSpiLoad(transaction, u32(20))
+    val transmit = esp32SoftwareSpiLoad(transaction, u32(32))
+    val receive = esp32SoftwareSpiLoad(transaction, u32(36))
+    // Other devices on this bus may use a different CPOL. Restore this
+    // device's idle clock while ownership is held and before asserting CS.
+    pin(int(i32(esp32SoftwareSpiLoad(esp32SoftwareSpiLoad(device, u32(4)), u32(12))))).write(
+        (esp32SoftwareSpiLoad(device, u32(20)) & u32(2)) != u32(0))
+    esp32SoftwareSpiChipSelect(device, true)
+    if ((esp32SoftwareSpiLoad(device, u32(24)) & u32(16)) != u32(0) &&
+        transmitBits != u32(0) && receiveBits != u32(0)) {
+        esp32SoftwareSpiTransferBits(device, transmit, transmitBits, u32(0), u32(0))
+        esp32SoftwareSpiTransferBits(device, u32(0), u32(0), receive, receiveBits)
+    } else {
+        esp32SoftwareSpiTransferBits(
+            device, transmit, transmitBits, receive, receiveBits
+        )
+    }
+    if ((flags & u32(256)) == u32(0))
+        esp32SoftwareSpiChipSelect(device, false)
+    if (!alreadyAcquired) esp32SoftwareSpiRelease(device)
+    return esp32SoftwareSpiOk
+}

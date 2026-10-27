@@ -1,0 +1,227 @@
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "../../xtensa/assembly.ab"
+import "../../xtensa/cpu.ab"
+import "../cpu/control_esp32.ab"
+
+// Pure Abla/LLVM implementation of the ESP32 per-core FreeRTOS hook registry.
+// The original C object used two [core][8] function-pointer arrays and one
+// recursive portMUX. One compiler-owned static region preserves the two
+// arrays and a private lock without a heap object, runtime module initializer,
+// opaque data assembly, or public storage symbol.
+
+@noinline
+@section(".iram1.abla.freertos.hooks_storage")
+fun esp32FreertosHooksStorage(): int = nativeStaticAllocate(132)
+
+@inline
+fun esp32FreertosIdleCallbacks(): int = esp32FreertosHooksStorage()
+
+@inline
+fun esp32FreertosTickCallbacks(): int =
+    esp32FreertosHooksStorage() + 64
+
+@inline
+fun esp32FreertosHooksLock(): u32 =
+    u32(esp32FreertosHooksStorage() + 128)
+
+@inline
+fun esp32FreertosHookSlotAddress(
+    callbacks: int,
+    core: u32,
+    hookSlot: u32
+): int = callbacks + int((core * u32(8) + hookSlot) * u32(4))
+
+@inline
+trusted fun esp32FreertosHookLoad(
+    callbacks: int,
+    core: u32,
+    hookSlot: u32
+): u32 = u32(ablaUnsafeVolatileLoadU32(
+    esp32FreertosHookSlotAddress(callbacks, core, hookSlot)
+))
+
+@inline
+trusted fun esp32FreertosHookStore(
+    callbacks: int,
+    core: u32,
+    hookSlot: u32,
+    callback: u32
+): void = ablaUnsafeVolatileStoreU32(
+    esp32FreertosHookSlotAddress(callbacks, core, hookSlot),
+    int(callback)
+)
+
+@inline
+trusted fun esp32FreertosHooksEnter(): u32 {
+    val processorState = xtensaRaiseInterruptLevel3()
+    while (xtensaAtomicCompareExchangeU32(
+        esp32FreertosHooksLock(), u32(0), u32(1)
+    ) != u32(0)) {}
+    processorState
+}
+
+@inline
+trusted fun esp32FreertosHooksExit(processorState: u32): void {
+    ablaUnsafeVolatileStoreU32(
+        int(esp32FreertosHooksLock()), int(u32(0))
+    )
+    xtensaRestoreProcessorState(processorState)
+}
+
+trusted fun esp32FreertosRegisterHookForCore(
+    callbacks: int,
+    callback: u32,
+    core: u32
+): u32 {
+    if (core >= u32(2)) return u32(258)
+    val processorState = esp32FreertosHooksEnter()
+    var hookSlot = u32(0)
+    while (hookSlot < u32(8)) {
+        if (esp32FreertosHookLoad(callbacks, core, hookSlot) == u32(0)) {
+            esp32FreertosHookStore(callbacks, core, hookSlot, callback)
+            esp32FreertosHooksExit(processorState)
+            return u32(0)
+        }
+        hookSlot = hookSlot + u32(1)
+    }
+    esp32FreertosHooksExit(processorState)
+    u32(257)
+}
+
+trusted fun esp32FreertosDeregisterHookForCore(
+    callbacks: int,
+    callback: u32,
+    core: u32
+): void {
+    if (core >= u32(2)) return
+    val processorState = esp32FreertosHooksEnter()
+    var hookSlot = u32(0)
+    while (hookSlot < u32(8)) {
+        if (esp32FreertosHookLoad(callbacks, core, hookSlot) == callback) {
+            esp32FreertosHookStore(callbacks, core, hookSlot, u32(0))
+        }
+        hookSlot = hookSlot + u32(1)
+    }
+    esp32FreertosHooksExit(processorState)
+}
+
+// Original ABI symbol: esp_vApplicationTickHook
+@section(".iram1.abla.freertos.application_tick_hook")
+trusted fun esp32RecoveredEspVApplicationTickHook(): void {
+    val core = cpuCoreId()
+    val callbacks = esp32FreertosTickCallbacks()
+    var hookSlot = u32(0)
+    while (hookSlot < u32(8)) {
+        val callback = esp32FreertosHookLoad(
+            callbacks, core, hookSlot
+        )
+        if (callback != u32(0)) ablaUnsafeCallVoid0(int(callback))
+        hookSlot = hookSlot + u32(1)
+    }
+}
+
+// Original ABI symbol: esp_vApplicationIdleHook
+trusted fun esp32RecoveredEspVApplicationIdleHook(): void {
+    val core = cpuCoreId()
+    val callbacks = esp32FreertosIdleCallbacks()
+    var canIdle = true
+    var hookSlot = u32(0)
+    while (hookSlot < u32(8)) {
+        val callback = esp32FreertosHookLoad(
+            callbacks, core, hookSlot
+        )
+        if (callback != u32(0) &&
+            ablaUnsafeCallI32(int(callback)) == 0) {
+            canIdle = false
+        }
+        hookSlot = hookSlot + u32(1)
+    }
+    if (canIdle) esp32RecoveredEspCpuWaitForIntr()
+}
+
+// Original ABI symbol: esp_register_freertos_idle_hook_for_cpu
+trusted fun esp32RecoveredEspRegisterFreertosIdleHookForCpu(
+    callback: u32,
+    core: u32
+): u32 = esp32FreertosRegisterHookForCore(
+    esp32FreertosIdleCallbacks(), callback, core
+)
+
+// Original ABI symbol: esp_register_freertos_idle_hook
+trusted fun esp32RecoveredEspRegisterFreertosIdleHook(callback: u32): u32 =
+    esp32RecoveredEspRegisterFreertosIdleHookForCpu(
+        callback, cpuCoreId()
+    )
+
+// Original ABI symbol: esp_register_freertos_tick_hook_for_cpu
+trusted fun esp32RecoveredEspRegisterFreertosTickHookForCpu(
+    callback: u32,
+    core: u32
+): u32 = esp32FreertosRegisterHookForCore(
+    esp32FreertosTickCallbacks(), callback, core
+)
+
+// Original ABI symbol: esp_register_freertos_tick_hook
+trusted fun esp32RecoveredEspRegisterFreertosTickHook(callback: u32): u32 =
+    esp32RecoveredEspRegisterFreertosTickHookForCpu(
+        callback, cpuCoreId()
+    )
+
+// Original ABI symbol: esp_deregister_freertos_idle_hook_for_cpu
+trusted fun esp32RecoveredEspDeregisterFreertosIdleHookForCpu(
+    callback: u32,
+    core: u32
+): void = esp32FreertosDeregisterHookForCore(
+    esp32FreertosIdleCallbacks(), callback, core
+)
+
+// Original ABI symbol: esp_deregister_freertos_idle_hook
+trusted fun esp32RecoveredEspDeregisterFreertosIdleHook(callback: u32): void {
+    val processorState = esp32FreertosHooksEnter()
+    var core = u32(0)
+    while (core < u32(2)) {
+        var hookSlot = u32(0)
+        while (hookSlot < u32(8)) {
+            if (esp32FreertosHookLoad(
+                esp32FreertosIdleCallbacks(), core, hookSlot
+            ) == callback) {
+                esp32FreertosHookStore(
+                    esp32FreertosIdleCallbacks(), core, hookSlot, u32(0)
+                )
+            }
+            hookSlot = hookSlot + u32(1)
+        }
+        core = core + u32(1)
+    }
+    esp32FreertosHooksExit(processorState)
+}
+
+// Original ABI symbol: esp_deregister_freertos_tick_hook_for_cpu
+trusted fun esp32RecoveredEspDeregisterFreertosTickHookForCpu(
+    callback: u32,
+    core: u32
+): void = esp32FreertosDeregisterHookForCore(
+    esp32FreertosTickCallbacks(), callback, core
+)
+
+// Original ABI symbol: esp_deregister_freertos_tick_hook
+trusted fun esp32RecoveredEspDeregisterFreertosTickHook(callback: u32): void {
+    val processorState = esp32FreertosHooksEnter()
+    var core = u32(0)
+    while (core < u32(2)) {
+        var hookSlot = u32(0)
+        while (hookSlot < u32(8)) {
+            if (esp32FreertosHookLoad(
+                esp32FreertosTickCallbacks(), core, hookSlot
+            ) == callback) {
+                esp32FreertosHookStore(
+                    esp32FreertosTickCallbacks(), core, hookSlot, u32(0)
+                )
+            }
+            hookSlot = hookSlot + u32(1)
+        }
+        core = core + u32(1)
+    }
+    esp32FreertosHooksExit(processorState)
+}

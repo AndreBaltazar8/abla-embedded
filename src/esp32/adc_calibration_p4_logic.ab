@@ -1,0 +1,67 @@
+// SPDX-FileCopyrightText: 2024-2025 Espressif Systems (Shanghai) CO LTD
+// SPDX-License-Identifier: Apache-2.0
+// ESP-IDF6.0.2 esp32p4 esp_efuse_rtc_calib.c and curve_fitting_coefficients.c.
+// Immutable scalar calibration. Hardware initial code is NOT channel-adjusted:
+// channel compensation is subtracted from RAW, clamped, then Q16-scaled.
+type P4AdcCalibration=int
+fun P4AdcCalibration.valid(): bool = (this&(1<<34)) != 0
+fun P4AdcCalibration.error(): int = if (this.valid()) 0 else this&255
+fun P4AdcCalibration.initCode(): int = if (this.valid()) this&4095 else -1
+fun P4AdcCalibration.referenceCode(): int = if (this.valid()) (this>>>12)&4095 else -1
+fun P4AdcCalibration.unit(): int = if (this.valid()) ((this>>>28)&1)+1 else 0
+fun P4AdcCalibration.attenuation(): int = if (this.valid()) (this>>>29)&3 else -1
+fun P4AdcCalibration.channel(): int = if (this.valid()) (this>>>31)&7 else -1
+fun P4AdcCalibration.compensation(): int {
+    if (!this.valid()) return 0
+    val encoded=(this>>>24)&15
+    val magnitude=encoded&7
+    return (if ((encoded&8) != 0) -magnitude else magnitude)*(4-this.attenuation())
+}
+fun p4AdcReferenceMillivolts(attenuation: int): int = if (attenuation == 0) 600 else if (attenuation == 1) 800 else if (attenuation == 2) 1200 else 2300
+// version is HAL block major*100+minor; IDF uses calibration version1 whenever
+// that value >=1. Error2input3unprogrammed-version4field-range5read-protected.
+fun esp32p4AdcCalibrationFromFields(unit: int,channel: int,attenuation: int,version: int,initial: int,reference: int,difference: int): P4AdcCalibration {
+    if (channel < 0 || !((unit == 1 && channel < 8) || (unit == 2 && channel < 6)) || attenuation < 0 || attenuation > 3) return P4AdcCalibration(2)
+    if (version < 1) return P4AdcCalibration(3)
+    if (initial < 0 || initial > 1023 || reference < 0 || reference > 1023 || difference < 0 || difference > 15) return P4AdcCalibration(4)
+    val magnitude=reference&511
+    val signedReference: int=if ((reference&512) != 0) -magnitude else magnitude
+    val code=(if (attenuation < 2) 2300 else 2350)+signedReference
+    return P4AdcCalibration((1<<34)|(initial+1400)|(code<<12)|(difference<<24)|((unit-1)<<28)|(attenuation<<29)|(channel<<31))
+}
+fun p4AdcCurveSlopeCoefficient(unit: int,attenuation: int): int {
+    if (unit == 1) return if (attenuation == 0) 10598497992115 else if (attenuation == 1) 15840076608145 else if (attenuation == 2) 1594266424857 else 10082311568625
+    return if (attenuation == 0) 5037402667913 else if (attenuation == 1) 11021577596635 else if (attenuation == 2) 11623930881896 else 9458501263393
+}
+// Exact floor(mv*coefficient/denominator), using 13 bounded doubling steps.
+// No float, allocation, 64-bit division or overflow-prone polynomial products.
+// Valid first-step range from every possible efuse field is below6000mV.
+fun p4AdcCurveLinearTerm(mv: u32,coefficient: int,denominator: int): int {
+    var remainder=0
+    var quotient=u32(0)
+    var bit=u32(4096)
+    while (bit != u32(0)) {
+        remainder=remainder+remainder
+        quotient=quotient<<u32(1)
+        if ((mv&bit) != u32(0)) remainder=remainder+coefficient
+        if (remainder >= denominator) { remainder=remainder-denominator;quotient=quotient+u32(1) }
+        if (remainder >= denominator) { remainder=remainder-denominator;quotient=quotient+u32(1) }
+        bit=bit>>u32(1)
+    }
+    return int(quotient)
+}
+fun P4AdcCalibration.millivolts(raw: int): int {
+    if (!this.valid() || raw < 0 || raw > 4095) return -1
+    val adjusted=raw-this.compensation()
+    val bounded=u32(if (adjusted < 0) 0 else if (adjusted > 4095) 4095 else adjusted)
+    val attenuation=this.attenuation()
+    // Preserve IDF's two separate truncations, not raw*voltage/reference.
+    val slope=(u32(p4AdcReferenceMillivolts(attenuation))<<u32(16))/u32(this.referenceCode())
+    val first=(bounded*slope)>>u32(16)
+    if (first == u32(0)) return 0
+    val denominator: int=if (this.unit() == 1 && attenuation == 2) 100000000000000000 else 10000000000000000
+    // floor(K0) is0,0,1,2 for both units; its sign is negative. The positive
+    // K1 term is truncated separately, exactly as get_reading_error in IDF.
+    val constant=if (attenuation < 2) 0 else attenuation-1
+    return int(first)+constant-p4AdcCurveLinearTerm(first,p4AdcCurveSlopeCoefficient(this.unit(),attenuation),denominator)
+}

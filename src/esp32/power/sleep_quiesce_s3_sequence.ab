@@ -1,0 +1,66 @@
+import "../sdk/raw_buffer.ab"
+import "../../xtensa/interrupt_guard_logic.ab"
+import "abla/runtime/scalar"
+// Caller already owns scheduler-safe rendezvous on BOTH cores, installed and
+// routed the OTHER core's non-reentrant peer handler, and stopped DMA/clients.
+// This supplies actual peer acknowledgement and local mask ownership, NOT
+// scheduler locks or DMA suspension. Internal record/mailbox/stack/code only.
+// Record32:magic,state,mailbox,ticket,core,guard,guardOwned,reserved.
+// States1requested2critical3release4restorelocal5closed.
+// Returns1critical,2pending,3invalid,4requestrefused,5closed,6restorefailed.
+// Close requires resourcesRecovered: clocks/cache/owners safe for either core.
+fun s3SleepQuiesceRecordValid(r: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x53335155 && r.loadU32(16) == xtensaGuardCore()
+@section(".iram1.abla.s3SleepQuiesceOpen")
+trusted fun esp32S3SleepQuiesceOpenOwned(r: NativeBuffer,mailbox: NativeBuffer,channel: int,schedulerSafeExclusive: bool): int {
+    if (!schedulerSafeExclusive || !r.hasAddressRange(0,32) || !mailbox.hasAddressRange(0,4) ||
+        ((r.addressValue()|mailbox.addressValue())&3) != 0 || r.loadU32(0) != 0 || channel < 0 || channel > 3 ||
+        (r.addressValue() < mailbox.addressValue()+4 && mailbox.addressValue() < r.addressValue()+32)) return 3
+    val ticket=esp32S3PeerParkNotifyOwned(mailbox.addressValue(),channel)
+    if (ticket == 0) return 4
+    var offset=4
+    while (offset < 32) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x53335155);r.storeU32(4,1);r.storeU32(8,mailbox.addressValue());r.storeU32(12,ticket);r.storeU32(16,xtensaGuardCore())
+    return 2
+}
+@section(".iram1.abla.s3SleepQuiescePoll")
+trusted fun esp32S3SleepQuiescePollOwned(r: NativeBuffer): int {
+    if (!s3SleepQuiesceRecordValid(r)) return 3
+    val state=r.loadU32(4)
+    if (state == 2) return if (r.loadU32(24) == 1 && (xtensaGuardStatus()&15) == 15 && xtensaPeerParkStatusOwned(r.loadU32(8),r.loadU32(12)) == 2) 1 else 3
+    if (state != 1) return 3
+    val phase=xtensaPeerParkStatusOwned(r.loadU32(8),r.loadU32(12))
+    if (phase == 1) return 2
+    if (phase != 2) return 3
+    val guard=xtensaInterruptGuardEnter()
+    r.storeU32(20,guard|0);r.storeU32(24,1);r.storeU32(4,2)
+    return 1
+}
+@section(".iram1.abla.s3SleepQuiesceClose")
+trusted fun esp32S3SleepQuiesceCloseOwned(r: NativeBuffer,resourcesRecovered: bool): int {
+    if (!resourcesRecovered || !s3SleepQuiesceRecordValid(r)) return 3
+    var state=r.loadU32(4)
+    if (state == 5) return 5
+    if (state < 1 || state > 4) return 3
+    val mailbox=r.loadU32(8);val ticket=r.loadU32(12)
+    if (state == 1 || state == 2) { r.storeU32(4,3);state=3 }
+    if (state == 3) {
+        var phase=xtensaPeerParkStatusOwned(mailbox,ticket)
+        if (phase == 1) {
+            xtensaPeerParkCancelOwned(mailbox,ticket)
+            phase=xtensaPeerParkStatusOwned(mailbox,ticket)
+        }
+        // A lost cancellation race is a real parked peer, not a timeout.
+        if (phase == 2) {
+            xtensaPeerParkReleaseOwned(mailbox,ticket)
+            phase=xtensaPeerParkStatusOwned(mailbox,ticket)
+        }
+        if (phase == 3) return 2
+        if (phase != 4 && phase != 5) return 3
+        r.storeU32(4,4)
+    }
+    if (r.loadU32(24) == 1) {
+        if (!xtensaInterruptGuardLeave(XtensaInterruptGuard(r.loadU32(20)))) return 6
+        r.storeU32(24,0)
+    }
+    r.storeU32(4,5);return 5
+}

@@ -1,0 +1,81 @@
+import "./gdma_clock_c6_sequence.ab"
+import "./gdma_tx_channel_c6_sequence.ab"
+// Own direction/trigger/ISR/ETM, stop peripheral requests first and pin clocks.
+// STOP token status8,channel2@8,TX10,lease11. 1parked2invalid3clock
+// 4reset/ETM/IRQ-owned5pending. PARK joins only the descriptor FSM, not FIFO,
+// peripheral completion, cache visibility or descriptor ownership.
+type C6GdmaStop=int
+fun C6GdmaStop.status(): int = this&255
+trusted fun c6GdmaControlAdmitted(channel: int,tx: bool): bool {
+    val base=c6GdmaChannelBase(channel,tx)
+    return (c6GdmaRead(base)&u32(if (tx) 65 else 33)) == u32(0) && c6GdmaRead(c6GdmaEventBase(channel,tx)+8) == u32(0)
+}
+trusted fun C6GdmaStop.waitOwned(polls: int,exclusive: bool): C6GdmaStop {
+    if (!exclusive || polls < 1 || polls > 1000000 || this < 0 || (this&~4095) != 0 || (this&2048) == 0 || ((this>>>8)&3) > 2) return this
+    val token=this&~255
+    val channel=(token>>>8)&3;val tx=(token&1024) != 0
+    if (!c6GdmaClocksReady()) return C6GdmaStop(token|3)
+    if (!c6GdmaControlAdmitted(channel,tx)) return C6GdmaStop(token|4)
+    val at=c6GdmaChannelBase(channel,tx)+16
+    var remaining=polls
+    while (remaining > 0) {
+        if ((c6GdmaRead(at)&u32(if (tx) 0xf00000 else 0x1e00000)) == u32(if (tx) 0x800000 else 0x1000000)) return C6GdmaStop(token|1)
+        remaining=remaining-1
+    }
+    return C6GdmaStop(token|5)
+}
+trusted fun c6GdmaStopBeginOwned(channel: int,tx: bool,polls: int,exclusive: bool): C6GdmaStop {
+    if (!exclusive || channel < 0 || channel > 2 || polls < 1 || polls > 1000000) return C6GdmaStop(2)
+    if (!c6GdmaClocksReady()) return C6GdmaStop(3)
+    if (!c6GdmaControlAdmitted(channel,tx)) return C6GdmaStop(4)
+    val token=C6GdmaStop(2048|(channel<<8)|(if (tx) 1024 else 0)|5)
+    val at=c6GdmaChannelBase(channel,tx)+16
+    val link=c6GdmaRead(at)
+    if ((link&u32(if (tx) 0xf00000 else 0x1e00000)) != u32(if (tx) 0x800000 else 0x1000000)) {
+        // Do not replay observed START/RESTART. Preserve RX AUTO_RET.
+        c6GdmaWrite(at,(link&~u32(if (tx) 0x700000 else 0xe00000))|u32(if (tx) 0x100000 else 0x200000))
+    }
+    return token.waitOwned(polls,true)
+}
+// Explicit recovery for a STOP command that may have been lost. Normal wait
+// never republishes commands. Reissue only with the same exclusive stopped
+// peripheral/channel lifetime; START/RESTART bits are never replayed.
+trusted fun C6GdmaStop.retryStopOwned(polls: int,exclusive: bool): C6GdmaStop {
+    if (!exclusive || polls < 1 || polls > 1000000 || this < 0 || (this&~4095) != 0 || (this&2048) == 0 || ((this>>>8)&3) > 2 || this.status() != 5) return this
+    return c6GdmaStopBeginOwned((this>>>8)&3,(this&1024) != 0,polls,true)
+}
+// Join descriptor FSM, then observe FIFO drain without reset/discard. Status6
+// means parked but FIFO still nonempty. Even success does not acknowledge
+// events, acquire descriptor ownership or prove peripheral wire completion.
+trusted fun C6GdmaStop.waitDrainedOwned(polls: int,exclusive: bool): C6GdmaStop {
+    if (!exclusive || polls < 1 || polls > 1000000 || this < 0 || (this&~4095) != 0 || (this&2048) == 0 || ((this>>>8)&3) > 2) return this
+    val parked=this.waitOwned(polls,exclusive)
+    if (!exclusive || polls < 1 || polls > 1000000 || (parked&2048) == 0 || parked.status() != 1) return parked
+    val token=parked&~255
+    val base=c6GdmaChannelBase((token>>>8)&3,(token&1024) != 0)
+    var left=polls
+    while (left > 0) {
+        if ((c6GdmaRead(base+8)&u32(2)) != u32(0)) return parked
+        left=left-1
+    }
+    return C6GdmaStop(token|6)
+}
+// Destructive FIFO/FSM initialization only after PARK and event handling.
+// Explicit discard authorization. releaseOnly lowers a previously stuck reset
+// without another pulse; it does NOT assert that initialization succeeded.
+// Returns1submitted/released2invalid3clock4busy/events5readback failure.
+trusted fun c6GdmaResetOwned(channel: int,tx: bool,exclusive: bool,discard: bool,releaseOnly: bool): int {
+    if (!exclusive || channel < 0 || channel > 2 || (!releaseOnly && !discard)) return 2
+    if (!c6GdmaClocksReady()) return 3
+    val base=c6GdmaChannelBase(channel,tx)
+    val before=c6GdmaRead(base)
+    val events=c6GdmaEventBase(channel,tx)
+    if ((before&u32(if (tx) 64 else 32)) != u32(0) || c6GdmaRead(events+8) != u32(0) ||
+        (!releaseOnly && ((before&u32(1)) != u32(0) || c6GdmaRead(events) != u32(0) ||
+        (c6GdmaRead(base+16)&u32(if (tx) 0xf00000 else 0x1e00000)) != u32(if (tx) 0x800000 else 0x1000000)))) return 4
+    // Caller retains the same exclusive stopped lifetime for releaseOnly.
+    // WT reset may self-clear, so high readback is not a completion proof.
+    if (!releaseOnly) c6GdmaWrite(base,before|u32(1))
+    c6GdmaWrite(base,c6GdmaRead(base)&~u32(1))
+    return if (c6GdmaRead(base) == (before&~u32(1))) 1 else 5
+}

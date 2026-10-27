@@ -1,0 +1,75 @@
+import "./transfer_c5_sequence.ab"
+// Caller-exclusive32B context; same canonical bus gate, CS, clocks and pads
+// retained from begin through completion AND any required failure recovery.
+// No CS handling, allocation, ISR, reset or replay. Caller polls cooperatively.
+// Fresh initialize only; do not reinitialize/copy a live or recovery-owned job.
+// Context tag0,state4(0idle1UPDATE2START3terminal),RX8,bytes12,time16,budget20,
+// receive24,result28. Result0pending, otherwise blocking-transfer status bits.
+fun c5SpiAsyncStorageValid(context: NativeBuffer): bool =
+    c5SpiBufferValid(context,32) && (context.addressValue()&3) == 0
+trusted fun esp32C5SpiAsyncInitialize(context: NativeBuffer): bool {
+    if (!c5SpiAsyncStorageValid(context)) return false
+    var offset=4
+    while (offset < 32) { context.storeU32(offset,0);offset=offset+4 }
+    context.storeU32(0,0x43534131);return true
+}
+trusted fun c5SpiAsyncValid(context: NativeBuffer): bool =
+    c5SpiAsyncStorageValid(context) && context.loadU32(0) == 0x43534131
+trusted fun c5SpiAsyncFinish(context: NativeBuffer,result: int): int {
+    context.storeU32(4,3);context.storeU32(28,result);return result
+}
+trusted fun esp32C5SpiAsyncBeginOwned(context: NativeBuffer,source: NativeBuffer,destination: NativeBuffer,
+    bytes: int,now: u32,budget: u32,receive: bool): int {
+    if (!c5SpiAsyncValid(context) || budget == u32(0) || budget > u32(0x7fffffff) ||
+        !c5SpiBufferValid(source,bytes) || (receive && !c5SpiBufferValid(destination,bytes))) return 2
+    if (context.loadU32(4) == 1 || context.loadU32(4) == 2) return 3
+    val address=context.addressValue()
+    if ((source.addressValue() < address+32 && address < source.addressValue()+bytes) ||
+        (receive && destination.addressValue() < address+32 && address < destination.addressValue()+bytes)) return 2
+    val prepared=c5SpiPrepareTransferOwned(source,destination,bytes,receive)
+    if (prepared != 0) return c5SpiAsyncFinish(context,prepared)
+    context.storeU32(8,destination.addressValue());context.storeU32(12,bytes)
+    context.storeU32(16,int(now));context.storeU32(20,int(budget))
+    context.storeU32(24,if (receive) 1 else 0);context.storeU32(28,0)
+    // Preserve non-command bits, exactly as the blocking latch operation.
+    if (!esp32C5SpiCpuIdleOwned()) return c5SpiAsyncFinish(context,3)
+    context.storeU32(4,1)
+    c5SpiWrite(0x60081000,(c5SpiRead(0x60081000)&~u32(0x01800000))|u32(1<<23))
+    return 0
+}
+// One bounded observation per phase, never a polling loop. One overall
+// modulo32 deadline includes UPDATE and transfer. Deadline expiration wins
+// over late DONE; timeout never publishes RX and does not imply hardware idle.
+trusted fun esp32C5SpiAsyncPollOwned(context: NativeBuffer,now: u32): int {
+    if (!c5SpiAsyncValid(context)) return 2
+    val state=context.loadU32(4)
+    if (state == 3) return context.loadU32(28)
+    if (state != 1 && state != 2) return 2
+    if (now-u32(context.loadU32(16)) >= u32(context.loadU32(20))) return c5SpiAsyncFinish(context,if (state == 1) 6 else 263)
+    val events=c5SpiRead(0x6008103c)
+    if ((events&u32(0x60003)) != u32(0)) return c5SpiAsyncFinish(context,
+        (if (state == 1) 9 else 265)|int(events&u32(0x60000))|(int(events&u32(3))<<19))
+    if (state == 1) {
+        if ((c5SpiRead(0x60081000)&u32(0x01800000)) != u32(0)) return 0
+        if (!esp32C5SpiCpuIdleOwned() || (c5SpiRead(0x600960c8)&u32(1<<22)) == u32(0)) return c5SpiAsyncFinish(context,3)
+        context.storeU32(4,2)
+        c5SpiWrite(0x60081000,u32(1<<24))
+        return 0
+    }
+    if ((events&u32(4096)) == u32(0) || (c5SpiRead(0x60081000)&u32(0x01800000)) != u32(0)) return 0
+    if (!esp32C5SpiCpuIdleOwned()) return c5SpiAsyncFinish(context,264)
+    if (context.loadU32(24) != 0) {
+        val bytes=context.loadU32(12)
+        val destination=nativeBufferAt(context.loadU32(8),bytes)
+        var offset=0
+        while (offset < bytes) {
+            val word=c5SpiRead(0x60081098+offset)
+            var lane=0
+            while (lane < 4 && offset+lane < bytes) {
+                destination.store(offset+lane,int(word>>u32(lane*8)));lane=lane+1
+            }
+            offset=offset+4
+        }
+    }
+    return c5SpiAsyncFinish(context,257)
+}

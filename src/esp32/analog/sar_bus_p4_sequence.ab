@@ -1,0 +1,74 @@
+import "../adc_clock_p4_sequence.ab"
+import "./register_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Retained32-byte caller-owned record, no heap. Magic0/state4/originalFlags8,
+// saved master0 route12/master1 route16/phase20/reserved24..31.
+// Caller excludes every analog-bus client, BOTH CPUs/masters, SAR/temperature,
+// RCC/PMU/sleep/reload for the entire lifetime, and pins the stable160MHz
+// upstream source. No oscillator/PLL started, no master reset ever pulsed.
+// Cold SAR analog-I2C power-up requires its peripheral reset sequence; an
+// already powered/released peripheral is borrowed WITHOUT resetting trims.
+// Status1ready2invalid3reset4busy5MMIO6closed. Keep record on ALL failures.
+fun p4SarBusRecordValid(r: NativeBuffer): bool = r.hasAddressRange(0,32) && (r.addressValue()&3) == 0
+trusted fun p4SarBusStatus(r: NativeBuffer,status: int): int { r.storeU32(4,status);return status }
+trusted fun esp32p4AnalogSarBusOpenOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4SarBusRecordValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(0) != 0) return 2
+    val pmu=p4AdcRead(0x5011515c)&u32(0xc000000)
+    if ((p4AdcRead(0x50120008)&u32(0x4000000)) != u32(0) || pmu == u32(0x8000000)) return 3
+    val flags=int((p4AdcRead(0x50111040)>>u32(28))&u32(1))|
+        (int((p4AdcRead(0x50120000)>>u32(27))&u32(1))<<1)|
+        (int(pmu>>u32(26))<<2)
+    r.storeU32(8,flags);r.storeU32(12,0);r.storeU32(16,0);r.storeU32(20,0)
+    r.storeU32(0,0x41325334)
+    if (!p4AdcField(0x50111040,u32(0x10000000),u32(0x10000000)) ||
+        !p4AdcField(0x50120000,u32(0x8000000),u32(0x8000000))) return p4SarBusStatus(r,5)
+    if (!p4AnalogWaitIdle(0,polls) || !p4AnalogWaitIdle(4,polls)) return p4SarBusStatus(r,4)
+    r.storeU32(12,p4AnalogRead(28)&0xffffff)
+    r.storeU32(16,p4AnalogRead(32)&0xffffff)
+    r.storeU32(8,flags|(int(p4AdcRead(0x50124034)&u32(1))<<4))
+    r.storeU32(20,1) // routing/clock-select captured BEFORE changing them
+    if (!p4AdcField(0x50124034,u32(1),u32(1))) return p4SarBusStatus(r,5)
+    if ((pmu&u32(0x8000000)) == u32(0)) {
+        // Set attempted before first power/reset write for partial cleanup.
+        r.storeU32(20,3)
+        if (!p4AdcField(0x5011515c,u32(0x4000000),u32(0)) ||
+            !p4AdcField(0x5011515c,u32(0x8000000),u32(0x8000000)) ||
+            !p4AdcField(0x5011515c,u32(0x4000000),u32(0x4000000))) return p4SarBusStatus(r,5)
+    }
+    return p4SarBusStatus(r,1)
+}
+// Caller first closes ADC controller/analog/power users. A timed-out master
+// must complete before restoration; never erase that evidence by reset.
+// phase4 marks restoration complete before clock gating, so a later RCC
+// failure can retry without reading a gated master or repowering the SAR.
+trusted fun esp32p4AnalogSarBusCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !p4SarBusRecordValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(0) != 0x41325334) return 2
+    if (r.loadU32(4) == 6) return 6
+    val flags=r.loadU32(8)
+    val phase=r.loadU32(20)
+    if ((phase&4) == 0) {
+        // Failed root/bus enable can leave the bus disabled: no transaction
+        // was issued then. A captured route proves it was enabled previously.
+        if ((p4AdcRead(0x50120000)&u32(0x8000000)) != u32(0)) {
+            if ((p4AdcRead(0x50120008)&u32(0x4000000)) != u32(0) ||
+                !p4AnalogWaitIdle(0,polls) || !p4AnalogWaitIdle(4,polls)) return p4SarBusStatus(r,4)
+        } else if ((phase&3) != 0) return p4SarBusStatus(r,4)
+        if ((phase&2) != 0) {
+            if (!p4AdcField(0x5011515c,u32(0x8000000),(u32(flags>>3)&u32(1))<<u32(27)) ||
+                !p4AdcField(0x5011515c,u32(0x4000000),(u32(flags>>2)&u32(1))<<u32(26))) return p4SarBusStatus(r,5)
+        }
+        if ((phase&1) != 0) {
+            // Detach both routes before restoring either; no transient dual
+            // master ownership introduced by a direct crossed-route swap.
+            if (!p4AnalogRouteField(28,0) || !p4AnalogRouteField(32,0) ||
+                !p4AnalogRouteField(28,r.loadU32(12)) || !p4AnalogRouteField(32,r.loadU32(16)) ||
+                !p4AdcField(0x50124034,u32(1),u32(flags>>4)&u32(1))) return p4SarBusStatus(r,5)
+        }
+        r.storeU32(20,phase|4)
+    }
+    if (!p4AdcField(0x50120000,u32(0x8000000),(u32(flags>>1)&u32(1))<<u32(27)) ||
+        !p4AdcField(0x50111040,u32(0x10000000),(u32(flags)&u32(1))<<u32(28))) return p4SarBusStatus(r,5)
+    return p4SarBusStatus(r,6)
+}

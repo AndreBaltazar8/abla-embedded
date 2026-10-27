@@ -1,0 +1,80 @@
+import "./timing_p4_sequence.ab"
+import "./pins_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Live trained MPLL-backed PSRAM speed lease. Implements the P4 low-speed
+// PSRAM part of MSPI timing coordination, NOT flash120MHz timing changes.
+// Caller owns clocks/pads/controllers, excludes CPUs/cache/IRQs/DMA/refills,
+// writes dirty PSRAM back and executes entirely from retained internal RAM.
+// MPLL320/400/500 and core divider1 stay pinned. No chip mode changes.
+// CPU must remain at least20MHz while the low-speed mode is exposed.
+// Drain/close AXI -> command+mapped clocks20MHz -> clear delay/phase -> restore
+// original AXI access. Close drains/closes AXI, restores trained pads BEFORE
+// fast clocks, then restores original AXI bits LAST. Do not expose consumers
+// during a partial transition; preserve record and retry the unfinished step.
+// Close's cpuClockRestored proof means CPU meets BOTH original port rates;
+// callers must complete CPU recovery first (SDK DIG-498 FIFO constraint).
+// Record112B:magic,next,result,detail,mhz,oldAXI,oldMapped,oldCommand,pads20.
+// Steps1close2cmd3mapped4..23pads24AXI25slowReady26close27..46pads
+// 47mapped48cmd49AXI50closed. Results1slow2invalid3clock4busy5write6closed.
+fun p4PsramSpeedPadMask(pin: int): int = if (pin == 8 || pin == 19) 0x001e0786 else 240
+trusted fun p4PsramSpeedResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun p4PsramSpeedClockReady(): bool = (p4PsramClockRead(192)&0x02800000) == 0 &&
+    (p4PsramClockRead(20)&0x80000000) != 0 && (p4PsramClockRead(48)&0x00fff000) == 0xd000
+trusted fun esp32p4PsramSpeedContinueOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,112) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50345350 || r.loadU32(4) < 1 || r.loadU32(4) > 50) return 2
+    if (r.loadU32(4) == 50) return 6
+    if (!p4PsramSpeedClockReady()) return p4PsramSpeedResult(r,3,0)
+    while (true) {
+        val step=r.loadU32(4)
+        if (step == 25) return p4PsramSpeedResult(r,1,0)
+        if (step == 50) return p4PsramSpeedResult(r,6,0)
+        if (step == 1 || step == 26) {
+            if ((p4PsramMappedRead(4096)&0x400f0) != 0 || !p4PsramMappedWaitIdle(polls)) return p4PsramSpeedResult(r,4,step)
+            if (!p4PsramMappedField(60,0x80000001,0x80000000)) return p4PsramSpeedResult(r,5,step)
+        } else {
+            if ((p4PsramMappedRead(60)&0x80000001) != 0x80000000) return p4PsramSpeedResult(r,4,step)
+            if ((step >= 4 && step <= 23) || (step >= 27 && step <= 46)) {
+                val pin=if (step <= 23) step-4 else step-27
+                val mask=p4PsramSpeedPadMask(pin)
+                val value=if (step <= 23) 0 else r.loadU32(32+pin*4)
+                if (!p4PsramPinField(28+pin*4,mask,value)) return p4PsramSpeedResult(r,5,step)
+            } else {
+                val offset=if (step == 24 || step == 49) 60 else if (step == 2 || step == 48) 4116 else 80
+                val mask=if (offset == 60) 0x80000001 else 0x80ffffff
+                val value=if (offset == 60) r.loadU32(20) else if (step <= 3) p4PsramBusClockValue(if (r.loadU32(16) == 320) 16 else if (r.loadU32(16) == 400) 20 else 25) else r.loadU32(if (step == 47) 24 else 28)
+                if (!p4PsramMappedField(offset,mask,value)) return p4PsramSpeedResult(r,5,step)
+            }
+        }
+        r.storeU32(4,step+1)
+    }
+    return 2
+}
+trusted fun esp32p4PsramSpeedOpenOwned(r: NativeBuffer,mhz: int,polls: int,exclusive: bool): int {
+    if (!exclusive || (mhz != 320 && mhz != 400 && mhz != 500) || polls < 1 || polls > 1000000 ||
+        !r.hasAddressRange(0,112) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    if (!p4PsramSpeedClockReady() || !p4PsramSpeedMpllReady(mhz,polls)) return 3
+    var port=0
+    while (port < 2) {
+        val clock=p4PsramMappedRead(if (port == 0) 80 else 4116)&0x80ffffff
+        val divider=if ((clock&0x80000000) != 0) 1 else ((clock>>>16)&255)+1
+        if (clock != p4PsramBusClockValue(divider)) return 2
+        port=port+1
+    }
+    r.storeU32(0,0x50345350);r.storeU32(4,1);r.storeU32(8,0);r.storeU32(12,0);r.storeU32(16,mhz)
+    r.storeU32(20,p4PsramMappedRead(60)&0x80000001);r.storeU32(24,p4PsramMappedRead(80)&0x80ffffff);r.storeU32(28,p4PsramMappedRead(4116)&0x80ffffff)
+    var pin=0
+    while (pin < 20) { r.storeU32(32+pin*4,p4PsramPinRead(28+pin*4)&p4PsramSpeedPadMask(pin));pin=pin+1 }
+    return esp32p4PsramSpeedContinueOwned(r,polls,true)
+}
+trusted fun esp32p4PsramSpeedCloseOwned(r: NativeBuffer,polls: int,cpuClockRestored: bool,exclusive: bool): int {
+    if (!cpuClockRestored) return 2
+    val state=esp32p4PsramSpeedContinueOwned(r,polls,exclusive)
+    if (state != 1) return state
+    if (!p4PsramSpeedMpllReady(r.loadU32(16),polls)) return p4PsramSpeedResult(r,3,0)
+    r.storeU32(4,26)
+    return esp32p4PsramSpeedContinueOwned(r,polls,true)
+}

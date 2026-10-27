@@ -1,0 +1,75 @@
+import "./shared_pins_sequence_esp32s3.ab"
+import "./buffer_sequence_esp32s3.ab"
+import "../gpio/snapshot_s3_sequence.ab"
+import "../gpio/input_snapshot_s3_sequence.ab"
+// Exclusive36B record: magic,state,port,error,input,CLK,DATA,DC,CS snapshots.
+// Caller holds canonical gate and owns old/new matrix consumers, pads, clock,
+// RTC/USB/hold/sleep domains and GPIO RMW serialization. No implicit takeover.
+// Fresh zero record or closed record only. 0invalid,1ready,2closed,3retained.
+fun esp32s3SpiSharedPinRecordRange(r: NativeBuffer): bool =
+    r.hasAddressRange(0,36) && (r.addressValue()&3) == 0 &&
+    (r.addressValue()+36 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun esp32s3SpiSharedPinSessionValid(r: NativeBuffer): bool {
+    if (!esp32s3SpiSharedPinRecordRange(r) || r.loadU32(0) != 0x53534933 ||
+        (r.loadU32(8) != 2 && r.loadU32(8) != 3)) return false
+    val input=S3GpioInputSnapshot(r.loadU32(16))
+    if (!input.valid() || input.signal() != (if (r.loadU32(8) == 2) 103 else 68)) return false
+    var i=0
+    while (i < 4) {
+        val pin=S3GpioSnapshot(r.loadU32(20+i*4))
+        if (!pin.valid()) return false
+        var j=0
+        while (j < i) {
+            if (pin.pin() == S3GpioSnapshot(r.loadU32(20+j*4)).pin()) return false
+            j=j+1
+        }
+        i=i+1
+    }
+    return true
+}
+trusted fun esp32s3SpiSharedPinsOpenOwned(r: NativeBuffer,peripheral: int,
+    clock: Pin,data: Pin,cs: Pin,dc: Pin,exclusive: bool): int {
+    if (!exclusive || !esp32s3SpiSharedPinRecordRange(r) ||
+        !esp32s3SpiSharedPinsValid(peripheral,clock,data,cs) || !dc.outputCapable() ||
+        dc == clock || dc == data || dc == cs ||
+        (r.loadU32(0) != 0 && (!esp32s3SpiSharedPinSessionValid(r) || r.loadU32(4) != 2))) return 0
+    if (!esp32s3SpiCpuBufferIdle(esp32s3SpiBase(peripheral))) return 0
+    // Capture every original before any mutation, including global SPID input.
+    val a=esp32S3GpioSnapshotOwned(clock|0,true);val b=esp32S3GpioSnapshotOwned(data|0,true)
+    val c=esp32S3GpioSnapshotOwned(dc|0,true);val d=esp32S3GpioSnapshotOwned(cs|0,true)
+    val input=esp32S3GpioInputCaptureOwned(if (peripheral == 2) 103 else 68,true)
+    if (!a.valid() || !b.valid() || !c.valid() || !d.valid() || !input.valid()) return 0
+    r.storeU32(8,peripheral);r.storeU32(12,0);r.storeU32(16,input|0)
+    r.storeU32(20,a|0);r.storeU32(24,b|0);r.storeU32(28,c|0);r.storeU32(32,d|0)
+    r.storeU32(4,3);r.storeU32(0,0x53534933)
+    var result=6
+    if (cs.outputLevelOwned(true)) {
+        result=7
+        if (dc.outputLevelOwned(true)) result=esp32s3SpiRouteSharedPinsOwned(peripheral,clock,data,cs)
+    }
+    r.storeU32(12,result)
+    if (result != 1) return 3
+    r.storeU32(4,1);return 1
+}
+trusted fun esp32s3SpiSharedPinsCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !esp32s3SpiSharedPinSessionValid(r) || polls < 1 || polls > 1000000) return 0
+    if (r.loadU32(4) == 2) return 2
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 0
+    r.storeU32(4,3)
+    val base=esp32s3SpiBase(r.loadU32(8))
+    var attempt=0
+    while (attempt < polls && !esp32s3SpiCpuBufferIdle(base)) attempt=attempt+1
+    if (attempt == polls) { r.storeU32(12,65);return 3 }
+    // Re-establish manual CS on retries: failed final restoration may already
+    // have changed its route/OE. Latch-only high is insufficient in that case.
+    val cs=Pin(S3GpioSnapshot(r.loadU32(32)).pin())
+    if (!cs.outputLevelOwned(true)) { r.storeU32(12,6);return 3 }
+    if (S3GpioInputSnapshot(r.loadU32(16)).restoreOwned(true) != 1) { r.storeU32(12,16);return 3 }
+    var step=0
+    while (step < 4) {
+        val index=if (step < 3) 2-step else 3
+        if (S3GpioSnapshot(r.loadU32(20+index*4)).restoreOwned(true) != 1) { r.storeU32(12,32+index);return 3 }
+        step=step+1
+    }
+    r.storeU32(12,0);r.storeU32(4,2);return 2
+}

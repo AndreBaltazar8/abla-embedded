@@ -1,0 +1,74 @@
+import "./sleep_smp_p4_sequence.ab"
+// Prepared coordinator callback48B; all children pinned in retained internal
+// RAM, exclusive on this hart, MIEoff, code/stack retained. Prepare AFTER peer
+// backed, clocks parked, graph published and CPU banks saved; invoke INSIDE
+// CpuRetained integer boundary. No cancellation/reuse after preparation until
+// boundary returns and recovery/rollback joins the peer.
+// magic,step,outcome,detail,cpu816,clocks288,session464,smp4,generation,hart,0,0.
+// Steps1publish-backed2authorize3session4returned. CPU-loss bypasses callback
+// return: outer coordinator recovery owns the live session, not another invoke.
+// Results7progress/pending9fault, or actual session1wake2reject3both10abort.
+fun p4RequestOverlap(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.addressValue() < b.addressValue()+bn && b.addressValue() < a.addressValue()+an
+trusted fun p4RequestReport(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(12,detail);return result
+}
+trusted fun esp32p4SleepCoordinatorRequestPrepareOwned(r: NativeBuffer,cpu: NativeBuffer,clocks: NativeBuffer,session: NativeBuffer,smp: NativeBuffer,generation: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,48) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !cpu.hasAddressRange(0,816) || (cpu.addressValue()&15) != 0 ||
+        !clocks.hasAddressRange(0,288) || (clocks.addressValue()&3) != 0 ||
+        !session.hasAddressRange(0,464) || (session.addressValue()&3) != 0 ||
+        !smp.hasAddressRange(0,4) || (smp.addressValue()&3) != 0) return 4
+    if (p4RequestOverlap(r,48,cpu,816) || p4RequestOverlap(r,48,clocks,288) ||
+        p4RequestOverlap(r,48,session,464) || p4RequestOverlap(r,48,smp,4) ||
+        p4RequestOverlap(cpu,816,clocks,288) || p4RequestOverlap(cpu,816,session,464) ||
+        p4RequestOverlap(cpu,816,smp,4) || p4RequestOverlap(clocks,288,session,464) ||
+        p4RequestOverlap(clocks,288,smp,4) || p4RequestOverlap(session,464,smp,4)) return 4
+    val hart=int(p4SmpHart());val state=esp32p4SleepSmpObserve(smp,generation)
+    if (hart < 0 || hart > 1 || (p4SmpStatus()&u32(8)) != u32(0) || state.status() != 1 ||
+        state.coordinator() != hart || state.stage() != 1 || state.phase(hart) != 1 || state.phase(1-hart) != 2 ||
+        cpu.loadU32(0) != 0x50345243 || cpu.loadU32(4) != 4 || cpu.loadU32(8) != hart || cpu.loadU32(672) != 0 ||
+        clocks.loadU32(0) != 0x50344353 || clocks.loadU32(4) != 4 || clocks.loadU32(32) != hart ||
+        session.loadU32(0) != 0x50345332 || session.loadU32(4) != 2 || session.loadU32(176) != 0 ||
+        session.loadU32(32) != 0x50345031 || session.loadU32(36) != 2) return 4
+    var i=4
+    while (i < 48) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344351);r.storeU32(4,1);r.storeU32(16,cpu.addressValue())
+    r.storeU32(20,clocks.addressValue());r.storeU32(24,session.addressValue());r.storeU32(28,smp.addressValue())
+    r.storeU32(32,generation);r.storeU32(36,hart);return 7
+}
+trusted fun esp32p4SleepCoordinatorRequestContinueOwned(r: NativeBuffer,polls: int,eventPolls: int,exclusiveBoundary: bool): int {
+    if (!exclusiveBoundary || polls < 1 || polls > 1000000 || eventPolls < 1 || eventPolls > 1000000 ||
+        !r.hasAddressRange(0,48) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344351 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 4 || int(p4SmpHart()) != r.loadU32(36) ||
+        (p4SmpStatus()&u32(8)) != u32(0)) return 4
+    val cpu=nativeBufferAt(r.loadU32(16),816)
+    if (cpu.loadU32(0) != 0x50345243 || cpu.loadU32(4) != 5 || cpu.loadU32(8) != r.loadU32(36) ||
+        cpu.loadU32(672) != 0x50344358 || cpu.loadU32(676) != 1 || cpu.loadU32(680) != r.loadU32(36)) return p4RequestReport(r,9,4)
+    if (r.loadU32(4) == 4) return r.loadU32(8)
+    val smp=nativeBufferAt(r.loadU32(28),4);val generation=r.loadU32(32)
+    val step=r.loadU32(4)
+    if (step < 3) {
+        val changed=esp32p4SleepSmpAdvanceOwned(smp,generation,if (step == 1) 2 else 3,polls,true)
+        if (changed.status() != 1) return p4RequestReport(r,if (changed.status() == 3) 7 else 9,changed.status())
+        r.storeU32(4,step+1);return p4RequestReport(r,7,0)
+    }
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    if (state.status() != 1 || state.stage() != 2 || state.coordinator() != r.loadU32(36) ||
+        state.phase(0) != 2 || state.phase(1) != 2) return p4RequestReport(r,9,state.status())
+    // Step3 is retained BEFORE calling the actual session. A lost stack must
+    // resume through post-boundary recovery, never replay authorization.
+    val result=p4RequestSession(nativeBufferAt(r.loadU32(24),464),polls,eventPolls)
+    if ((result < 1 || result > 3) && result != 10) return p4RequestReport(r,if (result == 7) 7 else 9,result)
+    r.storeU32(8,result);r.storeU32(4,4);return p4RequestReport(r,result,0)
+}
+trusted fun esp32p4SleepCoordinatorRequest(context: u32): u32 {
+    val r=nativeBufferAt(int(context),48)
+    while (true) {
+        val result=esp32p4SleepCoordinatorRequestContinueOwned(r,32,32,true)
+        if ((result >= 1 && result <= 3) || result == 10) return u32(result)
+        // Never unwind an active context on timeout/uncertain hardware fault.
+        p4RequestRelax()
+    }
+    return u32(0)
+}

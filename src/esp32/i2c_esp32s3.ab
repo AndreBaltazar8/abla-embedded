@@ -1,0 +1,315 @@
+import "./i2c/guarded_setup_esp32s3.ab"
+import "./i2c/stream_esp32s3.ab"
+import "./i2c/device_s3_logic.ab"
+import "./i2c/device_clock_s3_sequence.ab"
+import "./i2c/timeout_logic.ab"
+import "./i2c/facade_buffer_s3_logic.ab"
+import "./i2c/prepare_probe_s3_sequence.ab"
+import "./i2c/bus_clear_esp32s3.ab"
+import "../i2c/results.ab"
+import "../i2c/device_slots.ab"
+import "../i2c/register_access.ab"
+
+// Select instead of i2c_idf6.ab. Each physical controller owns36 bytes:
+// gate,generation,phase(0closed/1open/2partial),SDA,SCL,XTAL Hz,CPU Hz,bus Hz.
+// Final word retains the last admitted hardware operation result.
+// Devices use32-bit generation handles, compatible with packed M5 drivers.
+// Closing a bus revokes its slots; epochs and slot generations never wrap.
+type I2cBus = int
+type I2cDevice = int
+val esp32S3I2cState0 = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0])
+val esp32S3I2cState1 = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0])
+// Sixteen simultaneous device views, fixed200-byte storage, no heap. Device
+// close returns a slot; exhaustion is an explicit invalid device result.
+val esp32S3I2cDeviceStorage = nativeStaticMutableU32s([
+    0,16,
+    0,0,0, 0,0,0, 0,0,0, 0,0,0,
+    0,0,0, 0,0,0, 0,0,0, 0,0,0,
+    0,0,0, 0,0,0, 0,0,0, 0,0,0,
+    0,0,0, 0,0,0, 0,0,0, 0,0,0])
+fun esp32S3I2cDevicePool(): I2cDeviceSlots = i2cDeviceSlotsAt(esp32S3I2cDeviceStorage)
+
+// Other RCC users must share this lock, not create independent RCC words.
+fun esp32S3I2cRccLock(): AtomicU32 = esp32S3RccSharedLock()
+fun esp32S3I2cState(port: int): int =
+    if (port == 0) esp32S3I2cState0 else if (port == 1) esp32S3I2cState1 else 0
+
+fun I2cBus.valid(): bool = esp32S3I2cBusKeyValid(this)
+fun I2cDevice.valid(): bool = i2cDeviceSlotHandleValid(this)
+
+// Caller owns digital pads and keeps both supplied clocks stable while open.
+// No implicit RTC/USB ownership changes or guesses about CPU clock frequency.
+trusted fun i2cMaster(port: int, sda: int, scl: int, xtalHz: u32, cpuHz: u32): I2cBus {
+    if (!espChipS3().i2cMasterConfigurationValid(port, sda, scl) ||
+        cpuHz == u32(0) || !esp32S3I2cTiming(xtalHz, u32(100000)).valid()) return I2cBus(0)
+    val state = esp32S3I2cState(port)
+    val gate = peripheralGateAt(state)
+    val admission = gate.tryBegin(u32(1))
+    if (admission == 1 || admission == 3) return I2cBus(0)
+    val recovering = admission == 2
+    if (recovering && !gate.tryBeginRecovery(u32(1))) return I2cBus(0)
+    val epoch = nativeAddressLoadU32(state, 4)
+    var key = 0
+    var healthy = !recovering
+    val phase = nativeAddressLoadU32(state, 8)
+    if (phase == 1) {
+        if (!recovering && nativeAddressLoadU32(state, 12) == sda &&
+            nativeAddressLoadU32(state, 16) == scl &&
+            nativeAddressLoadU32(state, 20) == int(xtalHz) &&
+            nativeAddressLoadU32(state, 24) == int(cpuHz)) key = esp32S3I2cBusKey(port, epoch)
+    } else if (epoch < 2147483647 && (phase == 0 ||
+        (nativeAddressLoadU32(state, 12) == sda && nativeAddressLoadU32(state, 16) == scl))) {
+        healthy = false
+        // Record potential pad ownership before the first hardware mutation.
+        // Failed setup can retry the same pins or be explicitly aborted.
+        nativeAddressStoreU32(state, 12, sda)
+        nativeAddressStoreU32(state, 16, scl)
+        nativeAddressStoreU32(state, 8, 2)
+        nativeAddressStoreU32(state, 32, 0)
+        if (esp32S3I2cResetWithRccLock(port, esp32S3I2cRccLock(), u32(1), false) &&
+            esp32S3I2cSetupMaster(port, sda, scl, xtalHz, u32(100000)) &&
+            esp32S3I2cBusReleased(port, sda, scl)) {
+            nativeAddressStoreU32(state, 4, epoch + 1)
+            nativeAddressStoreU32(state, 12, sda)
+            nativeAddressStoreU32(state, 16, scl)
+            nativeAddressStoreU32(state, 20, int(xtalHz))
+            nativeAddressStoreU32(state, 24, int(cpuHz))
+            nativeAddressStoreU32(state, 28, 100000)
+            nativeAddressStoreU32(state, 8, 1)
+            key = esp32S3I2cBusKey(port, epoch + 1)
+            healthy = true
+        }
+    }
+    val released = if (recovering) gate.finishRecovery(u32(1), healthy) else gate.finish(u32(1), healthy)
+    I2cBus(if (released) key else 0)
+}
+
+// Called only while this controller's gate is held.
+trusted fun esp32S3I2cBusKeyOpen(state: int, key: int): bool =
+    esp32S3I2cBusKeyValid(key) && nativeAddressLoadU32(state, 8) == 1 &&
+    nativeAddressLoadU32(state, 4) == esp32S3I2cBusKeyGeneration(key)
+
+trusted fun I2cBus.device(address: int, frequency: int = 400000): I2cDevice {
+    if (!this.valid() || address < 0 || address > 127 || frequency < 1 || frequency > 1000000) return I2cDevice(0)
+    val port = esp32S3I2cBusKeyPort(this)
+    val state = esp32S3I2cState(port)
+    val gate = peripheralGateAt(state)
+    if (gate.tryBegin(u32(1)) != 0) return I2cDevice(0)
+    var key = 0
+    if (esp32S3I2cBusKeyOpen(state, this) &&
+        esp32S3I2cTiming(u32(nativeAddressLoadU32(state, 20)), u32(frequency)).valid()) {
+        key = esp32S3I2cDevicePool().allocate(esp32S3I2cDeviceKey(port, address, frequency, esp32S3I2cBusKeyGeneration(this)))
+    }
+    if (!gate.finish(u32(1), true)) return I2cDevice(0)
+    I2cDevice(key)
+}
+
+trusted fun I2cDevice.transferStatus(output: NativeBuffer, written: int,
+    input: NativeBuffer, read: int, timeoutMilliseconds: int = 1000, registerPrefix: int = -1): int {
+    if (!this.valid()) return 7
+    val descriptor = esp32S3I2cDevicePool().resolve(this)
+    esp32S3I2cTransferDescriptor(this, descriptor, output, written, input, read, timeoutMilliseconds, registerPrefix)
+}
+
+// A zero handle is reserved for an ephemeral bus probe: it publishes no
+// device and needs no cleanup that could fail under concurrent gate ownership.
+trusted fun esp32S3I2cTransferDescriptor(handle: int, descriptor: int,
+    output: NativeBuffer, written: int, input: NativeBuffer, read: int,
+    timeoutMilliseconds: int, registerPrefix: int): int {
+    if (!esp32S3I2cFacadeBufferSafe(output,written,esp32S3I2cState0,esp32S3I2cState1,esp32S3I2cDeviceStorage) ||
+        !esp32S3I2cFacadeBufferSafe(input,read,esp32S3I2cState0,esp32S3I2cState1,esp32S3I2cDeviceStorage) ||
+        registerPrefix < -1 || registerPrefix > 255) return 7
+    if (!esp32S3I2cDeviceKeyValid(descriptor)) return 7
+    val port = esp32S3I2cDeviceKeyPort(descriptor)
+    val state = esp32S3I2cState(port)
+    val gate = peripheralGateAt(state)
+    val admission = gate.tryBegin(u32(1))
+    if (admission != 0) return if (admission == 2) 10 else 9
+    val key = esp32S3I2cBusKey(port, esp32S3I2cDeviceKeyGeneration(descriptor))
+    val budget = esp32S3I2cTimeoutCycles(timeoutMilliseconds, nativeAddressLoadU32(state, 24))
+    val frequency = esp32S3I2cDeviceKeyFrequency(descriptor)
+    val timing = esp32S3I2cTiming(u32(nativeAddressLoadU32(state, 20)), u32(frequency))
+    var result = 7
+    var healthy = true
+    // Revalidate after taking controller ownership: close may have revoked
+    // the snapshot while this call was acquiring the gate.
+    if ((handle == 0 || esp32S3I2cDevicePool().resolve(handle) == descriptor) &&
+        esp32S3I2cBusKeyOpen(state, key) && budget != u32(0) && timing.valid()) {
+        val status = u32(mmioLoadU32(esp32S3I2cControllerAddress(port) + 8))
+        healthy = false
+        result = 8
+        if ((status & u32(16)) == u32(0) && esp32S3I2cTxCount(status) == 0 && esp32S3I2cRxCount(status) == 0) {
+            result = 7
+            if (nativeAddressLoadU32(state, 28) == frequency || esp32S3I2cConfigureTiming(port, timing)) {
+                nativeAddressStoreU32(state, 28, frequency)
+                result = esp32S3I2cTransferOwned(port, esp32S3I2cDeviceKeyAddress(descriptor), output, written, input, read, budget, registerPrefix)
+                healthy = result == 1
+            }
+        }
+        nativeAddressStoreU32(state, 32, result)
+    }
+    if (!gate.finish(u32(1), healthy)) return 11
+    result
+}
+
+trusted fun I2cDevice.write(source: NativeBuffer, length: int, timeoutMilliseconds: int = 1000): bool =
+    this.transferStatus(source, length, nativeBufferAt(0, 0), 0, timeoutMilliseconds) == 1
+trusted fun I2cDevice.read(destination: NativeBuffer, length: int, timeoutMilliseconds: int = 1000): bool =
+    this.transferStatus(nativeBufferAt(0, 0), 0, destination, length, timeoutMilliseconds) == 1
+trusted fun I2cDevice.writeRead(source: NativeBuffer, sourceLength: int,
+    destination: NativeBuffer, destinationLength: int, timeoutMilliseconds: int = 1000): bool =
+    this.transferStatus(source, sourceLength, destination, destinationLength, timeoutMilliseconds) == 1
+trusted fun I2cBus.probe(address: int, timeoutMilliseconds: int = 50): bool {
+    if (!this.valid()) return false
+    val descriptor = esp32S3I2cDeviceKey(esp32S3I2cBusKeyPort(this), address, 100000,
+        esp32S3I2cBusKeyGeneration(this))
+    esp32S3I2cTransferDescriptor(0, descriptor, nativeBufferAt(0, 0), 0,
+        nativeBufferAt(0, 0), 0, timeoutMilliseconds, -1) == 1
+}
+
+trusted fun I2cDevice.close(): bool {
+    val pool = esp32S3I2cDevicePool()
+    val descriptor = pool.resolve(this)
+    if (!esp32S3I2cDeviceKeyValid(descriptor)) return false
+    val gate = peripheralGateAt(esp32S3I2cState(esp32S3I2cDeviceKeyPort(descriptor)))
+    val admission = gate.tryBegin(u32(1))
+    if (admission == 1 || admission == 3) return false
+    val faulted = admission == 2
+    if (faulted && !gate.tryBeginRecovery(u32(1))) return false
+    val closed = pool.resolve(this) == descriptor && pool.release(this)
+    // Releasing a software view must not clear a hardware fault.
+    val released = if (faulted) gate.finishRecovery(u32(1), false) else gate.finish(u32(1), true)
+    closed && released
+}
+trusted fun I2cDevice.setFrequency(frequency: int): bool {
+    val pool=esp32S3I2cDevicePool();val descriptor=pool.resolve(this)
+    if (!esp32S3I2cDeviceKeyValid(descriptor)) return false
+    val port=esp32S3I2cDeviceKeyPort(descriptor);val state=esp32S3I2cState(port)
+    val gate=peripheralGateAt(state)
+    if (gate.tryBegin(u32(1)) != 0) return false
+    val bus=esp32S3I2cBusKey(port,esp32S3I2cDeviceKeyGeneration(descriptor))
+    val changed=esp32S3I2cBusKeyOpen(state,bus) &&
+        esp32S3I2cDeviceFrequencyOwned(pool,this,bus,u32(nativeAddressLoadU32(state,20)),frequency)
+    val released=gate.finish(u32(1),true)
+    return changed && released
+}
+
+trusted fun I2cDevice.readRegister(register: int, destination: NativeBuffer,
+    length: int, timeoutMilliseconds: int = 1000): bool {
+    if (register < 0 || register > 255) return false
+    this.transferStatus(nativeBufferAt(0, 0), 0, destination, length, timeoutMilliseconds, register) == 1
+}
+
+trusted fun I2cDevice.writeRegister(register: int, source: NativeBuffer,
+    length: int, timeoutMilliseconds: int = 1000): bool {
+    if (register < 0 || register > 255) return false
+    this.transferStatus(source, length, nativeBufferAt(0, 0), 0, timeoutMilliseconds, register) == 1
+}
+
+trusted fun I2cDevice.readRegister8Checked(register: int): I2cByteResult {
+    val cell = nativeStackAllocate(1)
+    if (!this.readRegister(register, nativeBufferAt(cell, 1), 1)) return I2cByteResult(0)
+    I2cByteResult(256 | nativeBufferAt(cell, 1).load(0))
+}
+
+trusted fun I2cDevice.readRegister8(register: int, fallback: int = 0): int {
+    val result = this.readRegister8Checked(register)
+    if (result.valid()) result.value() else fallback
+}
+
+trusted fun I2cDevice.writeRegister8(register: int, value: int): bool {
+    if (register < 0 || register > 255 || value < 0 || value > 255) return false
+    val cell = nativeStackAllocate(2)
+    nativeAddressStoreU8(cell, 0, register)
+    nativeAddressStoreU8(cell, 1, value)
+    this.write(nativeBufferAt(cell, 2), 2)
+}
+
+// The bus owns hardware lifetime. A close
+// leaves its owned pins floating inputs and disables its peripheral clock.
+trusted fun I2cBus.close(): bool {
+    if (!this.valid()) return false
+    val port = esp32S3I2cBusKeyPort(this)
+    val state = esp32S3I2cState(port)
+    val gate = peripheralGateAt(state)
+    val admission = gate.tryBegin(u32(1))
+    if (admission == 1 || admission == 3) return false
+    val recovering = admission == 2
+    if (recovering && !gate.tryBeginRecovery(u32(1))) return false
+    var closed = false
+    var healthy = !recovering
+    if (esp32S3I2cBusKeyOpen(state, this)) {
+        closed = esp32S3I2cCloseStateOwned(port, state)
+        healthy = closed
+    }
+    val released = if (recovering) gate.finishRecovery(u32(1), healthy) else gate.finish(u32(1), healthy)
+    closed && released
+}
+
+trusted fun esp32S3I2cCloseStateOwned(port: int, state: int): bool {
+    // Gate is held; revoke this epoch's views before releasing hardware.
+    val mask = (2147483647 << 29) | 2
+    val expected = (nativeAddressLoadU32(state, 4) << 29) | (port << 1)
+    if (esp32S3I2cDevicePool().releaseMatching(mask, expected) < 0) return false
+    nativeAddressStoreU32(state, 32, 0)
+    if (!esp32S3I2cResetWithRccLock(port, esp32S3I2cRccLock(), u32(1), false)) return false
+    val sda = pin(nativeAddressLoadU32(state, 12))
+    val scl = pin(nativeAddressLoadU32(state, 16))
+    sda.input()
+    scl.input()
+    sda.floating()
+    scl.floating()
+    if (!esp32S3I2cDisableClockWithRccLock(port, esp32S3I2cRccLock(), u32(1))) return false
+    nativeAddressStoreU32(state, 8, 0)
+    true
+}
+
+// A failed constructor has no published bus handle. Explicitly release its
+// partial configuration before changing pins, without touching an open bus.
+trusted fun i2cAbortSetup(port: int): bool {
+    val state = esp32S3I2cState(port)
+    if (state == 0) return false
+    val gate = peripheralGateAt(state)
+    if (!gate.tryBeginRecovery(u32(1))) return false
+    val closed = nativeAddressLoadU32(state, 8) == 2 && esp32S3I2cCloseStateOwned(port, state)
+    val released = gate.finishRecovery(u32(1), closed)
+    closed && released
+}
+
+trusted fun I2cBus.recover(): bool = esp32S3I2cFacadeRecover(this, false, 1000)
+
+// Explicit permission to clock slaves; SINGLE MASTER only, never while an
+// external master may own the bus following arbitration loss.
+trusted fun I2cBus.clearStuckBus(timeoutMilliseconds: int = 1000): bool =
+    esp32S3I2cFacadeRecover(this, true, timeoutMilliseconds)
+
+trusted fun esp32S3I2cFacadeRecover(key: int, active: bool, timeoutMilliseconds: int): bool {
+    if (!esp32S3I2cBusKeyValid(key)) return false
+    val port = esp32S3I2cBusKeyPort(key)
+    val state = esp32S3I2cState(port)
+    val gate = peripheralGateAt(state)
+    if (!gate.tryBeginRecovery(u32(1))) return false
+    var healthy = false
+    if (esp32S3I2cBusKeyOpen(state, key)) {
+        nativeAddressStoreU32(state, 32, 0)
+        val sda = nativeAddressLoadU32(state, 12)
+        val scl = nativeAddressLoadU32(state, 16)
+        val budget = esp32S3I2cTimeoutCycles(timeoutMilliseconds, nativeAddressLoadU32(state, 24))
+        if ((!active || budget != u32(0)) && esp32S3I2cConfiguredPinsMatch(port, sda, scl) &&
+            esp32S3I2cResetWithRccLock(port, esp32S3I2cRccLock(), u32(1), true)) {
+            healthy = if (active) esp32S3I2cClearStuckBusOwned(port, sda, scl, budget)
+                else esp32S3I2cBusReleased(port, sda, scl)
+        }
+    }
+    val released = gate.finishRecovery(u32(1), healthy)
+    healthy && released
+}
+trusted fun s3PrepareProbeRecover(state: int,port: int,owner: u32): int {
+    val sda=nativeAddressLoadU32(state,12)
+    val scl=nativeAddressLoadU32(state,16)
+    if (!esp32S3I2cConfiguredPinsMatch(port,sda,scl)) return 7
+    if (!esp32S3I2cResetWithRccLock(port,esp32S3I2cRccLock(),owner,true)) return 9
+    if (esp32S3I2cBusReleased(port,sda,scl)) 1 else 10
+}
+trusted fun I2cBus.prepareProbeStatus(): int = if (!this.valid()) 7 else
+    esp32S3I2cPrepareProbeOwned(esp32S3I2cState(esp32S3I2cBusKeyPort(this)),this,u32(1))

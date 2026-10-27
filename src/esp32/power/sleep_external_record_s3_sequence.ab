@@ -1,0 +1,59 @@
+import "../sdk/raw_buffer.ab"
+@inline
+fun esp32S3SleepWakeRecordsDisjoint(sleep: NativeBuffer,wake: NativeBuffer): bool {
+    if (!sleep.hasAddressRange(0,128) || !wake.hasAddressRange(0,176) || ((sleep.addressValue() | wake.addressValue()) & 3) != 0) return false
+    sleep.addressValue()+128 <= wake.addressValue() || wake.addressValue()+176 <= sleep.addressValue()
+}
+// Enter using the prepared external-wake record rather than hand-written
+// trigger bits. Both records and all retention DMA buffers must be separately
+// owned/disjoint BEFORE preparing them. Call retained resume on every return;
+// then Cleanup below, keeping peers/interrupts/clients quiescent throughout.
+// -6 means the wake record/power/USB ownership combination was refused.
+trusted fun esp32S3SleepExternalTriggersCheckedOwned(sleep: NativeBuffer,wake: NativeBuffer,flags: int): int {
+    if (!esp32S3SleepWakeRecordsDisjoint(sleep,wake)) return -6
+    val triggers=esp32S3ExternalWakeTriggersOwned(wake)
+    if (triggers < 0) return -6
+    val base=wake.addressValue()
+    var pins=0
+    if ((triggers & 1) != 0) {
+        if ((flags & 2) != 0) return -6
+        val pin=esp32S3RtcWakeRead(base+20)
+        if (pin < 0 || pin > 21) return -6
+        pins=1<<pin
+    }
+    if ((triggers & 2) != 0) {
+        val ext1=esp32S3RtcWakeRead(base+52)
+        if (!esp32S3RtcWakeMaskValid(ext1) || (pins & ext1) != 0) return -6
+        if ((flags & 2) != 0 && esp32S3RtcWakeRead(base+56) != ext1) return -6
+        pins=pins | ext1
+    }
+    // USB pads may currently be off for sleep, but scheduled to turn back on.
+    // Do not let that temporary state authorize stealing GPIO19/20 for wake.
+    if ((pins & 0x180000) != 0 && (esp32S3MspiStateRead(sleep.addressValue()+108) & 2) != 0) return -6
+    triggers
+}
+trusted fun esp32S3SleepExternalTimedEnterOwned(sleep: NativeBuffer,wake: NativeBuffer,flags: int,period: int,duration: int,reject: int): int {
+    val triggers=esp32S3SleepExternalTriggersCheckedOwned(sleep,wake,flags)
+    if (triggers < 0) return -6
+    esp32S3SleepTimedRecordEnterOwned(sleep,flags,period,duration,triggers,reject)
+}
+// Wake solely from the prepared external pins (for example a board RTC IRQ).
+// Zero triggers is invalid: never enter an unwakeable light-sleep cycle.
+trusted fun esp32S3SleepExternalEnterOwned(sleep: NativeBuffer,wake: NativeBuffer,flags: int,period: int,reject: int): int {
+    val triggers=esp32S3SleepExternalTriggersCheckedOwned(sleep,wake,flags)
+    if (triggers <= 0) return -6
+    esp32S3SleepExternalOnlyRecordEnterOwned(sleep,flags,period,triggers,reject)
+}
+// Cache-enabled final cleanup only, AFTER retained resume completed and the
+// caller consumed wake status. A failure leaves the wake record retryable;
+// clients must not resume until this succeeds. Does not attempt clock recovery
+// from flash code: retained resume has its own IRAM/manual-recovery contract.
+trusted fun esp32S3SleepExternalWakeCleanupOwned(sleep: NativeBuffer,wake: NativeBuffer): bool {
+    if (!esp32S3SleepWakeRecordsDisjoint(sleep,wake)) return false
+    val base=sleep.addressValue()
+    if (esp32S3MspiStateRead(base) != 0 || (esp32S3MspiStateRead(base+4) & 255) != 6) return false
+    val progress=Esp32S3SleepResume(esp32S3MspiStateLoad64(base+40))
+    if (!progress.valid() || !progress.complete()) return false
+    if (esp32S3ExternalWakeReleasedOwned(wake)) return true
+    esp32S3ExternalWakeRestoreOwned(wake)
+}

@@ -1,0 +1,76 @@
+import "./sleep_retained_p4_sequence.ab"
+import "./sleep_predictor_p4_sequence.ab"
+import "./sleep_l2_p4_sequence.ab"
+// Current-core predictor off -> L1 clean -> L2 suspend -> retained sleep
+// cycle -> L2 resume -> original predictor bits. RAM execution and peer-core,
+// IRQ/DMA/cache-user exclusion are caller prerequisites, as are installed
+// graph/session, PMU/wake/rail/CPU context, drained flash and powered flash.
+// This supplies cache/predictor lifecycle, NOT a board-ready sleep API.
+// Record288B: magic,state,last,detail,outcome,mhz,predictor,regdma;
+// L2record32@32; retainedCycle224@64. Same hart throughout all retries.
+// States1predictor2clean3L2suspend4cycle5L2resume6predictorRestore7done
+// 8cleanPendingAbort9engineFault. Results1wake2reject3both4invalid7pending
+// 9stageFailure10aborted11engineFault. Errors never release outer resources
+// while a child is pending or uncertain. Caller must keep all records alive.
+trusted fun p4SleepCachedResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun esp32p4SleepCachedContinueOwned(r: NativeBuffer,polls: int,eventPolls: int,exclusivePrepared: bool): int {
+    if (!exclusivePrepared || polls < 1 || polls > 1000000 || eventPolls < 1 || eventPolls > 1000000 ||
+        !r.hasAddressRange(0,288) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344331 || r.loadU32(4) < 1 || r.loadU32(4) > 9) return 4
+    val predictor=P4SleepPredictor(r.loadU32(24))
+    if (predictor.hasSnapshot() && int(p4SleepPredictorHart()) != ((predictor>>>12)&1)) return 4
+    if (r.loadU32(4) == 7) return r.loadU32(16)
+    if (r.loadU32(4) == 9) return 11
+    val l2=nativeBufferAt(r.addressValue()+32,32)
+    val cycle=nativeBufferAt(r.addressValue()+64,224)
+    while (true) {
+        val state=r.loadU32(4)
+        if (state == 1) {
+            val held=esp32p4SleepPredictorDisableOwned(true);r.storeU32(24,held|0)
+            if (held.status() != 1) { r.storeU32(16,10);r.storeU32(4,6);return p4SleepCachedResult(r,9,held.status()) }
+            r.storeU32(4,2)
+        } else if (state == 2) {
+            val clean=esp32p4SleepCacheWritebackOwned(polls,true)
+            if (clean != 1) { r.storeU32(4,8);r.storeU32(16,10);return p4SleepCachedResult(r,9,clean) }
+            r.storeU32(4,3)
+        } else if (state == 3) {
+            val suspended=if (l2.loadU32(0) == 0) esp32p4SleepL2OpenOwned(l2,polls,true) else esp32p4SleepL2ContinueOwned(l2,polls,true)
+            if (suspended != 1) return p4SleepCachedResult(r,if (suspended == 5) 7 else 9,suspended)
+            r.storeU32(4,4)
+        } else if (state == 4) {
+            val slept=if (cycle.loadU32(0) == 0) esp32p4SleepRetainedBeginOwned(cycle,300,r.loadU32(20),r.loadU32(28) != 0,polls,eventPolls,true) else esp32p4SleepRetainedContinueOwned(cycle,polls,eventPolls,true)
+            if (slept == 11) { r.storeU32(4,9);return p4SleepCachedResult(r,11,cycle.loadU32(12)) }
+            if ((slept < 1 || slept > 3) && slept != 10) return p4SleepCachedResult(r,if (slept == 7) 7 else 9,slept)
+            r.storeU32(16,slept);r.storeU32(4,5)
+        } else if (state == 5) {
+            val resumed=esp32p4SleepL2CloseOwned(l2,polls,true)
+            if (resumed != 6) return p4SleepCachedResult(r,9,resumed)
+            r.storeU32(4,6)
+        } else if (state == 6) {
+            var held=P4SleepPredictor(r.loadU32(24))
+            if (held.hasSnapshot()) {
+                held=held.closeOwned(true);r.storeU32(24,held|0)
+                if (held.status() != 4) return p4SleepCachedResult(r,9,held.status())
+            }
+            r.storeU32(4,7);return p4SleepCachedResult(r,r.loadU32(16),0)
+        } else if (state == 8) {
+            if ((p4SleepCacheRead(152)&u32(15)) != u32(0)) return 7
+            p4SleepCacheFence();r.storeU32(4,6)
+        } else return 4
+    }
+    return 4
+}
+trusted fun esp32p4SleepCachedBeginOwned(r: NativeBuffer,revision: int,mhz: int,regdmaBackup: bool,polls: int,eventPolls: int,exclusivePrepared: bool): int {
+    if (!exclusivePrepared || revision != 300 || (mhz != 320 && mhz != 400 && mhz != 500) || polls < 1 || polls > 1000000 ||
+        eventPolls < 1 || eventPolls > 1000000 || !r.hasAddressRange(0,288) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || int(p4SleepPredictorHart()) > 1) return 4
+    if (!p4RetentionClockReady() || (p4SleepRequestRead(296)&u32(0x7fffffff)) == u32(0) ||
+        (p4SleepRequestRead(356)&u32(0xc0000000)) != u32(0)) return 4
+    val entry=int(p4RetentionPauRead(24))
+    if (entry == 0 || !p4RetentionLinkAddressValid(entry) || (entry < r.addressValue()+288 && r.addressValue() < entry+4) ||
+        (p4RetentionPauRead(0)&u32(7)) != u32(0) || (p4RetentionPauRead(52)&u32(2)) != u32(0)) return 4
+    var i=8
+    while (i < 288) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344331);r.storeU32(4,1);r.storeU32(20,mhz);r.storeU32(28,if (regdmaBackup) 1 else 0)
+    return esp32p4SleepCachedContinueOwned(r,polls,eventPolls,true)
+}

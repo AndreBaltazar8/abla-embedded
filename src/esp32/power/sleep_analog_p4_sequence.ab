@@ -1,0 +1,68 @@
+import "./sleep_analog_fields_p4.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Full pmu_sleep_analog_init field ordering. Do not compose the independent
+// bias/regulator leases: upstream interleaves them and enables LPactive last.
+// Config32B: HPsleep bias, LPsleep bias, six regulator words in existing order.
+// Record56B: magic/state/primary/cleanup/revision + nine original field words.
+// Caller validates calibrated voltage/retention policy, owns PMU/analog power,
+// excludes HP/LP transitions and keeps recovery code in powered memory.
+// Includes ACTIVE DCM changes; does not enter sleep or toggle immediate DCDC_EN.
+fun p4SleepAnalogSlot(step: int): int = if (step == 0) 0 else if (step <= 4 || step == 10) 1 else
+    if (step <= 9 || step == 11) 3 else if (step == 12) 4 else if (step == 13 || step == 14 || step >= 24) 5 else
+    if (step == 15) 6 else if (step == 16 || step == 17 || step == 22) 2 else if (step <= 21) 7 else 8
+fun p4SleepAnalogStepMask(step: int): u32 =
+    if (step == 0 || step == 1) u32(0x01800000) else if (step == 2) u32(0x007c0000) else
+    if (step == 3 || step == 16) u32(0x40000000) else if (step == 4 || step == 17) u32(0x80000000) else
+    if (step == 5) u32(0x00010000) else if (step == 6) u32(0x00020000) else if (step == 7) u32(0x00040000) else
+    if (step == 8) u32(0x00780000) else if (step == 9 || step == 13 || step == 20) u32(0x07800000) else
+    if (step == 10 || step == 22) u32(0x3c000000) else if (step == 11 || step == 14 || step == 21) u32(0xf8000000) else
+    if (step == 12 || step == 15 || step == 23) u32(0xfc000000) else
+    if (step == 18 || step == 25) u32(0x00400000) else u32(0x00200000)
+trusted fun p4SleepAnalogSet(step: int,value: u32): bool {
+    val offset=p4SleepAnalogOffset(p4SleepAnalogSlot(step));val mask=p4SleepAnalogStepMask(step)
+    p4SleepAnalogWrite(offset,(p4SleepAnalogRead(offset)&~mask)|(value&mask))
+    return (p4SleepAnalogRead(offset)&mask) == (value&mask)
+}
+//1ready2invalid3partial4closed; primary/cleanup are one-based field steps.
+trusted fun esp32p4SleepAnalogOpenOwned(r: NativeBuffer,c: NativeBuffer,revision: int,deep: bool,exclusive: bool): int {
+    if (!exclusive || revision < 0 || revision > 399 || !r.hasAddressRange(0,56) || !c.hasAddressRange(0,32) ||
+        (r.addressValue()&3) != 0 || (c.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    if (r.addressValue() < c.addressValue()+32 && c.addressValue() < r.addressValue()+56) return 2
+    var slot=1
+    while (slot < 9) {
+        if ((u32(c.loadU32((slot-1)*4))&~p4SleepAnalogMask(slot,revision)) != u32(0)) return 2
+        slot=slot+1
+    }
+    if (revision >= 100 && (c.loadU32(8)&0x00380000) != 0) return 2
+    r.storeU32(0,0x50344131);r.storeU32(4,3);r.storeU32(8,0);r.storeU32(12,0);r.storeU32(16,revision)
+    slot=0
+    while (slot < 9) { r.storeU32(20+slot*4,int(p4SleepAnalogRead(p4SleepAnalogOffset(slot))&p4SleepAnalogMask(slot,revision)));slot=slot+1 }
+    var step=0
+    while (step < 26) {
+        if (step != 8 || revision >= 100) {
+            slot=p4SleepAnalogSlot(step)
+            val value=if (slot == 0) (if (deep) u32(0) else u32(0x00800000)) else u32(c.loadU32((slot-1)*4))
+            if (!p4SleepAnalogSet(step,value)) { r.storeU32(8,step+1);return 3 }
+        }
+        step=step+1
+    }
+    r.storeU32(4,1);return 1
+}
+// Restore the original analog profile in the same bias-before-enable order,
+// except ACTIVE DCM is restored LAST. Restore must not race a mode transition.
+trusted fun esp32p4SleepAnalogCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,56) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344131 || r.loadU32(16) > 399) return 2
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 2
+    r.storeU32(4,3)
+    var index=1
+    while (index <= 26) {
+        val step=if (index == 26) 0 else index
+        if (step != 8 || r.loadU32(16) >= 100) {
+            if (!p4SleepAnalogSet(step,u32(r.loadU32(20+p4SleepAnalogSlot(step)*4)))) { r.storeU32(12,step+1);return 3 }
+        }
+        index=index+1
+    }
+    r.storeU32(12,0);r.storeU32(4,4);return 4
+}

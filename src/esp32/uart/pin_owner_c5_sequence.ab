@@ -1,0 +1,58 @@
+import "./pins_c5_sequence.ab"
+import "../sdk/raw_buffer.ab"
+//64B RAM lease: tag0,status4,unit8,TX12,RX16,original RXroute20,
+// TX/RX mux24/28,output routes32/36,pad config40/44,latches48,setup result52.
+// Caller owns entire lifetime; stopped former users, GPIO-controlled OEoff
+// pads only. Restores changed fields, never re-enables old peripheral outputs.
+// Status1ready2invalid3admission4partial5closing6closed. Preserve setup result.
+fun c5UartPinOwnerStorage(record: NativeBuffer): bool =
+    record.hasAddressRange(0,64) && (record.addressValue()&3) == 0 &&
+    (record.addressValue()+64 <= 0x60000000 || record.addressValue() >= 0x60100000)
+trusted fun c5UartPinOwnerOpenOwned(record: NativeBuffer,unit: int,tx: int,rx: int,exclusiveStopped: bool): int {
+    if (!c5UartPinOwnerStorage(record) || record.loadU32(0) != 0) return 2
+    val admitted=c5UartPinsAdmission(unit,tx,rx,exclusiveStopped,true)
+    if (admitted != 1) return admitted
+    val txRoute=c5GpioRead(0x60091ad4+tx*4);val rxRoute=c5GpioRead(0x60091ad4+rx*4)
+    if ((txRoute&u32(3072)) != u32(1024) || (rxRoute&u32(3072)) != u32(1024)) return 3
+    record.storeU32(0,0x43355550);record.storeU32(4,4)
+    record.storeU32(8,unit);record.storeU32(12,tx);record.storeU32(16,rx)
+    record.storeU32(20,int(c5GpioRead(0x600912ec+unit*12)))
+    record.storeU32(24,int(c5GpioRead(0x60090000+tx*4)));record.storeU32(28,int(c5GpioRead(0x60090000+rx*4)))
+    record.storeU32(32,int(txRoute));record.storeU32(36,int(rxRoute))
+    record.storeU32(40,int(c5GpioRead(0x600910d4+tx*4)));record.storeU32(44,int(c5GpioRead(0x600910d4+rx*4)))
+    record.storeU32(48,int(c5GpioRead(0x60091004)));record.storeU32(52,0)
+    record.storeU32(56,0);record.storeU32(60,0)
+    val result=c5UartPinsConfigureOwned(unit,tx,rx,true)
+    record.storeU32(52,result)
+    if (result == 1) { record.storeU32(4,1);return 1 }
+    return 4
+}
+// Stop UART/peers first and keep GPIO/UART clocks until complete. Retry does
+// not repeat setup; every restore is idempotent with both outputs disabled.
+trusted fun c5UartPinOwnerCloseOwned(record: NativeBuffer,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !c5UartPinOwnerStorage(record) || record.loadU32(0) != 0x43355550) return 2
+    val status=record.loadU32(4)
+    if (status == 6) return 6
+    if (status != 1 && status != 4 && status != 5) return 2
+    val unit=record.loadU32(8);val tx=record.loadU32(12);val rx=record.loadU32(16)
+    if (c5UartPinsAdmission(unit,tx,rx,true,false) != 1) return 3
+    record.storeU32(4,5)
+    val mask=(u32(1)<<u32(tx))|(u32(1)<<u32(rx))
+    c5GpioWrite(0x6009103c,mask)
+    if ((c5GpioRead(0x60091034)&mask) != u32(0)) return 5
+    if (!c5GpioField(0x60091ad4+tx*4,u32(3072),u32(1024)) ||
+        !c5GpioField(0x60091ad4+rx*4,u32(3072),u32(1024))) return 5
+    val savedLatch=u32(record.loadU32(48))&mask
+    c5GpioWrite(0x60091008,savedLatch);c5GpioWrite(0x6009100c,mask&~savedLatch)
+    if ((c5GpioRead(0x60091004)&mask) != savedLatch) return 5
+    var index=0
+    while (index < 2) {
+        val pin=if (index == 0) tx else rx
+        if (!c5GpioField(0x600910d4+pin*4,u32(4),u32(record.loadU32(40+index*4))&u32(4)) ||
+            !c5GpioField(0x60090000+pin*4,u32(29570),u32(record.loadU32(24+index*4))&u32(29570)) ||
+            !c5GpioField(0x60091ad4+pin*4,u32(4095),u32(record.loadU32(32+index*4))&u32(4095))) return 5
+        index=index+1
+    }
+    if (!c5GpioField(0x600912ec+unit*12,u32(511),u32(record.loadU32(20))&u32(511))) return 5
+    record.storeU32(4,6);return 6
+}

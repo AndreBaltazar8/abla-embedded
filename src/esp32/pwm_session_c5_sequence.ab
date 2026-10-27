@@ -1,0 +1,163 @@
+import "./ledc_pin_owner_c5_sequence.ab"
+import "./ledc_channel_c5_sequence.ab"
+//88B caller-owned record: tag0,status4,stage8,clock12,timer16,channel20,
+// resolution24,divider28,duty32,pin36,result40,close-phase44,pad lease40@48.
+// Whole LEDC exclusive lifetime: other channels disabled/timers paused, all
+// IRQ/ETM/PCR users joined and selected source/GPIO clocks pinned. Not a
+// per-channel allocator. Non-inverted output; caller qualifies board pin.
+//1ready2invalid3partial4closing5closed. Failure retains all child ownership;
+// no automatic reset/replay. Close before reusing fresh storage. After duty
+// updates, duty32/result40 describe the latest accepted update attempt.
+fun c5PwmSessionStorage(record: NativeBuffer): bool = record.hasAddressRange(0,88) &&
+    (record.addressValue()&3) == 0 && (record.addressValue()+88 <= 0x60000000 || record.addressValue() >= 0x60100000)
+trusted fun c5PwmTimerWait(timer: int,polls: int): bool {
+    var left=polls
+    while (left > 0) {
+        if ((c5LedcRead(160+timer*8)&0x4000000) == 0) return true
+        left=left-1
+    }
+    return false
+}
+trusted fun c5PwmSessionOpenOwned(record: NativeBuffer,source: int,sourceHz: int,hz: int,
+    resolution: int,timer: int,channel: int,pin: int,duty: int,polls: int,exclusive: bool): int {
+    val divider=c5LedcDividerForHz(sourceHz,hz,resolution)
+    if (!exclusive || !c5PwmSessionStorage(record) || record.loadU32(0) != 0 || divider < 0 ||
+        source < 0 || source > 2 || timer < 0 || timer > 3 || channel < 0 || channel > 5 ||
+        !esp32C5GpioNumberValid(pin) || duty < 0 || polls < 1 || polls > 1000000) return 2
+    val limit=int(u32(1)<<u32(resolution))
+    if (duty > limit || (resolution == 20 && duty == limit)) return 2
+    var at=0
+    while (at < 88) { record.storeU32(at,0);at=at+4 }
+    record.storeU32(0,0x43355057);record.storeU32(4,3);record.storeU32(8,1)
+    record.storeU32(16,timer);record.storeU32(20,channel);record.storeU32(24,resolution)
+    record.storeU32(28,divider);record.storeU32(32,duty);record.storeU32(36,pin)
+    val clock=c5LedcClockOpenOwned(source,true,polls)
+    record.storeU32(12,clock|0);record.storeU32(40,clock.status())
+    if (!clock.ready()) return 3
+    record.storeU32(8,2)
+    var result=c5LedcTimerConfigurePausedOwned(timer,resolution,divider)
+    record.storeU32(40,result)
+    if (result != 1) return 3
+    if (!c5PwmTimerWait(timer,polls)) { record.storeU32(40,5);return 3 }
+    result=c5LedcTimerResumeOwned(timer);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,3)
+    result=c5LedcChannelStopOwned(channel,false,polls);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,4)
+    result=c5LedcPinOpenOwned(nativeBufferAt(record.addressValue()+48,40),pin,channel,false,true)
+    record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,5)
+    result=c5LedcChannelSetDutyOwned(channel,timer,duty,0,polls);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(4,1);return 1
+}
+// Update only the owned channel, keeping timer frequency and pad routing.
+// Admission failures leave the ready session intact. Partial writes/timeouts
+// withdraw further writes until checked completion or explicit cleanup.
+// Returns channel status1success2invalid3busy4readback5timeout6timer unavailable.
+trusted fun c5PwmSessionSetDutyOwned(record: NativeBuffer,duty: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5PwmSessionStorage(record) || record.loadU32(0) != 0x43355057 ||
+        record.loadU32(4) != 1 || record.loadU32(8) != 5 || duty < 0 || polls < 1 || polls > 1000000) return 2
+    val timer=record.loadU32(16);val channel=record.loadU32(20)
+    if (timer > 3 || channel > 5 || (c5LedcClockRead(0)&7) != 5 ||
+        (c5LedcClockRead(4)&0x400000) == 0 || (c5LedcClockRead(8)&4) != 0) return 6
+    // Reject a retuned timer: the scalar session's resolution/period still
+    // defines this channel's contract. Changing frequency is separate ownership.
+    if ((c5LedcRead(160+timer*8)&0x7fffff) != (record.loadU32(24)|(record.loadU32(28)<<5))) return 6
+    val result=c5LedcChannelSetDutyOwned(channel,timer,duty,0,polls)
+    if (result == 1 || result == 4 || result == 5) {
+        record.storeU32(32,duty);record.storeU32(40,result)
+        if (result != 1) record.storeU32(4,3)
+    }
+    return result
+}
+// Observe completion of a known timed-out initial or later duty update. Never
+// publish again. Actual-duty readback must match before ready is republished.
+trusted fun c5PwmSessionWaitDutyOwned(record: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5PwmSessionStorage(record) || record.loadU32(0) != 0x43355057 ||
+        record.loadU32(4) != 3 || record.loadU32(8) != 5 || record.loadU32(40) != 5 ||
+        record.loadU32(20) > 5 || polls < 1 || polls > 1000000) return 2
+    if ((c5LedcClockRead(0)&7) != 5 || (c5LedcClockRead(4)&0x400000) == 0 || (c5LedcClockRead(8)&4) != 0) return 6
+    val channel=record.loadU32(20)
+    val result=c5LedcChannelWaitOwned(channel,polls)
+    if (result != 1) return result
+    if ((c5LedcRead(channel*20+16)&0x1ffffff) != (record.loadU32(32)<<4)) return 4
+    record.storeU32(40,1);record.storeU32(4,1);return 1
+}
+// No discarded pending waveforms: wait for hardware completion, stop channel,
+// restore pad, pause owned timer, then release owned memory/clocks. The original
+// startup result remains intact. Caller keeps clocks until return5.
+trusted fun c5PwmSessionCloseOwned(record: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5PwmSessionStorage(record) || record.loadU32(0) != 0x43355057 || polls < 1 || polls > 1000000) return 2
+    val status=record.loadU32(4)
+    if (status == 5) return 5
+    if (status != 1 && status != 3 && status != 4) return 2
+    record.storeU32(4,4)
+    // Explicit isolated recovery owns phase4 until its one publication settles.
+    if (record.loadU32(44) == 4) return 4
+    val timer=record.loadU32(16);val channel=record.loadU32(20)
+    if (record.loadU32(8) >= 2 && record.loadU32(44) < 3) {
+        if ((c5LedcClockRead(0)&7) != 5 || (c5LedcClockRead(4)&0x400000) == 0 || !c5PwmTimerWait(timer,polls)) return 4
+        if (record.loadU32(44) == 0) {
+            if (c5LedcChannelWaitOwned(channel,polls) != 1) return 4
+            // Already inactive and idle-low needs no update on a paused timer.
+            if ((c5LedcRead(channel*20)&12) != 0) {
+                val stopped=c5LedcChannelStopOwned(channel,false,polls)
+                if (stopped != 1 && stopped != 5) return 4
+                record.storeU32(44,1)
+                if (stopped == 5) return 4
+            } else record.storeU32(44,1)
+        }
+        if (record.loadU32(44) == 1) {
+            if (c5LedcChannelWaitOwned(channel,polls) != 1) return 4
+            val pad=nativeBufferAt(record.addressValue()+48,40)
+            if (pad.loadU32(0) != 0 && c5LedcPinCloseOwned(pad,true) != 6) return 4
+            record.storeU32(44,2)
+        }
+        if (c5LedcTimerPauseOwned(timer) != 1) return 4
+        record.storeU32(44,3)
+    }
+    val clock=C5LedcClockOwner(record.loadU32(12)).closeOwned(true)
+    record.storeU32(12,clock|0)
+    if (clock.status() != 0) return 4
+    record.storeU32(4,5);return 5
+}
+// Explicit recovery for this session's timed-out static-duty publication.
+// NOT automatic cancellation or a general fade abort. Caller qualifies that
+// disconnecting the PWM pad (external safe bias) is safe and owns GPIO/LEDC
+// clocks, released global holds and all users. Isolation prevents a reissued
+// update from producing another external waveform. Never reset controller.
+// Phase4 records publication attempt BEFORE the write; retries only wait.
+trusted fun c5PwmSessionRecoverPublicationOwned(record: NativeBuffer,polls: int,
+    exclusive: bool,outputDisconnectSafe: bool): int {
+    if (!exclusive || !outputDisconnectSafe || !c5PwmSessionStorage(record) ||
+        record.loadU32(0) != 0x43355057 || record.loadU32(4) != 4 ||
+        record.loadU32(8) != 5 || record.loadU32(40) != 5 ||
+        (record.loadU32(44) != 0 && record.loadU32(44) != 4) || polls < 1 || polls > 1000000) return 2
+    val pin=record.loadU32(36);val channel=record.loadU32(20);val timer=record.loadU32(16)
+    if (!esp32C5GpioNumberValid(pin) || channel > 5 || timer > 3 ||
+        (c5LedcClockRead(0)&7) != 5 || (c5LedcClockRead(4)&0x400000) == 0 ||
+        (c5GpioRead(0x600960f0)&u32(3)) != u32(1) ||
+        (c5GpioRead(0x600960f4)&u32(0x400000)) == u32(0) ||
+        ((c5GpioRead(0x600960f4)>>u32(20))&u32(3)) == u32(3) ||
+        (c5GpioRead(0x60091df8)&u32(1)) == u32(0)) return 4
+    val bit=u32(1)<<u32(pin)
+    if ((c5GpioRead(0x600b102c)&bit) != u32(0) || (c5GpioRead(0x600b1028)&bit&u32(127)) != u32(0) ||
+        ((pin == 13 || pin == 14) && (c5GpioRead(0x6000f018)&u32(16384)) != u32(0)) ||
+        (c5GpioRead(0x60091ad4+pin*4)&u32(4095)) != u32(1024|channel)) return 4
+    val offset=channel*20
+    if (record.loadU32(44) == 0) {
+        val config=c5LedcRead(offset)
+        if ((config&0x801f) != (4|timer) || (c5LedcRead(offset+12)&0x80000000) == 0 ||
+            (c5LedcRead(offset+8)&0x1ffffff) != (record.loadU32(32)<<4)) return 4
+        c5GpioWrite(0x6009103c,bit)
+        if ((c5GpioRead(0x60091034)&bit) != u32(0)) return 4
+        record.storeU32(44,4)
+        c5LedcWrite(offset,(config&0xfffeffef)|16)
+    } else if ((c5GpioRead(0x60091034)&bit) != u32(0)) return 4
+    if (c5LedcChannelWaitOwned(channel,polls) != 1) return 4
+    record.storeU32(44,0)
+    return c5PwmSessionCloseOwned(record,polls,true)
+}

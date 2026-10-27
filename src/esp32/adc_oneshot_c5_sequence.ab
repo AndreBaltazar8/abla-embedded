@@ -1,0 +1,57 @@
+import "./adc_config_c5_sequence.ab"
+// Caller retains exclusive ADC/analog/pad/clock ownership, stable source Hz,
+// calibrated delay provider and completed pad/trim/controller/settling setup.
+// No forced cancellation/reset. A dropped trigger can remain pending forever;
+// absence of DONE is never treated as success or permission to release.
+// status1result2invalid3config4busy5clear-failed6write7released8pending.
+// channel@8,atten@11,start-attempt@13,lease@14,raw12@16.
+type C5AdcConversion=int
+fun C5AdcConversion.status(): int = this&255
+fun C5AdcConversion.raw(): int = if (this.status() == 1) (this>>>16)&4095 else -1
+trusted fun c5AdcConversionPrepared(channel: int,attenuation: int): bool =
+    c5AdcTrimPowered() && (c5AdcClockRead(4)&u32(0xfffff)) == u32(0xf040) &&
+    (c5AdcClockRead(0xc0)&u32(0xff00)) == u32(0x100) &&
+    (c5AdcRead(0)&u32(0x00800002)) == u32(0) &&
+    (c5AdcRead(4)&u32(0x1000000)) == u32(0) &&
+    (c5AdcRead(0x3c)&u32(0xc8000000)) == u32(0) &&
+    c5AdcRead(0x40) == u32(0) && (c5AdcRead(0x50)&u32(0xc0000000)) == u32(0) &&
+    (c5AdcRead(0x20)&u32(0x5f800000)) == (u32(attenuation|(channel<<2))<<u32(23))
+trusted fun c5AdcConversionStartOwned(channel: int,attenuation: int,sourceHz: int,exclusive: bool): C5AdcConversion {
+    val delay=c5AdcDefaultPulseMicros(sourceHz)
+    if (!exclusive || channel < 0 || channel > 5 || attenuation < 0 || attenuation > 3 || delay < 0) return C5AdcConversion(2)
+    if (!c5AdcConversionPrepared(channel,attenuation)) return C5AdcConversion(3)
+    if ((c5AdcRead(0x20)&u32(0xe0000000)) != u32(0)) return C5AdcConversion(4)
+    // W1C precisely our DONE event, never read-modify-write another event.
+    c5AdcWrite(0x4c,u32(0x80000000))
+    if ((c5AdcRead(0x44)&u32(0x80000000)) != u32(0)) return C5AdcConversion(5)
+    val token=(1<<14)|(channel<<8)|(attenuation<<11)
+    if (!c5AdcConfigField(u32(0x80000000),u32(0x80000000))) return C5AdcConversion(token|6)
+    // Preserve start-attempt even when readback fails. Always complete the
+    // high/low pulse; do not return early with a deliberately asserted START.
+    val high=c5AdcConfigField(u32(0x20000000),u32(0x20000000))
+    c5AdcDelayMicros(delay)
+    val low=c5AdcConfigField(u32(0x20000000),u32(0))
+    c5AdcDelayMicros(delay)
+    return C5AdcConversion(token|(1<<13)|(if (high && low) 8 else 6))
+}
+trusted fun C5AdcConversion.waitOwned(polls: int,exclusive: bool): C5AdcConversion {
+    if (!exclusive || polls < 1 || polls > 1000000 || this < 0 || (this&~0xfff7fff) != 0 || (this&0x6000) != 0x6000 || this.status() == 7) return this
+    val token=this&0x7f00
+    val channel=(this>>>8)&7;val attenuation=(this>>>11)&3
+    if (channel > 5 || !c5AdcConversionPrepared(channel,attenuation) || (c5AdcRead(0x20)&u32(0xa0000000)) != u32(0x80000000)) return C5AdcConversion(token|3)
+    var left=polls
+    while (left > 0) {
+        if ((c5AdcRead(0x44)&u32(0x80000000)) != u32(0)) return C5AdcConversion(token|1|(int(c5AdcRead(0x2c)&u32(4095))<<16))
+        left=left-1
+    }
+    return C5AdcConversion(token|8)
+}
+trusted fun C5AdcConversion.releaseOwned(exclusive: bool): C5AdcConversion {
+    if (!exclusive || this < 0 || (this&~0xfff7fff) != 0 || (this&0x4000) == 0 || this.status() == 7) return this
+    val token=this&~255
+    val channel=(this>>>8)&7;val attenuation=(this>>>11)&3
+    if (channel > 5 || !c5AdcConversionPrepared(channel,attenuation) || (c5AdcRead(0x20)&u32(0x20000000)) != u32(0)) return C5AdcConversion(token|3)
+    if ((this&0x2000) != 0 && (c5AdcRead(0x44)&u32(0x80000000)) == u32(0)) return C5AdcConversion(token|8)
+    if (!c5AdcConfigField(u32(0x80000000),u32(0))) return C5AdcConversion(token|6)
+    return C5AdcConversion(token|7)
+}

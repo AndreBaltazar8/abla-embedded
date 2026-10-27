@@ -1,0 +1,49 @@
+import "../gpio_hold_p4_sequence.ab"
+import "./snapshot_p4_value.ab"
+// One scalar: mux15bits, output-route12@15, drain27,enable28,latch29,
+// pin6@30, LP-mux-owner36,valid37,layout3 flag38. No heap/record allocation.
+// Captures fields touched by digital routing, NOT interrupt/analog/hold/global
+// input-matrix ownership. Both former and temporary users must be quiescent.
+trusted fun esp32p4GpioSnapshotOwned(pin: int,layout: int,exclusive: bool): P4GpioSnapshot {
+    if (!exclusive || (layout != 1 && layout != 3) || pin < 0 || pin > 54 ||
+        esp32P4GpioIndividualHoldOwned(layout,pin) != 0) return P4GpioSnapshot(0)
+    val shift=u32(pin&31)
+    val base=0x500e0000
+    val enable=p4PinSnapshotRead(base+(if (pin < 32) 32 else 44))
+    val latch=p4PinSnapshotRead(base+(if (pin < 32) 4 else 16))
+    val lp=if (pin < 16) (p4PinSnapshotRead(0x5012b008+pin*4) >>> 4)&1 else 0
+    return P4GpioSnapshot((1 << 37)|(if (layout == 3) 1 << 38 else 0)|(pin << 30)|(lp << 36)|
+        (p4PinSnapshotRead(base+4100+pin*4)&29570)|
+        ((p4PinSnapshotRead(base+1368+pin*4)&4095) << 15)|
+        (((p4PinSnapshotRead(base+116+pin*4) >>> 2)&1) << 27)|
+        (int((u32(enable)>>shift)&u32(1)) << 28)|(int((u32(latch)>>shift)&u32(1)) << 29))
+}
+trusted fun p4PinSnapshotField(address: int,mask: int,value: int): bool {
+    p4PinSnapshotWrite(address,(p4PinSnapshotRead(address)&(0xffffffff ^ mask))|value)
+    return (p4PinSnapshotRead(address)&mask) == value
+}
+// 1 restored,2 invalid,3 unowned/held,4 readbackfailure. Snapshot stays intact
+// for retry. Clocks/global holds pinned/released; former LP owner stopped too.
+// Disable GPIO OE and force matrix to that OE before changing output/mux.
+trusted fun P4GpioSnapshot.restoreOwned(exclusive: bool): int {
+    if (!this.valid()) return 2
+    val pin=this.pin()
+    if (!exclusive || esp32P4GpioIndividualHoldOwned(if ((this&(1 << 38)) != 0) 3 else 1,pin) != 0) return 3
+    val base=0x500e0000
+    val enable=base+(if (pin < 32) 32 else 44)
+    val bit=int(u32(1)<<u32(pin&31))
+    val route=base+1368+pin*4
+    p4PinSnapshotWrite(enable+8,bit)
+    if ((p4PinSnapshotRead(enable)&bit) != 0) return 4
+    if (!p4PinSnapshotField(route,3072,1024)) return 4
+    val high=(this&(1 << 29)) != 0
+    p4PinSnapshotWrite(base+(if (pin < 32) 8 else 20)+(if (high) 0 else 4),bit)
+    if (((p4PinSnapshotRead(base+(if (pin < 32) 4 else 16))&bit) != 0) != high) return 4
+    if (!p4PinSnapshotField(base+116+pin*4,4,((this >>> 27)&1) << 2)) return 4
+    if (!p4PinSnapshotField(base+4100+pin*4,29570,this&29570)) return 4
+    if (pin < 16 && !p4PinSnapshotField(0x5012b008+pin*4,16,((this >>> 36)&1) << 4)) return 4
+    if (!p4PinSnapshotField(route,4095,(this >>> 15)&4095)) return 4
+    if ((this&(1 << 28)) != 0) p4PinSnapshotWrite(enable+4,bit)
+    if (((p4PinSnapshotRead(enable)&bit) != 0) != ((this&(1 << 28)) != 0)) return 4
+    return 1
+}

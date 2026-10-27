@@ -1,0 +1,895 @@
+import "../runtime/libc_heap_esp32.ab"
+import "../runtime/libc_locks_esp32.ab"
+import "../heap/capabilities_base_esp32.ab"
+import "../runtime/picolibc_fprintf_esp32.ab"
+import "../runtime/picolibc_fwrite_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// ESP-IDF-compatible VFS registry written as structured Abla. The table
+// layouts intentionally remain ABI-compatible with ESP-IDF 6 on Xtensa:
+// vfs_entry_t is 20 bytes plus its inline path, and fd_table_t is 3 bytes.
+val esp32VfsOk = u32(0)
+val esp32VfsNoMemory = u32(0x101)
+val esp32VfsInvalidArgument = u32(0x102)
+val esp32VfsInvalidState = u32(0x103)
+val esp32VfsFlagContext = u32(2)
+val esp32VfsFlagReadonly = u32(4)
+val esp32VfsFlagStatic = u32(8)
+val esp32VfsIgnoredPathLength = u32(0xffffffff)
+val esp32VfsMaximumPathLength = u32(15)
+val esp32VfsMaximumCount = u32(8)
+val esp32VfsMaximumDescriptors = u32(64)
+val esp32VfsOperationsBytes = u32(52)
+val esp32VfsDirectoryOperationsBytes = u32(64)
+val esp32VfsSelectOperationsBytes = u32(24)
+
+val esp32VfsEntriesStorage = nativeStaticAllocate(32)
+val esp32VfsEntries = u32(esp32VfsEntriesStorage)
+val esp32VfsCountStorage = nativeStaticAllocate(4)
+val esp32VfsCount = u32(esp32VfsCountStorage)
+val esp32VfsDescriptorLockStorage = nativeStaticAllocate(4)
+val esp32VfsDescriptorLock = u32(esp32VfsDescriptorLockStorage)
+
+// Sixty-four FD_TABLE_ENTRY_UNUSED values. Each record is
+// flags=0, vfs_index=-1, local_fd=-1.
+val esp32VfsDescriptorsStorage = nativeStaticMutableU32s([
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015,
+    16776960,4278255615,4294902015,16776960,4278255615,4294902015
+])
+val esp32VfsDescriptors = u32(esp32VfsDescriptorsStorage)
+
+val esp32VfsRootPathStorage = nativeStaticBytes("\x2f\x00")
+val esp32VfsRootPath = u32(esp32VfsRootPathStorage)
+val esp32VfsEmptyPathStorage = nativeStaticAllocate(1)
+val esp32VfsEmptyPath = u32(esp32VfsEmptyPathStorage)
+val esp32VfsNullTextStorage = nativeStaticBytes("\x4e\x55\x4c\x4c\x00")
+val esp32VfsNullText = u32(esp32VfsNullTextStorage)
+
+val esp32VfsDumpSeparatorStorage = nativeStaticBytes(
+    "------------------------------------------------------\x0a\x00"
+)
+val esp32VfsDumpSeparator = u32(esp32VfsDumpSeparatorStorage)
+val esp32VfsDumpFdTitleStorage = nativeStaticBytes(
+    "<VFS Path Prefix>-<FD seen by App>-<FD seen by driver>\x0a\x00"
+)
+val esp32VfsDumpFdTitle = u32(esp32VfsDumpFdTitleStorage)
+val esp32VfsDumpFdFormatStorage = nativeStaticBytes(
+    "(%s) - 0x%x - 0x%x\x0a\x00"
+)
+val esp32VfsDumpFdFormat = u32(esp32VfsDumpFdFormatStorage)
+val esp32VfsDumpSocketFormatStorage = nativeStaticBytes(
+    "(socket) - 0x%x - 0x%x\x0a\x00"
+)
+val esp32VfsDumpSocketFormat = u32(esp32VfsDumpSocketFormatStorage)
+val esp32VfsDumpPathTitleStorage = nativeStaticBytes(
+    "<index>:<VFS Path Prefix> -> <VFS entry ptr>\x0a\x00"
+)
+val esp32VfsDumpPathTitle = u32(esp32VfsDumpPathTitleStorage)
+val esp32VfsDumpPathFormatStorage = nativeStaticBytes(
+    "%d:%s -> %p\x0a\x00"
+)
+val esp32VfsDumpPathFormat = u32(esp32VfsDumpPathFormatStorage)
+
+@inline trusted fun esp32VfsLoad(address: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+
+@inline trusted fun esp32VfsStore(address: u32, value: u32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+
+@inline trusted fun esp32VfsLoadByte(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+
+@inline trusted fun esp32VfsStoreByte(address: u32, value: u32): void =
+    ablaUnsafeStoreU8(
+        nativePointerFromAddress(int(address)),
+        int(value & u32(255))
+    )
+
+@inline trusted fun esp32VfsSignedByte(address: u32): u32 {
+    val value = esp32VfsLoadByte(address)
+    return if (value >= u32(128)) value | u32(0xffffff00) else value
+}
+
+trusted fun esp32VfsStringLength(value: u32): u32 {
+    if (value == u32(0)) return u32(0)
+    var length = u32(0)
+    while (esp32VfsLoadByte(value + length) != u32(0)) {
+        length = length + u32(1)
+    }
+    return length
+}
+
+trusted fun esp32VfsMemoryEqual(left: u32, right: u32, size: u32): bool {
+    var offset = u32(0)
+    while (offset < size) {
+        if (esp32VfsLoadByte(left + offset) !=
+            esp32VfsLoadByte(right + offset)) return false
+        offset = offset + u32(1)
+    }
+    return true
+}
+
+@inline trusted fun esp32VfsEntrySlot(index: u32): u32 =
+    esp32VfsEntries + index * u32(4)
+
+@inline trusted fun esp32VfsEntry(index: u32): u32 =
+    esp32VfsLoad(esp32VfsEntrySlot(index))
+
+@inline trusted fun esp32VfsSetEntry(index: u32, entry: u32): void =
+    esp32VfsStore(esp32VfsEntrySlot(index), entry)
+
+@inline trusted fun esp32VfsEntryFlags(entry: u32): u32 =
+    esp32VfsLoad(entry)
+
+@inline trusted fun esp32VfsEntryOperations(entry: u32): u32 =
+    esp32VfsLoad(entry + u32(4))
+
+@inline trusted fun esp32VfsEntryContext(entry: u32): u32 =
+    esp32VfsLoad(entry + u32(8))
+
+@inline trusted fun esp32VfsEntryIndex(entry: u32): u32 =
+    esp32VfsLoad(entry + u32(12))
+
+@inline trusted fun esp32VfsEntryPathLength(entry: u32): u32 =
+    esp32VfsLoad(entry + u32(16))
+
+@inline trusted fun esp32VfsEntryPath(entry: u32): u32 =
+    entry + u32(20)
+
+@inline trusted fun esp32VfsDescriptor(fd: u32): u32 =
+    esp32VfsDescriptors + fd * u32(3)
+
+@inline trusted fun esp32VfsDescriptorFlags(fd: u32): u32 =
+    esp32VfsLoadByte(esp32VfsDescriptor(fd))
+
+@inline trusted fun esp32VfsDescriptorIndex(fd: u32): u32 =
+    esp32VfsSignedByte(esp32VfsDescriptor(fd) + u32(1))
+
+@inline trusted fun esp32VfsDescriptorLocal(fd: u32): u32 =
+    esp32VfsLoadByte(esp32VfsDescriptor(fd) + u32(2))
+
+trusted fun esp32VfsDescriptorSet(
+    fd: u32,
+    index: u32,
+    local: u32,
+    permanent: bool
+): void {
+    val item = esp32VfsDescriptor(fd)
+    esp32VfsStoreByte(item, if (permanent) u32(1) else u32(0))
+    esp32VfsStoreByte(item + u32(1), index)
+    esp32VfsStoreByte(item + u32(2), local)
+}
+
+trusted fun esp32VfsDescriptorClear(fd: u32): void {
+    val item = esp32VfsDescriptor(fd)
+    esp32VfsStoreByte(item, u32(0))
+    esp32VfsStoreByte(item + u32(1), u32(255))
+    esp32VfsStoreByte(item + u32(2), u32(255))
+}
+
+trusted fun esp32VfsLock(): void {
+    esp32LibcLockAcquireGeneric(
+        esp32VfsDescriptorLock,
+        u32(0xffffffff),
+        esp32LibcLockNormalMutex
+    )
+    return
+}
+
+trusted fun esp32VfsUnlock(): void {
+    esp32LibcLockReleaseGeneric(
+        esp32VfsDescriptorLock,
+        esp32LibcLockNormalMutex
+    )
+}
+
+trusted fun esp32VfsFreeOperations(operations: u32): void {
+    if (operations == u32(0)) return
+    val directory = esp32VfsLoad(operations + u32(44))
+    val select = esp32VfsLoad(operations + u32(48))
+    if (directory != u32(0)) esp32LibcFree(directory)
+    if (select != u32(0)) esp32LibcFree(select)
+    esp32LibcFree(operations)
+}
+
+trusted fun esp32VfsFreeEntry(entry: u32): void {
+    if (entry == u32(0)) return
+    if ((esp32VfsEntryFlags(entry) & esp32VfsFlagStatic) == u32(0)) {
+        esp32VfsFreeOperations(esp32VfsEntryOperations(entry))
+    }
+    esp32LibcFree(entry)
+}
+
+trusted fun esp32VfsDuplicateOperations(source: u32): u32 {
+    if (source == u32(0)) return u32(0)
+    var directory = u32(0)
+    var select = u32(0)
+    val sourceDirectory = esp32VfsLoad(source + u32(44))
+    if (sourceDirectory != u32(0)) {
+        directory = esp32LibcMalloc(esp32VfsDirectoryOperationsBytes)
+        if (directory == u32(0)) return u32(0)
+        freestandingCopy(
+            directory,
+            sourceDirectory,
+            esp32VfsDirectoryOperationsBytes
+        )
+    }
+    val sourceSelect = esp32VfsLoad(source + u32(48))
+    if (sourceSelect != u32(0)) {
+        select = esp32LibcMalloc(esp32VfsSelectOperationsBytes)
+        if (select == u32(0)) {
+            if (directory != u32(0)) esp32LibcFree(directory)
+            return u32(0)
+        }
+        freestandingCopy(select, sourceSelect, esp32VfsSelectOperationsBytes)
+    }
+    val result = esp32LibcMalloc(esp32VfsOperationsBytes)
+    if (result == u32(0)) {
+        if (directory != u32(0)) esp32LibcFree(directory)
+        if (select != u32(0)) esp32LibcFree(select)
+        return u32(0)
+    }
+    freestandingCopy(result, source, esp32VfsOperationsBytes)
+    esp32VfsStore(result + u32(44), directory)
+    esp32VfsStore(result + u32(48), select)
+    return result
+}
+
+trusted fun esp32VfsLegacyHasDirectory(legacy: u32): bool {
+    var offset = u32(36)
+    while (offset <= u32(80)) {
+        if (esp32VfsLoad(legacy + offset) != u32(0)) return true
+        offset = offset + u32(4)
+    }
+    offset = u32(96)
+    while (offset <= u32(108)) {
+        if (esp32VfsLoad(legacy + offset) != u32(0)) return true
+        offset = offset + u32(4)
+    }
+    return false
+}
+
+trusted fun esp32VfsLegacyHasSelect(legacy: u32): bool {
+    var offset = u32(112)
+    while (offset <= u32(132)) {
+        if (esp32VfsLoad(legacy + offset) != u32(0)) return true
+        offset = offset + u32(4)
+    }
+    return false
+}
+
+trusted fun esp32VfsMakeOperations(legacy: u32, output: u32): u32 {
+    if (legacy == u32(0) || output == u32(0)) {
+        return esp32VfsInvalidArgument
+    }
+    var directory = u32(0)
+    var select = u32(0)
+    if (esp32VfsLegacyHasDirectory(legacy)) {
+        directory = esp32LibcMalloc(esp32VfsDirectoryOperationsBytes)
+        if (directory == u32(0)) return esp32VfsNoMemory
+        freestandingSet(directory, i32(0), esp32VfsDirectoryOperationsBytes)
+        var source = u32(36)
+        var target = u32(0)
+        while (source <= u32(80)) {
+            esp32VfsStore(directory + target, esp32VfsLoad(legacy + source))
+            source = source + u32(4)
+            target = target + u32(4)
+        }
+        source = u32(96)
+        while (source <= u32(108)) {
+            esp32VfsStore(directory + target, esp32VfsLoad(legacy + source))
+            source = source + u32(4)
+            target = target + u32(4)
+        }
+    }
+    if (esp32VfsLegacyHasSelect(legacy)) {
+        select = esp32LibcMalloc(esp32VfsSelectOperationsBytes)
+        if (select == u32(0)) {
+            if (directory != u32(0)) esp32LibcFree(directory)
+            return esp32VfsNoMemory
+        }
+        freestandingCopy(
+            select,
+            legacy + u32(112),
+            esp32VfsSelectOperationsBytes
+        )
+    }
+    val operations = esp32LibcMalloc(esp32VfsOperationsBytes)
+    if (operations == u32(0)) {
+        if (directory != u32(0)) esp32LibcFree(directory)
+        if (select != u32(0)) esp32LibcFree(select)
+        return esp32VfsNoMemory
+    }
+    freestandingSet(operations, i32(0), esp32VfsOperationsBytes)
+    var index = u32(0)
+    while (index < u32(8)) {
+        esp32VfsStore(
+            operations + index * u32(4),
+            esp32VfsLoad(legacy + u32(4) + index * u32(4))
+        )
+        index = index + u32(1)
+    }
+    esp32VfsStore(operations + u32(32), esp32VfsLoad(legacy + u32(84)))
+    esp32VfsStore(operations + u32(36), esp32VfsLoad(legacy + u32(88)))
+    esp32VfsStore(operations + u32(40), esp32VfsLoad(legacy + u32(92)))
+    esp32VfsStore(operations + u32(44), directory)
+    esp32VfsStore(operations + u32(48), select)
+    esp32VfsStore(output, operations)
+    return esp32VfsOk
+}
+
+@inline trusted fun esp32VfsFreeIndex(): u32 {
+    var index = u32(0)
+    while (index < esp32VfsMaximumCount) {
+        if (esp32VfsEntry(index) == u32(0)) return index
+        index = index + u32(1)
+    }
+    return u32(0xffffffff)
+}
+
+@inline trusted fun esp32VfsPathValid(path: u32, length: u32): bool =
+    length >= u32(2) &&
+    length <= esp32VfsMaximumPathLength &&
+    esp32VfsLoadByte(path) == u32(47) &&
+    esp32VfsLoadByte(path + length - u32(1)) != u32(47)
+
+// Register an immutable operation table when the caller already knows the
+// path length.  Device files declared in Abla use this path during startup:
+// it preserves the full registry representation while avoiding a dynamic
+// strlen, operation-table duplication, and the generic compatibility chain.
+@inline trusted fun esp32VfsRegisterStaticKnownPath(
+    basePath: u32,
+    pathLength: u32,
+    operations: u32,
+    flags: u32,
+    context: u32,
+    beforeScheduler: bool
+): u32 {
+    val count = esp32VfsLoad(esp32VfsCount)
+    if (count >= esp32VfsMaximumCount) return esp32VfsNoMemory
+    if (basePath == u32(0) || operations == u32(0) ||
+        !esp32VfsPathValid(basePath, pathLength)) {
+        return esp32VfsInvalidArgument
+    }
+    val index = esp32VfsFreeIndex()
+    if (index == u32(0xffffffff)) return esp32VfsNoMemory
+    val entry = if (beforeScheduler) {
+        esp32HeapCapsAllocateBeforeScheduler(
+            u32(21) + pathLength, u32(6144)
+        )
+    } else {
+        esp32HeapCapsAlignedAllocateBase(
+            u32(4), u32(21) + pathLength, u32(6144)
+        )
+    }
+    if (entry == u32(0)) return esp32VfsNoMemory
+    esp32VfsStore(entry, flags | esp32VfsFlagStatic)
+    esp32VfsStore(entry + u32(4), operations)
+    esp32VfsStore(entry + u32(8), context)
+    esp32VfsStore(entry + u32(12), index)
+    esp32VfsStore(entry + u32(16), pathLength)
+    freestandingCopy(entry + u32(20), basePath, pathLength + u32(1))
+    esp32VfsSetEntry(index, entry)
+    if (index == count) esp32VfsStore(esp32VfsCount, count + u32(1))
+    return esp32VfsOk
+}
+
+trusted fun esp32VfsRegisterOperationsCommon(
+    basePath: u32,
+    operations: u32,
+    flags: u32,
+    context: u32,
+    indexOutput: u32
+): u32 {
+    val count = esp32VfsLoad(esp32VfsCount)
+    if (count >= esp32VfsMaximumCount) return esp32VfsNoMemory
+    if (operations == u32(0)) return esp32VfsInvalidArgument
+
+    var path = esp32VfsEmptyPath
+    var pathLength = u32(0)
+    if (basePath != u32(0)) {
+        path = basePath
+        pathLength = esp32VfsStringLength(basePath)
+        if (pathLength != u32(0) &&
+            !esp32VfsPathValid(basePath, pathLength)) {
+            return esp32VfsInvalidArgument
+        }
+    }
+
+    val index = esp32VfsFreeIndex()
+    if (index == u32(0xffffffff)) return esp32VfsNoMemory
+    if (esp32VfsEntry(index) != u32(0)) return esp32VfsInvalidState
+    val entry = esp32LibcMalloc(u32(21) + pathLength)
+    if (entry == u32(0)) return esp32VfsNoMemory
+
+    esp32VfsStore(entry, flags)
+    esp32VfsStore(entry + u32(4), operations)
+    esp32VfsStore(entry + u32(8), context)
+    esp32VfsStore(entry + u32(12), index)
+    esp32VfsStore(
+        entry + u32(16),
+        if (basePath == u32(0)) esp32VfsIgnoredPathLength else pathLength
+    )
+    freestandingCopy(entry + u32(20), path, pathLength + u32(1))
+    esp32VfsSetEntry(index, entry)
+    if (index == count) esp32VfsStore(esp32VfsCount, count + u32(1))
+    if (indexOutput != u32(0)) esp32VfsStore(indexOutput, index)
+    return esp32VfsOk
+}
+
+trusted fun esp32VfsRegisterFs(
+    basePath: u32,
+    operations: u32,
+    flags: u32,
+    context: u32
+): u32 {
+    if (basePath == u32(0) || operations == u32(0)) {
+        return esp32VfsInvalidArgument
+    }
+    if ((flags & esp32VfsFlagStatic) != u32(0)) {
+        return esp32VfsRegisterOperationsCommon(
+            basePath, operations, flags, context, u32(0)
+        )
+    }
+    val copy = esp32VfsDuplicateOperations(operations)
+    if (copy == u32(0)) return esp32VfsNoMemory
+    val result = esp32VfsRegisterOperationsCommon(
+        basePath, copy, flags, context, u32(0)
+    )
+    if (result != esp32VfsOk) esp32VfsFreeOperations(copy)
+    return result
+}
+
+trusted fun esp32VfsRegisterCommon(
+    basePath: u32,
+    length: u32,
+    legacy: u32,
+    context: u32,
+    indexOutput: u32
+): u32 {
+    if (legacy == u32(0)) return esp32VfsInvalidArgument
+    val flags = esp32VfsLoad(legacy)
+    if ((flags & esp32VfsFlagStatic) != u32(0)) {
+        return esp32VfsInvalidArgument
+    }
+    var actualPath = basePath
+    if (length != esp32VfsIgnoredPathLength) {
+        if (basePath == u32(0) ||
+            esp32VfsStringLength(basePath) != length) {
+            return esp32VfsInvalidArgument
+        }
+    } else {
+        actualPath = u32(0)
+    }
+    val output = u32(nativeStackAllocate(4))
+    esp32VfsStore(output, u32(0))
+    val made = esp32VfsMakeOperations(legacy, output)
+    if (made != esp32VfsOk) return made
+    val operations = esp32VfsLoad(output)
+    val result = esp32VfsRegisterOperationsCommon(
+        actualPath, operations, flags, context, indexOutput
+    )
+    if (result != esp32VfsOk) esp32VfsFreeOperations(operations)
+    return result
+}
+
+trusted fun esp32VfsRegister(
+    basePath: u32,
+    legacy: u32,
+    context: u32
+): u32 {
+    if (basePath == u32(0)) return esp32VfsInvalidArgument
+    return esp32VfsRegisterCommon(
+        basePath,
+        esp32VfsStringLength(basePath),
+        legacy,
+        context,
+        u32(0)
+    )
+}
+
+trusted fun esp32VfsRegisterWithId(
+    legacy: u32,
+    context: u32,
+    indexOutput: u32
+): u32 {
+    if (indexOutput == u32(0)) return esp32VfsInvalidArgument
+    esp32VfsStore(indexOutput, u32(0xffffffff))
+    return esp32VfsRegisterCommon(
+        esp32VfsEmptyPath,
+        esp32VfsIgnoredPathLength,
+        legacy,
+        context,
+        indexOutput
+    )
+}
+
+trusted fun esp32VfsRegisterFdRange(
+    operations: u32,
+    flags: u32,
+    context: u32,
+    minimum: u32,
+    maximum: u32
+): u32 {
+    if (i32(minimum) < i32(0) || i32(maximum) < i32(0) ||
+        maximum > esp32VfsMaximumDescriptors ||
+        minimum > esp32VfsMaximumDescriptors || minimum > maximum) {
+        return esp32VfsInvalidArgument
+    }
+    val output = u32(nativeStackAllocate(4))
+    val result = esp32VfsRegisterOperationsCommon(
+        u32(0), operations, flags, context, output
+    )
+    if (result != esp32VfsOk) return result
+    val index = esp32VfsLoad(output)
+    esp32VfsLock()
+    var fd = minimum
+    while (fd < maximum) {
+        if (esp32VfsDescriptorIndex(fd) != u32(0xffffffff)) {
+            val entry = esp32VfsEntry(index)
+            if (entry != u32(0)) esp32LibcFree(entry)
+            esp32VfsSetEntry(index, u32(0))
+            var rollback = minimum
+            while (rollback < fd) {
+                if (esp32VfsDescriptorIndex(rollback) == index) {
+                    esp32VfsDescriptorClear(rollback)
+                }
+                rollback = rollback + u32(1)
+            }
+            esp32VfsUnlock()
+            return esp32VfsInvalidArgument
+        }
+        esp32VfsDescriptorSet(fd, index, fd, true)
+        fd = fd + u32(1)
+    }
+    esp32VfsUnlock()
+    return esp32VfsOk
+}
+
+trusted fun esp32VfsRegisterFsWithId(
+    operations: u32,
+    flags: u32,
+    context: u32,
+    indexOutput: u32
+): u32 {
+    if (indexOutput == u32(0)) return esp32VfsInvalidArgument
+    esp32VfsStore(indexOutput, u32(0xffffffff))
+    return esp32VfsRegisterOperationsCommon(
+        u32(0), operations, flags, context, indexOutput
+    )
+}
+
+trusted fun esp32VfsUnregisterWithId(index: u32): u32 {
+    if (i32(index) < i32(0) || index >= esp32VfsMaximumCount ||
+        esp32VfsEntry(index) == u32(0)) {
+        return esp32VfsInvalidArgument
+    }
+    esp32VfsFreeEntry(esp32VfsEntry(index))
+    esp32VfsSetEntry(index, u32(0))
+    esp32VfsLock()
+    var fd = u32(0)
+    while (fd < esp32VfsMaximumDescriptors) {
+        if (esp32VfsDescriptorIndex(fd) == index) {
+            esp32VfsDescriptorClear(fd)
+        }
+        fd = fd + u32(1)
+    }
+    esp32VfsUnlock()
+    return esp32VfsOk
+}
+
+trusted fun esp32VfsUnregister(basePath: u32): u32 {
+    if (basePath == u32(0)) return esp32VfsInvalidArgument
+    val length = esp32VfsStringLength(basePath)
+    var index = u32(0)
+    while (index < esp32VfsLoad(esp32VfsCount)) {
+        val entry = esp32VfsEntry(index)
+        if (entry != u32(0) &&
+            esp32VfsEntryPathLength(entry) == length &&
+            esp32VfsMemoryEqual(basePath, esp32VfsEntryPath(entry), length)) {
+            return esp32VfsUnregisterWithId(index)
+        }
+        index = index + u32(1)
+    }
+    return esp32VfsInvalidState
+}
+
+trusted fun esp32VfsRegisterFdWithLocalFd(
+    index: u32,
+    localFd: u32,
+    permanent: bool,
+    output: u32
+): u32 {
+    if (i32(index) < i32(0) ||
+        index >= esp32VfsLoad(esp32VfsCount) ||
+        esp32VfsEntry(index) == u32(0) || output == u32(0)) {
+        return esp32VfsInvalidArgument
+    }
+    var result = esp32VfsNoMemory
+    esp32VfsLock()
+    var fd = u32(0)
+    while (fd < esp32VfsMaximumDescriptors) {
+        if (esp32VfsDescriptorIndex(fd) == u32(0xffffffff)) {
+            esp32VfsDescriptorSet(
+                fd,
+                index,
+                if (i32(localFd) >= i32(0)) localFd else fd,
+                permanent
+            )
+            esp32VfsStore(output, fd)
+            result = esp32VfsOk
+            fd = esp32VfsMaximumDescriptors
+        } else {
+            fd = fd + u32(1)
+        }
+    }
+    esp32VfsUnlock()
+    return result
+}
+
+trusted fun esp32VfsRegisterFd(index: u32, output: u32): u32 =
+    esp32VfsRegisterFdWithLocalFd(
+        index, u32(0xffffffff), true, output
+    )
+
+trusted fun esp32VfsUnregisterFd(index: u32, fd: u32): u32 {
+    if (i32(index) < i32(0) ||
+        index >= esp32VfsLoad(esp32VfsCount) ||
+        fd >= esp32VfsMaximumDescriptors) {
+        return esp32VfsInvalidArgument
+    }
+    var result = esp32VfsInvalidArgument
+    esp32VfsLock()
+    if ((esp32VfsDescriptorFlags(fd) & u32(1)) != u32(0) &&
+        esp32VfsDescriptorIndex(fd) == index &&
+        esp32VfsDescriptorLocal(fd) == fd) {
+        esp32VfsDescriptorClear(fd)
+        result = esp32VfsOk
+    }
+    esp32VfsUnlock()
+    return result
+}
+
+trusted fun esp32VfsWriteBlock(stream: u32, text: u32, size: u32): void {
+    esp32PicolibcFwrite(text, u32(1), size, stream)
+    return
+}
+
+trusted fun esp32VfsDumpFds(stream: u32): void {
+    esp32VfsWriteBlock(stream, esp32VfsDumpSeparator, u32(55))
+    esp32VfsWriteBlock(stream, esp32VfsDumpFdTitle, u32(58))
+    esp32VfsWriteBlock(stream, esp32VfsDumpSeparator, u32(55))
+    esp32VfsLock()
+    var fd = u32(0)
+    while (fd < esp32VfsMaximumDescriptors) {
+        val index = esp32VfsDescriptorIndex(fd)
+        if (index != u32(0xffffffff)) {
+            val entry = esp32VfsEntry(index)
+            if (entry != u32(0)) {
+                if (esp32VfsLoadByte(esp32VfsEntryPath(entry)) != u32(0)) {
+                    esp32RecoveredFprintf(
+                        stream, esp32VfsDumpFdFormat,
+                        esp32VfsEntryPath(entry), fd,
+                        esp32VfsDescriptorLocal(fd), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                } else {
+                    esp32RecoveredFprintf(
+                        stream, esp32VfsDumpSocketFormat, fd,
+                        esp32VfsDescriptorLocal(fd), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            }
+        }
+        fd = fd + u32(1)
+    }
+    esp32VfsUnlock()
+}
+
+trusted fun esp32VfsDumpRegisteredPaths(stream: u32): void {
+    esp32VfsWriteBlock(stream, esp32VfsDumpSeparator, u32(55))
+    esp32VfsWriteBlock(stream, esp32VfsDumpPathTitle, u32(45))
+    esp32VfsWriteBlock(stream, esp32VfsDumpSeparator, u32(55))
+    var index = u32(0)
+    while (index < esp32VfsMaximumCount) {
+        val entry = esp32VfsEntry(index)
+        esp32RecoveredFprintf(
+            stream,
+            esp32VfsDumpPathFormat,
+            index,
+            if (entry == u32(0)) esp32VfsNullText else
+                esp32VfsEntryPath(entry),
+            if (entry == u32(0)) u32(0) else
+                esp32VfsEntryOperations(entry),
+            u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0)
+        )
+        index = index + u32(1)
+    }
+}
+
+trusted fun esp32VfsSetReadonlyFlag(basePath: u32): u32 {
+    if (basePath == u32(0)) return esp32VfsInvalidArgument
+    val length = esp32VfsStringLength(basePath)
+    var index = u32(0)
+    while (index < esp32VfsLoad(esp32VfsCount)) {
+        val entry = esp32VfsEntry(index)
+        if (entry != u32(0) &&
+            esp32VfsEntryPathLength(entry) == length &&
+            esp32VfsMemoryEqual(basePath, esp32VfsEntryPath(entry), length)) {
+            esp32VfsStore(
+                entry,
+                esp32VfsEntryFlags(entry) | esp32VfsFlagReadonly
+            )
+            return esp32VfsOk
+        }
+        index = index + u32(1)
+    }
+    return esp32VfsInvalidState
+}
+
+trusted fun esp32VfsGetForIndex(index: u32): u32 {
+    if (i32(index) < i32(0) ||
+        index >= esp32VfsLoad(esp32VfsCount)) return u32(0)
+    return esp32VfsEntry(index)
+}
+
+trusted fun esp32VfsRegisterLocalFd(
+    index: u32,
+    localFd: u32,
+    permanent: bool
+): u32 {
+    esp32VfsLock()
+    var fd = u32(0)
+    while (fd < esp32VfsMaximumDescriptors) {
+        if (esp32VfsDescriptorIndex(fd) == u32(0xffffffff)) {
+            esp32VfsDescriptorSet(fd, index, localFd, permanent)
+            esp32VfsUnlock()
+            return fd
+        }
+        fd = fd + u32(1)
+    }
+    esp32VfsUnlock()
+    return u32(0xffffffff)
+}
+
+// Startup runs on one core before task scheduling, so its fixed descriptor
+// bootstrap does not need to create and acquire the runtime registry mutex.
+// Runtime open/close paths continue to use esp32VfsRegisterLocalFd above.
+@inline trusted fun esp32VfsRegisterLocalFdDuringStartup(
+    index: u32,
+    localFd: u32
+): u32 {
+    var fd = u32(0)
+    while (fd < esp32VfsMaximumDescriptors) {
+        if (esp32VfsDescriptorIndex(fd) == u32(0xffffffff)) {
+            esp32VfsDescriptorSet(fd, index, localFd, false)
+            return fd
+        }
+        fd = fd + u32(1)
+    }
+    return u32(0xffffffff)
+}
+
+trusted fun esp32VfsUnregisterLocalFd(fd: u32): void {
+    if (fd >= esp32VfsMaximumDescriptors) return
+    esp32VfsLock()
+    val flags = esp32VfsDescriptorFlags(fd)
+    if ((flags & u32(1)) == u32(0)) {
+        if ((flags & u32(4)) != u32(0)) {
+            esp32VfsStoreByte(esp32VfsDescriptor(fd), flags | u32(2))
+        } else {
+            esp32VfsDescriptorClear(fd)
+        }
+    }
+    esp32VfsUnlock()
+}
+
+trusted fun esp32VfsGetFdEntry(fd: u32): u32 =
+    if (i32(fd) >= i32(0) && fd < esp32VfsMaximumDescriptors)
+        esp32VfsDescriptor(fd)
+    else u32(0)
+
+trusted fun esp32VfsGetForFd(fd: u32): u32 {
+    if (i32(fd) < i32(0) || fd >= esp32VfsMaximumDescriptors) {
+        return u32(0)
+    }
+    return esp32VfsGetForIndex(esp32VfsDescriptorIndex(fd))
+}
+
+trusted fun esp32VfsGetLocalFd(entry: u32, fd: u32): u32 {
+    if (entry == u32(0) || i32(fd) < i32(0) ||
+        fd >= esp32VfsMaximumDescriptors) return u32(0xffffffff)
+    return esp32VfsDescriptorLocal(fd)
+}
+
+trusted fun esp32VfsTranslatePath(entry: u32, source: u32): u32 {
+    if (entry == u32(0) || source == u32(0)) return u32(0)
+    val prefixLength = esp32VfsEntryPathLength(entry)
+    if (esp32VfsStringLength(source) == prefixLength) return esp32VfsRootPath
+    return source + prefixLength
+}
+
+trusted fun esp32VfsGetForPath(path: u32): u32 {
+    if (path == u32(0)) return u32(0)
+    val length = esp32VfsStringLength(path)
+    var best = u32(0)
+    var bestLength = u32(0xffffffff)
+    var index = u32(0)
+    while (index < esp32VfsLoad(esp32VfsCount)) {
+        val entry = esp32VfsEntry(index)
+        if (entry != u32(0)) {
+            val prefixLength = esp32VfsEntryPathLength(entry)
+            if (prefixLength != esp32VfsIgnoredPathLength &&
+                length >= prefixLength &&
+                esp32VfsMemoryEqual(
+                    path,
+                    esp32VfsEntryPath(entry),
+                    prefixLength
+                )) {
+                if (prefixLength == u32(0) && best == u32(0)) {
+                    best = entry
+                    bestLength = u32(0)
+                } else if ((length == prefixLength ||
+                    esp32VfsLoadByte(path + prefixLength) == u32(47)) &&
+                    (bestLength == u32(0xffffffff) ||
+                    prefixLength > bestLength)) {
+                    best = entry
+                    bestLength = prefixLength
+                }
+            }
+        }
+        index = index + u32(1)
+    }
+    return best
+}
+
+trusted fun esp32VfsGetCount(): u32 = esp32VfsLoad(esp32VfsCount)
+
+trusted fun esp32VfsClosePending(descriptorCount: u32): void {
+    val maximum = if (descriptorCount < esp32VfsMaximumDescriptors)
+        descriptorCount else esp32VfsMaximumDescriptors
+    esp32VfsLock()
+    var fd = u32(0)
+    while (fd < maximum) {
+        if ((esp32VfsDescriptorFlags(fd) & u32(2)) != u32(0)) {
+            esp32VfsDescriptorClear(fd)
+        }
+        fd = fd + u32(1)
+    }
+    esp32VfsUnlock()
+}
+
+@inline trusted fun esp32VfsFdSetContains(set: u32, fd: u32): bool {
+    if (set == u32(0) || fd >= esp32VfsMaximumDescriptors) return false
+    val word = esp32VfsLoad(set + (fd >> u32(5)) * u32(4))
+    val shift = fd & u32(31)
+    return (word & (u32(1) << shift)) != u32(0)
+}
+
+trusted fun esp32VfsStartSelect(fd: u32, errorFds: u32): u32 {
+    if (fd >= esp32VfsMaximumDescriptors) return u32(0x00ffff00)
+    esp32VfsLock()
+    val item = esp32VfsDescriptor(fd)
+    if (esp32VfsFdSetContains(errorFds, fd)) {
+        esp32VfsStoreByte(item, esp32VfsLoadByte(item) | u32(4))
+    }
+    val result =
+        esp32VfsLoadByte(item) |
+        (esp32VfsLoadByte(item + u32(1)) << u32(8)) |
+        (esp32VfsLoadByte(item + u32(2)) << u32(16))
+    esp32VfsUnlock()
+    return result
+}

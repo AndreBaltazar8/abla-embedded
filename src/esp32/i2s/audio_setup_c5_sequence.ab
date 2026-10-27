@@ -1,0 +1,73 @@
+import "./clock_session_c5_sequence.ab"
+import "./dma_config_c5_sequence.ab"
+import "./pin_session_c5_sequence.ab"
+//176B retained:tag0,state4,primary8,cleanup12,packedpins16,mode20,
+// clock32@24,DMAclock56,config68@60,pins48@128. State1pending2ready4partial
+// 5closing6closed. Returns1ready2invalid4partial5pending6closed.
+// Whole I2S/GDMA/codec/ETM/IRQ/pads exclusive lifetime. Root source already
+// selected/stable, GPIO clocks pinned, FIFOs/controller initialized. No reset,
+// discard or transfer start. Close only after transfer stop/event handling.
+fun c5AudioSetupStorage(r: NativeBuffer): bool = r.hasAddressRange(0,176) && (r.addressValue()&3) == 0 && (r.addressValue()+176 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c5AudioSetupWaitOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioSetupStorage(r) || r.loadU32(0) != 0x43354155 || r.loadU32(4) != 1 || polls < 1 || polls > 1000000) return 2
+    val config=nativeBufferAt(r.addressValue()+60,68)
+    if (config.loadU32(4) == 5) {
+        val result=c5I2sDmaConfigWaitOwned(config,polls,true)
+        if (result == 5) return 5
+        if (result != 1) { r.storeU32(8,0x30000|result);r.storeU32(4,4);return 4 }
+    }
+    if (config.loadU32(4) != 1) return 4
+    r.storeU32(4,4)
+    val pins=r.loadU32(16);val mode=r.loadU32(20)
+    val result=c5I2sPinSessionOpenOwned(nativeBufferAt(r.addressValue()+128,48),(mode&1) != 0,(mode&4) != 0,pins&31,(pins>>>5)&31,(pins>>>10)&31,if (((pins>>>15)&31) == 31) -1 else (pins>>>15)&31,(mode&2) != 0,true)
+    if (result != 1) { r.storeU32(8,0x40000|result);return 4 }
+    r.storeU32(4,2);return 1
+}
+trusted fun c5AudioSetupOpenOwned(r: NativeBuffer,channel: int,tx: bool,source: int,integer: int,numerator: int,denominator: int,bclkDivider: int,bclk: int,ws: int,data: int,mclk: int,dataBits: int,slotBits: int,wsWidth: int,shift: bool,slots: int,flags: int,bytes: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioSetupStorage(r) || r.loadU32(0) != 0 || channel < 0 || channel > 2 || source < 0 || source > 3 || integer < 2 || integer > 255 || denominator < 1 || denominator > 511 || numerator < 0 || numerator >= denominator || bclkDivider < 1 || bclkDivider > 64 || polls < 1 || polls > 1000000 || bytes < 4 || bytes > 4092 || (bytes&3) != 0 ||
+        c5I2sFrameWidthWord(dataBits,slotBits,wsWidth) < 0 || c5I2sStandardConfigWord(tx,slots,flags) < 0 ||
+        !esp32C5GpioNumberValid(bclk) || !esp32C5GpioNumberValid(ws) || !esp32C5GpioNumberValid(data) || mclk < -1 || mclk > 28 || (source == 3 && mclk < 0) ||
+        bclk == ws || bclk == data || ws == data || (mclk >= 0 && (mclk == bclk || mclk == ws || mclk == data))) return 2
+    var at=0
+    while (at < 176) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43354155);r.storeU32(4,4)
+    r.storeU32(16,bclk|(ws<<5)|(data<<10)|((mclk&31)<<15));r.storeU32(20,(if (tx) 1 else 0)|(if (source == 3) 2 else 0)|(if ((flags&2) != 0) 4 else 0))
+    val clock=c5I2sClockSessionOpenOwned(nativeBufferAt(r.addressValue()+24,32),tx,source,integer,numerator,denominator,bclkDivider,polls,true)
+    if (clock != 1) { r.storeU32(8,0x10000|clock);return 4 }
+    val dma=c5AhbGdmaClockOpenOwned(true);r.storeU32(56,dma|0)
+    if (dma.status() != 1) { r.storeU32(8,0x20000|dma.status());return 4 }
+    val config=c5I2sDmaConfigOpenOwned(nativeBufferAt(r.addressValue()+60,68),channel,tx,dataBits,slotBits,wsWidth,shift,slots,flags,bytes,polls,true)
+    if (config != 1 && config != 5) { r.storeU32(8,0x30000|config);return 4 }
+    r.storeU32(4,1)
+    if (config == 5) return 5
+    return c5AudioSetupWaitOwned(r,polls,true)
+}
+trusted fun c5AudioSetupCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioSetupStorage(r) || r.loadU32(0) != 0x43354155 || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 6) return 6
+    r.storeU32(4,5)
+    // Reject active DMA before touching pins or format.
+    val config=nativeBufferAt(r.addressValue()+60,68)
+    val token=config.loadU32(12)|(config.loadU32(16)<<32)
+    if (config.loadU32(4) != 6 && (token&(1<<50)) != 0 && (!c5AhbGdmaChannelClocks() || !c5AhbGdmaChannelParked((token>>>47)&3,(token&(1<<49)) != 0))) { r.storeU32(12,0x30003);return 4 }
+    val pins=nativeBufferAt(r.addressValue()+128,48)
+    if (pins.loadU32(0) != 0) {
+        val result=c5I2sPinSessionCloseOwned(pins,true)
+        if (result != 6) { r.storeU32(12,0x40000|result);return 4 }
+    }
+    if (config.loadU32(0) != 0) {
+        val result=c5I2sDmaConfigCloseOwned(config,polls,true)
+        if (result != 6) { r.storeU32(12,0x30000|result);return if (result == 5) 5 else 4 }
+    }
+    var dma=C5AhbGdmaClock(r.loadU32(56))
+    if ((dma&1024) != 0) {
+        dma=dma.closeOwned(true);r.storeU32(56,dma|0)
+        if (dma.status() != 7) { r.storeU32(12,0x20000|dma.status());return 4 }
+    }
+    val clock=nativeBufferAt(r.addressValue()+24,32)
+    if (clock.loadU32(0) != 0) {
+        val result=c5I2sClockSessionCloseOwned(clock,true)
+        if (result != 6) { r.storeU32(12,0x10000|result);return 4 }
+    }
+    r.storeU32(4,6);r.storeU32(12,0);return 6
+}

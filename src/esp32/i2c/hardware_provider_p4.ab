@@ -1,0 +1,127 @@
+import "./session_p4_sequence.ab"
+import "../../i2c/device_slots.ab"
+import "../../i2c/register_access.ab"
+// Select one I2cBus/I2cDevice provider per application. Bind an already-open
+// dedicated P4 session; after binding ALL access/close goes through this gate.
+// Caller keeps its72B record and clock/pad ownership alive until close succeeds.
+// This nonblocking gate serializes lifecycle, frequency changes and transfers.
+type I2cBus=int
+type I2cDevice=int
+// Offset32 pins a pending GPIO-clear record. Provider phase3 excludes every
+// ordinary bus operation until that record's restoration completes.
+val p4HardwareState=nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0])
+val p4HardwareSlots=nativeStaticMutableU32s([
+    0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+trusted fun p4HardwareLoad(at: int): int = nativeAddressLoadU32(p4HardwareState,at)
+trusted fun p4HardwareStore(at: int,value: int): void { nativeAddressStoreU32(p4HardwareState,at,value);return }
+fun p4HardwarePool(): I2cDeviceSlots = i2cDeviceSlotsAt(p4HardwareSlots)
+trusted fun p4HardwareEnter(): bool = atomicU32At(p4HardwareState).tryClaim(u32(1))
+trusted fun p4HardwareLeave(): bool = atomicU32At(p4HardwareState).releaseClaim(u32(1))
+trusted fun p4HardwareSession(): NativeBuffer = nativeBufferAt(p4HardwareLoad(8),72)
+fun I2cBus.valid(): bool = this > 0 && this <= 16777215
+fun I2cDevice.valid(): bool = i2cDeviceSlotHandleValid(this)
+trusted fun I2cBus.current(): bool = this.valid() && this == p4HardwareLoad(4) && p4HardwareLoad(20) == 1
+fun p4HardwareSeparate(buffer: NativeBuffer,count: int,address: int,size: int): bool =
+    count == 0 || buffer.addressValue()+count <= address || buffer.addressValue() >= address+size
+trusted fun p4HardwareCoreSafe(buffer: NativeBuffer,count: int): bool =
+    buffer.hasAddressRange(0,count) && p4HardwareSeparate(buffer,count,p4HardwareState,36) &&
+    p4HardwareSeparate(buffer,count,p4HardwareSlots,200) && p4HardwareSeparate(buffer,count,p4HardwareLoad(24),p4HardwareLoad(28))
+trusted fun p4HardwareSafe(buffer: NativeBuffer,count: int): bool = p4HardwareCoreSafe(buffer,count) &&
+    (p4HardwareLoad(32) == 0 || p4HardwareSeparate(buffer,count,p4HardwareLoad(32),40))
+// Frequencies must be the actual pinned clocks, not nominal guesses.
+// Optional enclosing record protects outer lifecycle state as well as session.
+trusted fun i2cHardwareBindOwned(session: NativeBuffer,sourceHz: u32,cpuHz: u32,enclosing: NativeBuffer = NativeBuffer(0)): I2cBus {
+    val protected=if (enclosing == NativeBuffer(0)) nativeBufferAt(session.addressValue(),72) else enclosing
+    if (!p4I2cSessionValid(session) || session.loadU32(4) != 1 || sourceHz == u32(0) ||
+        cpuHz < u32(1000) || cpuHz > u32(1000000000) ||
+        !protected.hasAddressRange(0,protected.capacity()) || protected.addressValue() > session.addressValue() ||
+        protected.addressValue()+protected.capacity() < session.addressValue()+72 ||
+        !p4HardwareSeparate(protected,protected.capacity(),p4HardwareState,36) || !p4HardwareSeparate(protected,protected.capacity(),p4HardwareSlots,200) ||
+        !p4HardwareEnter()) return I2cBus(0)
+    var result=0
+    if (p4HardwareLoad(20) == 0 && p4HardwareLoad(4) < 16777215) {
+        result=p4HardwareLoad(4)+1
+        p4HardwareStore(4,result);p4HardwareStore(8,session.addressValue())
+        p4HardwareStore(12,int(sourceHz));p4HardwareStore(16,int(cpuHz));p4HardwareStore(20,1)
+        p4HardwareStore(24,protected.addressValue());p4HardwareStore(28,protected.capacity())
+        p4HardwareStore(32,0)
+    }
+    if (!p4HardwareLeave()) return I2cBus(0)
+    return I2cBus(result)
+}
+trusted fun I2cBus.device(address: int,frequency: int = 400000): I2cDevice {
+    if (!this.valid() || address < 1 || address > 127 || frequency < 1000 || frequency > 400000 || !p4HardwareEnter()) return I2cDevice(0)
+    var result=0
+    if (this.current() && p4HardwareSession().loadU32(4) == 1 && esp32p4I2cTiming(u32(p4HardwareLoad(12)),u32(frequency)).valid())
+        result=p4HardwarePool().allocate((this|0)|(address<<24)|(frequency<<31))
+    if (!p4HardwareLeave()) return I2cDevice(0)
+    return I2cDevice(result)
+}
+trusted fun I2cDevice.close(): bool {
+    if (!this.valid() || !p4HardwareEnter()) return false
+    val descriptor=p4HardwarePool().resolve(this)
+    val result=descriptor != 0 && (descriptor&16777215) == p4HardwareLoad(4) && p4HardwarePool().release(this)
+    val unlocked=p4HardwareLeave();return result && unlocked
+}
+trusted fun I2cBus.close(): bool {
+    if (!this.valid() || !p4HardwareEnter()) return false
+    var result=false
+    if (this == p4HardwareLoad(4) && (p4HardwareLoad(20) == 1 || p4HardwareLoad(20) == 2)) {
+        p4HardwareStore(20,2)
+        if (p4HardwarePool().releaseMatching(16777215,this|0) >= 0 && esp32p4I2cSessionCloseOwned(p4HardwareSession(),true) == 8) {
+            p4HardwareStore(20,0);p4HardwareStore(8,0);result=true
+        }
+    }
+    val unlocked=p4HardwareLeave();return result && unlocked
+}
+// Public statuses match software provider:1complete2invalid3timeout4busy/
+// arbitration5NACK6transport7prior fault. Raw result stays in session.primary.
+// Total wire budget uses actual CPU cycles; reject overflow, never clamp it.
+trusted fun I2cDevice.transferStatus(output: NativeBuffer,written: int,input: NativeBuffer,read: int,timeoutMilliseconds: int = 1000,registerPrefix: int = -1): int {
+    if (!this.valid() || written < 0 || written > 65535 || read < 0 || read > 65535 ||
+        timeoutMilliseconds < 1 || timeoutMilliseconds > 1000000 || registerPrefix < -1 || registerPrefix > 255 ||
+        !output.hasAddressRange(0,written) || !input.hasAddressRange(0,read)) return 2
+    if (!p4HardwareEnter()) return 4
+    var result=2
+    val descriptor=p4HardwarePool().resolve(this)
+    if (p4HardwareLoad(20) == 1 && descriptor != 0 && (descriptor&16777215) == p4HardwareLoad(4) &&
+        p4HardwareSafe(output,written) && p4HardwareSafe(input,read)) {
+        val r=p4HardwareSession()
+        // Round cycles/ms upward (at most one cycle per millisecond), using
+        // bounded RV32 arithmetic rather than importing a 64-bit divide.
+        val perMs=(u32(p4HardwareLoad(16))+u32(999))/u32(1000)
+        val fits=u32(timeoutMilliseconds) <= u32(2147483647)/perMs
+        val cycles=if (fits) perMs*u32(timeoutMilliseconds) else u32(0)
+        if (r.loadU32(4) != 1) result=7
+        else if (cycles != u32(0)) {
+            val timing=esp32p4I2cTiming(u32(p4HardwareLoad(12)),u32(descriptor>>>31))
+            if (p4I2cSessionTiming(r.loadU32(20),timing) != 1) { r.storeU32(4,3);r.storeU32(8,5);result=6 }
+            else {
+                val raw=esp32p4I2cSessionTransferOwned(r,(descriptor>>>24)&127,output,written,input,read,u32(cycles),true,registerPrefix)
+                result=if (raw == 1) 1 else if (raw == 3) 5 else if (raw == 4 || raw == 8) 4 else if (raw == 5) 3 else if (raw == 7) 2 else 6
+            }
+        }
+    }
+    if (!p4HardwareLeave()) return 4
+    return result
+}
+trusted fun I2cDevice.write(source: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(source,length,NativeBuffer(0),0,timeoutMilliseconds) == 1
+trusted fun I2cDevice.read(destination: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(NativeBuffer(0),0,destination,length,timeoutMilliseconds) == 1
+trusted fun I2cDevice.writeRead(source: NativeBuffer,length: int,destination: NativeBuffer,read: int,timeoutMilliseconds: int = 1000): bool = this.transferStatus(source,length,destination,read,timeoutMilliseconds) == 1
+trusted fun I2cDevice.readRegister(register: int,destination: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = register >= 0 && register <= 255 && this.transferStatus(NativeBuffer(0),0,destination,length,timeoutMilliseconds,register) == 1
+trusted fun I2cDevice.writeRegister(register: int,source: NativeBuffer,length: int,timeoutMilliseconds: int = 1000): bool = register >= 0 && register <= 255 && this.transferStatus(source,length,NativeBuffer(0),0,timeoutMilliseconds,register) == 1
+trusted fun I2cDevice.readRegister8Checked(register: int): I2cByteResult {
+    val buffer=nativeBufferAt(nativeStackAllocate(1),1)
+    if (!this.readRegister(register,buffer,1)) return I2cByteResult(0)
+    return I2cByteResult(256|buffer.load(0))
+}
+trusted fun I2cDevice.readRegister8(register: int,fallback: int = 0): int {
+    val result=this.readRegister8Checked(register)
+    return if (result.valid()) result.value() else fallback
+}
+trusted fun I2cDevice.writeRegister8(register: int,value: int): bool {
+    if (register < 0 || register > 255 || value < 0 || value > 255) return false
+    val buffer=nativeBufferAt(nativeStackAllocate(1),1);buffer.store(0,value)
+    return this.writeRegister(register,buffer,1)
+}

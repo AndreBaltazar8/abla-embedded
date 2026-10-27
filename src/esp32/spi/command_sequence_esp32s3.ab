@@ -1,0 +1,58 @@
+import "./transmit_transaction_sequence_esp32s3.ab"
+import "./command_pins_sequence_esp32s3.ab"
+
+fun esp32s3SpiCommandPinsValid(peripheral: int, pins: SpiPins, select: Pin,
+    dataCommand: Pin, sharedDataCommand: bool): bool =
+    esp32s3SpiTransmitPinsValid(peripheral, pins, select) && dataCommand.outputCapable() &&
+    dataCommand != select && dataCommand.number() != pins.clockPin() &&
+    dataCommand.number() != pins.mosiPin() &&
+    (dataCommand.number() != pins.misoPin() || sharedDataCommand)
+
+// Byte command followed by0..65536data bytes under one gate/CS admission.
+// Caller owns initialized SPI and all other CS lines are inactive. Shared
+// D/C (CoreS3 SD MISO) must be input on entry; it is restored AFTER CS high,
+// on success and controller failure, with checked cleanup. Pin failures fault
+// the gate and retain recovery obligations. No reset/automatic recovery is hidden.
+// Device must tolerate gaps between command and data and64-byte chunks.
+trusted fun esp32s3SpiCommand(gate: PeripheralGate, owner: u32,
+    peripheral: int, pins: SpiPins, select: Pin, dataCommand: Pin,
+    command: int, data: NativeBuffer, bytes: int, sharedDataCommand: bool = false): SpiTransactionResult {
+    if (!esp32s3SpiCommandPinsValid(peripheral, pins, select, dataCommand, sharedDataCommand) ||
+        command < 0 || command > 255 || bytes > 65536 ||
+        !esp32s3SpiMemoryRangeValid(peripheral, data, bytes) ||
+        !gate.bufferDisjoint(data, bytes)) return SpiTransactionResult(3 << 32)
+    val gateAddress = gate.word().address()
+    if (gateAddress <= 0 || gateAddress > 4294967292) return SpiTransactionResult(3 << 32)
+    val admission = gate.tryBegin(owner)
+    if (admission != 0) return SpiTransactionResult((if (admission == 1) 2 else if (admission == 2) 4 else 3) << 32)
+    val detail = esp32s3SpiCommandOwned(peripheral, select, dataCommand,
+        command, data, bytes, sharedDataCommand)
+    val healthy = (detail & 255) == 1
+    if (!gate.finish(owner, healthy)) return SpiTransactionResult((5 << 32) | detail)
+    SpiTransactionResult(((if (healthy) 1 else 6) << 32) | detail)
+}
+
+// Internal: caller holds the canonical gate and has validated all pins,
+// command/data spans and immutable storage before entering this sequence.
+trusted fun esp32s3SpiCommandOwned(peripheral: int, select: Pin, dataCommand: Pin,
+    command: int, data: NativeBuffer, bytes: int, sharedDataCommand: bool): int {
+    var detail = esp32s3SpiExchangeReady(peripheral)
+    if (detail == 1) {
+        detail = esp32s3SpiCommandPinsBegin(select,dataCommand)
+        if (detail == 1) detail = esp32s3SpiTransmitByteOwned(peripheral, command, 100000)
+        if ((detail & 255) == 1 && bytes != 0) {
+            // The command helper confirms DONE+idle before D/C changes.
+            if (!dataCommand.writeLevelOwned(true)) detail=(detail&~255)|13
+            var offset = 0
+            while (offset < bytes && (detail&255) == 1) {
+                val count = if (bytes - offset < 64) bytes - offset else 64
+                detail = esp32s3SpiTransmitOwned(peripheral,
+                    nativeBufferAt(data.addressValue() + offset, count), count, 100000)
+                if ((detail & 255) != 1) break
+                offset = offset + count
+            }
+        }
+        detail=esp32s3SpiCommandPinsEndQuiescent(peripheral,select,dataCommand,sharedDataCommand,detail)
+    }
+    detail
+}

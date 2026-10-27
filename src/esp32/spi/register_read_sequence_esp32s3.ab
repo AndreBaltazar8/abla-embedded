@@ -1,0 +1,62 @@
+import "./phases_sequence_esp32s3.ab"
+import "./shared_pins_sequence_esp32s3.ab"
+import "../../spi/transaction_result.ab"
+import "../../spi/buffer_gate.ab"
+// Preconfigured native clock/mode and SPID bidirectional data route required.
+// Caller owns controller/pads/DC and all other devices have inactive CS.
+// Gate spans deselected idle clocks, D/C-low command, D/C-high shared read.
+// Success value is four received bytes in FIFO order (first byte low).
+// Failure value: raw phase result low24, stage1idle/2command/3read/4GPIO@24,
+// bit23 cleanup pending. Timeout may leave CS asserted: retain all resources,
+// quiesce the controller before restoring CS/DC, never replay automatically.
+trusted fun esp32s3SpiReadRegister32Shared(gate: PeripheralGate,owner: u32,peripheral: int,
+    clock: Pin,data: Pin,cs: Pin,dc: Pin,command: int,dummyBits: int,polls: int): SpiTransactionResult {
+    if (!esp32s3SpiSharedPinsValid(peripheral,clock,data,cs) || !dc.outputCapable() || dc == clock || dc == data || dc == cs ||
+        command < 0 || command > 255 || dummyBits < 0 || dummyBits > 256 || polls < 1 || polls > 1000000 ||
+        gate.word().address() <= 0 || gate.word().address() > 4294967292 ||
+        (gate.word().address() >= 0x60024000 && gate.word().address() < 0x60026000)) return SpiTransactionResult(3<<32)
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return SpiTransactionResult((if (admitted == 1) 2 else if (admitted == 2) 4 else 3)<<32)
+    val result=esp32s3SpiReadRegister32SharedOwned(peripheral,clock,data,cs,dc,command,dummyBits,polls)
+    if (!gate.finish(owner,result.valid())) return SpiTransactionResult((5<<32)|(result&0xffffffff))
+    return result
+}
+// Composition worker: caller holds canonical gate for the whole operation,
+// including any clock switching/restoration. Never acquires/releases it here.
+trusted fun esp32s3SpiReadRegister32SharedOwned(peripheral: int,
+    clock: Pin,data: Pin,cs: Pin,dc: Pin,command: int,dummyBits: int,polls: int): SpiTransactionResult {
+    if (!esp32s3SpiSharedPinsValid(peripheral,clock,data,cs) || !dc.outputCapable() || dc == clock || dc == data || dc == cs ||
+        command < 0 || command > 255 || dummyBits < 0 || dummyBits > 256 || polls < 1 || polls > 1000000) return SpiTransactionResult(3<<32)
+    val output=nativeBufferAt(nativeStackAllocate(4),4)
+    var detail=esp32s3SpiExchangeReady(peripheral)
+    var stage=4
+    if (detail == 1) {
+        if (!cs.writeLevelOwned(true) || !dc.writeLevelOwned(false)) detail=11
+        else {
+            stage=1
+            detail=esp32s3SpiPhasesOwned(peripheral,0,8,0,0,0,0,NativeBuffer(0),0,polls)
+            if ((detail&255) == 1) {
+                if (!cs.writeLevelOwned(false)) { detail=11;stage=4 }
+                else {
+                    stage=2
+                    detail=esp32s3SpiPhasesOwned(peripheral,command,8,0,0,0,0,NativeBuffer(0),0,polls)
+                    if ((detail&255) == 1) {
+                        if (!dc.writeLevelOwned(true)) { detail=11;stage=4 }
+                        else {
+                            stage=3
+                            detail=esp32s3SpiPhasesOwned(peripheral,0,0,0,0,dummyBits,2,output,4,polls,true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Never manipulate selection while the controller may still clock data.
+    val idle=esp32s3SpiCpuBufferIdle(esp32s3SpiBase(peripheral))
+    val released=if (idle) cs.writeLevelOwned(true) else false
+    val restored=if (released) dc.writeLevelOwned(true) else false
+    val healthy=(detail&255) == 1 && released && restored
+    val report=(detail&0x7fffff)|(stage<<24)|(if (released && restored) 0 else 0x800000)
+    val value=if (healthy) output.loadU32(0) else report
+    return SpiTransactionResult(((if (healthy) 1 else 6)<<32)|value)
+}

@@ -1,0 +1,435 @@
+import "../gpio.ab"
+import "./configuration_logic.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../rom/system_esp32.ab"
+import "../../atomic.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Compact synchronous I2C master used when no native controller backend is
+// selected. It implements the complete API surface consumed by i2c_idf6.ab
+// with open-drain GPIO, clock stretching, repeated starts, and ACK/NACK.
+// Bus/device values are plain pointers and remain compatible with the public
+// zero-cost I2cBus and I2cDevice scalar types.
+
+val esp32SoftwareI2cBusMagic = u32(0x41424932)
+val esp32SoftwareI2cDeviceMagic = u32(0x41424432)
+val esp32SoftwareI2cOk = i32(0)
+val esp32SoftwareI2cNoMemory = i32(257)
+val esp32SoftwareI2cInvalidArgument = i32(258)
+val esp32SoftwareI2cInvalidState = i32(259)
+val esp32SoftwareI2cNotFound = i32(261)
+val esp32SoftwareI2cNotSupported = i32(262)
+val esp32SoftwareI2cTimeout = i32(263)
+
+@inline
+trusted fun esp32SoftwareI2cLoad(address: u32, offset: u32 = u32(0)): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address + offset))))
+
+@inline
+trusted fun esp32SoftwareI2cStore(
+    address: u32, offset: u32, value: u32
+): void {
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(address + offset)), int(value)
+    )
+    return
+}
+
+@inline
+trusted fun esp32SoftwareI2cByte(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32SoftwareI2cBusValid(bus: u32): bool =
+    bus != u32(0) &&
+    esp32SoftwareI2cLoad(bus) == esp32SoftwareI2cBusMagic
+
+@inline
+trusted fun esp32SoftwareI2cDeviceValid(device: u32): bool =
+    device != u32(0) &&
+    esp32SoftwareI2cLoad(device) == esp32SoftwareI2cDeviceMagic &&
+    esp32SoftwareI2cBusValid(esp32SoftwareI2cLoad(device, u32(4)))
+
+@inline
+fun esp32SoftwareI2cSda(bus: u32): Pin =
+    pin(int(esp32SoftwareI2cLoad(bus, u32(8))))
+
+@inline
+fun esp32SoftwareI2cScl(bus: u32): Pin =
+    pin(int(esp32SoftwareI2cLoad(bus, u32(12))))
+
+@inline
+trusted fun esp32SoftwareI2cPause(bus: u32): void {
+    esp32DelayMicroseconds(esp32SoftwareI2cLoad(bus, u32(16)))
+    return
+}
+
+trusted fun esp32SoftwareI2cAcquire(bus: u32, timeoutMilliseconds: i32): bool {
+    val lock = atomicU32At(int(bus + u32(20)))
+    val start = xtensaReadCycleCount()
+    val ticksPerMicrosecond = esp32RomGetCpuTicksPerUs()
+    val timeoutCycles = if (timeoutMilliseconds < i32(0)) u32(0xffffffff)
+        else u32(timeoutMilliseconds) * u32(1000) * ticksPerMicrosecond
+    while (!lock.compareSetRelaxed(u32(0), u32(1))) {
+        if (timeoutMilliseconds >= i32(0) &&
+            xtensaReadCycleCount() - start >= timeoutCycles) return false
+    }
+    atomicMemoryFence()
+    return true
+}
+
+trusted fun esp32SoftwareI2cRelease(bus: u32): void {
+    atomicMemoryFence()
+    esp32SoftwareI2cStore(bus, u32(20), u32(0))
+    return
+}
+
+trusted fun esp32SoftwareI2cWaitClockHigh(
+    bus: u32, timeoutMicroseconds: u32
+): bool {
+    val scl = esp32SoftwareI2cScl(bus)
+    val start = xtensaReadCycleCount()
+    val timeoutCycles = timeoutMicroseconds * esp32RomGetCpuTicksPerUs()
+    while (!scl.read()) {
+        if (xtensaReadCycleCount() - start >= timeoutCycles) return false
+    }
+    return true
+}
+
+trusted fun esp32SoftwareI2cStart(bus: u32, repeated: bool): bool {
+    val sda = esp32SoftwareI2cSda(bus)
+    val scl = esp32SoftwareI2cScl(bus)
+    if (repeated) {
+        sda.write(true)
+        esp32SoftwareI2cPause(bus)
+    }
+    scl.write(true)
+    if (!esp32SoftwareI2cWaitClockHigh(bus, u32(2000))) return false
+    esp32SoftwareI2cPause(bus)
+    if (!repeated && !sda.read()) return false
+    sda.write(false)
+    esp32SoftwareI2cPause(bus)
+    scl.write(false)
+    return true
+}
+
+trusted fun esp32SoftwareI2cStop(bus: u32): bool {
+    val sda = esp32SoftwareI2cSda(bus)
+    val scl = esp32SoftwareI2cScl(bus)
+    sda.write(false)
+    esp32SoftwareI2cPause(bus)
+    scl.write(true)
+    if (!esp32SoftwareI2cWaitClockHigh(bus, u32(2000))) return false
+    esp32SoftwareI2cPause(bus)
+    sda.write(true)
+    esp32SoftwareI2cPause(bus)
+    return true
+}
+
+trusted fun esp32SoftwareI2cWriteBit(bus: u32, bit: bool): bool {
+    val sda = esp32SoftwareI2cSda(bus)
+    val scl = esp32SoftwareI2cScl(bus)
+    sda.write(bit)
+    esp32SoftwareI2cPause(bus)
+    scl.write(true)
+    if (!esp32SoftwareI2cWaitClockHigh(bus, u32(2000))) return false
+    esp32SoftwareI2cPause(bus)
+    scl.write(false)
+    return true
+}
+
+trusted fun esp32SoftwareI2cReadBit(bus: u32, output: u32): bool {
+    val sda = esp32SoftwareI2cSda(bus)
+    val scl = esp32SoftwareI2cScl(bus)
+    sda.write(true)
+    esp32SoftwareI2cPause(bus)
+    scl.write(true)
+    if (!esp32SoftwareI2cWaitClockHigh(bus, u32(2000))) return false
+    esp32SoftwareI2cStore(output, u32(0), if (sda.read()) u32(1) else u32(0))
+    esp32SoftwareI2cPause(bus)
+    scl.write(false)
+    return true
+}
+
+trusted fun esp32SoftwareI2cWriteByte(bus: u32, value: u32): i32 {
+    var bit = i32(7)
+    while (bit >= i32(0)) {
+        if (!esp32SoftwareI2cWriteBit(
+            bus, (value & (u32(1) << u32(bit))) != u32(0)
+        )) return esp32SoftwareI2cTimeout
+        bit = bit - i32(1)
+    }
+    val ack = u32(nativeStackAllocate(4))
+    if (!esp32SoftwareI2cReadBit(bus, ack)) return esp32SoftwareI2cTimeout
+    return if (esp32SoftwareI2cLoad(ack) == u32(0))
+        esp32SoftwareI2cOk else esp32SoftwareI2cNotFound
+}
+
+trusted fun esp32SoftwareI2cReadByte(
+    bus: u32, destination: u32, acknowledge: bool
+): i32 {
+    var value = u32(0)
+    var count = u32(0)
+    val bitCell = u32(nativeStackAllocate(4))
+    while (count < u32(8)) {
+        if (!esp32SoftwareI2cReadBit(bus, bitCell))
+            return esp32SoftwareI2cTimeout
+        value = (value << u32(1)) | esp32SoftwareI2cLoad(bitCell)
+        count = count + u32(1)
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(destination)), int(value))
+    if (!esp32SoftwareI2cWriteBit(bus, !acknowledge))
+        return esp32SoftwareI2cTimeout
+    return esp32SoftwareI2cOk
+}
+
+trusted fun esp32SoftwareI2cAddress(
+    bus: u32, address: u32, read: bool, repeated: bool
+): i32 {
+    if (!esp32SoftwareI2cStart(bus, repeated))
+        return esp32SoftwareI2cTimeout
+    return esp32SoftwareI2cWriteByte(
+        bus, (address << u32(1)) | if (read) u32(1) else u32(0)
+    )
+}
+
+trusted fun esp32SoftwareI2cWriteBytes(
+    bus: u32, source: u32, length: u32
+): i32 {
+    var index = u32(0)
+    while (index < length) {
+        val result = esp32SoftwareI2cWriteByte(
+            bus, esp32SoftwareI2cByte(source + index)
+        )
+        if (result != esp32SoftwareI2cOk) return result
+        index = index + u32(1)
+    }
+    return esp32SoftwareI2cOk
+}
+
+trusted fun esp32SoftwareI2cReadBytes(
+    bus: u32, destination: u32, length: u32
+): i32 {
+    var index = u32(0)
+    while (index < length) {
+        val result = esp32SoftwareI2cReadByte(
+            bus, destination + index, index + u32(1) < length
+        )
+        if (result != esp32SoftwareI2cOk) return result
+        index = index + u32(1)
+    }
+    return esp32SoftwareI2cOk
+}
+
+trusted fun esp32SoftwareI2cFinish(bus: u32, result: i32): i32 {
+    val stopped = esp32SoftwareI2cStop(bus)
+    esp32SoftwareI2cRelease(bus)
+    if (!stopped && result == esp32SoftwareI2cOk)
+        esp32SoftwareI2cTimeout else result
+}
+
+trusted noescape fun softwareI2cNewMasterBus(
+    configurationPointer: i64*, handlePointer: i64*
+): i32 {
+    val configuration = u32(nativePointerAddress(configurationPointer))
+    val output = u32(nativePointerAddress(handlePointer))
+    if (configuration == u32(0) || output == u32(0))
+        return esp32SoftwareI2cInvalidArgument
+    val port = esp32SoftwareI2cLoad(configuration)
+    val sdaNumber = esp32SoftwareI2cLoad(configuration, u32(4))
+    val sclNumber = esp32SoftwareI2cLoad(configuration, u32(8))
+    val queueDepth = esp32SoftwareI2cLoad(configuration, u32(24))
+    if (!espChip32().i2cMasterConfigurationValid(
+            int(port), int(sdaNumber), int(sclNumber)))
+        return esp32SoftwareI2cInvalidArgument
+    if (queueDepth != u32(0)) return esp32SoftwareI2cNotSupported
+    val bus = esp32LibcMalloc(u32(28))
+    if (bus == u32(0)) return esp32SoftwareI2cNoMemory
+    esp32SoftwareI2cStore(bus, u32(0), esp32SoftwareI2cBusMagic)
+    esp32SoftwareI2cStore(bus, u32(4), port)
+    esp32SoftwareI2cStore(bus, u32(8), sdaNumber)
+    esp32SoftwareI2cStore(bus, u32(12), sclNumber)
+    esp32SoftwareI2cStore(bus, u32(16), u32(5))
+    esp32SoftwareI2cStore(bus, u32(20), u32(0))
+    esp32SoftwareI2cStore(bus, u32(24), u32(0))
+    val sda = pin(int(sdaNumber))
+    val scl = pin(int(sclNumber))
+    sda.openDrainOutput()
+    scl.openDrainOutput()
+    if ((esp32SoftwareI2cLoad(configuration, u32(28)) & u32(1)) != u32(0)) {
+        sda.pullUp()
+        scl.pullUp()
+    }
+    sda.write(true)
+    scl.write(true)
+    esp32SoftwareI2cStore(output, u32(0), bus)
+    return esp32SoftwareI2cOk
+}
+
+trusted noescape fun softwareI2cDeleteMasterBus(handlePointer: i64*): i32 {
+    val bus = u32(nativePointerAddress(handlePointer))
+    if (!esp32SoftwareI2cBusValid(bus))
+        return esp32SoftwareI2cInvalidArgument
+    if (esp32SoftwareI2cLoad(bus, u32(24)) != u32(0))
+        return esp32SoftwareI2cInvalidState
+    esp32SoftwareI2cStore(bus, u32(0), u32(0))
+    esp32LibcFree(bus)
+    return esp32SoftwareI2cOk
+}
+
+trusted noescape fun softwareI2cMasterBusAddDevice(
+    busPointer: i64*, configurationPointer: i64*, handlePointer: i64*
+): i32 {
+    val bus = u32(nativePointerAddress(busPointer))
+    val configuration = u32(nativePointerAddress(configurationPointer))
+    val output = u32(nativePointerAddress(handlePointer))
+    if (!esp32SoftwareI2cBusValid(bus) || configuration == u32(0) ||
+        output == u32(0)) return esp32SoftwareI2cInvalidArgument
+    val address = u32(ablaUnsafeLoadU16(
+        nativePointerFromAddress(int(configuration + u32(4)))
+    ))
+    val frequency = esp32SoftwareI2cLoad(configuration, u32(8))
+    if (address >= u32(128) || frequency == u32(0))
+        return esp32SoftwareI2cInvalidArgument
+    val device = esp32LibcMalloc(u32(20))
+    if (device == u32(0)) return esp32SoftwareI2cNoMemory
+    esp32SoftwareI2cStore(device, u32(0), esp32SoftwareI2cDeviceMagic)
+    esp32SoftwareI2cStore(device, u32(4), bus)
+    esp32SoftwareI2cStore(device, u32(8), address)
+    esp32SoftwareI2cStore(device, u32(12), frequency)
+    esp32SoftwareI2cStore(device, u32(16),
+        esp32SoftwareI2cLoad(configuration, u32(16)))
+    val halfPeriod = (u32(500000) + frequency - u32(1)) / frequency
+    esp32SoftwareI2cStore(bus, u32(16), if (halfPeriod == u32(0)) u32(1) else halfPeriod)
+    esp32SoftwareI2cStore(bus, u32(24),
+        esp32SoftwareI2cLoad(bus, u32(24)) + u32(1))
+    esp32SoftwareI2cStore(output, u32(0), device)
+    return esp32SoftwareI2cOk
+}
+
+trusted noescape fun softwareI2cMasterBusRemoveDevice(handlePointer: i64*): i32 {
+    val device = u32(nativePointerAddress(handlePointer))
+    if (!esp32SoftwareI2cDeviceValid(device))
+        return esp32SoftwareI2cInvalidArgument
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    val count = esp32SoftwareI2cLoad(bus, u32(24))
+    esp32SoftwareI2cStore(bus, u32(24), if (count == u32(0)) u32(0) else count - u32(1))
+    esp32SoftwareI2cStore(device, u32(0), u32(0))
+    esp32LibcFree(device)
+    return esp32SoftwareI2cOk
+}
+
+trusted fun esp32SoftwareI2cBeginDevice(
+    device: u32, read: bool, timeoutMilliseconds: i32
+): i32 {
+    if (!esp32SoftwareI2cDeviceValid(device))
+        return esp32SoftwareI2cInvalidArgument
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    if (!esp32SoftwareI2cAcquire(bus, timeoutMilliseconds))
+        return esp32SoftwareI2cTimeout
+    val frequency = esp32SoftwareI2cLoad(device, u32(12))
+    val halfPeriod = (u32(500000) + frequency - u32(1)) / frequency
+    esp32SoftwareI2cStore(
+        bus, u32(16), if (halfPeriod == u32(0)) u32(1) else halfPeriod
+    )
+    val result = esp32SoftwareI2cAddress(
+        bus, esp32SoftwareI2cLoad(device, u32(8)), read, false
+    )
+    if (result != esp32SoftwareI2cOk)
+        return esp32SoftwareI2cFinish(bus, result)
+    return esp32SoftwareI2cOk
+}
+
+trusted noescape fun softwareI2cMasterProbe(
+    busPointer: i64*, address: u16, timeoutMilliseconds: i32
+): i32 {
+    val bus = u32(nativePointerAddress(busPointer))
+    if (!esp32SoftwareI2cBusValid(bus) || u32(address) >= u32(128))
+        return esp32SoftwareI2cInvalidArgument
+    if (!esp32SoftwareI2cAcquire(bus, timeoutMilliseconds))
+        return esp32SoftwareI2cTimeout
+    val result = esp32SoftwareI2cAddress(bus, u32(address), false, false)
+    return esp32SoftwareI2cFinish(bus, result)
+}
+
+trusted noescape fun softwareI2cMasterTransmit(
+    devicePointer: i64*, sourcePointer: i64*, length: u32,
+    timeoutMilliseconds: i32
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    val source = u32(nativePointerAddress(sourcePointer))
+    if (source == u32(0) || length == u32(0))
+        return esp32SoftwareI2cInvalidArgument
+    val begun = esp32SoftwareI2cBeginDevice(device, false, timeoutMilliseconds)
+    if (begun != esp32SoftwareI2cOk) return begun
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    return esp32SoftwareI2cFinish(
+        bus, esp32SoftwareI2cWriteBytes(bus, source, length)
+    )
+}
+
+trusted noescape fun softwareI2cMasterReceive(
+    devicePointer: i64*, destinationPointer: i64*, length: u32,
+    timeoutMilliseconds: i32
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    val destination = u32(nativePointerAddress(destinationPointer))
+    if (destination == u32(0) || length == u32(0))
+        return esp32SoftwareI2cInvalidArgument
+    val begun = esp32SoftwareI2cBeginDevice(device, true, timeoutMilliseconds)
+    if (begun != esp32SoftwareI2cOk) return begun
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    return esp32SoftwareI2cFinish(
+        bus, esp32SoftwareI2cReadBytes(bus, destination, length)
+    )
+}
+
+trusted noescape fun softwareI2cMasterTransmitReceive(
+    devicePointer: i64*, sourcePointer: i64*, sourceLength: u32,
+    destinationPointer: i64*, destinationLength: u32,
+    timeoutMilliseconds: i32
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    val source = u32(nativePointerAddress(sourcePointer))
+    val destination = u32(nativePointerAddress(destinationPointer))
+    if (source == u32(0) || destination == u32(0) ||
+        sourceLength == u32(0) || destinationLength == u32(0))
+        return esp32SoftwareI2cInvalidArgument
+    val begun = esp32SoftwareI2cBeginDevice(device, false, timeoutMilliseconds)
+    if (begun != esp32SoftwareI2cOk) return begun
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    var result = esp32SoftwareI2cWriteBytes(bus, source, sourceLength)
+    if (result == esp32SoftwareI2cOk) result = esp32SoftwareI2cAddress(
+        bus, esp32SoftwareI2cLoad(device, u32(8)), true, true
+    )
+    if (result == esp32SoftwareI2cOk) result =
+        esp32SoftwareI2cReadBytes(bus, destination, destinationLength)
+    return esp32SoftwareI2cFinish(bus, result)
+}
+
+trusted noescape fun softwareI2cMasterMultiBufferTransmit(
+    devicePointer: i64*, buffersPointer: i64*, bufferCount: u32,
+    timeoutMilliseconds: i32
+): i32 {
+    val device = u32(nativePointerAddress(devicePointer))
+    val buffers = u32(nativePointerAddress(buffersPointer))
+    if (buffers == u32(0) || bufferCount == u32(0) || bufferCount > u32(14))
+        return esp32SoftwareI2cInvalidArgument
+    val begun = esp32SoftwareI2cBeginDevice(device, false, timeoutMilliseconds)
+    if (begun != esp32SoftwareI2cOk) return begun
+    val bus = esp32SoftwareI2cLoad(device, u32(4))
+    var result = esp32SoftwareI2cOk
+    var index = u32(0)
+    while (index < bufferCount && result == esp32SoftwareI2cOk) {
+        val entry = buffers + (index << u32(3))
+        val source = esp32SoftwareI2cLoad(entry)
+        val length = esp32SoftwareI2cLoad(entry, u32(4))
+        if (length != u32(0)) {
+            if (source == u32(0)) result = esp32SoftwareI2cInvalidArgument
+            else result = esp32SoftwareI2cWriteBytes(bus, source, length)
+        }
+        index = index + u32(1)
+    }
+    return esp32SoftwareI2cFinish(bus, result)
+}

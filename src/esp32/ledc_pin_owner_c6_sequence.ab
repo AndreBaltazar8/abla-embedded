@@ -1,0 +1,59 @@
+import "./gpio_c6_sequence.ab"
+import "./ledc_clock_c6_sequence.ab"
+import "./sdk/raw_buffer.ab"
+//40B RAM: tag0,status4,pin8,channel12,inverted16,old mux20,route24,
+// pad config28,latch32,setup result36. Exclusive relinquished GPIO OEoff only;
+// caller keeps GPIO/LEDC clocks, global holds and board-reserved pins safe.
+//1ready2invalid3admission4partial5closing6closed. Stop channel before close.
+fun c6LedcPinStorage(record: NativeBuffer): bool = record.hasAddressRange(0,40) &&
+    (record.addressValue()&3) == 0 && (record.addressValue()+40 <= 0x60000000 || record.addressValue() >= 0x60100000)
+trusted fun c6LedcPinAdmission(pin: int,channel: int,inverted: bool,exclusive: bool): bool {
+    if (!exclusive || !esp32C6GpioNumberValid(pin) || channel < 0 || channel > 5 ||
+        (c6LedcClockRead(0)&3) != 1 || (c6LedcClockRead(4)&0x400000) == 0 ||
+        ((c6LedcClockRead(4)>>>20)&3) == 0 ||
+        (c6GpioRead(0x600960e8)&u32(3)) != u32(1) ||
+        (c6GpioRead(0x600960ec)&u32(0x400000)) == u32(0) ||
+        ((c6GpioRead(0x600960ec)>>u32(20))&u32(3)) == u32(0) ||
+        (c6GpioRead(0x6009162c)&u32(1)) == u32(0)) return false
+    val bit=u32(1)<<u32(pin)
+    return (c6GpioRead(0x600b102c)&bit) == u32(0) &&
+        (c6GpioRead(0x600b1028)&bit&u32(255)) == u32(0) &&
+        ((pin != 12 && pin != 13) || (c6GpioRead(0x6000f018)&u32(16384)) == u32(0)) &&
+        (c6LedcRead(channel*20)&0x801c) == (if (inverted) 8 else 0) &&
+        (c6LedcRead(channel*20+12)&0x80000000) == 0
+}
+trusted fun c6LedcPinOpenOwned(record: NativeBuffer,pin: int,channel: int,inverted: bool,exclusive: bool): int {
+    if (!c6LedcPinStorage(record) || record.loadU32(0) != 0 || !esp32C6GpioNumberValid(pin) || channel < 0 || channel > 5) return 2
+    if (!c6LedcPinAdmission(pin,channel,inverted,exclusive)) return 3
+    val bit=u32(1)<<u32(pin);val route=c6GpioRead(0x60091554+pin*4)
+    if ((c6GpioRead(0x60091020)&bit) != u32(0) || (route&u32(1536)) != u32(512)) return 3
+    record.storeU32(0,0x43354c60);record.storeU32(4,4);record.storeU32(8,pin);record.storeU32(12,channel)
+    record.storeU32(16,if (inverted) 1 else 0);record.storeU32(20,int(c6GpioRead(0x60090004+pin*4)))
+    record.storeU32(24,int(route));record.storeU32(28,int(c6GpioRead(0x60091074+pin*4)))
+    record.storeU32(32,int(c6GpioRead(0x60091004)&bit));record.storeU32(36,0)
+    val configured=esp32C6GpioConfigureOwned(pin,false,false,false,false,0,true)
+    record.storeU32(36,configured)
+    if (configured != 1) return 4
+    if (!c6GpioField(0x60091554+pin*4,u32(2047),u32(512|channel|(if (inverted) 256 else 0)))) return 4
+    c6GpioWrite(0x60091024,bit)
+    if ((c6GpioRead(0x60091020)&bit) == u32(0)) return 4
+    record.storeU32(4,1);return 1
+}
+trusted fun c6LedcPinCloseOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c6LedcPinStorage(record) || record.loadU32(0) != 0x43354c60) return 2
+    val status=record.loadU32(4)
+    if (status == 6) return 6
+    if (status != 1 && status != 4 && status != 5) return 2
+    val pin=record.loadU32(8)
+    if (!c6LedcPinAdmission(pin,record.loadU32(12),record.loadU32(16) != 0,true)) return 3
+    record.storeU32(4,5)
+    val bit=u32(1)<<u32(pin)
+    c6GpioWrite(0x60091028,bit)
+    if ((c6GpioRead(0x60091020)&bit) != u32(0) || !c6GpioField(0x60091554+pin*4,u32(1536),u32(512))) return 5
+    esp32C6GpioWriteOwned(pin,record.loadU32(32) != 0)
+    if ((c6GpioRead(0x60091004)&bit) != u32(record.loadU32(32)) ||
+        !c6GpioField(0x60091074+pin*4,u32(4),u32(record.loadU32(28))&u32(4)) ||
+        !c6GpioField(0x60090004+pin*4,u32(29570),u32(record.loadU32(20))&u32(29570)) ||
+        !c6GpioField(0x60091554+pin*4,u32(2047),u32(record.loadU32(24))&u32(2047))) return 5
+    record.storeU32(4,6);return 6
+}

@@ -1,0 +1,140 @@
+import "./power/sleep_record_c5.ab"
+import "../runtime/unsigned_division64.ab"
+// C5 TIMG0 measurement against XTAL, following IDF6 rtc_time.c. Sources:
+//0resolve current RTC_SLOW,1XTAL32K,2external OSC_SLOW,3RC_SLOW,4RC_FAST.
+//64B record:tag0,status4,stage8,resolved source12,hardware cycles16,XTAL MHz20,
+// saved calibration gate24/config28/mux32/timeout36/digital gate40,
+// raw XTAL count44,Q19 period48,outcome52,requested source56/cycles60.
+//1complete valid period,2invalid admission,3pending owned,5invalid measurement.
+// Caller owns calibration hardware/config/results and explicitly permits
+// consuming any prior calibration. Stable powered source/XTAL and TG0 bus
+// required. Cache stays enabled through this pre-sleep operation (portable
+// division may reside in flash). Never resets TG0 or touches its timers/watchdog. Old one-shot START
+// is not replayed; background cycling/config/gates are restored. Retry the same
+// record with identical source/cycles; no result usable before cleanup ends.
+// Software poll exhaustion stays pending; only hardware timeout fails a sample.
+@section(".iram1.abla.c5CalibrationPeriod")
+fun esp32C5CalibrationPeriod(source: int,cycles: int,xtalMHz: int,raw: int): int {
+    if (source < 1 || source > 4 || cycles < 1 || cycles >= 32767 ||
+        (xtalMHz != 40 && xtalMHz != 48) || raw <= 0 || raw > 0x1ffffff) return 0
+    if (source == 1) {
+        val expected=(xtalMHz*1000000*cycles)>>>15
+        val delta=int(unsignedDivide64(u64(expected),u64(2000)))
+        if (raw < expected-delta || raw > expected+delta) return 0
+    }
+    val measured=if (source == 4) raw>>>5 else raw
+    val divider=xtalMHz*cycles
+    val period=int(unsignedDivide64(u64((measured<<19)+(divider>>>1)-1),u64(divider)))
+    if (period < 1 || period > 0xffffffff) return 0
+    period
+}
+@section(".iram1.abla.c5CalibrationField")
+trusted fun c5CalibrationField(address: int,mask: int,value: int): bool {
+    c5CalibrationWrite(address,(c5CalibrationRead(address)&~mask)|(value&mask))
+    (c5CalibrationRead(address)&mask) == (value&mask)
+}
+@section(".iram1.abla.c5ClockCalibrate")
+trusted fun esp32C5ClockCalibrateOwned(record: NativeBuffer,source: int,cycles: int,exclusive: bool,polls: int = 64): int {
+    if (!exclusive || !record.hasAddressRange(0,64) || (record.addressValue()&3) != 0 ||
+        source < 0 || source > 4 || cycles < 1 || cycles > 1048512 || polls < 1 || polls > 1000000) return 2
+    val tag=c5SleepRecordRead(record,0)
+    if (tag != 0 && tag != 0x43414c31) return 2
+    if (tag != 0) {
+        if (c5SleepRecordRead(record,56) != source || c5SleepRecordRead(record,60) != cycles) return 2
+        val state=c5SleepRecordRead(record,4)
+        if (state == 1 || state == 5) return state
+        if (state != 3 || c5SleepRecordRead(record,8) > 12) return 2
+    } else {
+        var selected=source
+        if (selected == 0) {
+            val slow=c5CalibrationRead(0x600b0400)&3
+            if (slow == 2) return 2
+            selected=if (slow == 0) 3 else if (slow == 1) 1 else 2
+        }
+        val count=if (selected == 4) cycles>>>5 else cycles
+        // Reject threshold overflow rather than truncating the 25-bit field.
+        if (count < 1 || count >= 32767 || ((selected == 1 || selected == 2) && count > 8191)) return 2
+        val xtal=(c5CalibrationRead(0x60096110)>>>24)&127
+        val gate=c5CalibrationRead(0x60096160)
+        if ((xtal != 40 && xtal != 48) || (gate&1) != 0 || (c5CalibrationRead(0x60096054)&3) != 1) return 2
+        if (selected == 4 && (c5CalibrationRead(0x600b00ac)&0x40000000) == 0) return 2
+        c5SleepRecordWrite(record,12,selected);c5SleepRecordWrite(record,16,count);c5SleepRecordWrite(record,20,xtal)
+        c5SleepRecordWrite(record,24,gate&4);c5SleepRecordWrite(record,28,c5CalibrationRead(0x60008068)&0x7fff1000)
+        c5SleepRecordWrite(record,32,c5CalibrationRead(0x60096130)&0xff07)
+        c5SleepRecordWrite(record,36,c5CalibrationRead(0x60008080)&0xffffff80)
+        c5SleepRecordWrite(record,40,c5CalibrationRead(0x600b0420))
+        c5SleepRecordWrite(record,44,0);c5SleepRecordWrite(record,48,0);c5SleepRecordWrite(record,52,5)
+        c5SleepRecordWrite(record,56,source);c5SleepRecordWrite(record,60,cycles)
+        c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x43414c31)
+    }
+    val selected=c5SleepRecordRead(record,12);val count=c5SleepRecordRead(record,16)
+    val digital=if (selected == 1) 0x10000000 else if (selected == 3) 0x20000000 else if (selected == 4) 0x80000000 else 0
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        if (!c5CalibrationField(0x600b0420,digital,digital) || !c5CalibrationField(0x60096160,4,4)) return 3
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        if ((c5CalibrationRead(0x60008068)&0x80001000) != 0) {
+            if (!c5CalibrationField(0x60008080,0xffffff80,128)) return 3
+            var attempt=0
+            while (attempt < polls && (c5CalibrationRead(0x60008068)&0x8000) == 0 && (c5CalibrationRead(0x60008080)&1) == 0) attempt=attempt+1
+            if (attempt == polls) return 3
+        }
+        c5SleepRecordWrite(record,8,2)
+    }
+    if (stage <= 2) {
+        if (!c5CalibrationField(0x60008068,0x80001000,0)) return 3
+        c5SleepRecordWrite(record,8,3)
+    }
+    if (stage <= 3) {
+        if (!c5CalibrationField(0x60096130,if (selected == 4) 0xff07 else 7,selected|(if (selected == 4) 31<<8 else 0))) return 3
+        c5SleepRecordWrite(record,8,4)
+    }
+    if (stage <= 4) {
+        if (!c5CalibrationField(0x60008068,0x7fff0000,count<<16) ||
+            !c5CalibrationField(0x60008080,0xffffff80,int(u32(count)<<u32(if (selected == 1 || selected == 2) 19 else 17)))) return 3
+        c5SleepRecordWrite(record,8,5)
+    }
+    if (stage <= 5) {
+        if (!c5CalibrationField(0x60008068,0x80000000,0x80000000)) return 3
+        c5SleepRecordWrite(record,8,6)
+    }
+    if (stage <= 6) {
+        var attempt=0;var done=false
+        while (attempt < polls && !done) {
+            if ((c5CalibrationRead(0x60008068)&0x8000) != 0) {
+                val raw=(c5CalibrationRead(0x6000806c)>>>7)&0x1ffffff
+                val period=esp32C5CalibrationPeriod(selected,count,c5SleepRecordRead(record,20),raw)
+                c5SleepRecordWrite(record,44,raw);c5SleepRecordWrite(record,48,period)
+                c5SleepRecordWrite(record,52,if (period == 0) 5 else 1);done=true
+            } else if ((c5CalibrationRead(0x60008080)&1) != 0) done=true
+            attempt=attempt+1
+        }
+        if (!done) return 3
+        c5SleepRecordWrite(record,8,7)
+    }
+    if (stage <= 7) {
+        if (!c5CalibrationField(0x60008068,0x80000000,0)) return 3
+        c5SleepRecordWrite(record,8,8)
+    }
+    if (stage <= 8) {
+        if (!c5CalibrationField(0x60096130,0xff07,c5SleepRecordRead(record,32))) return 3
+        c5SleepRecordWrite(record,8,9)
+    }
+    if (stage <= 9) {
+        if (!c5CalibrationField(0x60008080,0xffffff80,c5SleepRecordRead(record,36))) return 3
+        c5SleepRecordWrite(record,8,10)
+    }
+    if (stage <= 10) {
+        if (!c5CalibrationField(0x60008068,0x7fff1000,c5SleepRecordRead(record,28))) return 3
+        c5SleepRecordWrite(record,8,11)
+    }
+    if (stage <= 11) {
+        if (!c5CalibrationField(0x600b0420,digital,c5SleepRecordRead(record,40))) return 3
+        c5SleepRecordWrite(record,8,12)
+    }
+    if (!c5CalibrationField(0x60096160,4,c5SleepRecordRead(record,24))) return 3
+    c5SleepRecordWrite(record,8,13);c5SleepRecordWrite(record,4,c5SleepRecordRead(record,52))
+    c5SleepRecordRead(record,4)
+}

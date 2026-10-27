@@ -1,0 +1,192 @@
+import "driver_esp32.ab"
+import "hal_iram_esp32.ab"
+import "../freertos/port_esp32.ab"
+import "../runtime/libc_heap_esp32.ab"
+import "../runtime/libc_locks_esp32.ab"
+import "../vfs/calls_esp32.ab"
+import "../vfs/registry_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+// Structured Abla implementation of the UART character device and its VFS
+// operations. The only function pointers below are the VFS protocol table;
+// UART behavior itself remains direct and visible to LLVM.
+val esp32UartVfsPortCount = u32(3)
+val esp32UartVfsNone = u32(0xffffffff)
+val esp32UartVfsNonBlockingFlag = u32(0x4000)
+val esp32UartVfsLineFeed = u32(0)
+val esp32UartVfsCarriageReturn = u32(1)
+val esp32UartVfsCarriageReturnLineFeed = u32(2)
+
+val esp32UartVfsDevicesStorage = nativeStaticMutableU32s([
+    int(u32(0x3ff40000)), int(u32(0x3ff50000)), int(u32(0x3ff6e000))
+])
+val esp32UartVfsDevices = u32(esp32UartVfsDevicesStorage)
+val esp32UartVfsPeekStorage = nativeStaticMutableU32s([4294967295,4294967295,4294967295])
+val esp32UartVfsPeek = u32(esp32UartVfsPeekStorage)
+val esp32UartVfsNonBlockingStorage = nativeStaticAllocate(12)
+val esp32UartVfsNonBlocking = u32(esp32UartVfsNonBlockingStorage)
+val esp32UartVfsTxModesStorage = nativeStaticAllocate(12)
+val esp32UartVfsTxModes = u32(esp32UartVfsTxModesStorage)
+val esp32UartVfsRxModesStorage = nativeStaticMutableU32s([1,1,1])
+val esp32UartVfsRxModes = u32(esp32UartVfsRxModesStorage)
+val esp32UartVfsDriverModesStorage = nativeStaticAllocate(12)
+val esp32UartVfsDriverModes = u32(esp32UartVfsDriverModesStorage)
+val esp32UartVfsLocksStorage = nativeStaticAllocate(24)
+val esp32UartVfsLocks = u32(esp32UartVfsLocksStorage)
+val esp32UartVfsRegisteredStorage = nativeStaticAllocate(4)
+val esp32UartVfsRegistered = u32(esp32UartVfsRegisteredStorage)
+val esp32UartVfsRegisteredCountStorage = nativeStaticAllocate(4)
+val esp32UartVfsRegisteredCount = u32(esp32UartVfsRegisteredCountStorage)
+val esp32UartVfsSelectCountsStorage = nativeStaticAllocate(12)
+val esp32UartVfsSelectCounts = u32(esp32UartVfsSelectCountsStorage)
+val esp32UartVfsSelectLockStorage = nativeStaticMutableU32s([3007315967,0])
+val esp32UartVfsSelectLock = u32(esp32UartVfsSelectLockStorage)
+
+@inline trusted fun esp32UartVfsLoad(address:u32):u32 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+@inline trusted fun esp32UartVfsStore(address:u32,value:u32):void = ablaUnsafeStoreU32(nativePointerFromAddress(int(address)),int(value))
+@inline trusted fun esp32UartVfsLoadByte(address:u32):u32 = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+@inline trusted fun esp32UartVfsStoreByte(address:u32,value:u32):void = ablaUnsafeStoreU8(nativePointerFromAddress(int(address)),int(value&u32(255)))
+@inline trusted fun esp32UartVfsDevice(port:u32):u32 = esp32UartVfsLoad(esp32UartVfsDevices+port*u32(4))
+@inline trusted fun esp32UartVfsArray(array:u32,port:u32):u32 = array+port*u32(4)
+@inline trusted fun esp32UartVfsGet(array:u32,port:u32):u32 = esp32UartVfsLoad(esp32UartVfsArray(array,port))
+@inline trusted fun esp32UartVfsSet(array:u32,port:u32,value:u32):void = esp32UartVfsStore(esp32UartVfsArray(array,port),value)
+trusted fun esp32UartVfsSetErrno(value:u32):void = esp32UartVfsStore(u32(nativeInternalSectionThreadLocalAllocate(4,"errno",".tdata.errno",4)),value)
+
+trusted fun esp32UartVfsAcquire(port:u32,write:bool):void {
+    val lock=esp32UartVfsLocks+port*u32(8)+(if(write)u32(4)else u32(0))
+    esp32RecoveredLockAcquireRecursive(lock,u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    return
+}
+trusted fun esp32UartVfsRelease(port:u32,write:bool):void {
+    val lock=esp32UartVfsLocks+port*u32(8)+(if(write)u32(4)else u32(0))
+    esp32RecoveredLockReleaseRecursive(lock,u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+    return
+}
+
+trusted fun esp32UartVfsRawAvailable(port:u32):u32 = esp32UartIramReceiveCount(esp32UartVfsDevice(port))
+trusted fun esp32UartVfsAvailable(port:u32):u32 {
+    if(esp32UartVfsGet(esp32UartVfsDriverModes,port)==u32(0)) return esp32UartVfsRawAvailable(port)
+    val out=u32(nativeStackAllocate(4));esp32UartVfsStore(out,u32(0));esp32UartGetBufferedDataLen(port,out);return esp32UartVfsLoad(out)
+}
+trusted fun esp32UartVfsRawTransmit(port:u32,character:u32):void {
+    val byte=u32(nativeStackAllocate(1));val written=u32(nativeStackAllocate(4));esp32UartVfsStoreByte(byte,character)
+    var count=u32(0);while(count==u32(0)){esp32UartVfsStore(written,u32(0));esp32UartHalWriteTransmitFifo(esp32UartContext(port),byte,u32(1),written);count=esp32UartVfsLoad(written)}
+}
+trusted fun esp32UartVfsTransmit(port:u32,character:u32):void {
+    if(esp32UartVfsGet(esp32UartVfsDriverModes,port)==u32(0)){esp32UartVfsRawTransmit(port,character);return}
+    val byte=u32(nativeStackAllocate(1));esp32UartVfsStoreByte(byte,character);esp32UartWriteBytes(port,byte,u32(1))
+    return
+}
+trusted fun esp32UartVfsRawReceive(port:u32):u32 {
+    if(esp32UartVfsRawAvailable(port)==u32(0))return esp32UartVfsNone
+    return u32(ablaUnsafeVolatileLoadU32(int(esp32UartVfsDevice(port))))&u32(255)
+}
+trusted fun esp32UartVfsReceive(port:u32):u32 {
+    if(esp32UartVfsGet(esp32UartVfsDriverModes,port)==u32(0))return esp32UartVfsRawReceive(port)
+    val out=u32(nativeStackAllocate(1));val ticks=if(esp32UartVfsGet(esp32UartVfsNonBlocking,port)!=u32(0))u32(0)else u32(0xffffffff)
+    return if(esp32UartReadBytes(port,out,u32(1),ticks)==u32(1))esp32UartVfsLoadByte(out)else esp32UartVfsNone
+}
+trusted fun esp32UartVfsReadCharacter(port:u32):u32 {
+    val peek=esp32UartVfsGet(esp32UartVfsPeek,port);if(peek!=esp32UartVfsNone){esp32UartVfsSet(esp32UartVfsPeek,port,esp32UartVfsNone);return peek};return esp32UartVfsReceive(port)
+}
+trusted fun esp32UartVfsReturnCharacter(port:u32,character:u32):void = esp32UartVfsSet(esp32UartVfsPeek,port,character)
+
+trusted fun esp32UartVfsWrite(context:u32,port:u32,data:u32,size:u32):u32 {
+    if(port>=u32(3)||data==u32(0))return u32(0xffffffff);esp32UartVfsAcquire(port,true);val mode=esp32UartVfsGet(esp32UartVfsTxModes,port);var i=u32(0)
+    while(i<size){val c=esp32UartVfsLoadByte(data+i);if(c==u32(10)&&mode!=esp32UartVfsLineFeed){esp32UartVfsTransmit(port,u32(13));if(mode!=esp32UartVfsCarriageReturn)esp32UartVfsTransmit(port,c)}else esp32UartVfsTransmit(port,c);i=i+u32(1)}
+    esp32UartVfsRelease(port,true);return size
+}
+trusted fun esp32UartVfsRead(context:u32,port:u32,data:u32,size:u32):u32 {
+    if(port>=u32(3)||data==u32(0))return u32(0xffffffff);esp32UartVfsAcquire(port,false);var first=esp32UartVfsNone
+    if(esp32UartVfsGet(esp32UartVfsNonBlocking,port)==u32(0))first=esp32UartVfsReadCharacter(port)
+    var available=esp32UartVfsAvailable(port);if(first!=esp32UartVfsNone)available=available+u32(1);if(esp32UartVfsGet(esp32UartVfsPeek,port)!=esp32UartVfsNone)available=available+u32(1)
+    val fetch=if(available<size)available else size;var received=u32(0);var current=first
+    while(received<fetch){if(current==esp32UartVfsNone)current=esp32UartVfsReadCharacter(port);if(current==esp32UartVfsNone)break
+        if(current==u32(13)){val mode=esp32UartVfsGet(esp32UartVfsRxModes,port);if(mode==esp32UartVfsCarriageReturn)current=u32(10)else if(mode==esp32UartVfsCarriageReturnLineFeed){val next=esp32UartVfsReadCharacter(port);if(next==u32(10))current=u32(10)else if(next!=esp32UartVfsNone)esp32UartVfsReturnCharacter(port,next)}}
+        esp32UartVfsStoreByte(data+received,current);received=received+u32(1);current=esp32UartVfsNone
+    }
+    if(current!=esp32UartVfsNone)esp32UartVfsReturnCharacter(port,current);esp32UartVfsRelease(port,false)
+    if(received!=u32(0))return received;esp32UartVfsSetErrno(u32(11));return u32(0xffffffff)
+}
+trusted fun esp32UartVfsPathPort(path:u32):u32 {
+    if(path==u32(0)||esp32UartVfsLoadByte(path)!=u32(47)||esp32UartVfsLoadByte(path+u32(2))!=u32(0))return esp32UartVfsNone
+    val digit=esp32UartVfsLoadByte(path+u32(1));return if(digit>=u32(48)&&digit<=u32(50))digit-u32(48)else esp32UartVfsNone
+}
+trusted fun esp32UartVfsOpen(context:u32,path:u32,flags:u32,mode:u32):u32 {val port=esp32UartVfsPathPort(path);if(port==esp32UartVfsNone){esp32UartVfsSetErrno(u32(2));return port};esp32UartVfsSet(esp32UartVfsNonBlocking,port,if((flags&esp32UartVfsNonBlockingFlag)!=u32(0))u32(1)else u32(0));return port}
+trusted fun esp32UartVfsClose(context:u32,port:u32):u32=if(port<u32(3))u32(0)else u32(0xffffffff)
+trusted fun esp32UartVfsFstat(context:u32,port:u32,status:u32):u32 {if(port>=u32(3)||status==u32(0))return u32(0xffffffff);freestandingSet(status,i32(0),u32(88));esp32UartVfsStore(status+u32(4),u32(8192));return u32(0)}
+trusted fun esp32UartVfsFcntl(context:u32,port:u32,command:u32,argument:u32):u32 {if(port>=u32(3))return u32(0xffffffff);if(command==u32(3))return u32(2)|(if(esp32UartVfsGet(esp32UartVfsNonBlocking,port)!=u32(0))esp32UartVfsNonBlockingFlag else u32(0));if(command==u32(4)){esp32UartVfsSet(esp32UartVfsNonBlocking,port,if((argument&esp32UartVfsNonBlockingFlag)!=u32(0))u32(1)else u32(0));return u32(0)};esp32UartVfsSetErrno(u32(88));return u32(0xffffffff)}
+trusted fun esp32UartVfsFsync(context:u32,port:u32):u32 {if(port>=u32(3))return u32(0xffffffff);esp32UartVfsAcquire(port,true);esp32RomOutputTxWaitIdle(port);esp32UartVfsRelease(port,true);return u32(0)}
+trusted fun esp32UartVfsAccess(context:u32,path:u32,mode:u32):u32 {if(esp32UartVfsPathPort(path)==esp32UartVfsNone){esp32UartVfsSetErrno(u32(2));return u32(0xffffffff)};if(mode==u32(0)||((mode&u32(1))==u32(0)&&(mode&u32(6))!=u32(0)))return u32(0);esp32UartVfsSetErrno(u32(13));return u32(0xffffffff)}
+
+trusted fun esp32UartVfsFdMask(fd:u32):u32=u32(1)<<((u32(32)-(fd&u32(31)))&u32(31))
+trusted fun esp32UartVfsFdSetContains(set:u32,fd:u32):bool=set!=u32(0)&&(esp32UartVfsLoad(set+(fd>>>u32(5))*u32(4))&esp32UartVfsFdMask(fd))!=u32(0)
+trusted fun esp32UartVfsFdSetAdd(set:u32,fd:u32):void {if(set!=u32(0)){val slot=set+(fd>>>u32(5))*u32(4);esp32UartVfsStore(slot,esp32UartVfsLoad(slot)|esp32UartVfsFdMask(fd))}}
+trusted fun esp32UartVfsAny(args:u32,fd:u32):bool=esp32UartVfsFdSetContains(args+u32(20),fd)||esp32UartVfsFdSetContains(args+u32(28),fd)||esp32UartVfsFdSetContains(args+u32(36),fd)
+trusted fun esp32UartVfsTriggerIsr(args:u32,woken:u32):void =
+    esp32VfsSelectTriggeredIsr(
+        esp32UartVfsLoad(args),
+        esp32UartVfsLoad(args+u32(4)),
+        woken
+    )
+
+trusted fun esp32UartVfsSelectCallback(port:u32,kind:u32,woken:u32):void {
+    esp32RecoveredXPortEnterCriticalTimeout(esp32UartVfsSelectLock,u32(0xffffffff));val list=esp32UartVfsLoad(esp32UartVfsRegistered);val count=esp32UartVfsLoad(esp32UartVfsRegisteredCount);var i=u32(0)
+    while(i<count){val args=esp32UartVfsLoad(list+i*u32(4));if(args!=u32(0)){val original=if(kind==u32(0))args+u32(20)else if(kind==u32(1))args+u32(28)else args+u32(36);val output=if(kind==u32(0))esp32UartVfsLoad(args+u32(8))else if(kind==u32(1))esp32UartVfsLoad(args+u32(12))else esp32UartVfsLoad(args+u32(16));if(esp32UartVfsFdSetContains(original,port)){esp32UartVfsFdSetAdd(output,port);esp32UartVfsTriggerIsr(args,woken)}};i=i+u32(1)}
+    esp32RecoveredVPortExitCriticalValue(esp32UartVfsSelectLock)
+    return
+}
+trusted fun esp32UartVfsRegisterSelect(args:u32):u32 {val count=esp32UartVfsLoad(esp32UartVfsRegisteredCount);val replacement=esp32LibcReallocate(esp32UartVfsLoad(esp32UartVfsRegistered),(count+u32(1))*u32(4));if(replacement==u32(0))return u32(0x101);esp32UartVfsStore(replacement+count*u32(4),args);esp32UartVfsStore(esp32UartVfsRegistered,replacement);esp32UartVfsStore(esp32UartVfsRegisteredCount,count+u32(1));return u32(0)}
+trusted fun esp32UartVfsUnregisterSelect(args:u32):u32 {val list=esp32UartVfsLoad(esp32UartVfsRegistered);var count=esp32UartVfsLoad(esp32UartVfsRegisteredCount);var i=u32(0);while(i<count){if(esp32UartVfsLoad(list+i*u32(4))==args){count=count-u32(1);if(i<count)esp32UartVfsStore(list+i*u32(4),esp32UartVfsLoad(list+count*u32(4)));esp32UartVfsStore(esp32UartVfsRegisteredCount,count);return u32(0)};i=i+u32(1)};return u32(0x103)}
+trusted fun esp32UartVfsStartSelect(nfds:u32,read:u32,write:u32,error:u32,sem0:u32,sem1:u32,endArgs:u32):u32 {
+    val maximum=if(nfds<u32(3))nfds else u32(3);if(endArgs==u32(0))return u32(0x102);esp32UartVfsStore(endArgs,u32(0));var fd=u32(0)
+    while(fd<maximum){if((esp32UartVfsFdSetContains(read,fd)||esp32UartVfsFdSetContains(write,fd)||esp32UartVfsFdSetContains(error,fd))&&esp32UartIsDriverInstalled(fd)==u32(0))return u32(0x103);fd=fd+u32(1)}
+    val args=esp32LibcMalloc(u32(44));if(args==u32(0))return u32(0x101);esp32UartVfsStore(args,sem0);esp32UartVfsStore(args+u32(4),sem1);esp32UartVfsStore(args+u32(8),read);esp32UartVfsStore(args+u32(12),write);esp32UartVfsStore(args+u32(16),error);freestandingCopy(args+u32(20),read,u32(8));freestandingCopy(args+u32(28),write,u32(8));freestandingCopy(args+u32(36),error,u32(8));freestandingSet(read,i32(0),u32(8));freestandingSet(write,i32(0),u32(8));freestandingSet(error,i32(0),u32(8))
+    esp32RecoveredXPortEnterCriticalTimeout(esp32UartGetSelectLock(),u32(0xffffffff));fd=u32(0);while(fd<maximum){if(esp32UartVfsAny(args,fd)){val slot=esp32UartVfsSelectCounts+fd*u32(4);val count=esp32UartVfsLoad(slot);if(count==u32(0))esp32UartSetSelectNotifCallback(fd,u32(nativeFunctionAddress(esp32UartVfsSelectCallback)));esp32UartVfsStore(slot,count+u32(1))};if(esp32UartVfsFdSetContains(args+u32(20),fd)){val amount=u32(nativeStackAllocate(4));if(esp32UartGetBufferedDataLen(fd,amount)==u32(0)&&esp32UartVfsLoad(amount)!=u32(0)){esp32UartVfsFdSetAdd(read,fd);esp32VfsSelectTriggered(sem0,sem1)}};fd=fd+u32(1)}
+    val result=esp32UartVfsRegisterSelect(args);esp32RecoveredVPortExitCriticalValue(esp32UartGetSelectLock());if(result!=u32(0)){esp32LibcFree(args);return result};esp32UartVfsStore(endArgs,args);return u32(0)
+}
+trusted fun esp32UartVfsEndSelect(args:u32):u32 {if(args==u32(0))return u32(0x102);esp32RecoveredXPortEnterCriticalTimeout(esp32UartGetSelectLock(),u32(0xffffffff));val result=esp32UartVfsUnregisterSelect(args);var fd=u32(0);while(fd<u32(3)){if(esp32UartVfsAny(args,fd)){val slot=esp32UartVfsSelectCounts+fd*u32(4);val count=esp32UartVfsLoad(slot)-u32(1);esp32UartVfsStore(slot,count);if(count==u32(0))esp32UartSetSelectNotifCallback(fd,u32(0))};fd=fd+u32(1)};esp32RecoveredVPortExitCriticalValue(esp32UartGetSelectLock());esp32LibcFree(args);return result}
+
+val esp32UartVfsDevicePathStorage=nativeStaticBytes("\x2f\x64\x65\x76\x2f\x75\x61\x72\x74\x00")
+val esp32UartVfsDevicePath=u32(esp32UartVfsDevicePathStorage)
+val esp32UartVfsDirectoryStorage=nativeStaticU32s([0,0,0,0,0,0,0,0,0,0,0,0,int(u32(nativeFunctionAddress(esp32UartVfsAccess))),0,0,0])
+val esp32UartVfsDirectory=u32(esp32UartVfsDirectoryStorage)
+val esp32UartVfsSelectStorage=nativeStaticU32s([int(u32(nativeFunctionAddress(esp32UartVfsStartSelect))),0,0,0,0,int(u32(nativeFunctionAddress(esp32UartVfsEndSelect)))])
+val esp32UartVfsSelect=u32(esp32UartVfsSelectStorage)
+val esp32UartVfsOperationsStorage=nativeStaticU32s([
+    int(u32(nativeFunctionAddress(esp32UartVfsWrite))),0,int(u32(nativeFunctionAddress(esp32UartVfsRead))),0,0,
+    int(u32(nativeFunctionAddress(esp32UartVfsOpen))),int(u32(nativeFunctionAddress(esp32UartVfsClose))),int(u32(nativeFunctionAddress(esp32UartVfsFstat))),int(u32(nativeFunctionAddress(esp32UartVfsFcntl))),0,int(u32(nativeFunctionAddress(esp32UartVfsFsync))),int(esp32UartVfsDirectory),int(esp32UartVfsSelect)
+])
+val esp32UartVfsOperations=u32(esp32UartVfsOperationsStorage)
+
+trusted fun esp32UartVfsGetVfs():u32=esp32UartVfsOperations
+trusted fun esp32UartVfsDevRegister():u32 =
+    esp32VfsRegisterStaticKnownPath(
+        esp32UartVfsDevicePath,
+        u32(9),
+        esp32UartVfsOperations,
+        u32(10),
+        u32(0),
+        false
+    )
+trusted fun esp32UartVfsDevPortSetRxLineEndings(port:u32,mode:u32):u32 {if(port>=u32(3)){esp32UartVfsSetErrno(u32(9));return u32(0xffffffff)};esp32UartVfsSet(esp32UartVfsRxModes,port,mode);return u32(0)}
+trusted fun esp32UartVfsDevPortSetTxLineEndings(port:u32,mode:u32):u32 {if(port>=u32(3)){esp32UartVfsSetErrno(u32(9));return u32(0xffffffff)};esp32UartVfsSet(esp32UartVfsTxModes,port,mode);return u32(0)}
+trusted fun esp32UartVfsDevSetRxLineEndings(mode:u32):void {var port=u32(0);while(port<u32(3)){esp32UartVfsSet(esp32UartVfsRxModes,port,mode);port=port+u32(1)}}
+trusted fun esp32UartVfsDevSetTxLineEndings(mode:u32):void {var port=u32(0);while(port<u32(3)){esp32UartVfsSet(esp32UartVfsTxModes,port,mode);port=port+u32(1)}}
+trusted fun esp32UartVfsDevUseNonblocking(port:u32):void {if(port<u32(3))esp32UartVfsSet(esp32UartVfsDriverModes,port,u32(0))}
+trusted fun esp32UartVfsDevUseDriver(port:u32):void {if(port<u32(3))esp32UartVfsSet(esp32UartVfsDriverModes,port,u32(1))}
+trusted fun esp32UartVfsInitialize():u32 {
+    esp32VfsRegisterStaticKnownPath(
+        esp32UartVfsDevicePath,
+        u32(9),
+        esp32UartVfsOperations,
+        u32(10),
+        u32(0),
+        true
+    )
+    return u32(0)
+}
+trusted fun esp32UartVfsIncludeDevInit():void {}
+val esp32UartVfsInitSection=nativeInternalSectionU32s([int(u32(nativeFunctionAddress(esp32UartVfsInitialize))),1],"abla_esp32_system_init_110_vfs_uart",".esp_system_init_fn.110")

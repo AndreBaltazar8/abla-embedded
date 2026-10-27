@@ -1,0 +1,71 @@
+import "abla/runtime/scalar"
+import "../../runtime/rtc_time48.ab"
+// Snapshot latch is shared across both counters: caller serializes with ALL
+// HP/LP readers, not just the selected alarm. Matches P4 IDF LL's update then
+// low/high reads; no invented completion bit. Peripheral/bus clocks must run.
+trusted fun esp32p4WakeTimerCyclesOwned(timer: int,exclusive: bool): int {
+    if (!exclusive || timer < 0 || timer > 1) return -1
+    val control=p4WakeTimerRead(16)
+    // A reset/stalled counter cannot establish a useful sleep deadline.
+    if ((control&u32(0xc0000000)) != u32(0)) return -1
+    p4WakeTimerWrite(16,control|u32(0x10000000))
+    val low=p4WakeTimerRead(20+timer*8)
+    val high=p4WakeTimerRead(24+timer*8)&u32(65535)
+    return int(low)|(int(high)<<32)
+}
+// Returned absolute deadline still needs a future-distance check immediately
+// before arming/entering sleep. This function does not mutate an alarm.
+trusted fun esp32p4WakeTimerDeadlineOwned(timer: int,microseconds: int,periodQ19: int,exclusive: bool): int {
+    val ticks=rtc48TicksForMicroseconds(microseconds,periodQ19)
+    if (ticks <= 0) return -1
+    return rtc48DeadlineAfter(esp32p4WakeTimerCyclesOwned(timer,exclusive),ticks)
+}
+// P4 LP_TIMER 0x50112000, two 48-bit target registers. The enable bit31
+// is WT: neither readback nor writing zero proves an alarm is disarmed.
+// Exclusive caller must quiesce the former alarm and park PMU timer triggers
+// before staging/restoring, pin LP power/clock, and exclude HP/LP writers.
+// No counter reset, clock change, sleep entry, implicit status acknowledgment
+// or attempt to restore an unknowable previously armed alarm.
+type P4WakeTimer=int
+fun P4WakeTimer.status(): int = this&255
+fun P4WakeTimer.hasSnapshot(): bool = (this&(1<<57)) != 0
+fun P4WakeTimer.armIssued(): bool = (this&(1<<58)) != 0
+// Original target48@8, timerId56, snapshot57, arm-issued58.
+//1staged2invalid3partialwrite4arm-issued5restored.
+trusted fun p4WakeTimerTarget(timer: int,ticks: int): bool {
+    val high=timer*8+4
+    // Clear WT from every ordinary field write, even if hardware reads it high.
+    val before=p4WakeTimerRead(high)
+    p4WakeTimerWrite(high,(before&u32(0x7fff0000))|u32(ticks>>>32))
+    if ((p4WakeTimerRead(high)&u32(65535)) != u32(ticks>>>32)) return false
+    p4WakeTimerWrite(timer*8,u32(ticks&0xffffffff))
+    return p4WakeTimerRead(timer*8) == u32(ticks&0xffffffff)
+}
+trusted fun esp32p4WakeTimerStageOwned(timer: int,ticks: int,exclusiveQuiesced: bool): P4WakeTimer {
+    if (!exclusiveQuiesced || timer < 0 || timer > 1 || ticks < 0 || ticks > 0xffffffffffff) return P4WakeTimer(2)
+    val old=int(p4WakeTimerRead(timer*8))|(int(p4WakeTimerRead(timer*8+4)&u32(65535))<<32)
+    val token=(1<<57)|(timer<<56)|(old<<8)
+    return P4WakeTimer(token|(if (p4WakeTimerTarget(timer,ticks)) 1 else 3))
+}
+// Explicit irreversible arm command. A successful bus write is NOT evidence
+// the alarm fired or the CPU woke. Only a freshly staged token can arm once.
+trusted fun P4WakeTimer.armOwned(exclusive: bool): P4WakeTimer {
+    if (!exclusive || !this.hasSnapshot() || this.status() != 1 || this.armIssued()) return this
+    val offset=((this>>>56)&1)*8+4
+    p4WakeTimerWrite(offset,p4WakeTimerRead(offset)|u32(0x80000000))
+    return P4WakeTimer((this&(~255))|(1<<58)|4)
+}
+// After arm, the caller must independently establish quiescence again. The
+// token preserves that an arm was issued even after restoration.
+trusted fun P4WakeTimer.restoreOwned(exclusiveQuiesced: bool): P4WakeTimer {
+    if (!exclusiveQuiesced || !this.hasSnapshot() || this.status() == 5) return this
+    val timer=(this>>>56)&1
+    return P4WakeTimer((this&(~255))|(if (p4WakeTimerTarget(timer,(this>>>8)&0xffffffffffff)) 5 else 3))
+}
+trusted fun esp32p4WakeTimerAlarmPending(timer: int): bool =
+    (timer == 0 || timer == 1) && (p4WakeTimerRead(40+timer*16)&u32(0x80000000)) != u32(0)
+// Exact W1C command; do not read/modify/write and accidentally clear overflow.
+trusted fun esp32p4WakeTimerAcknowledgeOwned(timer: int,exclusive: bool): bool {
+    if (!exclusive || timer < 0 || timer > 1) return false
+    p4WakeTimerWrite(52+timer*16,u32(0x80000000));return true
+}

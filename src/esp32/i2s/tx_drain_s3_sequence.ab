@@ -1,0 +1,47 @@
+import "abla/runtime/scalar"
+// Opt-in FINITE-chain TX draining, not circular-stream cancellation. Configure
+// while stopped, then use normal StartStream (which clears stale GDMA events).
+// Caller owns TX/clock/channel/whole chain and prevents rearm or ISR event
+// acknowledgement until finish. Terminal descriptor must be EOF with next0.
+// No FIFO reset, descriptor rewrite, clock change or discarded samples.
+trusted fun esp32s3I2sSetTxDrainMode(port: int,enabled: bool): bool {
+    if (port < 0 || port > 1) return false
+    val address=0x6000F024+port*0x1E000
+    if ((esp32s3I2sClockRead(address)&260) != 0) return false
+    esp32s3I2sClockField(address,8192,if (enabled) 8192 else 0)
+    return (esp32s3I2sClockRead(address)&8192) == (if (enabled) 8192 else 0)
+}
+// 1 finished/stopped;2 invalid;3 drain mode not armed;4 DMA error;
+// 5 still draining (bounded poll budget);6 stop did not latch.
+// Status5 leaves transfer running and ownership intact. Error4 does not turn
+// into success: explicitly recover/abort through StopStream if desired.
+// Last successful EOF + TOTAL_EOF + ownership + parked/empty DMA + TX_IDLE
+// must ALL agree before START is cleared. This proves digital transfer only,
+// not external codec/amplifier analog settling. Internal SRAM chains only.
+trusted fun esp32s3I2sFinishTxStream(port: int,channel: int,terminal: int,polls: int): int {
+    if (port < 0 || port > 1 || channel < 0 || channel > 4 || polls < 1 || polls > 1000000 ||
+        !esp32s3GdmaDescriptorValid(terminal)) return 2
+    val base=0x6000F000+port*0x1E000
+    val dma=0x6003F060+channel*192
+    val initial=esp32s3I2sClockRead(base+36)
+    if ((initial&8192) == 0 || (initial&256) != 0) return 3
+    val flags=esp32s3GdmaRead(terminal)
+    if ((flags&0x40000000) == 0 || esp32s3GdmaRead(terminal+8) != 0 || (flags&4095) == 0 ||
+        ((flags>>>12)&4095) == 0 || ((flags>>>12)&4095) > (flags&4095)) return 2
+    var attempt=0
+    while (attempt < polls) {
+        val events=esp32s3GdmaRead(dma+8)&255
+        if ((events&244) != 0) return 4
+        if ((events&10) == 10 && esp32s3GdmaRead(dma+40) == terminal &&
+            (esp32s3GdmaRead(terminal)&0x80000000) == 0 &&
+            (esp32s3GdmaRead(dma+32)&0xF00000) == 0x800000 &&
+            (esp32s3GdmaRead(dma+24)&0x7FFFFF) == 42 &&
+            (esp32s3I2sClockRead(base+108)&1) != 0) {
+            esp32s3GdmaPublish()
+            if (!esp32s3I2sStopDirection(port,true) || (esp32s3I2sClockRead(base+36)&4) != 0) return 6
+            return 1
+        }
+        attempt=attempt+1
+    }
+    return 5
+}

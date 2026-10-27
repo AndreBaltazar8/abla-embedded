@@ -1,0 +1,46 @@
+import "../scheduler/ready_queue_sequence.ab"
+// Bounded task table: ID1 maps entry0,16 bytes each: binding0,savedFrame4,
+// state8 (0inactive,1ready,2runningCPU0,3runningCPU1), affinityMask12 (1..3).
+// runningIds8 contains current ID per core, separate from current CP bindings.
+// Caller owns disjoint INTERNAL RAM table/queue/running IDs/current bindings/CP owner table,
+// task stacks and CP records. Caller holds shared scheduler lock, mask15 and
+// disabled CP, in outermost post-drain IRQ. One FIFO priority/affinity domain;
+// broader priority policy chooses queue. This operation round-robins RUNNABLE
+// tasks only; blocked/exit transitions and idle fallback are separate policy.
+// 1 switched,0 no ready task,-5 invalid metadata; task-switch errors propagate.
+// -4 is fatal (including a queue commit failure AFTER CPU-frame selection).
+// Do not unmask or dispatch more callbacks after success; return to IRQ shell.
+@section(".iram1.abla.s3SchedulerSelect")
+trusted fun esp32S3SchedulerSelectOwned(queue: NativeBuffer,records: NativeBuffer,running: NativeBuffer,current: NativeBuffer,owners: NativeBuffer,interrupted: NativeBuffer,core: int,level: int): int {
+    if (core < 0 || core > 1 || level < 1 || level > 3 ||
+        !records.hasAddressRange(0,16) || (records.addressValue() & 3) != 0 ||
+        records.addressValue()+records.capacity() > 0x100000000 || (records.capacity() & 15) != 0 ||
+        !running.hasAddressRange(0,8) || (running.addressValue() & 3) != 0 ||
+        !current.hasAddressRange(0,8) || !interrupted.hasAddressRange(0,192)) return -5
+    val id=readyQueuePeekOwned(queue)
+    if (id == 0) return 0
+    val previous=esp32S3SchedulerSelectRead(running.addressValue()+core*4)
+    val count=records.capacity()/16
+    if (id < 1 || id > count || previous < 1 || previous > count || id == previous ||
+        esp32S3SchedulerSelectRead(running.addressValue()+(core ^ 1)*4) == id ||
+        !readyQueueCanCommitOwned(queue,id,previous)) return -5
+    val old=records.addressValue()+(previous-1)*16
+    val next=records.addressValue()+(id-1)*16
+    val affinity=1<<core
+    val oldAffinity=esp32S3SchedulerSelectRead(old+12)
+    val nextAffinity=esp32S3SchedulerSelectRead(next+12)
+    if (esp32S3SchedulerSelectRead(old+8) != core+2 || esp32S3SchedulerSelectRead(next+8) != 1 ||
+        oldAffinity > 3 || nextAffinity > 3 || (oldAffinity & affinity) == 0 || (nextAffinity & affinity) == 0) return -5
+    val previousBinding=esp32S3SchedulerSelectRead(old)
+    val nextBinding=esp32S3SchedulerSelectRead(next)
+    if (esp32S3SchedulerSelectRead(current.addressValue()+core*4) != previousBinding) return -5
+    val result=esp32S3SchedulerSelectSwitch(current,nativeBufferAt(previousBinding,16),nativeBufferAt(nextBinding,16),
+        owners,interrupted,nativeBufferAt(esp32S3SchedulerSelectRead(next+4),192),core,level)
+    if (result != 1) return result
+    if (!readyQueueCommitOwned(queue,id,previous)) return -4
+    esp32S3SchedulerSelectWrite(old+4,interrupted.addressValue())
+    esp32S3SchedulerSelectWrite(old+8,1)
+    esp32S3SchedulerSelectWrite(next+8,core+2)
+    esp32S3SchedulerSelectWrite(running.addressValue()+core*4,id)
+    return 1
+}

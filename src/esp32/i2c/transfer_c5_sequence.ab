@@ -1,0 +1,43 @@
+import "../sdk/raw_buffer.ab"
+import "./transfer_s3_logic.ab"
+// Shared pure command planning; hardware hooks are supplied by C5 adapter.
+fun esp32C5I2cSmallTransferValid(address: int,written: int,read: int): bool = esp32S3I2cSmallTransferValid(address,written,read)
+fun esp32C5I2cSmallTransferLast(written: int,read: int): int = esp32S3I2cSmallTransferLast(written,read)
+fun esp32C5I2cSmallTransferCommand(written: int,read: int,index: int): u32 = esp32S3I2cSmallTransferCommand(written,read,index)
+
+// Synchronous, allocation-free single-FIFO operation on an exclusively owned,
+// configured, idle controller. No clock/ownership acquisition is implicit.
+// Return codes match RunBatch. On errors the owner must recover before reuse;
+// this layer must not send STOP after another master wins arbitration.
+// Large transfers belong in a streaming layer, not silently truncated here.
+trusted fun esp32C5I2cSmallTransferOwned(port: int, address: int,
+    output: NativeBuffer, written: int, input: NativeBuffer, read: int,
+    timeoutCycles: u32): int {
+    val base = esp32C5I2cControllerAddress(port)
+    if (base == 0 || !esp32C5I2cSmallTransferValid(address, written, read) ||
+        !output.hasAddressRange(0, written) || !input.hasAddressRange(0, read) ||
+        timeoutCycles == u32(0) || timeoutCycles > u32(0x7fffffff)) return 7
+    val status = u32(c5I2cTransferLoad(base + 8))
+    if ((status & u32(16)) != u32(0)) return 8
+    // Refuse stale FIFO data rather than silently discarding another operation.
+    if (esp32C5I2cTxCount(status) != 0 || esp32C5I2cRxCount(status) != 0) return 7
+    val last = esp32C5I2cSmallTransferLast(written, read)
+    var index = 0
+    while (index <= last) {
+        if (!esp32C5I2cWriteCommand(port, index,
+            esp32C5I2cSmallTransferCommand(written, read, index))) return 7
+        index = index + 1
+    }
+    c5I2cTransferStore(base + 0x1c, (address << 1) |
+        (if (written == 0 && read > 0) 1 else 0))
+    if (!esp32C5I2cWriteFifo(port, output, written)) return 7
+    if (written > 0 && read > 0) c5I2cTransferStore(base + 0x1c, (address << 1) | 1)
+    val result = esp32C5I2cRunBatch(port, last, timeoutCycles)
+    if (result != 1) return result
+    // Completion must account for every requested byte, not just the IRQ.
+    val completed = u32(c5I2cTransferLoad(base + 8))
+    if (esp32C5I2cTxCount(completed) != 0 ||
+        esp32C5I2cRxCount(completed) != read) return 6
+    if (!esp32C5I2cReadFifo(port, input, read)) return 6
+    1
+}

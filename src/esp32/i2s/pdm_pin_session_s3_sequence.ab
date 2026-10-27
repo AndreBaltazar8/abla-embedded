@@ -1,0 +1,70 @@
+import "./pdm_pins_s3_sequence.ab"
+import "../gpio/snapshot_s3_sequence.ab"
+import "../gpio/input_snapshot_s3_sequence.ab"
+import "../sdk/raw_buffer.ab"
+//56B: magic/status/active-mask+slave/error, five pad snapshots16..35,
+// five optional global-input snapshots36..55. Data0..3 then clock atindex4.
+// Caller owns stopped old/new pad and input consumers, I2S/DMA, RTC/USB/holds/
+// sleep and shared register updates. Close only AFTER confirmed capture stop.
+trusted fun esp32s3PdmPinSessionValid(r: NativeBuffer): bool = r.hasAddressRange(0,56) &&
+    (r.addressValue()&3) == 0 && r.loadU32(0) == 0x50445031 &&
+    (r.loadU32(8)&16) != 0 && (r.loadU32(8)&15) != 0 && r.loadU32(8) < 64
+// Read-only hardware capture;1 captured,0 invalid. No routing/clock mutation.
+trusted fun esp32s3PdmPinsCaptureOwned(r: NativeBuffer,pins: PdmPins,slots: int,slave: bool,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,56) || (r.addressValue()&3) != 0 || !esp32s3PdmPinsValid(0,pins,slots,slave)) return 0
+    if (r.loadU32(0) != 0 && (!esp32s3PdmPinSessionValid(r) || r.loadU32(4) != 2)) return 0
+    var mask=16|(if (slave) 32 else 0);var index=0
+    while (index < 5) {
+        val active=index == 4 || (slots&(3<<(index*2))) != 0
+        var pad=0;var input=0
+        if (active) {
+            mask=mask|(1<<index)
+            val saved=esp32S3GpioSnapshotOwned(if (index == 4) pins.clockPin() else pins.dataPin(index),true)
+            if (!saved.valid()) return 0
+            pad=saved|0
+            if (index != 4 || slave) {
+                val route=esp32S3GpioInputCaptureOwned(if (index == 4) 27 else esp32s3PdmInputSignal(index),true)
+                if (!route.valid()) return 0
+                input=route|0
+            }
+        }
+        r.storeU32(16+index*4,pad);r.storeU32(36+index*4,input);index=index+1
+    }
+    r.storeU32(0,0x50445031);r.storeU32(4,3);r.storeU32(8,mask);r.storeU32(12,0);return 1
+}
+trusted fun esp32s3PdmPinsOpenOwned(r: NativeBuffer,pins: PdmPins,slots: int,slave: bool,inverted: bool,exclusive: bool): int {
+    if (esp32s3PdmPinsCaptureOwned(r,pins,slots,slave,exclusive) != 1) return 0
+    val routed=esp32s3PdmRoutePinsOwned(0,pins,slots,slave,inverted)
+    if (routed != 1) { r.storeU32(12,routed);return 3 }
+    r.storeU32(4,1);return 1
+}
+//1ready2closed3cleanup. Restore global input routes first, data pads next,
+// original clock pad LAST. Readback failure retains every snapshot for retry.
+trusted fun esp32s3PdmPinsCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !esp32s3PdmPinSessionValid(r)) return 0
+    if (r.loadU32(4) == 2) return 2
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 0
+    val mask=r.loadU32(8);var index=0
+    while (index < 5) {
+        val pad=S3GpioSnapshot(r.loadU32(16+index*4));val input=S3GpioInputSnapshot(r.loadU32(36+index*4))
+        if ((mask&(1<<index)) != 0) {
+            if (!pad.valid()) return 0
+            if (index != 4 || (mask&32) != 0) {
+                if (!input.valid() || input.signal() != (if (index == 4) 27 else esp32s3PdmInputSignal(index))) return 0
+            } else if (input != S3GpioInputSnapshot(0)) return 0
+        } else if (pad != S3GpioSnapshot(0) || input != S3GpioInputSnapshot(0)) return 0
+        index=index+1
+    }
+    r.storeU32(4,3);index=0
+    while (index < 5) {
+        val input=S3GpioInputSnapshot(r.loadU32(36+index*4))
+        if (input != S3GpioInputSnapshot(0) && input.restoreOwned(true) != 1) { r.storeU32(12,16+index);return 3 }
+        index=index+1
+    }
+    index=0
+    while (index < 5) {
+        if ((mask&(1<<index)) != 0 && S3GpioSnapshot(r.loadU32(16+index*4)).restoreOwned(true) != 1) { r.storeU32(12,32+index);return 3 }
+        index=index+1
+    }
+    r.storeU32(12,0);r.storeU32(4,2);return 2
+}

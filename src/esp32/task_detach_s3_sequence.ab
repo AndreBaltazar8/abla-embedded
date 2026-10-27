@@ -1,0 +1,56 @@
+import "./coprocessor_owner_s3_sequence.ab"
+@inline
+fun esp32S3TaskDetachOverlap(a: int,size: int,b: int,length: int): bool = a < b+length && b < a+size
+// Called on owning core under the scheduler lock, live CP disabled/level15.
+// Integer context must already be saved by the scheduler. Detach is NOT a
+// context switch. Clear saved CP-enable bits before transfer, so a resumed
+// partial failure faults through ownership lookup instead of using stale
+// ownership. Retry is safe; completed CP saves remain valid.
+// Binding16 uses task_resolver layout. Keep magic/CP pointers for later reuse;
+// clear current pointer and bound-core only after both CP states are safe.
+@section(".iram1.abla.s3TaskDetach")
+trusted fun esp32S3TaskDetachOwned(current: NativeBuffer,binding: NativeBuffer,owners: NativeBuffer,frame: NativeBuffer,core: int): bool {
+    if (!esp32S3CpOwnerGuard(owners,core,0) || !esp32S3CpOwnerGuard(owners,core,3) ||
+        !current.hasAddressRange(0,8) || !esp32S3CpOwnerRange(current.addressValue(),8,3) ||
+        !binding.hasAddressRange(0,16) || !esp32S3CpOwnerRange(binding.addressValue(),16,3) ||
+        !frame.hasAddressRange(0,192) || !esp32S3CpOwnerRange(frame.addressValue(),192,15)) return false
+    val table=current.addressValue()
+    val address=binding.addressValue()
+    val ownerTable=owners.addressValue()
+    val saved=frame.addressValue()
+    if (esp32S3TaskDetachOverlap(saved,192,table,8) || esp32S3TaskDetachOverlap(saved,192,address,16) ||
+        esp32S3TaskDetachOverlap(saved,192,ownerTable,16)) return false
+    if (esp32S3TaskDetachOverlap(table,8,address,16) || esp32S3TaskDetachOverlap(table,8,ownerTable,16) ||
+        esp32S3TaskDetachOverlap(address,16,ownerTable,16) ||
+        esp32S3CpOwnerRead(table+core*4) != address || esp32S3CpOwnerRead(table+(core ^ 1)*4) == address ||
+        esp32S3CpOwnerRead(address+8) != core+1 || esp32S3CpOwnerRead(address+12) != 0x54415331) return false
+    val first=esp32S3CpOwnerRead(address)
+    val second=esp32S3CpOwnerRead(address+4)
+    if (!esp32S3CpOwnerRecordValid(first,0) || !esp32S3CpOwnerRecordValid(second,3) ||
+        esp32S3TaskDetachOverlap(first,256,second,256)) return false
+    // Validate BOTH states before changing either. Never save local registers
+    // into a record owned by a peer or referenced from a conflicting slot.
+    var index=0
+    while (index < 2) {
+        val record=if (index == 0) first else second
+        if (esp32S3TaskDetachOverlap(record,256,table,8) || esp32S3TaskDetachOverlap(record,256,address,16) ||
+            esp32S3TaskDetachOverlap(record,256,ownerTable,16) || esp32S3TaskDetachOverlap(record,256,saved,192)) return false
+        val resident=esp32S3CpOwnerRead(record+8)
+        val slot=core*8+index*4
+        if (resident != 0 && resident != core+1) return false
+        if (resident == 0 && esp32S3CpOwnerRead(record+12) != 1) return false
+        var offset=0
+        while (offset < 16) {
+            val matches=esp32S3CpOwnerRead(ownerTable+offset) == record
+            if (matches != (resident == core+1 && offset == slot)) return false
+            offset=offset+4
+        }
+        index=index+1
+    }
+    esp32S3CpOwnerWrite(saved+148,0)
+    if (esp32S3CpOwnerRead(first+8) != 0 && !esp32S3CpOwnerReleaseOwned(owners,core,0)) return false
+    if (esp32S3CpOwnerRead(second+8) != 0 && !esp32S3CpOwnerReleaseOwned(owners,core,3)) return false
+    esp32S3CpOwnerWrite(table+core*4,0)
+    esp32S3CpOwnerWrite(address+8,0)
+    true
+}

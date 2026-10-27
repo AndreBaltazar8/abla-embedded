@@ -1,0 +1,117 @@
+import "./sleep_cpu_retained_p4_sequence.ab"
+import "./sleep_peer_p4_sequence.ab"
+// Retained peer IRQ payload848B aligned16: header32 + actual CPU owner816.
+// Header magic,step,last,detail,smpAddress,generation,hart,revision.
+// Prepared by the coordinator BEFORE Notify, remains pinned until IRQ return
+// (SMP idle alone does not authorize freeing this payload/IRQ registration).
+// Actual handler runs MIEoff on peer hart, internal code/stack, integer-only.
+// Coordinator must restore shared memory/cache/clocks BEFORE publishing its
+// phase4 restored; peer waits for that proof before restoring its own banks.
+// IRQ setup/routes, global wake entry and coordinator PMU lifecycle are external
+// owners. Step is observable for fault reporting, not an IRQ cancellation API.
+// Steps1ack2join3save4invoke5resume-core1 6wait-coordinator7restore-start
+// 8close-banks9restore-done10wait-release11done12request-save-abort.
+// Results1done2invalid3progress/wait4retryable-child-failure9unsafe/active-fault.
+trusted fun p4PeerIrqValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,848) && (r.addressValue()&15) == 0
+fun p4PeerIrqCpu(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+32,816)
+trusted fun p4PeerIrqReport(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun esp32p4SleepPeerIrqPrepareOwned(r: NativeBuffer,smp: NativeBuffer,generation: int,peer: int,revision: int,exclusivePayload: bool): int {
+    if (!exclusivePayload || !p4PeerIrqValid(r) || r.loadU32(0) != 0 || !smp.hasAddressRange(0,4) ||
+        (smp.addressValue()&3) != 0 || (smp.addressValue() < r.addressValue()+848 && r.addressValue() < smp.addressValue()+4) ||
+        peer < 0 || peer > 1 || revision < 0 || revision > 399) return 2
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    if (state.status() != 1 || state.stage() != 1 || state.coordinator() == peer || state.phase(peer) != 0 ||
+        (state.control()&4096) != 0) return 2
+    var offset=4
+    while (offset < 848) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x50344950);r.storeU32(4,1);r.storeU32(16,smp.addressValue())
+    r.storeU32(20,generation);r.storeU32(24,peer);r.storeU32(28,revision)
+    return 1
+}
+// Enclosed integer callback. Backed is published only after the boundary's
+// retained GPR/trap frame exists. Never return merely because polling is slow.
+// Hardware wake can resume through ROM instead; a no-CPU-loss wake is also a
+// valid callback return when the coordinator publishes the actual wake event.
+trusted fun esp32p4SleepPeerPark(context: u32): u32 {
+    val r=nativeBufferAt(int(context),848)
+    val smp=nativeBufferAt(r.loadU32(16),4)
+    val generation=r.loadU32(20)
+    while (true) {
+        val backed=esp32p4SleepSmpAdvanceOwned(smp,generation,2,32,true)
+        if (backed.status() == 1) break
+        val state=esp32p4SleepSmpObserve(smp,generation)
+        if (state.status() == 1 && state.stage() == 4) return u32(1)
+        p4PeerIrqReport(r,9,backed.status());p4PeerIrqRelax()
+    }
+    while (true) {
+        val state=esp32p4SleepSmpObserve(smp,generation)
+        if (state.status() == 1 && (state.stage() == 3 || state.stage() == 4)) return u32(if (state.stage() == 4) 1 else 2)
+        if (state.status() != 1) p4PeerIrqReport(r,9,state.status())
+        p4PeerIrqRelax()
+    }
+    return u32(0)
+}
+trusted fun esp32p4SleepPeerIrqContinueOwned(r: NativeBuffer,exclusiveHandler: bool): int {
+    if (!exclusiveHandler || !p4PeerIrqValid(r) || r.loadU32(0) != 0x50344950 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 12) return 2
+    if (!p4SleepPeerMasked() || int(p4SmpHart()) != r.loadU32(24)) return 2
+    val step=r.loadU32(4)
+    if (step == 11) return 1
+    val smp=nativeBufferAt(r.loadU32(16),4)
+    val generation=r.loadU32(20)
+    val state=esp32p4SleepSmpObserve(smp,generation)
+    // Ack can let a canceled, never-joined round finish before this load.
+    if (step == 2 && (state.status() == 5 || (state.status() == 1 && (state.stage() == 4 || state.stage() == 0)))) {
+        r.storeU32(4,11);return p4PeerIrqReport(r,1,0)
+    }
+    if (state.status() != 1) return p4PeerIrqReport(r,9,state.status())
+    val cpu=p4PeerIrqCpu(r)
+    if (step == 1) {
+        val ack=esp32p4SleepPeerAcknowledgeOwned(smp,generation,32,true)
+        if (ack != 1) return p4PeerIrqReport(r,4,ack)
+    } else if (step == 2) {
+        val join=esp32p4SleepSmpAdvanceOwned(smp,generation,1,32,true)
+        if (join.status() != 1) return p4PeerIrqReport(r,3,join.status())
+    } else if (step == 3) {
+        val saved=esp32p4CpuRetainedOpenOwned(cpu,r.loadU32(28),true)
+        if (saved != 1) { r.storeU32(4,12);return p4PeerIrqReport(r,4,saved) }
+    } else if (step == 4) {
+        val entered=esp32p4CpuRetainedInvokeOwned(cpu,p4PeerIrqParkAddress(),u32(r.addressValue()),true)
+        if (entered == 5) { r.storeU32(4,12);return p4PeerIrqReport(r,4,entered) }
+        if (entered != 6 && entered != 7) return p4PeerIrqReport(r,9,entered)
+    } else if (step == 5) {
+        val core=esp32p4CpuRetainedCore(cpu)
+        if (r.loadU32(24) == 0 && core.loadU32(4) == 3) {
+            val resumed=esp32p4SleepPeerResumeOwned(core,smp,generation,true)
+            if (resumed != 1) return p4PeerIrqReport(r,4,resumed)
+        }
+    } else if (step == 6) {
+        if ((state.stage() != 3 && state.stage() != 4) || state.phase(state.coordinator()) != 4) return p4PeerIrqReport(r,3,6)
+    } else if (step == 7) {
+        val restoring=esp32p4SleepSmpAdvanceOwned(smp,generation,7,32,true)
+        if (restoring.status() != 1) return p4PeerIrqReport(r,4,restoring.status())
+    } else if (step == 8) {
+        if (cpu.loadU32(0) != 0) {
+            val closed=esp32p4CpuRetainedCloseOwned(cpu,true)
+            if (closed != 8) return p4PeerIrqReport(r,4,closed)
+        }
+    } else if (step == 9) {
+        val done=esp32p4SleepSmpAdvanceOwned(smp,generation,8,32,true)
+        if (done.status() != 1) return p4PeerIrqReport(r,4,done.status())
+    } else if (step == 10) {
+        if (state.stage() != 5) return p4PeerIrqReport(r,3,10)
+        val release=esp32p4SleepSmpAdvanceOwned(smp,generation,10,32,true)
+        if (release.status() != 1) return p4PeerIrqReport(r,4,release.status())
+    } else if (step == 12) {
+        if (state.stage() != 4) {
+            val abort=esp32p4SleepSmpAdvanceOwned(smp,generation,13,32,true)
+            if (abort.status() != 1) return p4PeerIrqReport(r,4,abort.status())
+        }
+        r.storeU32(4,6);return p4PeerIrqReport(r,3,0)
+    }
+    r.storeU32(4,step+1)
+    return p4PeerIrqReport(r,if (step == 10) 1 else 3,0)
+}

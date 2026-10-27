@@ -1,0 +1,55 @@
+import "./phases_sequence_esp32s3.ab"
+// Non-blocking CPU-buffer phase transfer. Caller retains initialized bus,
+// CS, gate, stable clocks and all memory until completion OR explicit recovery.
+// Timeout is terminal to this request, NOT proof hardware stopped. Never begin
+// over live context. No DMA/interrupt ownership or queue is implied here.
+// context32: tag/status0,phase4,peripheral5,RX6,bytes7,payload8,start12,
+// tickBudget16,detail20,reserved24..31. Caller supplies wrapping monotonic ticks.
+// 1done2pending3input4prepare5UPDATEtimeout6transfertimeout7FIFO8RXcopy.
+trusted fun spiPhasesAsyncStatus(context: NativeBuffer): int {
+    if (!context.hasAddressRange(0,32) || (context.loadU32(0)&0xffffff00) != 0x53504100) return 3
+    return context.load(0)
+}
+trusted fun spiPhasesAsyncEnd(context: NativeBuffer,status: int,detail: int): int {
+    context.store(0,status); context.storeU32(20,detail); return status
+}
+trusted fun esp32s3SpiPhasesBeginOwned(context: NativeBuffer,peripheral: int,command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,now: u32,budget: u32,releasedExclusive: bool): int {
+    if (!releasedExclusive || !context.hasAddressRange(0,32) || !esp32s3SpiMemoryRangeValid(peripheral,context,32) ||
+        budget == u32(0) || budget > u32(0x7fffffff) || !spiPhasesValid(command,commandBits,address,addressBits,dummy,direction,bytes) ||
+        !esp32s3SpiBufferRangeValid(peripheral,data,bytes) ||
+        (bytes > 0 && context.addressValue() < data.addressValue()+bytes && data.addressValue() < context.addressValue()+32)) return 3
+    var index=0
+    while (index < 32) { context.store(index,0); index=index+1 }
+    context.storeU32(0,0x53504102); context.store(4,1); context.store(5,peripheral); context.store(6,if (direction == 2) 1 else 0)
+    context.store(7,bytes); context.storeU32(8,data.addressValue()); context.storeU32(12,int(now)); context.storeU32(16,int(budget))
+    val prepared=esp32s3SpiPhasesPrepareOwned(peripheral,command,commandBits,address,addressBits,dummy,direction,data,bytes)
+    if (prepared != 1) return spiPhasesAsyncEnd(context,4,prepared)
+    val base=esp32s3SpiBase(peripheral)
+    esp32s3SpiWrite(base+0x38,0x61000)
+    esp32s3SpiWrite(base,0x00800000)
+    return 2
+}
+trusted fun esp32s3SpiPhasesPollOwned(context: NativeBuffer,now: u32): int {
+    val status=spiPhasesAsyncStatus(context)
+    if (status != 2) return status
+    val phase=context.load(4)
+    val peripheral=context.load(5)
+    val base=esp32s3SpiBase(peripheral)
+    if (base == 0 || (phase != 1 && phase != 2) || context.load(6) > 1 || context.load(7) > 64) return spiPhasesAsyncEnd(context,3,0)
+    val events=esp32s3SpiRead(base+0x3c)
+    if ((events&0x60000) != 0) return spiPhasesAsyncEnd(context,7,events&0x61000)
+    if (now-u32(context.loadU32(12)) >= u32(context.loadU32(16))) return spiPhasesAsyncEnd(context,if (phase == 1) 5 else 6,events)
+    val command=esp32s3SpiRead(base)
+    if (phase == 1) {
+        if ((command&0x01800000) != 0) return 2
+        // Clear again at the launch boundary: stale DONE during UPDATE must
+        // never complete a transaction that has not actually run.
+        esp32s3SpiWrite(base+0x38,4096)
+        esp32s3SpiWrite(base,0x01000000)
+        context.store(4,2); return 2
+    }
+    if ((events&4096) == 0 || (command&0x01800000) != 0) return 2
+    if (context.load(6) != 0 && !esp32s3SpiReadBufferOwned(peripheral,nativeBufferAt(context.loadU32(8),context.load(7)),context.load(7))) return spiPhasesAsyncEnd(context,8,events)
+    esp32s3SpiWrite(base+0x38,4096)
+    return spiPhasesAsyncEnd(context,1,events)
+}

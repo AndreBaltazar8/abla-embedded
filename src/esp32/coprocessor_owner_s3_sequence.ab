@@ -1,0 +1,88 @@
+import "./sdk/raw_buffer.ab"
+// One caller-owned256byte record per task/CP: magic0,cp4,resident8(0/1/2),
+// snapshotValid12, reserved16..31, payload32..239. The full record is16aligned.
+// Owner table16bytes: core0 CP0/CP3 then core1 CP0/CP3, initially all zero.
+// All operations require caller-held cross-core scheduler ownership; pointers
+// cannot be freed/reused while referenced. No hidden lock, allocation or ABA.
+@inline
+fun esp32S3CpOwnerRange(address: int,size: int,mask: int): bool =
+    address >= 0x3FC88000 && address <= 0x3FD00000-size && (address & mask) == 0
+@inline
+trusted fun esp32S3CpOwnerRecordValid(address: int,cp: int): bool =
+    esp32S3CpOwnerRange(address,256,15) && esp32S3CpOwnerRead(address) == 0x43503331 &&
+    esp32S3CpOwnerRead(address+4) == cp && esp32S3CpOwnerRead(address+8) <= 2 && esp32S3CpOwnerRead(address+12) <= 1
+@section(".iram1.abla.s3CpRecordInit")
+trusted fun esp32S3CpRecordInitializeOwned(record: NativeBuffer,cp: int): bool {
+    if ((cp != 0 && cp != 3) || !record.hasAddressRange(0,256) || !esp32S3CpOwnerRange(record.addressValue(),256,15)) return false
+    val address=record.addressValue()
+    // Fresh/unreferenced storage with zero magic only; never overwrite live state.
+    if (esp32S3CpOwnerRead(address) != 0) return false
+    var offset=4
+    while (offset < 256) { esp32S3CpOwnerWrite(address+offset,0); offset=offset+4 }
+    esp32S3CpOwnerWrite(address+4,cp)
+    esp32S3CpOwnerWrite(address+12,1)
+    esp32S3CpOwnerWrite(address,0x43503331)
+    true
+}
+@inline
+trusted fun esp32S3CpOwnerGuard(table: NativeBuffer,core: int,cp: int): bool =
+    core >= 0 && core <= 1 && (cp == 0 || cp == 3) && table.hasAddressRange(0,16) &&
+    esp32S3CpOwnerRange(table.addressValue(),16,3) && esp32S3CpOwnerCore() == core &&
+    (esp32S3CpOwnerStatus() & 0x4001F) == 0x4000F && (esp32S3CpOwnerEnabled() & (1<<cp)) == 0
+
+// Load requested task state, saving previous resident first. Leave CP disabled;
+// exception return/scheduler enables it only after publishing the resumed task.
+// A refused restore leaves previous hardware/table/residency intact. A completed
+// save may leave an extra valid snapshot, which remains correct on retry.
+@section(".iram1.abla.s3CpOwnerAcquire")
+trusted fun esp32S3CpOwnerAcquireOwned(table: NativeBuffer,record: NativeBuffer,core: int,cp: int): bool {
+    if (!esp32S3CpOwnerGuard(table,core,cp) || !record.hasAddressRange(0,256)) return false
+    val target=record.addressValue()
+    val tab=table.addressValue()
+    if (!esp32S3CpOwnerRecordValid(target,cp) || (target < tab+16 && tab < target+256)) return false
+    val slot=core*8+(if (cp == 0) 0 else 4)
+    val previous=esp32S3CpOwnerRead(tab+slot)
+    if (previous != 0 && (!esp32S3CpOwnerRecordValid(previous,cp) || esp32S3CpOwnerRead(previous+8) != core+1 || (previous < tab+16 && tab < previous+256))) return false
+    var offset=0
+    while (offset < 16) {
+        if (offset != slot) {
+            val other=esp32S3CpOwnerRead(tab+offset)
+            if (other == target || (previous != 0 && other == previous)) return false
+        }
+        offset=offset+4
+    }
+    if (previous == target) return true
+    if (esp32S3CpOwnerRead(target+8) != 0 || esp32S3CpOwnerRead(target+12) != 1 ||
+        (previous != 0 && target < previous+256 && previous < target+256)) return false
+    val size=if (cp == 0) 72 else 208
+    if (previous != 0) {
+        if (!esp32S3CpOwnerTransfer(nativeBufferAt(previous+32,size),core,cp,false)) return false
+        esp32S3CpOwnerWrite(previous+12,1)
+    }
+    if (!esp32S3CpOwnerTransfer(nativeBufferAt(target+32,size),core,cp,true)) return false
+    if (previous != 0) esp32S3CpOwnerWrite(previous+8,0)
+    esp32S3CpOwnerWrite(target+8,core+1)
+    esp32S3CpOwnerWrite(target+12,0)
+    esp32S3CpOwnerWrite(tab+slot,target)
+    true
+}
+// Save on the owning core before migration/destruction. Never steal live remote
+// registers. Caller keeps task stopped until destination acquisition completes.
+@section(".iram1.abla.s3CpOwnerRelease")
+trusted fun esp32S3CpOwnerReleaseOwned(table: NativeBuffer,core: int,cp: int): bool {
+    if (!esp32S3CpOwnerGuard(table,core,cp)) return false
+    val tab=table.addressValue()
+    val slot=core*8+(if (cp == 0) 0 else 4)
+    val record=esp32S3CpOwnerRead(tab+slot)
+    if (!esp32S3CpOwnerRecordValid(record,cp) || esp32S3CpOwnerRead(record+8) != core+1 || (record < tab+16 && tab < record+256)) return false
+    var offset=0
+    while (offset < 16) {
+        if (offset != slot && esp32S3CpOwnerRead(tab+offset) == record) return false
+        offset=offset+4
+    }
+    if (!esp32S3CpOwnerTransfer(nativeBufferAt(record+32,if (cp == 0) 72 else 208),core,cp,false)) return false
+    esp32S3CpOwnerWrite(record+12,1)
+    esp32S3CpOwnerWrite(record+8,0)
+    esp32S3CpOwnerWrite(tab+slot,0)
+    true
+}

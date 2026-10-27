@@ -1,0 +1,281 @@
+import "../heap/capabilities_policy_esp32.ab"
+import "../heap/capabilities_base_esp32.ab"
+import "../../xtensa/atomic.ab"
+import "abla/unsafe/memory"
+
+// Freestanding Abla runtime platform for classic ESP32. Allocations are
+// ordinary ESP32 heap-capability allocations with a compact intrusive header;
+// no libc allocator, pthread object, or host runtime enters the target graph.
+var esp32AblaRuntimeAllocationTail: u32 = u32(0)
+var esp32AblaRuntimeLiveBytes: int = 0
+var esp32AblaRuntimeMemoryLimit: int = 4294967295
+val esp32AblaRuntimeStateLockStorage: u32 = nativeStaticAllocate(4)
+val esp32AblaRuntimeRegionCheckpoints: u32 = nativeStaticAllocate(64)
+var esp32AblaRuntimeRegionDepth: int = 0
+
+@inline
+trusted fun esp32AblaRuntimeLoad(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
+
+@inline
+trusted fun esp32AblaRuntimeStore(address: u32, value: u32): void {
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(address)),
+        int(value)
+    )
+    return
+}
+
+trusted fun esp32AblaRuntimeStateLock(): void {
+    val lock = xtensaSpinLock(esp32AblaRuntimeStateLockStorage)
+    while (!lock.tryAcquire()) {}
+    return
+}
+
+@inline
+trusted fun esp32AblaRuntimeStateUnlock(): void =
+    xtensaSpinLock(esp32AblaRuntimeStateLockStorage).release()
+
+trusted fun __ablaRuntimePlatformMutexInitialize(address: int): void {
+    if (address == 0 || (address & 3) != 0) ablaRuntimeTrap()
+    esp32AblaRuntimeStore(u32(address), u32(0))
+    return
+}
+
+trusted fun __ablaRuntimePlatformMutexLock(address: int): void {
+    if (address == 0 || (address & 3) != 0) ablaRuntimeTrap()
+    val lock = xtensaSpinLock(u32(address))
+    while (!lock.tryAcquire()) {}
+    return
+}
+
+trusted fun __ablaRuntimePlatformMutexUnlock(address: int): void {
+    if (address == 0 || (address & 3) != 0) ablaRuntimeTrap()
+    xtensaSpinLock(u32(address)).release()
+    return
+}
+
+trusted fun __ablaRuntimePlatformMutexDestroy(address: int): void {
+    __ablaRuntimePlatformMutexUnlock(address)
+    return
+}
+
+trusted fun __ablaRuntimePlatformThreadsEnable(): void {}
+
+// Abla Thread<T> needs a scheduler adapter rather than a host pthread ABI.
+// Keep the unsupported path explicit; FreeRTOS tasks used by the firmware are
+// implemented by the ESP32 framework and do not pass through this API.
+trusted fun __ablaRuntimePlatformThreadCreate(
+    handle: int,
+    entry: int,
+    argument: int
+): bool {
+    ablaRuntimeTrap()
+    false
+}
+
+trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool {
+    ablaRuntimeTrap()
+    false
+}
+
+@inline
+trusted fun esp32AblaRuntimeAllocationHeader(address: int): u32 =
+    u32(address - 16)
+
+trusted fun __ablaRuntimePlatformAllocateLayout(
+    requested: int,
+    layout: int
+): int {
+    val size = if (requested <= 0) 1 else requested
+    if (size > 4294967279 || layout < 0 || layout >= 16) {
+        ablaRuntimeTrap()
+    }
+    esp32AblaRuntimeStateLock()
+    if (size > esp32AblaRuntimeMemoryLimit -
+        esp32AblaRuntimeLiveBytes) {
+        esp32AblaRuntimeStateUnlock()
+        ablaRuntimeTrap()
+    }
+    val allocation = esp32HeapCapsMallocDefault(u32(size + 16))
+    if (allocation == u32(0)) {
+        esp32AblaRuntimeStateUnlock()
+        ablaRuntimeTrap()
+    }
+    esp32AblaRuntimeStore(
+        allocation,
+        esp32AblaRuntimeAllocationTail
+    )
+    esp32AblaRuntimeStore(allocation + u32(4), u32(size))
+    esp32AblaRuntimeStore(allocation + u32(8), u32(layout))
+    esp32AblaRuntimeStore(allocation + u32(12), u32(0))
+    esp32AblaRuntimeAllocationTail = allocation
+    esp32AblaRuntimeLiveBytes = esp32AblaRuntimeLiveBytes + size
+    esp32AblaRuntimeStateUnlock()
+    int(allocation + u32(16))
+}
+
+@inline
+trusted fun __ablaRuntimePlatformAllocate(requested: int): int =
+    __ablaRuntimePlatformAllocateLayout(requested, 0)
+
+trusted fun esp32AblaRuntimeUnlink(header: u32): bool {
+    if (esp32AblaRuntimeAllocationTail == header) {
+        esp32AblaRuntimeAllocationTail = esp32AblaRuntimeLoad(header)
+        return true
+    }
+    var cursor = esp32AblaRuntimeAllocationTail
+    while (cursor != u32(0)) {
+        val previous = esp32AblaRuntimeLoad(cursor)
+        if (previous == header) {
+            esp32AblaRuntimeStore(cursor, esp32AblaRuntimeLoad(header))
+            return true
+        }
+        cursor = previous
+    }
+    false
+}
+
+trusted fun esp32AblaRuntimeFreeLocked(address: int): void {
+    if (address == 0) return
+    val header = esp32AblaRuntimeAllocationHeader(address)
+    if (!esp32AblaRuntimeUnlink(header)) ablaRuntimeTrap()
+    val size = int(esp32AblaRuntimeLoad(header + u32(4)))
+    if (size <= 0 || size > esp32AblaRuntimeLiveBytes) {
+        ablaRuntimeTrap()
+    }
+    esp32AblaRuntimeLiveBytes = esp32AblaRuntimeLiveBytes - size
+    esp32HeapCapsFree(header)
+    return
+}
+
+trusted fun __ablaRuntimePlatformFree(address: int): void {
+    esp32AblaRuntimeStateLock()
+    esp32AblaRuntimeFreeLocked(address)
+    esp32AblaRuntimeStateUnlock()
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int =
+    int(esp32AblaRuntimeAllocationTail)
+
+trusted fun esp32AblaRuntimeResetLocked(checkpoint: u32): void {
+    var promoted = u32(0)
+    while (esp32AblaRuntimeAllocationTail != checkpoint) {
+        val header = esp32AblaRuntimeAllocationTail
+        if (header == u32(0)) ablaRuntimeTrap()
+        val previous = esp32AblaRuntimeLoad(header)
+        esp32AblaRuntimeAllocationTail = previous
+        val state = esp32AblaRuntimeLoad(header + u32(8))
+        if ((state & u32(2147483648)) != u32(0)) {
+            esp32AblaRuntimeStore(header, promoted)
+            esp32AblaRuntimeStore(
+                header + u32(8),
+                state & u32(2147483647)
+            )
+            promoted = header
+        } else {
+            val size = int(esp32AblaRuntimeLoad(header + u32(4)))
+            esp32AblaRuntimeLiveBytes =
+                esp32AblaRuntimeLiveBytes - size
+            esp32HeapCapsFree(header)
+        }
+    }
+    while (promoted != u32(0)) {
+        val next = esp32AblaRuntimeLoad(promoted)
+        esp32AblaRuntimeStore(
+            promoted,
+            esp32AblaRuntimeAllocationTail
+        )
+        esp32AblaRuntimeAllocationTail = promoted
+        promoted = next
+    }
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemoryReset(checkpoint: int): void {
+    esp32AblaRuntimeStateLock()
+    esp32AblaRuntimeResetLocked(u32(checkpoint))
+    esp32AblaRuntimeStateUnlock()
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
+    esp32AblaRuntimeLiveBytes
+
+trusted fun __ablaRuntimePlatformMemoryLimit(): int =
+    esp32AblaRuntimeMemoryLimit
+
+trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
+    if (limit < esp32AblaRuntimeLiveBytes || limit > 4294967295) {
+        ablaRuntimeTrap()
+    }
+    esp32AblaRuntimeMemoryLimit = limit
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemorySetLayout(
+    address: int,
+    layout: int
+): void {
+    if (address == 0 || layout < 0 || layout >= 16) ablaRuntimeTrap()
+    esp32AblaRuntimeStore(
+        esp32AblaRuntimeAllocationHeader(address) + u32(8),
+        u32(layout)
+    )
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemoryCollect(): int = 0
+
+trusted fun __ablaRuntimePlatformRegionBegin(): int {
+    esp32AblaRuntimeStateLock()
+    val depth = esp32AblaRuntimeRegionDepth
+    if (depth < 0 || depth >= 16) {
+        esp32AblaRuntimeStateUnlock()
+        ablaRuntimeTrap()
+    }
+    esp32AblaRuntimeStore(
+        esp32AblaRuntimeRegionCheckpoints + u32(depth * 4),
+        esp32AblaRuntimeAllocationTail
+    )
+    esp32AblaRuntimeRegionDepth = depth + 1
+    esp32AblaRuntimeStateUnlock()
+    depth + 1
+}
+
+trusted fun __ablaRuntimePlatformRegionEnd(regionToken: int): void {
+    esp32AblaRuntimeStateLock()
+    if (regionToken <= 0 || regionToken != esp32AblaRuntimeRegionDepth) {
+        esp32AblaRuntimeStateUnlock()
+        ablaRuntimeTrap()
+    }
+    val depth = regionToken - 1
+    val checkpoint = esp32AblaRuntimeLoad(
+        esp32AblaRuntimeRegionCheckpoints + u32(depth * 4)
+    )
+    esp32AblaRuntimeResetLocked(checkpoint)
+    esp32AblaRuntimeRegionDepth = depth
+    esp32AblaRuntimeStateUnlock()
+    return
+}
+
+trusted fun __ablaRuntimePlatformRegionActive(): bool =
+    esp32AblaRuntimeRegionDepth > 0
+
+trusted fun __ablaRuntimePlatformPromoteAllocation(address: int): int {
+    if (address == 0) return 0
+    val header = esp32AblaRuntimeAllocationHeader(address)
+    val state = esp32AblaRuntimeLoad(header + u32(8))
+    esp32AblaRuntimeStore(
+        header + u32(8),
+        state | u32(2147483648)
+    )
+    address
+}
+
+trusted fun __ablaRuntimePlatformPanic(data: int, length: int): int {
+    ablaRuntimeTrap()
+    0
+}

@@ -1,0 +1,58 @@
+import "./clock_state_s3.ab"
+import "./clock_bias_s3.ab"
+
+@inline
+fun esp32S3ClockResumeMegahertz(saved: Esp32S3ClockState): int {
+    if (!saved.valid() || ((saved | 0) & ~0x1001FFFFFFF) != 0) return 0
+    val source=saved.source()
+    val freq=saved.sourceMegahertz()
+    val div=saved.divider()
+    var cpuMHz=0
+    if (source == 1) {
+        if (freq == 480) cpuMHz=if (div == 6) 80 else if (div == 3) 160 else if (div == 2) 240 else 0
+        else if (freq == 320) cpuMHz=if (div == 4) 80 else if (div == 2) 160 else 0
+        if (cpuMHz == 0) return 0
+    } else if (source == 0) {
+        if ((freq != 32 && freq != 40) || div < 1 || div > 1024) return 0
+        // Exact integer-MHz divisors of supported crystals. Avoid outlining a
+        // shared division helper into flash in this cache-disabled closure.
+        if (freq == 32) cpuMHz=if (div == 1) 32 else if (div == 2) 16 else if (div == 4) 8 else if (div == 8) 4 else if (div == 16) 2 else if (div == 32) 1 else 0
+        else cpuMHz=if (div == 1) 40 else if (div == 2) 20 else if (div == 4) 10 else if (div == 5) 8 else if (div == 8) 5 else if (div == 10) 4 else if (div == 20) 2 else if (div == 40) 1 else 0
+        if (cpuMHz == 0) return 0
+    } else return 0
+    cpuMHz
+}
+
+// Resume CPU after an owned sleep transition to undivided XTAL with PLL off.
+// Caller keeps UARTs, radio, other cores and interrupts quiescent and MSPI in
+// low-speed mode until this succeeds. Bias must be an initialized decode/read
+// result retained in internal RAM. Returned positive value is the new APB Hz;
+// owner must rebase APB consumers before releasing them. No global IDF state.
+// -1 unsupported/corrupt snapshot, -2 current clock ownership/state mismatch,
+// -3 PLL calibration timeout (CPU stays XTAL), -4 PLL/switch failure.
+// RC_FAST resume is deliberately rejected: IDF S3 itself asserts on that path.
+@section(".iram1.abla.s3ClockResume")
+trusted fun esp32S3ClockResumeFromXtalOwned(saved: Esp32S3ClockState,bias: Esp32S3ClockBias,polls: int): int {
+    if (!saved.valid() || polls <= 0 || ((saved | 0) & ~0x1001FFFFFFF) != 0 ||
+        ((bias | 0) & ~0x1FFFFF) != 0) return -1
+    val source=saved.source()
+    val freq=saved.sourceMegahertz()
+    val div=saved.divider()
+    val cpuMHz=esp32S3ClockResumeMegahertz(saved)
+    if (cpuMHz == 0) return -1
+    val xtal=esp32S3StoredXtalMegahertz(esp32S3ClockRead(0x600080C0))
+    if ((esp32S3ClockRead(0x600C0060) & 4095) != 0 ||
+        (xtal != 32 && xtal != 40) || (source == 0 && freq != xtal)) return -2
+    if (source == 0) {
+        esp32S3ClockRomTicks(cpuMHz)
+        esp32S3ClockUpdate(0x600C0060,1023,0)
+        esp32S3ClockUpdate(0x600C0060,1023,div-1)
+        return cpuMHz*1000000
+    }
+    val started=esp32S3PllStartOwned(freq,polls)
+    if (started == 3) return -3
+    if (started != 1) return -4
+    val before=esp32S3ClockToReadyPllOwned(cpuMHz,bias.rtc240(),bias.digital240(),bias.rtcLow(),bias.digitalLow())
+    if (!before.valid()) return -4
+    80000000
+}

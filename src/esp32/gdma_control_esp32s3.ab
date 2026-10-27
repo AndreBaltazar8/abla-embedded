@@ -1,0 +1,89 @@
+// GDMA S3 register layout: five pairs, stride0xC0; RX at+0, TX at+0x60.
+// Import through gdma_esp32s3.ab. Caller reserves this channel direction and
+// enables the shared GDMA clock without resetting other users. No allocator.
+fun esp32s3GdmaChannelBase(channel: int, transmit: bool): int =
+    if (channel < 0 || channel > 4) 0 else 0x6003f000 + channel * 192 + (if (transmit) 96 else 0)
+fun esp32s3GdmaDescriptorValid(address: int): bool =
+    address >= 0x3fc88000 && address <= 0x3fd00000 - 12 && (address & 3) == 0
+fun esp32s3GdmaParkMask(transmit: bool): int = if (transmit) 1 << 23 else 1 << 24
+fun esp32s3GdmaCommandMask(transmit: bool): int = if (transmit) 7 << 20 else 7 << 21
+
+trusted fun esp32s3GdmaParked(channel: int, transmit: bool): bool {
+    val base = esp32s3GdmaChannelBase(channel, transmit)
+    base != 0 && (esp32s3GdmaRead(base + 32) & esp32s3GdmaParkMask(transmit)) != 0
+}
+
+// Configure a stopped channel for I2S0/1, without starting any transfer.
+// Descriptor address validation checks only internal DMA-addressable SRAM;
+// caller must own/live-initialize the full chain and buffers before starting.
+trusted fun esp32s3GdmaConfigureI2s(channel: int, transmit: bool,
+    i2sPort: int, descriptor: int): bool {
+    if (i2sPort < 0 || i2sPort > 1) return false
+    esp32s3GdmaConfigureStreamTrigger(channel, transmit, 3 + i2sPort, descriptor)
+}
+
+// RMT's DMA request is trigger9 and TX-only. This selects the GDMA mux;
+// the RMT side must independently own/configure its DMA-capable TXchannel3.
+trusted fun esp32s3GdmaConfigureRmt(channel: int, descriptor: int): bool =
+    esp32s3GdmaConfigureStreamTrigger(channel, true, 9, descriptor)
+// S3 LCD_CAM LCD0 uses AHB GDMA trigger5, TX only.
+trusted fun esp32s3GdmaConfigureLcd(channel: int,descriptor: int): bool =
+    esp32s3GdmaConfigureStreamTrigger(channel,true,5,descriptor)
+
+// Internal shared configuration for the supported I2S and RMT stream routes.
+trusted fun esp32s3GdmaConfigureStreamTrigger(channel: int, transmit: bool,
+    trigger: int, descriptor: int): bool {
+    val base = esp32s3GdmaChannelBase(channel, transmit)
+    if (base == 0 || (trigger != 3 && trigger != 4 && ((trigger != 9 && trigger != 5) || !transmit)) ||
+        !esp32s3GdmaDescriptorValid(descriptor)) return false
+    val link = esp32s3GdmaRead(base + 32)
+    if ((link & esp32s3GdmaParkMask(transmit)) == 0) return false
+    val config = esp32s3GdmaRead(base)
+    esp32s3GdmaWrite(base, config | 1)
+    // TX returns descriptor ownership and raises EOF after data leaves its
+    // FIFO. Do not inherit the memory-read EOF mode of a previous peripheral.
+    // This is DMA completion, not proof of the final analog audio sample.
+    esp32s3GdmaWrite(base, if (transmit) (config & 0xfffffffe) | 12 else config & 0xffffffee)
+    esp32s3GdmaWrite(base + 4, esp32s3GdmaRead(base + 4) | 4096)
+    // S3 trigger IDs are peripheral DMA requests, not controller indices.
+    esp32s3GdmaWrite(base + 72, (esp32s3GdmaRead(base + 72) & 0xffffffc0) | trigger)
+    // Preserve RX auto-return and reserved bits, never replay self-clearing
+    // start/stop/restart commands read from a previous transaction.
+    val preserved = link & (0xffffffff ^ (1048575 | esp32s3GdmaCommandMask(transmit)))
+    esp32s3GdmaWrite(base + 32, preserved | (descriptor & 1048575))
+    true
+}
+
+// A request, not proof of completion. Poll parked before reclaiming buffers.
+trusted fun esp32s3GdmaRequestStop(channel: int, transmit: bool): bool {
+    val base = esp32s3GdmaChannelBase(channel, transmit)
+    if (base == 0) return false
+    val link = esp32s3GdmaRead(base + 32)
+    esp32s3GdmaWrite(base + 32, (link & (0xffffffff ^ esp32s3GdmaCommandMask(transmit))) | (if (transmit) 1 << 20 else 1 << 21))
+    true
+}
+
+// Start a prepared internal-SRAM transfer. Caller retains exclusive channel
+// ownership and proves the entire chain/buffer lifetime; checking the first
+// descriptor cannot establish ownership of arbitrary linked descriptors.
+// No external RAM/cache support is implied by this primitive.
+trusted fun esp32s3GdmaStart(channel: int, transmit: bool): bool {
+    val base = esp32s3GdmaChannelBase(channel, transmit)
+    if (base == 0) return false
+    val link = esp32s3GdmaRead(base + 32)
+    if ((link & esp32s3GdmaParkMask(transmit)) == 0) return false
+    val descriptor = 0x3fc00000 | (link & 1048575)
+    if (!esp32s3GdmaDescriptorValid(descriptor)) return false
+    val flags = esp32s3GdmaRead(descriptor)
+    val capacity = flags & 4095
+    val length = (flags >>> 12) & 4095
+    if ((flags & 2147483648) == 0 || capacity == 0 ||
+        (transmit && (length == 0 || length > capacity))) return false
+    val buffer = esp32s3GdmaRead(descriptor + 4)
+    if (buffer < 0x3fc88000 || (buffer & 3) != 0 || buffer > 0x3fd00000 - capacity) return false
+    // Publish descriptor/payload stores before the start bit reaches GDMA.
+    esp32s3GdmaPublish()
+    val start = if (transmit) 1 << 21 else 1 << 22
+    esp32s3GdmaWrite(base + 32, (link & (0xffffffff ^ esp32s3GdmaCommandMask(transmit))) | start)
+    true
+}

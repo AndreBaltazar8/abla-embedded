@@ -1,0 +1,69 @@
+import "./bus_c5_sequence.ab"
+import "./device_s3_logic.ab"
+import "./timing_s3_logic.ab"
+import "./device_clock_s3_sequence.ab"
+import "../../i2c/device_slots.ab"
+// Pool belongs exclusively to this physical bus. Its storage must remain
+// alive and disjoint from the bus record. Public handles stay32-bit so existing
+// sensor scalars can retain their calibration alongside the handle.
+trusted fun Esp32C5I2cBusState.devicePoolValid(pool: I2cDeviceSlots): bool {
+    if (!this.valid() || !pool.valid()) return false
+    val count=nativeAddressLoadU32(pool.address(),4)
+    val bytes=i2cDeviceSlotsBytes(count)
+    val buffer=nativeBufferAt(pool.address(),bytes)
+    bytes > 0 && buffer.hasAddressRange(0,bytes) &&
+        (pool.address()+bytes <= this.buffer().addressValue() || this.buffer().addressValue()+64 <= pool.address())
+}
+// Lock ordering is always controller then pool. Descriptor layout is shared
+// with S3, with port fixed to0. No device publication on stale/faulted buses.
+trusted fun Esp32C5I2cBusState.deviceOwned(pool: I2cDeviceSlots,epoch: int,owner: u32,address: int,frequency: int): int {
+    val descriptor=esp32S3I2cDeviceKey(0,address,frequency,epoch)
+    if (descriptor == 0 || !this.devicePoolValid(pool) || !peripheralOwnerValid(owner)) return 0
+    val gate=this.gate()
+    if (gate.tryBegin(owner) != 0) return 0
+    var handle=0
+    if (this.matches(epoch) && esp32S3I2cTiming(u32(this.buffer().loadU32(28)),u32(frequency)).valid())
+        handle=pool.allocate(descriptor)
+    if (!gate.finish(owner,true)) return 0
+    handle
+}
+// Read-only identity admission under controller->pool lock order. Used when
+// borrowing a live device to authorize another device on the same bus. Does
+// not turn an old descriptor snapshot into a lease across later operations.
+trusted fun Esp32C5I2cBusState.deviceMatchesOwned(pool: I2cDeviceSlots,owner: u32,bus: int,handle: int,address: int): bool {
+    if (!this.devicePoolValid(pool) || !peripheralOwnerValid(owner) || !i2cDeviceSlotHandleValid(handle) ||
+        address < 0 || address > 127 || !esp32S3I2cBusKeyValid(bus) || esp32S3I2cBusKeyPort(bus) != 0) return false
+    val gate=this.gate()
+    if (gate.tryBegin(owner) != 0) return false
+    val descriptor=pool.resolve(handle)
+    val matches=this.matches(esp32S3I2cBusKeyGeneration(bus)) && esp32S3I2cDeviceKeyMatchesBus(descriptor,bus) &&
+        esp32S3I2cDeviceKeyAddress(descriptor) == address
+    val released=gate.finish(owner,true)
+    return matches && released
+}
+// Frequency changes require the current ready epoch and nonfaulted gate.
+// Only the descriptor changes; the next transfer programs checked timing.
+trusted fun Esp32C5I2cBusState.setDeviceFrequencyOwned(pool: I2cDeviceSlots,owner: u32,handle: int,frequency: int): bool {
+    if (!this.devicePoolValid(pool) || !peripheralOwnerValid(owner) || !i2cDeviceSlotHandleValid(handle)) return false
+    val gate=this.gate()
+    if (gate.tryBegin(owner) != 0) return false
+    val epoch=this.epoch()
+    val changed=this.matches(epoch) && esp32S3I2cDeviceFrequencyOwned(pool,handle,
+        esp32S3I2cBusKey(0,epoch),u32(this.buffer().loadU32(28)),frequency)
+    val released=gate.finish(owner,true)
+    return changed && released
+}
+// Close is legal during a bus fault: only software ownership is released,
+// and the fault stays latched. A stale device can be cleaned after reopening.
+trusted fun Esp32C5I2cBusState.closeDeviceOwned(pool: I2cDeviceSlots,owner: u32,handle: int): bool {
+    if (!this.devicePoolValid(pool) || !peripheralOwnerValid(owner) || !i2cDeviceSlotHandleValid(handle)) return false
+    val gate=this.gate()
+    val admission=gate.tryBegin(owner)
+    if (admission == 1 || admission == 3) return false
+    val faulted=admission == 2
+    if (faulted && !gate.tryBeginRecovery(owner)) return false
+    val descriptor=pool.resolve(handle)
+    val released=esp32S3I2cDeviceKeyValid(descriptor) && esp32S3I2cDeviceKeyPort(descriptor) == 0 && pool.release(handle)
+    val unlocked=if (faulted) gate.finishRecovery(owner,false) else gate.finish(owner,true)
+    released && unlocked
+}

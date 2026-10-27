@@ -1,0 +1,54 @@
+import "./buffer_transaction_c5_sequence.ab"
+// Manual D/C already configured as exclusive push-pull GPIO output, separate
+// from all SPI pads. One physical-bus gate and one CS across command + data.
+// Writes only, command8bits then0..65535 data bytes; no heap/DMA/replay.
+// CompletedBytes counts DATA only. Detail bit25 proves command completed,
+// not panel acknowledgement. Low-level START/FIFO evidence remains intact;
+// low report14 = failed D/C write. RX is unused.
+// Timeout retains CS and D/C until idle; master.recover releases CS but does
+// not replay the command or repair D/C. Caller keeps D/C owned throughout.
+trusted fun Esp32C5SpiMaster.commandData(gate: PeripheralGate,owner: u32,dc: int,command: int,
+    data: NativeBuffer,bytes: int,polls: int): SpiBufferResult {
+    if (!this.ready() || this.pins().pinAt(1) >= 29 || dc < 0 || dc >= 29 ||
+        dc == this.pins().pinAt(0) || dc == this.pins().pinAt(1) ||
+        dc == this.pins().pinAt(2) || dc == this.pins().pinAt(3) ||
+        command < 0 || command > 255 || bytes < 0 || bytes > 65535 ||
+        polls < 1 || polls > 1000000 || !c5SpiGateValid(gate) ||
+        (bytes != 0 && (!c5SpiLargeBufferValid(data,bytes) || !gate.bufferDisjoint(data,bytes)))) return SpiBufferResult(3<<56)
+    val admission=gate.tryBegin(owner)
+    if (admission != 0) return SpiBufferResult((if (admission == 1) 2 else if (admission == 2) 4 else 3)<<56)
+    val result=c5SpiCommandDataOwned(this,dc,command,data,bytes,polls)
+    if (!gate.finish(owner,result.valid())) return SpiBufferResult((result&((1<<56)-1))|(5<<56))
+    return result
+}
+// Internal only: validated arguments, canonical gate held, immutable input.
+// Caller must fault that gate on any failure before exposing it to users.
+trusted fun c5SpiCommandDataOwned(master: Esp32C5SpiMaster,dc: int,command: int,
+    data: NativeBuffer,bytes: int,polls: int): SpiBufferResult {
+    val cs=master.pins().pinAt(3)
+    var report=13;var completed=0;var commandDone=false;var healthy=false
+    if (c5SpiMasterDataReady(master,false) && c5SpiManualSelectReady(dc)) {
+        if (!c5SpiSelectLevel(dc,false)) report=14
+        else if (!c5SpiSelectLevel(cs,false)) report=11
+        else {
+            val packet=nativeBufferAt(nativeStackAllocate(1),1);packet.store(0,command)
+            report=esp32C5SpiTransferOwned(packet,NativeBuffer(0),1,polls,false)
+            commandDone=report == 257
+            if (commandDone && bytes != 0) {
+                if (!c5SpiSelectLevel(dc,true)) report=14
+                else {
+                    while (completed < bytes && report == 257) {
+                        val count=if (bytes-completed > 64) 64 else bytes-completed
+                        report=esp32C5SpiTransferOwned(nativeBufferAt(data.addressValue()+completed,count),NativeBuffer(0),count,polls,false)
+                        if (report == 257) completed=completed+count
+                    }
+                }
+            }
+        }
+        if (esp32C5SpiCpuIdleOwned()) {
+            if (!c5SpiSelectLevel(cs,true)) report=report|(12<<16)|(1<<24)
+            else healthy=report == 257 && completed == bytes
+        } else report=report|(1<<24)
+    }
+    return SpiBufferResult(((if (healthy) 1 else 6)<<56)|(completed<<32)|report|(if (commandDone) 1<<25 else 0))
+}

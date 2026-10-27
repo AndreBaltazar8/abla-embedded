@@ -1,0 +1,55 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Exact revision300 TOP-power-up flash workaround from sleep_mspi.c.
+// Run AFTER wake, BEFORE software entry3 flash restore/cache resume. Caller
+// excludes both CPUs/IRQs/DMA/cache users from all flash/PSRAM/MSPI accesses;
+// code, stack, constants and record must reside in retained internal RAM.
+// Requires powered/clocked MSPI, held flash pins, valid retained backup graph.
+// Forced uncached MMIO reads cannot be software-timed-out if the bus stalls.
+//32B record: magic,nextStep,oldMMU0,mappingFlags,lastFailure,reserved[3].
+// Step16done. Returns1done2invalid3preflight4write5encryptionChanged.
+// Failure retains ownership; continue retries only the unfinished step.
+// Reset destroys controller config: MUST execute retained entry3 restore
+// after success. Not a standalone reset/recovery or generic MMU mapping API.
+trusted fun p4SleepFlashField(address: int,mask: u32,value: u32): bool {
+    p4SleepFlashWrite(address,(p4SleepFlashRead(address)&~mask)|(value&mask))
+    return (p4SleepFlashRead(address)&mask) == (value&mask)
+}
+trusted fun esp32p4SleepFlashRev3ContinueOwned(r: NativeBuffer,exclusiveWake: bool): int {
+    if (!exclusiveWake || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50344633 || r.loadU32(4) < 1 || r.loadU32(4) > 16) return 2
+    if (r.loadU32(4) == 16) return 1
+    if ((if (p4SleepFlashEncrypted()) 0x3000 else 0x1000) != r.loadU32(12)) return 5
+    while (r.loadU32(4) < 16) {
+        val step=r.loadU32(4)
+        var ok=true
+        if (step == 1) ok=p4SleepFlashField(0x5008c03c,u32(0x80000000),u32(0))
+        else if (step == 2) ok=p4SleepFlashField(0x5008c03c,u32(1),u32(1))
+        else if (step == 3) ok=p4SleepFlashField(0x500e51a4,u32(7),u32(7))
+        else if (step == 4 || step == 9) {
+            p4SleepFlashWrite(0x5008c380,u32(0));ok=p4SleepFlashRead(0x5008c380) == u32(0)
+        } else if (step == 5) r.storeU32(8,int(p4SleepFlashRead(0x5008c37c)))
+        else if (step == 6 || step == 10) {
+            val value=u32(r.loadU32(12)|(if (step == 10) r.loadU32(8) else 0))
+            p4SleepFlashWrite(0x5008c37c,value);ok=p4SleepFlashRead(0x5008c37c) == value
+        } else if (step == 7 || step == 8) {
+            p4SleepFlashFence()
+            p4SleepFlashRead(if (step == 7) 0x80000000 else 0x80000080)
+            p4SleepFlashFence()
+        } else if (step >= 11 && step <= 14) {
+            val mask=if (step <= 12) u32(1<<22) else u32(1<<24)
+            ok=p4SleepFlashField(0x500e60c0,mask,if ((step&1) != 0) mask else u32(0))
+        } else ok=p4SleepFlashField(0x500e51a4,u32(7),u32(0))
+        if (!ok) { r.storeU32(16,step);return 4 }
+        r.storeU32(4,step+1)
+    }
+    r.storeU32(16,0);return 1
+}
+trusted fun esp32p4SleepFlashRev3BeginOwned(r: NativeBuffer,minimumRevision: int,exclusiveWake: bool): int {
+    if (!exclusiveWake || minimumRevision != 300 || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    if ((p4SleepFlashRead(0x500e60c0)&u32(0x01400000)) != u32(0)) return 3
+    var i=8
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(12,if (p4SleepFlashEncrypted()) 0x3000 else 0x1000)
+    r.storeU32(0,0x50344633);r.storeU32(4,1)
+    return esp32p4SleepFlashRev3ContinueOwned(r,true)
+}

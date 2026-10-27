@@ -1,0 +1,828 @@
+import "abla/integer"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "tlsf_primitives_esp32.ab"
+
+// The ESP-IDF TLSF implementation is scalar pointer arithmetic, bitmaps, and
+// integer control flow. Keeping that logic here gives LLVM one optimizable
+// allocation graph; only the memory accesses themselves require trust.
+
+@inline
+trusted fun esp32TlsfStoreU32(address: u32, value: u32): void =
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(address)), int(value)
+    )
+
+@inline
+fun esp32TlsfAlignUp(value: u32, alignment: u32): u32 {
+    val mask = alignment - u32(1)
+    val rounded = value + mask
+    // This is the same power-of-two alignment operation as rounded & ~mask.
+    // Subtraction keeps the low-bit dependency explicit and lets Xtensa emit
+    // it without materialising a full-width complemented mask.
+    rounded - (rounded & mask)
+}
+
+@inline
+fun esp32TlsfAlignDown(value: u32, alignment: u32): u32 {
+    val mask = alignment - u32(1)
+    value - (value & mask)
+}
+
+@inline
+trusted fun esp32TlsfFirstLevelCount(control: u32): u32 =
+    esp32TlsfLoadU32(control + u32(16)) & u32(31)
+
+@inline
+trusted fun esp32TlsfFirstLevelShift(control: u32): u32 =
+    (esp32TlsfLoadU32(control + u32(16)) >>> u32(5)) & u32(7)
+
+@inline
+trusted fun esp32TlsfFirstLevelMaximum(control: u32): u32 =
+    (esp32TlsfLoadU32(control + u32(16)) >>> u32(8)) & u32(63)
+
+@inline
+trusted fun esp32TlsfSecondLevelCount(control: u32): u32 =
+    (esp32TlsfLoadU32(control + u32(16)) >>> u32(14)) & u32(63)
+
+@inline
+trusted fun esp32TlsfSecondLevelLog2(control: u32): u32 =
+    (esp32TlsfLoadU32(control + u32(16)) >>> u32(20)) & u32(7)
+
+@inline
+trusted fun esp32TlsfSmallBlockSize(control: u32): u32 =
+    (esp32TlsfLoadU32(control + u32(16)) >>> u32(23)) & u32(255)
+
+@inline
+trusted fun esp32TlsfMaximumBlockSize(control: u32): u32 =
+    if (control == u32(0)) u32(0)
+    else u32(1) << esp32TlsfFirstLevelMaximum(control)
+
+@inline
+fun esp32TlsfFirstSetBit(word: u32): u32 {
+    val isolated = word & ((~word) + u32(1))
+    if (isolated == u32(0)) u32(32)
+    else u32(31) - isolated.countLeadingZeros()
+}
+
+@inline
+fun esp32TlsfLastSetBit(word: u32): u32 =
+    if (word == u32(0)) u32(4294967295)
+    else u32(31) - word.countLeadingZeros()
+
+@inline
+trusted fun esp32TlsfBlockRawSize(block: u32): u32 =
+    esp32TlsfLoadU32(block + u32(4))
+
+@inline
+trusted fun esp32TlsfSetBlockRawSize(block: u32, value: u32): void =
+    esp32TlsfStoreU32(block + u32(4), value)
+
+@inline
+trusted fun esp32TlsfHeaderBlockSize(block: u32): u32 =
+    esp32TlsfBlockRawSize(block) & ~u32(3)
+
+@inline
+trusted fun esp32TlsfSetBlockSize(block: u32, size: u32): void =
+    esp32TlsfSetBlockRawSize(
+        block, size | (esp32TlsfBlockRawSize(block) & u32(3))
+    )
+
+@inline
+trusted fun esp32TlsfBlockIsFree(block: u32): bool =
+    (esp32TlsfBlockRawSize(block) & u32(1)) != u32(0)
+
+@inline
+trusted fun esp32TlsfBlockPreviousIsFree(block: u32): bool =
+    (esp32TlsfBlockRawSize(block) & u32(2)) != u32(0)
+
+@inline
+trusted fun esp32TlsfSetBlockFree(block: u32): void =
+    esp32TlsfSetBlockRawSize(block, esp32TlsfBlockRawSize(block) | u32(1))
+
+@inline
+trusted fun esp32TlsfSetBlockUsed(block: u32): void =
+    esp32TlsfSetBlockRawSize(
+        block, esp32TlsfBlockRawSize(block) & ~u32(1)
+    )
+
+@inline
+trusted fun esp32TlsfSetBlockPreviousFree(block: u32): void =
+    esp32TlsfSetBlockRawSize(block, esp32TlsfBlockRawSize(block) | u32(2))
+
+@inline
+trusted fun esp32TlsfSetBlockPreviousUsed(block: u32): void =
+    esp32TlsfSetBlockRawSize(
+        block, esp32TlsfBlockRawSize(block) & ~u32(2)
+    )
+
+@inline
+fun esp32TlsfBlockFromMemory(memory: u32): u32 = memory - u32(8)
+
+@inline
+fun esp32TlsfBlockToMemory(block: u32): u32 = block + u32(8)
+
+@inline
+trusted fun esp32TlsfNextBlock(block: u32): u32 =
+    block + esp32TlsfHeaderBlockSize(block) + u32(4)
+
+@inline
+trusted fun esp32TlsfLinkNextBlock(block: u32): u32 {
+    val next = esp32TlsfNextBlock(block)
+    esp32TlsfStoreU32(next, block)
+    next
+}
+
+@inline
+trusted fun esp32TlsfMarkBlockFree(block: u32): void {
+    val next = esp32TlsfLinkNextBlock(block)
+    esp32TlsfSetBlockPreviousFree(next)
+    esp32TlsfSetBlockFree(block)
+}
+
+@inline
+trusted fun esp32TlsfMarkBlockUsed(block: u32): void {
+    val next = esp32TlsfNextBlock(block)
+    esp32TlsfSetBlockPreviousUsed(next)
+    esp32TlsfSetBlockUsed(block)
+}
+
+@inline
+fun esp32TlsfPackIndices(first: u32, second: u32): u32 =
+    first | (second << u32(8))
+
+@inline
+fun esp32TlsfPackedFirst(value: u32): u32 = value & u32(255)
+
+@inline
+fun esp32TlsfPackedSecond(value: u32): u32 = (value >>> u32(8)) & u32(255)
+
+@inline
+trusted fun esp32TlsfMappingInsert(control: u32, size: u32): u32 {
+    val small = esp32TlsfSmallBlockSize(control)
+    val secondCount = esp32TlsfSecondLevelCount(control)
+    if (size < small) {
+        return esp32TlsfPackIndices(
+            u32(0), size / (small / secondCount)
+        )
+    }
+    val top = esp32TlsfLastSetBit(size)
+    val secondLog2 = esp32TlsfSecondLevelLog2(control)
+    val second = (size >>> (top - secondLog2)) ^
+        (u32(1) << secondLog2)
+    val first = top - (esp32TlsfFirstLevelShift(control) - u32(1))
+    esp32TlsfPackIndices(first, second)
+}
+
+@inline
+trusted fun esp32TlsfAdjustRequestSize(
+    control: u32,
+    size: u32,
+    alignment: u32
+): u32 {
+    if (size == u32(0)) return u32(0)
+    val aligned = esp32TlsfAlignUp(size, alignment)
+    if (aligned >= esp32TlsfMaximumBlockSize(control)) return u32(0)
+    if (aligned < u32(12)) u32(12) else aligned
+}
+
+@inline
+trusted fun esp32TlsfMappingSearchSize(control: u32, requested: u32): u32 {
+    var size = requested
+    if (size >= esp32TlsfSmallBlockSize(control)) {
+        val shift = esp32TlsfLastSetBit(size) -
+            esp32TlsfSecondLevelLog2(control)
+        size = esp32TlsfAlignUp(size, u32(1) << shift)
+    }
+    size
+}
+
+@inline
+trusted fun esp32TlsfBlocksAddress(
+    control: u32,
+    first: u32,
+    second: u32
+): u32 = esp32TlsfLoadU32(control + u32(32)) +
+    ((first * esp32TlsfSecondLevelCount(control) + second) << u32(2))
+
+@inline
+trusted fun esp32TlsfRemoveFreeBlock(
+    control: u32,
+    block: u32,
+    first: u32,
+    second: u32
+): void {
+    val previous = esp32TlsfLoadU32(block + u32(12))
+    val next = esp32TlsfLoadU32(block + u32(8))
+    esp32TlsfStoreU32(next + u32(12), previous)
+    esp32TlsfStoreU32(previous + u32(8), next)
+    val headAddress = esp32TlsfBlocksAddress(control, first, second)
+    if (esp32TlsfLoadU32(headAddress) == block) {
+        esp32TlsfStoreU32(headAddress, next)
+        if (next == control) {
+            val mapAddress = esp32TlsfLoadU32(control + u32(28)) +
+                (first << u32(2))
+            val map = esp32TlsfLoadU32(mapAddress) &
+                ~(u32(1) << second)
+            esp32TlsfStoreU32(mapAddress, map)
+            if (map == u32(0)) {
+                esp32TlsfStoreU32(
+                    control + u32(24),
+                    esp32TlsfLoadU32(control + u32(24)) &
+                        ~(u32(1) << first)
+                )
+            }
+        }
+    }
+}
+
+@inline
+trusted fun esp32TlsfInsertFreeBlock(
+    control: u32,
+    block: u32,
+    first: u32,
+    second: u32
+): void {
+    val headAddress = esp32TlsfBlocksAddress(control, first, second)
+    val current = esp32TlsfLoadU32(headAddress)
+    esp32TlsfStoreU32(block + u32(8), current)
+    esp32TlsfStoreU32(block + u32(12), control)
+    esp32TlsfStoreU32(current + u32(12), block)
+    esp32TlsfStoreU32(headAddress, block)
+    esp32TlsfStoreU32(
+        control + u32(24),
+        esp32TlsfLoadU32(control + u32(24)) | (u32(1) << first)
+    )
+    val mapAddress = esp32TlsfLoadU32(control + u32(28)) +
+        (first << u32(2))
+    esp32TlsfStoreU32(
+        mapAddress,
+        esp32TlsfLoadU32(mapAddress) | (u32(1) << second)
+    )
+}
+
+@inline
+trusted fun esp32TlsfRemoveBlock(control: u32, block: u32): void {
+    val indices = esp32TlsfMappingInsert(
+        control, esp32TlsfHeaderBlockSize(block)
+    )
+    esp32TlsfRemoveFreeBlock(
+        control, block,
+        esp32TlsfPackedFirst(indices), esp32TlsfPackedSecond(indices)
+    )
+}
+
+@inline
+trusted fun esp32TlsfInsertBlock(control: u32, block: u32): void {
+    val indices = esp32TlsfMappingInsert(
+        control, esp32TlsfHeaderBlockSize(block)
+    )
+    esp32TlsfInsertFreeBlock(
+        control, block,
+        esp32TlsfPackedFirst(indices), esp32TlsfPackedSecond(indices)
+    )
+}
+
+@inline
+trusted fun esp32TlsfBlockCanSplit(block: u32, size: u32): bool =
+    esp32TlsfHeaderBlockSize(block) >= size + u32(16)
+
+@inline
+trusted fun esp32TlsfSplitBlock(block: u32, size: u32): u32 {
+    val oldSize = esp32TlsfHeaderBlockSize(block)
+    val remaining = block + size + u32(4)
+    val remainingSize = oldSize - size - u32(4)
+    esp32TlsfSetBlockRawSize(remaining, remainingSize)
+    esp32TlsfSetBlockSize(block, size)
+    esp32TlsfMarkBlockFree(remaining)
+    remaining
+}
+
+@inline
+trusted fun esp32TlsfAbsorbBlock(previous: u32, block: u32): u32 {
+    esp32TlsfSetBlockRawSize(
+        previous,
+        esp32TlsfBlockRawSize(previous) +
+            esp32TlsfHeaderBlockSize(block) + u32(4)
+    )
+    esp32TlsfLinkNextBlock(previous)
+    previous
+}
+
+@inline
+trusted fun esp32TlsfMergePrevious(control: u32, original: u32): u32 {
+    var block = original
+    if (esp32TlsfBlockPreviousIsFree(block)) {
+        val previous = esp32TlsfLoadU32(block)
+        esp32TlsfRemoveBlock(control, previous)
+        block = esp32TlsfAbsorbBlock(previous, block)
+    }
+    block
+}
+
+@inline
+trusted fun esp32TlsfMergeNext(control: u32, original: u32): u32 {
+    var block = original
+    val next = esp32TlsfNextBlock(block)
+    if (esp32TlsfBlockIsFree(next)) {
+        esp32TlsfRemoveBlock(control, next)
+        block = esp32TlsfAbsorbBlock(block, next)
+    }
+    block
+}
+
+@inline
+trusted fun esp32TlsfTrimFree(control: u32, block: u32, size: u32): void {
+    if (esp32TlsfBlockCanSplit(block, size)) {
+        val remaining = esp32TlsfSplitBlock(block, size)
+        esp32TlsfLinkNextBlock(block)
+        esp32TlsfSetBlockPreviousFree(remaining)
+        esp32TlsfInsertBlock(control, remaining)
+    }
+}
+
+@inline
+trusted fun esp32TlsfLocateFree(control: u32, requested: u32): u32 {
+    if (requested == u32(0)) return u32(0)
+    // Like C's block_locate_free, mapping_search is performed exactly once by
+    // the caller and its rounded size is also the size used to split the
+    // selected block. Re-mapping here obscures that data flow from LLVM and
+    // can make allocation and aligned-allocation disagree about the size.
+    val indices = esp32TlsfMappingInsert(control, requested)
+    var first = esp32TlsfPackedFirst(indices)
+    var second = esp32TlsfPackedSecond(indices)
+    if (first >= esp32TlsfFirstLevelCount(control)) {
+        return u32(0)
+    }
+
+    val secondMaps = esp32TlsfLoadU32(control + u32(28))
+    var secondMap = esp32TlsfLoadU32(
+        secondMaps + (first << u32(2))
+    ) & (~u32(0) << second)
+    if (secondMap == u32(0)) {
+        val nextFirst = first + u32(1)
+        val firstMap = if (nextFirst >= u32(32)) u32(0) else
+            esp32TlsfLoadU32(control + u32(24)) &
+                (~u32(0) << nextFirst)
+        if (firstMap == u32(0)) return u32(0)
+        first = esp32TlsfFirstSetBit(firstMap)
+        secondMap = esp32TlsfLoadU32(
+            secondMaps + (first << u32(2))
+        )
+    }
+
+    second = esp32TlsfFirstSetBit(secondMap)
+    val block = esp32TlsfLoadU32(
+        esp32TlsfBlocksAddress(control, first, second)
+    )
+    // search_suitable_block updates the selected class. Removing with that
+    // exact class is both cheaper and stricter than deriving it again from the
+    // chosen block's size after the search.
+    if (block != u32(0)) esp32TlsfRemoveFreeBlock(
+        control, block, first, second
+    )
+    block
+}
+
+@inline
+trusted fun esp32TlsfPrepareUsed(
+    control: u32,
+    block: u32,
+    size: u32
+): u32 {
+    if (block == u32(0)) return u32(0)
+    esp32TlsfTrimFree(control, block, size)
+    esp32TlsfMarkBlockUsed(block)
+    esp32TlsfBlockToMemory(block)
+}
+
+trusted fun esp32TlsfFitSize(control: u32, size: u32): u32 {
+    if (control == u32(0) || size == u32(0)) return u32(0)
+    if (size < esp32TlsfSmallBlockSize(control)) {
+        return esp32TlsfAdjustRequestSize(control, size, u32(4))
+    }
+    val interval = (u32(1) << esp32TlsfLastSetBit(size)) /
+        esp32TlsfSecondLevelCount(control)
+    size & ~(interval - u32(1))
+}
+
+trusted fun esp32TlsfConstructControl(control: u32, bytes: u32): u32 {
+    if (control == u32(0) || bytes < u32(36)) return u32(0)
+    val firstMaximum = u32(32) - bytes.countLeadingZeros()
+    val secondLog2 = if (bytes <= u32(16384)) u32(3)
+        else if (bytes <= u32(262144)) u32(4) else u32(5)
+    val firstShift = secondLog2 + u32(2)
+    val secondCount = u32(1) << secondLog2
+    val firstCount = firstMaximum - firstShift + u32(1)
+    val small = u32(1) << firstShift
+    val metadata = u32(36) + (firstCount << u32(2)) +
+        ((firstCount * secondCount) << u32(2))
+    if (bytes < metadata + u32(12)) return u32(0)
+    esp32TlsfStoreU32(control + u32(8), control)
+    esp32TlsfStoreU32(control + u32(12), control)
+    esp32TlsfStoreU32(
+        control + u32(16),
+        firstCount | (firstShift << u32(5)) |
+            (firstMaximum << u32(8)) | (secondCount << u32(14)) |
+            (secondLog2 << u32(20)) | (small << u32(23))
+    )
+    esp32TlsfStoreU32(control + u32(20), metadata)
+    esp32TlsfStoreU32(control + u32(24), u32(0))
+    // control is 4-byte aligned, sizeof(control_t) is 36, and each bitmap
+    // entry is four bytes, so both addresses are aligned by construction.
+    val secondMaps = control + u32(36)
+    val blocks = secondMaps + (firstCount << u32(2))
+    esp32TlsfStoreU32(control + u32(28), secondMaps)
+    esp32TlsfStoreU32(control + u32(32), blocks)
+    var first = u32(0)
+    while (first < firstCount) {
+        esp32TlsfStoreU32(secondMaps + (first << u32(2)), u32(0))
+        var second = u32(0)
+        while (second < secondCount) {
+            esp32TlsfStoreU32(
+                blocks + ((first * secondCount + second) << u32(2)),
+                control
+            )
+            second = second + u32(1)
+        }
+        first = first + u32(1)
+    }
+    control
+}
+
+trusted fun esp32TlsfCreate(memory: u32, maximumBytes: u32): u32 {
+    if (memory == u32(0) || (memory & u32(3)) != u32(0)) return u32(0)
+    esp32TlsfConstructControl(memory, maximumBytes)
+}
+
+trusted fun esp32TlsfAddPool(control: u32, memory: u32, bytes: u32): u32 {
+    if (control == u32(0) || memory == u32(0) || bytes < u32(8) ||
+        (memory & u32(3)) != u32(0)) return u32(0)
+    val poolBytes = esp32TlsfAlignDown(bytes - u32(8), u32(4))
+    if (poolBytes < u32(12) ||
+        poolBytes > esp32TlsfMaximumBlockSize(control)) return u32(0)
+    val block = memory - u32(4)
+    esp32TlsfSetBlockRawSize(block, poolBytes)
+    esp32TlsfSetBlockFree(block)
+    esp32TlsfSetBlockPreviousUsed(block)
+    esp32TlsfInsertBlock(control, block)
+    val sentinel = esp32TlsfLinkNextBlock(block)
+    esp32TlsfSetBlockRawSize(sentinel, u32(0))
+    esp32TlsfSetBlockUsed(sentinel)
+    esp32TlsfSetBlockPreviousFree(sentinel)
+    memory
+}
+
+trusted fun esp32TlsfCreateWithPool(
+    memory: u32,
+    poolBytes: u32,
+    maximumBytes: u32
+): u32 {
+    val control = esp32TlsfCreate(
+        memory, if (maximumBytes == u32(0)) poolBytes else maximumBytes
+    )
+    if (control != u32(0)) {
+        val metadata = esp32TlsfSize(control)
+        if (poolBytes > metadata) {
+            esp32TlsfAddPool(
+                control, memory + metadata, poolBytes - metadata
+            )
+        }
+    }
+    control
+}
+
+trusted fun esp32TlsfMalloc(control: u32, size: u32): u32 {
+    if (control == u32(0)) return u32(0)
+    val adjusted = esp32TlsfAdjustRequestSize(control, size, u32(4))
+    if (adjusted == u32(0)) return u32(0)
+    // TLSF's mapping_search rounds the request up to the selected size class
+    // and returns that new size to malloc. Splitting with
+    // the pre-search value creates blocks that the bitmap search did not
+    // account for and diverges from the allocator's C implementation.
+    val allocationSize = esp32TlsfMappingSearchSize(control, adjusted)
+    val block = esp32TlsfLocateFree(control, allocationSize)
+    val memory = esp32TlsfPrepareUsed(control, block, allocationSize)
+    memory
+}
+
+@inline
+trusted fun esp32TlsfMallocInterruptStartup(
+    control: u32,
+    size: u32
+): u32 {
+    if (control == u32(0)) return u32(0)
+    val adjusted = esp32TlsfAdjustRequestSize(control, size, u32(4))
+    if (adjusted == u32(0)) return u32(0)
+    val allocationSize = esp32TlsfMappingSearchSize(control, adjusted)
+    val block = esp32TlsfLocateFree(control, allocationSize)
+    return esp32TlsfPrepareUsed(control, block, allocationSize)
+}
+
+trusted fun esp32TlsfFree(control: u32, memory: u32): void {
+    if (control == u32(0) || memory == u32(0)) return
+    var block = esp32TlsfBlockFromMemory(memory)
+    esp32TlsfMarkBlockFree(block)
+    block = esp32TlsfMergePrevious(control, block)
+    block = esp32TlsfMergeNext(control, block)
+    esp32TlsfInsertBlock(control, block)
+}
+
+// Optional integrity callback. Keeping it in Abla module state makes the
+// diagnostic path disappear when no application installs a callback.
+var esp32TlsfCheckCallback: u32 = u32(0)
+
+trusted fun esp32TlsfSetCheckCallback(callback: u32): void {
+    esp32TlsfCheckCallback = callback
+    return
+}
+
+trusted fun esp32TlsfCheckHook(block: u32, size: u32, free: u32): u32 {
+    if (esp32TlsfCheckCallback == u32(0)) return u32(1)
+    return u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+        int(esp32TlsfCheckCallback), int(block), int(size), int(free),
+        int(u32(0)), int(u32(0)), int(u32(0))
+    ))
+}
+
+@inline
+trusted fun esp32TlsfTrimUsed(
+    control: u32,
+    block: u32,
+    size: u32
+): void {
+    if (esp32TlsfBlockCanSplit(block, size)) {
+        var remaining = esp32TlsfSplitBlock(block, size)
+        esp32TlsfSetBlockPreviousUsed(remaining)
+        remaining = esp32TlsfMergeNext(control, remaining)
+        esp32TlsfInsertBlock(control, remaining)
+    }
+    return
+}
+
+@inline
+trusted fun esp32TlsfTrimFreeLeading(
+    control: u32,
+    block: u32,
+    totalLeadingBytes: u32
+): u32 {
+    if (!esp32TlsfBlockCanSplit(block, totalLeadingBytes)) return block
+    val remaining = esp32TlsfSplitBlock(block, totalLeadingBytes - u32(4))
+    esp32TlsfSetBlockPreviousFree(remaining)
+    esp32TlsfLinkNextBlock(block)
+    esp32TlsfInsertBlock(control, block)
+    remaining
+}
+
+trusted fun esp32TlsfRemovePool(control: u32, pool: u32): void {
+    if (control == u32(0) || pool == u32(0)) return
+    val block = pool - u32(4)
+    esp32TlsfRemoveBlock(control, block)
+    return
+}
+
+trusted fun esp32TlsfMallocAtAddress(
+    control: u32,
+    requestedSize: u32,
+    address: u32
+): u32 {
+    if (control == u32(0) || address == u32(0)) return u32(0)
+    val adjustedAddress = esp32TlsfAlignDown(address, u32(4))
+    var adjustedSize = esp32TlsfAlignUp(
+        requestedSize + address - adjustedAddress, u32(4)
+    )
+    adjustedSize = esp32TlsfAdjustRequestSize(
+        control, adjustedSize, u32(4)
+    )
+    if (adjustedSize == u32(0)) return u32(0)
+
+    var block = control + esp32TlsfSize(control) - u32(4)
+    var found = false
+    while (esp32TlsfHeaderBlockSize(block) != u32(0) && !found) {
+        val blockStart = esp32TlsfBlockToMemory(block)
+        val blockEnd = blockStart + esp32TlsfHeaderBlockSize(block)
+        if (blockStart <= adjustedAddress && blockEnd > adjustedAddress) {
+            if (blockEnd < adjustedAddress + adjustedSize ||
+                !esp32TlsfBlockIsFree(block)) return u32(0)
+            found = true
+        } else {
+            block = esp32TlsfNextBlock(block)
+        }
+    }
+    if (!found) return u32(0)
+
+    esp32TlsfRemoveBlock(control, block)
+    val leading = adjustedAddress - esp32TlsfBlockToMemory(block)
+    var returnedBlock = block
+    if (leading >= u32(12)) {
+        returnedBlock = esp32TlsfTrimFreeLeading(control, block, leading)
+    } else {
+        adjustedSize = adjustedSize + leading
+    }
+    esp32TlsfPrepareUsed(control, returnedBlock, adjustedSize)
+}
+
+trusted fun esp32TlsfMemalignOffset(
+    control: u32,
+    alignment: u32,
+    requestedSize: u32,
+    dataOffset: u32
+): u32 {
+    if (control == u32(0) || alignment == u32(0) ||
+        (alignment & (alignment - u32(1))) != u32(0)) return u32(0)
+    val adjusted = esp32TlsfAdjustRequestSize(control, requestedSize, u32(4))
+    val offset = esp32TlsfAlignUp(dataOffset, u32(4))
+    val minimumGap = u32(16) + offset
+    val withGap = esp32TlsfAdjustRequestSize(
+        control, adjusted + alignment + minimumGap - offset, alignment
+    )
+    val requestedSearchSize = if (adjusted != u32(0) && alignment > u32(4)) {
+        withGap
+    } else adjusted
+    val searchSize = esp32TlsfMappingSearchSize(control, requestedSearchSize)
+    var block = esp32TlsfLocateFree(control, searchSize)
+    if (block == u32(0)) return u32(0)
+
+    val memory = esp32TlsfBlockToMemory(block)
+    var aligned = esp32TlsfAlignUp(memory, alignment)
+    var gap = aligned - memory
+    if ((gap != u32(0) && gap < minimumGap) ||
+        (gap == u32(0) && offset != u32(0) && alignment > u32(4))) {
+        val remaining = minimumGap - gap
+        aligned = esp32TlsfAlignUp(
+            aligned + (if (remaining > alignment) remaining else alignment),
+            alignment
+        )
+        gap = aligned - memory
+    }
+    if (gap != u32(0)) {
+        block = esp32TlsfTrimFreeLeading(control, block, gap - offset)
+    }
+    esp32TlsfPrepareUsed(control, block, adjusted)
+}
+
+trusted fun esp32TlsfMemalign(
+    control: u32,
+    alignment: u32,
+    size: u32
+): u32 = esp32TlsfMemalignOffset(control, alignment, size, u32(0))
+
+trusted fun esp32TlsfCopy(destination: u32, source: u32, bytes: u32): void {
+    var offset = u32(0)
+    while (offset < bytes) {
+        val byte = u32(ablaUnsafeLoadU8(
+            nativePointerFromAddress(int(source + offset))
+        ))
+        ablaUnsafeStoreU8(
+            nativePointerFromAddress(int(destination + offset)), int(byte)
+        )
+        offset = offset + u32(1)
+    }
+    return
+}
+
+trusted fun esp32TlsfReallocate(
+    control: u32,
+    memory: u32,
+    requestedSize: u32
+): u32 {
+    if (memory != u32(0) && requestedSize == u32(0)) {
+        esp32TlsfFree(control, memory)
+        return u32(0)
+    }
+    if (memory == u32(0)) return esp32TlsfMalloc(control, requestedSize)
+
+    val block = esp32TlsfBlockFromMemory(memory)
+    val next = esp32TlsfNextBlock(block)
+    val currentSize = esp32TlsfHeaderBlockSize(block)
+    val combined = currentSize + esp32TlsfHeaderBlockSize(next) + u32(4)
+    val adjusted = esp32TlsfAdjustRequestSize(control, requestedSize, u32(4))
+    if (adjusted == u32(0)) return u32(0)
+
+    if (adjusted > currentSize &&
+        (!esp32TlsfBlockIsFree(next) || adjusted > combined)) {
+        val replacement = esp32TlsfMalloc(control, requestedSize)
+        if (replacement != u32(0)) {
+            esp32TlsfCopy(
+                replacement, memory,
+                if (currentSize < requestedSize) currentSize else requestedSize
+            )
+            esp32TlsfFree(control, memory)
+        }
+        return replacement
+    }
+
+    if (adjusted > currentSize) {
+        esp32TlsfMergeNext(control, block)
+        esp32TlsfMarkBlockUsed(block)
+    }
+    esp32TlsfTrimUsed(control, block, adjusted)
+    memory
+}
+
+trusted fun esp32TlsfFindContainingBlock(pool: u32, pointer: u32): u32 {
+    if (pool == u32(0) || pointer == u32(0)) return u32(0)
+    var block = pool - u32(4)
+    while (esp32TlsfHeaderBlockSize(block) != u32(0)) {
+        if (!esp32TlsfBlockIsFree(block)) {
+            val start = esp32TlsfBlockToMemory(block)
+            if (start <= pointer &&
+                start + esp32TlsfHeaderBlockSize(block) > pointer) return start
+        }
+        block = esp32TlsfNextBlock(block)
+    }
+    u32(0)
+}
+
+trusted fun esp32TlsfWalkPool(pool: u32, walker: u32, user: u32): void {
+    if (pool == u32(0)) return
+    var block = pool - u32(4)
+    var keepWalking = true
+    while (esp32TlsfHeaderBlockSize(block) != u32(0) && keepWalking) {
+        if (walker != u32(0)) {
+            keepWalking = u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                int(walker), int(esp32TlsfBlockToMemory(block)),
+                int(esp32TlsfHeaderBlockSize(block)),
+                int(if (esp32TlsfBlockIsFree(block)) u32(0) else u32(1)),
+                int(user), int(u32(0)), int(u32(0))
+            )) != u32(0)
+        }
+        if (keepWalking) block = esp32TlsfNextBlock(block)
+    }
+    return
+}
+
+trusted fun esp32TlsfCheckPool(pool: u32): i32 {
+    if (pool == u32(0)) return i32(-1)
+    var block = pool - u32(4)
+    var previousWasFree = false
+    var status = i32(0)
+    while (esp32TlsfHeaderBlockSize(block) != u32(0)) {
+        val isFree = esp32TlsfBlockIsFree(block)
+        if (esp32TlsfBlockPreviousIsFree(block) != previousWasFree) {
+            status = status - i32(1)
+        }
+        val size = esp32TlsfHeaderBlockSize(block)
+        val callbackPointer = if (isFree) block + u32(16)
+            else esp32TlsfBlockToMemory(block)
+        val callbackSize = if (isFree && size >= u32(12)) size - u32(12)
+            else size
+        if (esp32TlsfCheckHook(
+            callbackPointer, callbackSize, if (isFree) u32(1) else u32(0)
+        ) == u32(0)) status = status - i32(1)
+        previousWasFree = isFree
+        block = esp32TlsfNextBlock(block)
+    }
+    status
+}
+
+trusted fun esp32TlsfCheck(control: u32): i32 {
+    if (control == u32(0)) return i32(-1)
+    var status = i32(0)
+    val firstCount = esp32TlsfFirstLevelCount(control)
+    val secondCount = esp32TlsfSecondLevelCount(control)
+    val firstBitmap = esp32TlsfLoadU32(control + u32(24))
+    val secondMaps = esp32TlsfLoadU32(control + u32(28))
+    var first = u32(0)
+    while (first < firstCount) {
+        val secondBitmap = esp32TlsfLoadU32(secondMaps + (first << u32(2)))
+        var second = u32(0)
+        while (second < secondCount) {
+            val firstPresent = (firstBitmap & (u32(1) << first)) != u32(0)
+            val secondPresent = (secondBitmap & (u32(1) << second)) != u32(0)
+            val head = esp32TlsfLoadU32(
+                esp32TlsfBlocksAddress(control, first, second)
+            )
+            if (!firstPresent && secondPresent) status = status - i32(1)
+            if (!secondPresent) {
+                if (head != control) status = status - i32(1)
+            } else {
+                if (head == control) status = status - i32(1)
+                var block = head
+                while (block != control) {
+                    if (!esp32TlsfBlockIsFree(block)) status = status - i32(1)
+                    if (esp32TlsfBlockPreviousIsFree(block)) status = status - i32(1)
+                    val nextPhysical = esp32TlsfNextBlock(block)
+                    if (esp32TlsfBlockIsFree(nextPhysical)) status = status - i32(1)
+                    if (!esp32TlsfBlockPreviousIsFree(nextPhysical)) {
+                        status = status - i32(1)
+                    }
+                    if (esp32TlsfHeaderBlockSize(block) < u32(12)) {
+                        status = status - i32(1)
+                    }
+                    val mapped = esp32TlsfMappingInsert(
+                        control, esp32TlsfHeaderBlockSize(block)
+                    )
+                    if (esp32TlsfPackedFirst(mapped) != first ||
+                        esp32TlsfPackedSecond(mapped) != second) {
+                        status = status - i32(1)
+                    }
+                    block = esp32TlsfLoadU32(block + u32(8))
+                }
+            }
+            second = second + u32(1)
+        }
+        first = first + u32(1)
+    }
+    status
+}

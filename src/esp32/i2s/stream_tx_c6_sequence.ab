@@ -1,0 +1,52 @@
+import "./dma_start_c6_sequence.ab"
+import "../gdma_buffer_c6_sequence.ab"
+// 32B retained circular TX cursor:tag0,bound start4,index8,state12,
+// observed events16,last acquire20,publication count24,reserved28.
+// Graceful drain owns cursor state5 and withdraws ordinary acquire/refill.
+// State1waiting2CPU-owned3error4publication-attempted. All start/layout fields
+// immutable; caller owns entire ring, pinned clocks/IRQ/ETM and payload lifetime.
+// No start/stop/reset/IRQ ack. Caller starts a prefilled circular ring separately.
+// Acquire returns1CPU-owned2invalid3error5DMA-owned. Publish returns1attempted,
+// not wire completion; same acquisition cannot publish twice. Retain errors and
+// stop/join DMA before releasing resources. Events are sticky, not a count.
+fun c6I2sStreamStorage(q: NativeBuffer): bool = q.hasAddressRange(0,32) && (q.addressValue()&3) == 0 && (q.addressValue()+32 <= 0x60000000 || q.addressValue() >= 0x60100000)
+trusted fun c6I2sStreamLayout(r: NativeBuffer,q: NativeBuffer): bool {
+    if (!c6I2sDmaStartStorage(r) || r.loadU32(0) != 0x43364944 || r.loadU32(4) != 1 || r.loadU32(16) != 1 || r.loadU32(40) != 1 || r.loadU32(12) > 2 || !c6I2sStreamStorage(q)) return false
+    val descriptors=r.loadU32(20);val count=r.loadU32(24);val buffers=r.loadU32(28);val stride=r.loadU32(32);val bytes=r.loadU32(36);val address=q.addressValue()
+    return c6GdmaRingValid(descriptors,count,buffers,stride,bytes) && count >= 2 &&
+        !(address < r.addressValue()+72 && r.addressValue() < address+32) &&
+        !(address < descriptors+count*12 && descriptors < address+32) &&
+        !(address < buffers+(count-1)*stride+bytes && buffers < address+32)
+}
+trusted fun c6I2sStreamBound(r: NativeBuffer,q: NativeBuffer): bool = c6I2sStreamLayout(r,q) && q.loadU32(0) == 0x43365354 && q.loadU32(4) == r.addressValue() && q.loadU32(8) < r.loadU32(24) && q.loadU32(28) == 0
+trusted fun c6I2sStreamAcquireOwned(r: NativeBuffer,q: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c6I2sStreamLayout(r,q)) return 2
+    if (q.loadU32(0) == 0) {
+        var at=0
+        while (at < 32) { q.storeU32(at,0);at=at+4 }
+        q.storeU32(0,0x43365354);q.storeU32(4,r.addressValue());q.storeU32(12,1)
+    }
+    if (!c6I2sStreamBound(r,q)) return 2
+    if (q.loadU32(12) == 2) return 1
+    if (q.loadU32(12) == 3) return 3
+    if (q.loadU32(12) != 1) return 2
+    val acquired=c6GdmaAcquireOwned(r.loadU32(12),true,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),q.loadU32(8),true,true)
+    q.storeU32(16,q.loadU32(16)|acquired.events());q.storeU32(20,acquired.status())
+    if (acquired.status() == 5) return 5
+    if (acquired.status() != 1) { q.storeU32(12,3);return 3 }
+    q.storeU32(12,2);return 1
+}
+// View available only after acquire; retain no writable aliases after publish.
+trusted fun c6I2sStreamWritableBuffer(r: NativeBuffer,q: NativeBuffer): NativeBuffer =
+    if (c6I2sStreamBound(r,q) && q.loadU32(12) == 2) nativeBufferAt(r.loadU32(28)+q.loadU32(8)*r.loadU32(32),r.loadU32(36)) else NativeBuffer(0)
+// Caller has fully initialized the acquired payload before this call. On a
+// rejected rearm keep that prepared payload; never rerender advanced sources.
+trusted fun c6I2sStreamPublishOwned(r: NativeBuffer,q: NativeBuffer,payloadPrepared: bool,exclusive: bool): int {
+    if (!exclusive || !payloadPrepared || !c6I2sStreamBound(r,q) || q.loadU32(12) != 2) return 2
+    q.storeU32(12,4)
+    val result=c6GdmaRearmOwned(r.loadU32(12),true,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),q.loadU32(8),true,true)
+    if (result != 65537) { q.storeU32(16,q.loadU32(16)|C6GdmaBuffer(result).events());q.storeU32(20,C6GdmaBuffer(result).status());q.storeU32(12,3);return 3 }
+    q.storeU32(24,(q.loadU32(24)+1)&0xffffffff)
+    q.storeU32(8,if (q.loadU32(8)+1 == r.loadU32(24)) 0 else q.loadU32(8)+1)
+    q.storeU32(12,1);return 1
+}

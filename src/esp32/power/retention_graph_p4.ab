@@ -1,0 +1,87 @@
+import "./retention_profile_p4.ab"
+// Encode the ordered system profile, including shared flash entry3 on a
+// minimum-revision300 build. Entry0 traverses all profile nodes; entry3
+// traverses exactly the same eight flash descriptors/backing buffers, then
+// a both-skipped terminal WAIT. Final flash WRITE branches to IOMUX for0,
+// terminal for3. No duplicate backup storage or software SDK metadata.
+// Entries16B = four hardware head pointers (unused1/2 are zero).
+// Configs must be exactly ProfileConfigs output, still disconnected. Scratch
+//56B is disposable; output/entries/configs/backing must be mutually exclusive.
+// Full validation before any output/entry write. Caller owns retained DMA
+// memory, cache publication, PMU_DATE scratch, PAU exclusion/timeouts and all
+// CPU/clock/power prerequisites. This does NOT activate any hardware.
+trusted fun esp32p4RetentionGraphEncode(out: NativeBuffer,entries: NativeBuffer,configs: NativeBuffer,scratch: NativeBuffer,uart: int,psram: bool,pvt: bool,minimumRevision: int): int {
+    val count=esp32p4RetentionProfileCount(uart,psram,pvt)
+    if (count == 0 || minimumRevision < 0 || minimumRevision > 399 ||
+        !configs.hasAddressRange(0,count*56) || !scratch.hasAddressRange(0,56) || !entries.hasAddressRange(0,16) ||
+        (configs.addressValue()&3) != 0 || (scratch.addressValue()&3) != 0 || (entries.addressValue()&3) != 0 || (out.addressValue()&3) != 0) return 0
+    val routed=minimumRevision == 300
+    var linear=0
+    var flashStart=0
+    var flashEnd=0
+    var i=0
+    while (i < count) {
+        val key=p4RetentionProfileNode(uart,psram,pvt,i)
+        if (key == 1536) flashStart=linear
+        if (key == 1543) flashEnd=linear
+        val head=configs.loadU32(i*56)
+        linear=linear+p4RetentionDescriptorBytes(head)+(if (p4RetentionWaitPoison(head,configs.loadU32(i*56+52))) 40 else 0)
+        i=i+1
+    }
+    val total=linear+(if (routed) 32 else 0)
+    if (!out.hasAddressRange(0,total) || !p4RetentionAddressSpan(out.addressValue(),total) ||
+        p4RetentionRangesOverlap(out.addressValue(),total,configs.addressValue(),count*56) ||
+        p4RetentionRangesOverlap(out.addressValue(),total,scratch.addressValue(),56) ||
+        p4RetentionRangesOverlap(out.addressValue(),total,entries.addressValue(),16) ||
+        p4RetentionRangesOverlap(configs.addressValue(),count*56,scratch.addressValue(),56) ||
+        p4RetentionRangesOverlap(configs.addressValue(),count*56,entries.addressValue(),16) ||
+        p4RetentionRangesOverlap(scratch.addressValue(),56,entries.addressValue(),16)) return 0
+    i=0
+    while (i < count) {
+        val c=nativeBufferAt(configs.addressValue()+i*56,56)
+        val key=p4RetentionProfileNode(uart,psram,pvt,i)
+        val size=p4RetentionProfileWords(key)*4
+        val memory=c.loadU32(28)
+        if (size != 0 && (p4RetentionRangesOverlap(memory,size,out.addressValue(),total) ||
+            p4RetentionRangesOverlap(memory,size,entries.addressValue(),16) ||
+            p4RetentionRangesOverlap(memory,size,scratch.addressValue(),56) ||
+            p4RetentionRangesOverlap(memory,size,configs.addressValue(),count*56))) return 0
+        i=i+1
+    }
+    i=0
+    while (i < count) {
+        val c=nativeBufferAt(configs.addressValue()+i*56,56)
+        val key=p4RetentionProfileNode(uart,psram,pvt,i)
+        val memory=c.loadU32(28)
+        if (!p4RetentionProfileConfig(scratch,key,uart,memory)) return 0
+        var word=0
+        while (word < 56) { if (scratch.loadU32(word) != c.loadU32(word)) return 0;word=word+4 }
+        i=i+1
+    }
+    if (esp32p4RetentionListEncode(nativeBufferAt(out.addressValue(),linear),configs,scratch,count) != linear) return 0
+    if (routed) {
+        // Add three next pointers before the final flash command body.
+        // Backward copy preserves the command and entire IOMUX suffix.
+        var word=linear-4
+        while (word >= flashEnd+8) { out.storeU32(word+12,out.loadU32(word));word=word-4 }
+        out.storeU32(flashEnd,out.loadU32(flashEnd)|0x10000000)
+        out.storeU32(flashEnd+8,0);out.storeU32(flashEnd+12,0)
+        out.storeU32(flashEnd+16,out.addressValue()+linear+12)
+        // Re-link the contiguous entry0 path after inserting the branch.
+        var offset=0
+        while (offset < linear+12) {
+            val head=out.loadU32(offset)
+            val size=p4RetentionDescriptorBytes(head)
+            if ((head&0x80000000) == 0) out.storeU32(offset+4,out.addressValue()+offset+size)
+            offset=offset+size
+        }
+        // Same no-op leaf as IDF's REGDMA_LINK_WAIT_INIT(ffff,0,0,0,1,1).
+        // Both directions skip it; address0 is never dereferenced.
+        word=4
+        while (word < 20) { out.storeU32(linear+12+word,0);word=word+4 }
+        out.storeU32(linear+12,0xe0030000)
+    }
+    entries.storeU32(0,out.addressValue());entries.storeU32(4,0);entries.storeU32(8,0)
+    entries.storeU32(12,if (routed) out.addressValue()+flashStart else 0)
+    return total
+}

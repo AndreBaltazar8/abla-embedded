@@ -1,0 +1,62 @@
+import "./async_transaction_c5_sequence.ab"
+import "./buffer_transaction_c5_sequence.ab"
+// Caller-exclusive96B: transaction64 + TX64,RX68,total72,completed76,
+// initialTime80,totalBudget84,receive88,tag92. One continuous CS and gate.
+// Entire TX/RX pinned until final result; exact-base in-place is safe, shifted
+// overlap is not. Published RX prefixes remain provisional after an error.
+// Zero SpiBufferResult = pending; terminal statuses match transferBuffer().
+trusted fun c5SpiAsyncBufferValid(context: NativeBuffer): bool =
+    c5SpiLargeBufferValid(context,96) && (context.addressValue()&3) == 0 &&
+    context.loadU32(92) == 0x43414231 && c5SpiAsyncTransactionValid(context)
+trusted fun esp32C5SpiAsyncBufferInitialize(context: NativeBuffer): bool {
+    if (!c5SpiLargeBufferValid(context,96) || (context.addressValue()&3) != 0) return false
+    if (!esp32C5SpiAsyncTransactionInitialize(context)) return false
+    var offset=64;while (offset < 92) { context.storeU32(offset,0);offset=offset+4 }
+    context.storeU32(92,0x43414231);return true
+}
+trusted fun c5SpiAsyncBufferResult(context: NativeBuffer,result: SpiTransactionResult): SpiBufferResult =
+    SpiBufferResult((result.status()<<56)|(context.loadU32(76)<<32)|int(result.value()))
+trusted fun Esp32C5SpiMaster.beginBufferAsync(context: NativeBuffer,gate: PeripheralGate,owner: u32,
+    tx: NativeBuffer,rx: NativeBuffer,bytes: int,now: u32,budget: u32,receive: bool = true): SpiBufferResult {
+    if (!c5SpiAsyncBufferValid(context) || !c5SpiLargeBufferValid(tx,bytes) ||
+        (receive && !c5SpiLargeBufferValid(rx,bytes)) || !gate.bufferDisjoint(context,96) ||
+        !gate.bufferDisjoint(tx,bytes) || (receive && !gate.bufferDisjoint(rx,bytes))) return SpiBufferResult(3<<56)
+    val address=context.addressValue()
+    if ((tx.addressValue() < address+96 && address < tx.addressValue()+bytes) ||
+        (receive && ((rx.addressValue() < address+96 && address < rx.addressValue()+bytes) ||
+            (tx.addressValue() != rx.addressValue() && tx.addressValue() < rx.addressValue()+bytes && rx.addressValue() < tx.addressValue()+bytes)))) return SpiBufferResult(3<<56)
+    val count=if (bytes > 64) 64 else bytes
+    val result=this.beginTransferAsync(context,gate,owner,nativeBufferAt(tx.addressValue(),count),
+        if (receive) nativeBufferAt(rx.addressValue(),count) else NativeBuffer(0),count,now,budget,receive)
+    if (result.status() == 2 || result.status() == 3 || result.status() == 4) return SpiBufferResult((result.status()<<56)|int(result.value()))
+    context.storeU32(64,tx.addressValue());context.storeU32(68,if (receive) rx.addressValue() else 0)
+    context.storeU32(72,bytes);context.storeU32(76,0);context.storeU32(80,int(now))
+    context.storeU32(84,int(budget));context.storeU32(88,if (receive) 1 else 0)
+    return if (result == SpiTransactionResult(0)) SpiBufferResult(0) else c5SpiAsyncBufferResult(context,result)
+}
+// Each call observes one FIFO job and stages at most one following chunk.
+// No spin waiting; single overall deadline, no reset/replay. Failed hardware
+// may remain active: retain context/master/pads and recover explicitly.
+trusted fun esp32C5SpiAsyncBufferPoll(context: NativeBuffer,now: u32): SpiBufferResult {
+    if (!c5SpiAsyncBufferValid(context)) return SpiBufferResult(3<<56)
+    val state=context.loadU32(48)&255
+    if (state == 2) return SpiBufferResult((context.loadU32(52)<<56)|(context.loadU32(76)<<32)|context.loadU32(56))
+    if (state != 1) return SpiBufferResult(3<<56)
+    val gate=peripheralGateAt(context.loadU32(40));val owner=u32(context.loadU32(44))
+    if (gate.word().compareExchange(owner,owner) != owner) return c5SpiAsyncBufferResult(context,c5SpiAsyncTransactionSave(context,5,1<<24))
+    val low=nativeBufferAt(context.addressValue(),32)
+    val report=esp32C5SpiAsyncPollOwned(low,now)
+    if (report == 0) return SpiBufferResult(0)
+    if (report != 257) return c5SpiAsyncBufferResult(context,c5SpiAsyncTransactionFinish(context,report))
+    val completed=context.loadU32(76)+low.loadU32(12)
+    context.storeU32(76,completed)
+    if (completed == context.loadU32(72)) return c5SpiAsyncBufferResult(context,c5SpiAsyncTransactionFinish(context,257))
+    val elapsed=now-u32(context.loadU32(80));val budget=u32(context.loadU32(84))
+    if (elapsed >= budget) return c5SpiAsyncBufferResult(context,c5SpiAsyncTransactionFinish(context,263))
+    val remaining=context.loadU32(72)-completed;val count=if (remaining > 64) 64 else remaining
+    val receive=context.loadU32(88) != 0
+    esp32C5SpiAsyncInitialize(low)
+    val next=esp32C5SpiAsyncBeginOwned(low,nativeBufferAt(context.loadU32(64)+completed,count),
+        if (receive) nativeBufferAt(context.loadU32(68)+completed,count) else NativeBuffer(0),count,now,budget-elapsed,receive)
+    return if (next == 0) SpiBufferResult(0) else c5SpiAsyncBufferResult(context,c5SpiAsyncTransactionFinish(context,next))
+}

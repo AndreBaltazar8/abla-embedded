@@ -1,0 +1,405 @@
+import "../freertos/port_esp32.ab"
+import "../cpu/rtc_interrupts_esp32.ab"
+import "../../xtensa/assembly.ab"
+import "abla/unsafe/memory"
+import "rtc_hal_esp32.ab"
+import "rtc_periph_esp32.ab"
+
+// Complete ESP32 RTC-GPIO driver in structured Abla. The packed GPIO-to-RTC
+// map and RTC pad descriptors are source data; all policy and MMIO remain
+// visible to the monolithic optimizer.
+
+val esp32RtcGpioOk = u32(0)
+val esp32RtcGpioInvalidArgument = u32(258)
+val esp32RtcControlBase = u32(0x3ff48000)
+
+@inline
+trusted fun esp32RtcGpioMapValue(gpio: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(
+        int(esp32Data_rtc_io_num_map_8f1a03bb74 + gpio)
+    )))
+
+@inline
+trusted fun esp32RtcGpioValid(gpio: u32): bool =
+    gpio < u32(40) && esp32RtcGpioMapValue(gpio) != u32(255)
+
+@inline
+trusted fun esp32RtcIoNumber(gpio: u32): u32 =
+    esp32RtcGpioMapValue(gpio)
+
+@inline
+trusted fun esp32RtcEnterCritical(): void {
+    esp32RecoveredXPortEnterCriticalTimeout(
+        esp32Data_rtc_spinlock_a4e495d389, u32(0xffffffff)
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcExitCritical(): void {
+    esp32RecoveredVPortExitCritical(esp32Data_rtc_spinlock_a4e495d389)
+    return
+}
+
+@inline
+trusted fun esp32RtcIoFunctionSelect(rtcio: u32, rtcFunction: bool): void {
+    val mux = esp32RtcIoDescriptorField(rtcio, u32(4))
+    esp32GpioUpdateRegister(
+        esp32RtcIoDescriptorRegister(rtcio),
+        mux,
+        if (rtcFunction) mux else u32(0)
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcIoSetLevel(rtcio: u32, level: u32): void {
+    xtensaDeviceStoreU32(
+        esp32RtcIoDevice + if (level != u32(0)) u32(4) else u32(8),
+        u32(1) << (rtcio + u32(14))
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcIoGetLevel(rtcio: u32): u32 =
+    (xtensaDeviceLoadU32(esp32RtcIoDevice + u32(36)) >>>
+        (rtcio + u32(14))) & u32(1)
+
+@inline
+trusted fun esp32RtcIoSetDrive(rtcio: u32, strength: u32): void {
+    val mask = esp32RtcIoDescriptorField(rtcio, u32(44))
+    if (mask != u32(0)) {
+        val shift = esp32RtcIoDescriptorField(rtcio, u32(48))
+        esp32GpioUpdateRegister(
+            esp32RtcIoDescriptorRegister(rtcio),
+            mask << shift,
+            (strength & mask) << shift
+        )
+    }
+    return
+}
+
+@inline
+trusted fun esp32RtcIoGetDrive(rtcio: u32): u32 {
+    val mask = esp32RtcIoDescriptorField(rtcio, u32(44))
+    val shift = esp32RtcIoDescriptorField(rtcio, u32(48))
+    return (xtensaDeviceLoadU32(esp32RtcIoDescriptorRegister(rtcio)) >>> shift) & mask
+}
+
+@inline
+trusted fun esp32RtcIoHold(rtcio: u32, enable: bool): void {
+    val forceMask = esp32RtcIoDescriptorField(rtcio, u32(40))
+    val holdMask = esp32RtcIoDescriptorField(rtcio, u32(36))
+    esp32GpioUpdateRegister(
+        esp32RtcControlBase + u32(0xc8),
+        forceMask,
+        if (enable) forceMask else u32(0)
+    )
+    esp32GpioUpdateRegister(
+        esp32RtcIoDescriptorRegister(rtcio),
+        holdMask,
+        if (enable) holdMask else u32(0)
+    )
+    return
+}
+
+@inline
+trusted fun esp32RtcIoWakeup(rtcio: u32, interruptType: u32, enable: bool): void {
+    esp32GpioUpdateRegister(
+        esp32RtcIoDevice + u32(40) + (rtcio << u32(2)),
+        (u32(7) << u32(7)) | (u32(1) << u32(10)),
+        if (enable) ((interruptType & u32(7)) << u32(7)) |
+            (u32(1) << u32(10)) else u32(0)
+    )
+    return
+}
+
+trusted fun esp32RtcGpioInitialize(gpio: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    val rtcio = esp32RtcIoNumber(gpio)
+    esp32RtcEnterCritical()
+    esp32RtcIoFunctionSelect(rtcio, true)
+    esp32RtcIoSelectIomuxFunction(rtcio, u32(0))
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioDeinitialize(gpio: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    val rtcio = esp32RtcIoNumber(gpio)
+    esp32RtcEnterCritical()
+    esp32RtcIoFunctionSelect(rtcio, false)
+    // ESP32 has no independent LP-IO clock, so io_mux_is_lp_io_in_use is
+    // always true and the RTC configuration must always be disconnected.
+    esp32RtcIoSetDirection(rtcio, u32(3))
+    esp32RtcIoPullup(rtcio, false)
+    esp32RtcIoPulldown(rtcio, false)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioLevel(gpio: u32, level: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoSetLevel(esp32RtcIoNumber(gpio), level)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioRead(gpio: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    return esp32RtcIoGetLevel(esp32RtcIoNumber(gpio))
+}
+
+trusted fun esp32RtcGpioDriveSet(gpio: u32, strength: u32): u32 {
+    if (!esp32RtcGpioValid(gpio) || gpio >= u32(34) || strength >= u32(4))
+        return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoSetDrive(esp32RtcIoNumber(gpio), strength)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioDriveGet(gpio: u32, output: u32): u32 {
+    if (!esp32RtcGpioValid(gpio) || gpio >= u32(34) || output == u32(0))
+        return esp32RtcGpioInvalidArgument
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(output)),
+        int(esp32RtcIoGetDrive(esp32RtcIoNumber(gpio)))
+    )
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioDirection(gpio: u32, mode: u32, sleep: bool): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    if (sleep) esp32RtcIoSetSleepDirection(esp32RtcIoNumber(gpio), mode)
+    else esp32RtcIoSetDirection(esp32RtcIoNumber(gpio), mode)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioPull(gpio: u32, pullup: bool, enable: bool): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    if (pullup) esp32RtcIoPullup(esp32RtcIoNumber(gpio), enable)
+    else esp32RtcIoPulldown(esp32RtcIoNumber(gpio), enable)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioIomuxFunction(gpio: u32, function: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoSelectIomuxFunction(esp32RtcIoNumber(gpio), function)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioIomuxInputValue(
+    gpio: u32, function: u32, signal: u32
+): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoIomuxInput(esp32RtcIoNumber(gpio), function)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioIomuxOutputValue(gpio: u32, function: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoIomuxOutput(esp32RtcIoNumber(gpio), function)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioHoldValue(gpio: u32, enable: bool): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoHold(esp32RtcIoNumber(gpio), enable)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioForceHoldAll(enable: bool): u32 {
+    esp32RtcEnterCritical()
+    esp32GpioUpdateRegister(
+        esp32RtcControlBase + u32(0xc8),
+        u32(0x3ffff),
+        if (enable) u32(0x3ffff) else u32(0)
+    )
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioIsolateValue(gpio: u32): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    val rtcio = esp32RtcIoNumber(gpio)
+    esp32RtcEnterCritical()
+    esp32RtcIoIsolate(rtcio)
+    esp32RtcIoHold(rtcio, true)
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+trusted fun esp32RtcGpioWakeupValue(
+    gpio: u32, interruptType: u32, enable: bool
+): u32 {
+    if (!esp32RtcGpioValid(gpio)) return esp32RtcGpioInvalidArgument
+    if (enable && interruptType != u32(4) && interruptType != u32(5))
+        return esp32RtcGpioInvalidArgument
+    esp32RtcEnterCritical()
+    esp32RtcIoWakeup(
+        esp32RtcIoNumber(gpio), interruptType, enable
+    )
+    esp32RtcExitCritical()
+    return esp32RtcGpioOk
+}
+
+
+trusted fun esp32RecoveredRtcGpioIsValidGpio(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = if (esp32RtcGpioValid(a2)) u32(1) else u32(0)
+
+trusted fun esp32RecoveredRtcIoNumberGet(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcIoNumber(a2)
+
+trusted fun esp32RecoveredRtcGpioInit(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioInitialize(a2)
+
+trusted fun esp32RecoveredRtcGpioSetLevel(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioLevel(a2, a3)
+
+trusted fun esp32RecoveredRtcGpioGetLevel(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioRead(a2)
+
+trusted fun esp32RecoveredRtcGpioSetDriveCapability(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioDriveSet(a2, a3)
+
+trusted fun esp32RecoveredRtcGpioGetDriveCapability(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioDriveGet(a2, a3)
+
+trusted fun esp32RecoveredRtcGpioSetDirection(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioDirection(a2, a3, false)
+
+trusted fun esp32RecoveredRtcGpioSetDirectionInSleep(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioDirection(a2, a3, true)
+
+trusted fun esp32RecoveredRtcGpioPullupEn(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioPull(a2, true, true)
+
+trusted fun esp32RecoveredRtcGpioPullupDis(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioPull(a2, true, false)
+
+trusted fun esp32RecoveredRtcGpioPulldownEn(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioPull(a2, false, true)
+
+trusted fun esp32RecoveredRtcGpioPulldownDis(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioPull(a2, false, false)
+
+trusted fun esp32RecoveredRtcGpioDeinit(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioDeinitialize(a2)
+
+trusted fun esp32RecoveredRtcGpioIomuxFuncSel(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioIomuxFunction(a2, a3)
+
+trusted fun esp32RecoveredRtcGpioIomuxInput(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioIomuxInputValue(a2, a3, a4)
+
+trusted fun esp32RecoveredRtcGpioIomuxOutput(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioIomuxOutputValue(a2, a3)
+
+trusted fun esp32RecoveredRtcGpioHoldEn(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioHoldValue(a2, true)
+
+trusted fun esp32RecoveredRtcGpioHoldDis(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioHoldValue(a2, false)
+
+trusted fun esp32RecoveredRtcGpioForceHoldEnAll(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioForceHoldAll(true)
+
+trusted fun esp32RecoveredRtcGpioForceHoldDisAll(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioForceHoldAll(false)
+
+trusted fun esp32RecoveredRtcGpioIsolate(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioIsolateValue(a2)
+
+trusted fun esp32RecoveredRtcGpioWakeupEnable(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioWakeupValue(a2, a3, true)
+
+trusted fun esp32RecoveredRtcGpioWakeupDisable(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 = esp32RtcGpioWakeupValue(a2, u32(0), false)
+

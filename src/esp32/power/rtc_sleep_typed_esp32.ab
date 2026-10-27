@@ -1,0 +1,350 @@
+import "../../xtensa/assembly.ab"
+import "../dport_esp32.ab"
+import "abla/unsafe/memory"
+
+// Typed ESP32 RTC sleep power configuration. Register addresses and fields are
+// from ESP32 rtc_cntl_reg.h and the ESP-IDF rtc_sleep implementation. Keeping
+// the policy as ordinary Abla lets LLVM combine adjacent masks and specialize
+// the packed configuration supplied by each sleep path.
+
+@inline
+fun esp32RtcSleepConfigBit(configuration: u32, shift: u32): u32 =
+    (configuration >>> shift) & u32(1)
+
+@inline
+trusted fun esp32RtcSleepUpdate(
+    address: u32,
+    clearMask: u32,
+    setMask: u32
+): void {
+    val current = xtensaDeviceLoadU32(address)
+    xtensaDeviceStoreU32(address, (current & ~clearMask) | setMask)
+}
+
+@inline
+trusted fun esp32RtcSleepSetBit(
+    address: u32,
+    mask: u32,
+    enabled: u32
+): void = esp32RtcSleepUpdate(
+    address,
+    mask,
+    if (enabled != u32(0)) mask else u32(0)
+)
+
+// ABI-compatible rtc_sleep_pd_config_t: bits 0..6 are digital, RTC memory,
+// CPU memory, I2S, baseband, NRX, and front-end power-down requests.
+@section(".iram1.abla.esp32RtcSleepPd")
+trusted fun esp32RtcSleepPd(configuration: u32): void {
+    val digitalPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(0))
+    val rtcPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(1))
+    val cpuPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(2))
+    val i2sPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(3))
+    val basebandPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(4))
+    val nrxPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(5))
+    val frontEndPu = u32(1) ^ esp32RtcSleepConfigBit(configuration, u32(6))
+
+    esp32RtcSleepSetBit(u32(0x3ff48084), u32(0x10), digitalPu)
+    esp32RtcSleepUpdate(
+        u32(0x3ff48080),
+        u32(0x900),
+        (rtcPu << u32(11)) | (rtcPu << u32(8))
+    )
+    esp32DportUpdate(u32(0x3ff0008c), u32(1), cpuPu)
+    esp32RtcSleepUpdate(
+        u32(0x3ff4f0a4),
+        u32(0x0a),
+        (i2sPu << u32(3)) | (i2sPu << u32(1))
+    )
+    esp32RtcSleepUpdate(
+        u32(0x3ff5d054),
+        u32(0x0a),
+        (basebandPu << u32(3)) | (basebandPu << u32(1))
+    )
+    esp32RtcSleepUpdate(
+        u32(0x3ff5ccd4),
+        u32(0x2a),
+        (nrxPu << u32(5)) | (nrxPu << u32(3)) | (nrxPu << u32(1))
+    )
+    esp32RtcSleepSetBit(u32(0x3ff46090), u32(0x20), frontEndPu)
+    esp32RtcSleepSetBit(u32(0x3ff450f0), u32(0x400), frontEndPu)
+}
+
+trusted fun esp32RtcSleepGetDefaultConfig(
+    sleepFlags: u32,
+    outputAddress: u32
+): void {
+    var configuration =
+        (((sleepFlags >>> u32(4)) & u32(1)) << u32(2)) |
+        (((sleepFlags >>> u32(3)) & u32(1)) << u32(3)) |
+        (((sleepFlags >>> u32(2)) & u32(1)) << u32(4)) |
+        (((sleepFlags >>> u32(1)) & u32(1)) << u32(5)) |
+        (((sleepFlags >>> u32(6)) & u32(1)) << u32(6)) |
+        (((sleepFlags >>> u32(8)) & u32(1)) << u32(7)) |
+        ((sleepFlags & u32(1)) << u32(9)) |
+        u32(0x19000000) |
+        (((sleepFlags >>> u32(5)) & u32(1)) << u32(25)) |
+        (((u32(1) ^ (sleepFlags >>> u32(7))) & u32(1)) << u32(26))
+
+    // Both wake biases use 1.10 V (encoding 4).
+    configuration = configuration | u32(0x00082000)
+
+    if ((sleepFlags & u32(1)) != u32(0)) {
+        // Deep sleep uses the 0.90 V encoding (zero) while asleep.
+        if ((sleepFlags & u32(0x100)) != u32(0)) {
+            configuration = configuration | u32(0x60000000)
+        }
+    } else {
+        val sleepBias = if (
+            (sleepFlags & u32(0x100)) == u32(0)
+        ) u32(4) else u32(0)
+        configuration = configuration |
+            (sleepBias << u32(14)) |
+            (sleepBias << u32(20)) |
+            u32(0x80000000)
+    }
+
+    if ((sleepFlags & u32(0x8000)) == u32(0)) {
+        configuration = configuration | u32(0x00800000)
+    }
+
+    ablaUnsafeStoreU32(
+        nativePointerFromAddress(int(outputAddress)),
+        int(configuration)
+    )
+}
+
+// ABI-compatible rtc_sleep_config_t packed into one u32:
+//  0 lslp_mem_inf_fpu       17..19 rtc_dbias_wak
+//  1 rtc_mem_inf_fpu        20..22 rtc_dbias_slp
+//  2 rtc_mem_inf_follow_cpu 23 dbias_follow_8m
+//  3 rtc_fastmem_pd_en      24 lslp_meminf_pd
+//  4 rtc_slowmem_pd_en      25 vddsdio_pd_en
+//  5 rtc_peri_pd_en         26 xtal_fpu
+//  6 modem_pd_en            27 deep_slp_reject
+//  7 int_8m_pd_en           28 light_slp_reject
+//  8 rom_mem_pd_en          29..30 dbg_atten_slp
+//  9 deep_slp
+// 11..13 dig_dbias_wak, 14..16 dig_dbias_slp
+trusted fun esp32RtcSleepInit(configuration: u32): void {
+    // TIMER3 and TIMER4 cover all 32 bits. Each power-up/wait field is one.
+    // TIMER5 preserves its low byte while setting memory timers and the
+    // hardware minimum sleep value (128 cycles).
+    xtensaDeviceStoreU32(u32(0x3ff48024), u32(0x02010201))
+    xtensaDeviceStoreU32(u32(0x3ff48028), u32(0x02010201))
+    esp32RtcSleepUpdate(
+        u32(0x3ff4802c),
+        u32(0xffffff00),
+        u32(0x02018000)
+    )
+
+    esp32RtcSleepSetBit(
+        u32(0x3ff48084),
+        u32(0x10),
+        esp32RtcSleepConfigBit(configuration, u32(0))
+    )
+
+    val allPowerDown = if (
+        esp32RtcSleepConfigBit(configuration, u32(24)) != u32(0)
+    ) u32(0x7f) else u32(0)
+    esp32RtcSleepPd(allPowerDown)
+
+    esp32RtcSleepSetBit(
+        u32(0x3ff48080),
+        u32(0x12000),
+        esp32RtcSleepConfigBit(configuration, u32(1))
+    )
+    esp32RtcSleepSetBit(
+        u32(0x3ff48080),
+        u32(0x240),
+        esp32RtcSleepConfigBit(configuration, u32(2))
+    )
+
+    val fastMemoryDown = esp32RtcSleepConfigBit(configuration, u32(3))
+    esp32RtcSleepUpdate(
+        u32(0x3ff48080),
+        u32(0x6001),
+        if (fastMemoryDown != u32(0)) u32(0x4000) else u32(0x2001)
+    )
+
+    val slowMemoryDown = esp32RtcSleepConfigBit(configuration, u32(4))
+    esp32RtcSleepUpdate(
+        u32(0x3ff48080),
+        u32(0x30004),
+        if (slowMemoryDown != u32(0)) u32(0x20000) else u32(0x10004)
+    )
+
+    esp32RtcSleepSetBit(
+        u32(0x3ff48080),
+        u32(0x100000),
+        esp32RtcSleepConfigBit(configuration, u32(5))
+    )
+
+    if (esp32RtcSleepConfigBit(configuration, u32(6)) != u32(0)) {
+        esp32RtcSleepUpdate(u32(0x3ff48088), u32(0x20000000), u32(0))
+        esp32RtcSleepUpdate(
+            u32(0x3ff48084),
+            u32(0x40040000),
+            u32(0x40000000)
+        )
+    } else {
+        esp32RtcSleepUpdate(u32(0x3ff48084), u32(0x40000000), u32(0))
+    }
+
+    esp32RtcSleepSetBit(
+        u32(0x3ff48084),
+        u32(0x3f000000),
+        esp32RtcSleepConfigBit(configuration, u32(8))
+    )
+
+    if (esp32RtcSleepConfigBit(configuration, u32(9)) != u32(0)) {
+        esp32RtcSleepUpdate(u32(0x3ff48088), u32(0x3000), u32(0))
+        esp32RtcSleepUpdate(
+            u32(0x3ff48084),
+            u32(0x80180000),
+            u32(0x80000000)
+        )
+        esp32RtcSleepUpdate(u32(0x3ff48000), u32(0x00100080), u32(0))
+        esp32RtcSleepUpdate(u32(0x3ff48030), u32(0xd8000000), u32(0))
+    } else {
+        esp32RtcSleepUpdate(u32(0x3ff48084), u32(0x80000000), u32(0))
+    }
+
+    esp32RtcSleepSetBit(
+        u32(0x3ff48000),
+        u32(0x2000),
+        esp32RtcSleepConfigBit(configuration, u32(26))
+    )
+
+    val internal8mPowerUp = u32(1) ^
+        esp32RtcSleepConfigBit(configuration, u32(7))
+    esp32RtcSleepSetBit(u32(0x3ff48070), u32(0x04000000), internal8mPowerUp)
+
+    val follow8m = esp32RtcSleepConfigBit(configuration, u32(23))
+    esp32RtcSleepSetBit(
+        u32(0x3ff48000),
+        u32(0x00124000),
+        follow8m
+    )
+
+    // Let the RTC state machine control VDDSDIO and select its sleep policy.
+    esp32RtcSleepUpdate(
+        u32(0x3ff48074),
+        u32(0x00600000),
+        esp32RtcSleepConfigBit(configuration, u32(25)) << u32(21)
+    )
+
+    val rtcBias =
+        (((configuration >>> u32(20)) & u32(7)) << u32(22)) |
+        (((configuration >>> u32(17)) & u32(7)) << u32(25)) |
+        (((configuration >>> u32(11)) & u32(7)) << u32(11)) |
+        (((configuration >>> u32(14)) & u32(7)) << u32(8))
+    esp32RtcSleepUpdate(u32(0x3ff4807c), u32(0x0fc03f00), rtcBias)
+
+    esp32RtcSleepUpdate(
+        u32(0x3ff48078),
+        u32(0x03000000),
+        ((configuration >>> u32(29)) & u32(3)) << u32(24)
+    )
+    esp32RtcSleepUpdate(
+        u32(0x3ff48064),
+        u32(0x0c000000),
+        (esp32RtcSleepConfigBit(configuration, u32(27)) << u32(27)) |
+        (esp32RtcSleepConfigBit(configuration, u32(28)) << u32(26))
+    )
+}
+
+// Program the RTC state-machine delays. The only run-time conversion in the
+// light-sleep path is (1000 us * 2^19) / calibrated slow-clock period; the
+// numerator fits in u32, so the generic 64-bit division helper is unnecessary.
+@section(".iram1.0.abla.esp32RtcSleepLowInit")
+trusted fun esp32RtcSleepLowInit(
+    slowClockPeriod: u32,
+    deepSleep: u32
+): void {
+    val deep = (deepSleep & u32(0xff)) != u32(0)
+    val pllWait = if (deep) u32(20) else u32(1)
+    val xtalWait = if (deep)
+        u32(20)
+    else
+        (u32(524288000) / slowClockPeriod) & u32(0x3ff)
+    val internal8mWait = if (deep) u32(20) else u32(4)
+
+    esp32RtcSleepUpdate(
+        u32(0x3ff4801c),
+        u32(0xffffffc0),
+        (pllWait << u32(24)) |
+        (xtalWait << u32(14)) |
+        (internal8mWait << u32(6))
+    )
+}
+
+@inline
+trusted fun esp32RtcSleepPrepare(
+    wakeupOptions: u32,
+    rejectOptions: u32
+): void {
+    esp32RtcSleepUpdate(
+        u32(0x3ff48038),
+        u32(0x003ff800),
+        (wakeupOptions & u32(0x7ff)) << u32(11)
+    )
+
+    val rejectSources =
+        (if ((rejectOptions & u32(4)) != u32(0))
+            u32(0x01000000) else u32(0)) |
+        (if ((rejectOptions & u32(16)) != u32(0))
+            u32(0x02000000) else u32(0))
+    if (rejectSources != u32(0)) {
+        esp32RtcSleepUpdate(u32(0x3ff48064), u32(0), rejectSources)
+    }
+
+    esp32RtcSleepUpdate(u32(0x3ff48048), u32(0), u32(3))
+}
+
+@inline
+trusted fun esp32RtcSleepFinish(): u32 {
+    val interruptStatus = xtensaDeviceLoadU32(u32(0x3ff48040))
+    esp32RtcSleepUpdate(u32(0x3ff48048), u32(0), u32(3))
+    esp32RtcSleepUpdate(u32(0x3ff48078), u32(0), u32(0x03000000))
+    return (interruptStatus >>> u32(1)) & u32(1)
+}
+
+@section(".iram1.0.abla.esp32RtcSleepStart")
+trusted fun esp32RtcSleepStart(
+    wakeupOptions: u32,
+    rejectOptions: u32
+): u32 {
+    esp32RtcSleepPrepare(wakeupOptions, rejectOptions)
+    esp32RtcSleepUpdate(u32(0x3ff48018), u32(0), u32(0x80000000))
+
+    while ((xtensaDeviceLoadU32(u32(0x3ff48040)) & u32(3)) == u32(0)) { }
+    return esp32RtcSleepFinish()
+}
+
+// This remains ordinary typed Abla, but the generated instruction window from
+// RTC_MEM_CRC_START through RTC_CNTL_SLEEP_EN must be audited after codegen:
+// the stack may itself reside in RTC fast memory and cannot be written after
+// its CRC has been calculated. Keeping the values scalar and the helpers
+// inline gives LLVM enough visibility to hold the short sequence in registers.
+@section(".iram1.abla.esp32RtcDeepSleepStart")
+trusted fun esp32RtcDeepSleepStart(
+    wakeupOptions: u32,
+    rejectOptions: u32
+): u32 {
+    esp32RtcSleepPrepare(wakeupOptions, rejectOptions)
+
+    val crcControl = u32(0x3ff48100)
+    xtensaDeviceStoreU32(crcControl, u32(0x7ff00001))
+    xtensaDeviceStoreU32(crcControl, u32(0x7ff00101))
+    while ((xtensaDeviceLoadU32(crcControl) & u32(0x80000000)) == u32(0)) { }
+    esp32RtcSleepUpdate(crcControl, u32(0x100), u32(0))
+    xtensaDeviceStoreU32(
+        u32(0x3ff480bc),
+        xtensaDeviceLoadU32(u32(0x3ff48104))
+    )
+
+    esp32RtcSleepUpdate(u32(0x3ff48018), u32(0), u32(0x80000000))
+    while ((xtensaDeviceLoadU32(u32(0x3ff48040)) & u32(3)) == u32(0)) { }
+    return esp32RtcSleepFinish()
+}

@@ -1,0 +1,65 @@
+import "./sleep_policy_p4_sequence.ab"
+import "./wake_trigger_p4_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Light-sleep PMU profile + reject policy + EXT1 source ownership.388B:
+// header32 magic,state,primary,cleanup,hart,reserved3; profile180@32,
+// wakeSource160@212, policy64@372, trigger64@380. Children never independent.
+// Caller holds both harts/PMU/RCC/pads exclusive, MIEoff, sources powered;
+// no sleep entry until ready, cleanup only after memory/CPU recovery or abort.
+// Trigger mask parked FIRST and restored LAST; no SLEEP_REQ or cause clearing.
+// States1ready3partial4closed. Results1ready2invalid3park4profile5policy
+// 6source7arm8closed9cleanup. Failures retain snapshots and primary cause.
+trusted fun p4PolicySessionLoad(r: NativeBuffer,offset: int): int = r.loadU32(offset)|(r.loadU32(offset+4)<<32)
+trusted fun p4PolicySessionStore(r: NativeBuffer,offset: int,value: int): void {
+    r.storeU32(offset,value&0xffffffff);r.storeU32(offset+4,value>>>32);return
+}
+trusted fun esp32p4SleepPolicySessionOpenOwned(r: NativeBuffer,c: NativeBuffer,revision: int,selection: u32,levels: u32,pull: int,filter: bool,rejectMask: u32,rejectEnabled: bool,minHp: int,protection: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,388) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        !p4PolicyProfileValid(c,revision) || (r.addressValue() < c.addressValue()+108 && c.addressValue() < r.addressValue()+388) ||
+        selection == u32(0) || selection > u32(65535) || (levels&~selection) != u32(0) || pull < 0 || pull > 2 ||
+        rejectMask > u32(0xfffff) || minHp < 0 || minHp > 255 || protection < 0 || protection > 3 ||
+        p4PolicyHart() > u32(1) || (p4PolicyStatus()&u32(8)) != u32(0)) return 2
+    var i=4
+    while (i < 388) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50345053);r.storeU32(4,3);r.storeU32(16,int(p4PolicyHart()))
+    var trigger=esp32p4WakeTriggerParkOwned(true);p4PolicySessionStore(r,380,trigger|0)
+    var result=3
+    if (trigger.status() == 5) {
+        result=4
+        if (p4PolicyProfileOpen(nativeBufferAt(r.addressValue()+32,180),c,revision) == 1) {
+            val policy=esp32p4SleepPolicyOpenOwned(rejectMask,rejectEnabled,minHp,protection,true)
+            p4PolicySessionStore(r,372,policy|0);result=5
+            if (policy.status() == 1) {
+                result=6
+                if (p4PolicySourceOpen(nativeBufferAt(r.addressValue()+212,160),selection,levels,pull,filter,if (revision >= 300) 3 else 1) == 1) {
+                    trigger=trigger.configureOwned(esp32p4WakeTriggerExt1(),true)
+                    p4PolicySessionStore(r,380,trigger|0);result=7
+                    if (trigger.status() == 1) { r.storeU32(4,1);return 1 }
+                }
+            }
+        }
+    }
+    r.storeU32(8,result);return result
+}
+trusted fun esp32p4SleepPolicySessionCloseOwned(r: NativeBuffer,exclusiveRecovered: bool): int {
+    if (!exclusiveRecovered || !r.hasAddressRange(0,388) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50345053 ||
+        int(p4PolicyHart()) != r.loadU32(16) || (p4PolicyStatus()&u32(8)) != u32(0)) return 2
+    if (r.loadU32(4) == 4) return 8
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 2
+    r.storeU32(4,3)
+    var trigger=P4WakeTrigger(p4PolicySessionLoad(r,380))
+    trigger=trigger.parkOwned(true);p4PolicySessionStore(r,380,trigger|0)
+    if (trigger.status() != 5) { r.storeU32(12,3);return 9 }
+    val source=nativeBufferAt(r.addressValue()+212,160)
+    if (source.loadU32(0) != 0 && p4PolicySourceClose(source) != 8) { r.storeU32(12,6);return 9 }
+    var policy=P4SleepPolicy(p4PolicySessionLoad(r,372))
+    if (policy.hasSnapshot()) {
+        policy=policy.closeOwned(true);p4PolicySessionStore(r,372,policy|0)
+        if (policy.status() != 4) { r.storeU32(12,5);return 9 }
+    }
+    val profile=nativeBufferAt(r.addressValue()+32,180)
+    if (profile.loadU32(0) != 0 && p4PolicyProfileClose(profile) != 8) { r.storeU32(12,4);return 9 }
+    trigger=trigger.closeOwned(true);p4PolicySessionStore(r,380,trigger|0)
+    if (trigger.status() != 4) { r.storeU32(12,7);return 9 }
+    r.storeU32(12,0);r.storeU32(4,4);return 8
+}

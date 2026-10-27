@@ -1,0 +1,51 @@
+import "./stream_tx_c6_sequence.ab"
+import "./standard_tx_c6_sequence.ab"
+import "../../audio/buzzer_source_block.ab"
+// Refill one released circular-DMA block from the existing queued mixer.
+// Ring must be prefilled from these same sources/encoder before starting; their
+// current positions/remainder follow that prefill. Configured frame rate must
+// equal the queue rate, standard stereo16/MSB-first/LE, no mono copy/padding.
+// Retained staging is separate from DMA payload. Producer release is safe after
+// synchronous copy + publication because DMA reads the COPY, not staging.
+// Own start/cursor/producer, sources, all workspaces and ring for the lifetime.
+// Keep the same producer/staging across retries. No IRQ ack/start/stop/reset.
+//1published2invalid3latched failure5DMA-owned. Never rerender a prepared block.
+trusted fun c6BuzzerStreamWorkSafe(r: NativeBuffer,q: NativeBuffer,buffer: NativeBuffer,bytes: int): bool {
+    return buffer.hasAddressRange(0,bytes) && !pcmMixSpansOverlap(buffer,bytes,r,72) && !pcmMixSpansOverlap(buffer,bytes,q,32) &&
+        !pcmMixSpansOverlap(buffer,bytes,nativeBufferAt(r.loadU32(20),r.loadU32(24)*12),r.loadU32(24)*12) &&
+        !pcmMixSpansOverlap(buffer,bytes,nativeBufferAt(r.loadU32(28),(r.loadU32(24)-1)*r.loadU32(32)+r.loadU32(36)),(r.loadU32(24)-1)*r.loadU32(32)+r.loadU32(36))
+}
+// Prepare and synchronously copy, but leave OWNER with CPU. Shared by ordinary
+// refill and final-tail sealing. Repeating this phase copies retained staging;
+// it never advances sources twice. Caller must publish or retain all resources.
+trusted fun c6BuzzerStreamPrepareOwned(r: NativeBuffer,q: NativeBuffer,producer: NativeBuffer,sources: PcmSourceQueues,configuredRate: int,accumulator: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,staging: NativeBuffer,volume: PcmVolume,exclusive: bool): int {
+    if (!exclusive || !c6I2sStreamLayout(r,q) || !buzzerSourceBlockValid(producer) || !volume.valid() || !sources.valid() || sources.queue(0).storage().loadU32(4) != configuredRate) return 2
+    val bytes=r.loadU32(36);val frames=bytes>>>2
+    if (!c6I2sUpdateClocks(true) || (c6I2sRead(0x24)&u32(0x107)) != u32(4) || (c6I2sRead(0x24)&u32(0x1fbce8)) != u32(0x8b000) ||
+        (c6I2sRead(0x2c)&u32(0x3fffe07f)) != u32(c6I2sStereoFrameWord(16,16,16,false)) || (c6I2sRead(0x54)&u32(0x1fffff)) != u32(0x10003)) return 2
+    if (!c6BuzzerStreamWorkSafe(r,q,producer,24) || !c6BuzzerStreamWorkSafe(r,q,accumulator,frames*8) || !c6BuzzerStreamWorkSafe(r,q,scratch,frames*4) || !c6BuzzerStreamWorkSafe(r,q,mono,frames*2) || !c6BuzzerStreamWorkSafe(r,q,staging,bytes) ||
+        !sources.disjointFrom(r,72) || !sources.disjointFrom(q,32) || !sources.disjointFrom(producer,24) || !sources.disjointFrom(nativeBufferAt(r.loadU32(20),r.loadU32(24)*12),r.loadU32(24)*12) ||
+        !sources.disjointFrom(nativeBufferAt(r.loadU32(28),(r.loadU32(24)-1)*r.loadU32(32)+bytes),(r.loadU32(24)-1)*r.loadU32(32)+bytes)) return 2
+    if (producer.loadU32(4) == 2 && (producer.loadU32(12) != frames || producer.loadU32(16) != staging.addressValue() || producer.loadU32(20) != bytes)) return 2
+    val acquired=c6I2sStreamAcquireOwned(r,q,true)
+    if (acquired != 1) return acquired
+    if (producer.loadU32(4) != 2) {
+        val prepared=buzzerSourceBlockPrepareOwned(producer,sources,frames,accumulator,scratch,mono,staging,volume,true)
+        if (prepared != 1) return if (prepared == 2) 2 else 3
+    }
+    val output=c6I2sStreamWritableBuffer(r,q)
+    if (!output.hasAddressRange(0,bytes)) return 3
+    var at=0
+    while (at < bytes) {
+        if (!output.storeU32(at,staging.loadU32(at))) return 3
+        at=at+4
+    }
+    return 1
+}
+trusted fun c6BuzzerStreamRefillOwned(r: NativeBuffer,q: NativeBuffer,producer: NativeBuffer,sources: PcmSourceQueues,configuredRate: int,accumulator: NativeBuffer,scratch: NativeBuffer,mono: NativeBuffer,staging: NativeBuffer,volume: PcmVolume,exclusive: bool): int {
+    val prepared=c6BuzzerStreamPrepareOwned(r,q,producer,sources,configuredRate,accumulator,scratch,mono,staging,volume,exclusive)
+    if (prepared != 1) return prepared
+    val published=c6I2sStreamPublishOwned(r,q,true,true)
+    if (published != 1) return published
+    return if (buzzerSourceBlockReleaseOwned(producer,true,true)) 1 else 3
+}

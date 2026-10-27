@@ -1,0 +1,68 @@
+import "../sdk/raw_buffer.ab"
+import "./standard_tx_c6_sequence.ab"
+import "./standard_rx_c6_sequence.ab"
+import "./update_c6_sequence.ab"
+// 44B retained alignedRAM: tag0,state4,TX8,primary12,oldCONF16,
+// oldCONF1@20,oldconverter28(TX only, RX reserved),oldslots24,update64@32,phase40.
+// states1ready2pending3partial4closing5closed; returns1ready2invalid3failure
+// 4pending5closed. Clock/divider/pad/GDMA/FIFO initialization is separate;
+// exclusively own both stopped directions and codec/clock consumers throughout.
+// Configures standard uncompressed PCM (bypass), not A-law/u-law conversion.
+// No reset/FIFO discard/start. Close restores fields AND latches restoration.
+fun c6I2sStandardStorage(r: NativeBuffer): bool = r.hasAddressRange(0,44) && (r.addressValue()&3) == 0 && (r.addressValue()+44 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6I2sStandardValid(r: NativeBuffer): bool = c6I2sStandardStorage(r) && r.loadU32(0) == 0x43364953 && r.loadU32(8) <= 1
+trusted fun c6I2sStandardSaveUpdate(r: NativeBuffer,u: C6I2sUpdate): void { r.storeU32(32,u|0);r.storeU32(36,u>>>32);return }
+trusted fun c6I2sStandardWaitOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6I2sStandardValid(r) || polls < 1 || polls > 1000000 || (r.loadU32(40) != 1 && r.loadU32(40) != 3)) return 2
+    val update=C6I2sUpdate(r.loadU32(32)|(r.loadU32(36)<<32)).waitOwned(polls,true)
+    c6I2sStandardSaveUpdate(r,update)
+    if (!update.complete()) return if (update.status() == 5) 4 else 3
+    if (r.loadU32(40) == 3) { r.storeU32(4,5);r.storeU32(40,0);return 5 }
+    r.storeU32(40,0)
+    if (r.loadU32(4) != 4) r.storeU32(4,1)
+    return 1
+}
+trusted fun c6I2sStandardOpenOwned(r: NativeBuffer,dataBits: int,slotBits: int,wsWidth: int,shift: bool,polls: int,exclusive: bool,transmit: bool=true,slave: bool=false,stopMode: int=0): int {
+    if (!exclusive || !c6I2sStandardStorage(r) || c6I2sStereoFrameWord(dataBits,slotBits,wsWidth,shift) < 0 || polls < 1 || polls > 1000000 || stopMode < 0 || stopMode > 2 || (transmit && (slave || stopMode != 0))) return 2
+    if (r.loadU32(0) != 0) return 2
+    if (!c6I2sUpdateClocks(transmit) || !c6I2sStopped()) return 3
+    val conf=if (transmit) 0x24 else 0x20
+    r.storeU32(0,0x43364953);r.storeU32(4,3);r.storeU32(8,if (transmit) 1 else 0);r.storeU32(12,0)
+    r.storeU32(16,int(c6I2sRead(conf)));r.storeU32(20,int(c6I2sRead(conf+8)))
+    r.storeU32(24,int(c6I2sRead(if (transmit) 0x54 else 0x50)))
+    r.storeU32(28,if (transmit) int(c6I2sRead(0x40)) else 0);r.storeU32(32,0);r.storeU32(36,0);r.storeU32(40,0)
+    val configured=if (transmit) c6I2sConfigureStereoTxOwned(dataBits,slotBits,wsWidth,shift,true) else c6I2sConfigureStereoRxOwned(dataBits,slotBits,wsWidth,shift,true,slave,stopMode)
+    if (configured != 1) { r.storeU32(12,0x20000|configured);return 3 }
+    val update=c6I2sUpdateBeginOwned(0,transmit,polls,true)
+    c6I2sStandardSaveUpdate(r,update)
+    if ((update&512) != 0) r.storeU32(40,1)
+    if (!update.complete()) {
+        r.storeU32(4,if (update.status() == 5) 2 else 3);r.storeU32(12,0x40000|update.status())
+        return if (update.status() == 5) 4 else 3
+    }
+    r.storeU32(40,0);r.storeU32(4,1);return 1
+}
+trusted fun c6I2sStandardCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6I2sStandardValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 5) return 5
+    r.storeU32(4,4)
+    if (r.loadU32(40) == 1 || r.loadU32(40) == 3) {
+        val result=c6I2sStandardWaitOwned(r,polls,true)
+        if (result != 1) return result
+    }
+    val transmit=r.loadU32(8) != 0
+    if (!c6I2sUpdateClocks(transmit) || !c6I2sStopped()) return 3
+    val conf=if (transmit) 0x24 else 0x20
+    r.storeU32(40,2)
+    val slotsMask=if (transmit) u32(0x1fffff) else u32(0xfffff)
+    val confMask=if (transmit) u32(0x1fbce8) else u32(0x1ffea8)
+    if ((transmit && !c6I2sTxField(0x40,u32(0x2000000),u32(r.loadU32(28))&u32(0x2000000))) ||
+        !c6I2sTxField(if (transmit) 0x54 else 0x50,slotsMask,u32(r.loadU32(24))&slotsMask) ||
+        !c6I2sTxField(conf+8,u32(0x3fffe07f),u32(r.loadU32(20))&u32(0x3fffe07f)) ||
+        !c6I2sTxField(conf,confMask,u32(r.loadU32(16))&confMask)) return 3
+    val update=c6I2sUpdateBeginOwned(0,transmit,polls,true)
+    c6I2sStandardSaveUpdate(r,update)
+    if ((update&512) != 0) r.storeU32(40,3)
+    if (!update.complete()) return if (update.status() == 5) 4 else 3
+    r.storeU32(40,0);r.storeU32(4,5);return 5
+}

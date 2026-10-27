@@ -1,0 +1,73 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Pure PAU/REGDMA hardware descriptor encoder. No heap, SDK metadata, MMIO or
+// activation. Hardware pointers address the HEAD, not IDF's preceding stat.
+// Caller supplies retained DMA-accessible memory and owns disconnected lists;
+// validate whole graph, register safety, buffers and cache visibility before
+// publishing to PAU. WAIT nodes require a hardware timeout policy externally.
+// Config56B: hardware head@0; next[4]@4; backup20,restore24,memory28;
+// bitmap[4]32; write/wait value48,mask52. Reserved head bits must be zero.
+// Output: head,next[1 or4],backup,restore+memory OR value+mask,optional bitmap.
+// Copy modes0continuous/1bitmap; command modes2write/3wait. Length low10;
+// mode16..19,branch28,skipRestore29,skipBackup30,eof31. Addresses are u32.
+fun p4RetentionAddressSpan(address: int,bytes: int): bool =
+    address > 0 && address <= 0xffffffff && (address&3) == 0 && bytes >= 0 && bytes <= 0x100000000-address
+fun p4RetentionDescriptorBytes(head: int): int =
+    20+(if ((head&0x10000000) != 0) 12 else 0)+(if (((head>>>16)&15) == 1) 16 else 0)
+trusted fun esp32p4RetentionDescriptorEncode(out: NativeBuffer,c: NativeBuffer): bool {
+    if (!c.hasAddressRange(0,56) || (c.addressValue()&3) != 0) return false
+    val head=c.loadU32(0)
+    val mode=(head>>>16)&15
+    val count=head&1023
+    if ((head&0x0ffcfc00) != 0 || mode > 3 || (mode < 2 && count == 0) || (mode >= 2 && count != 0)) return false
+    val bytes=p4RetentionDescriptorBytes(head)
+    if (!out.hasAddressRange(0,bytes) || (out.addressValue()&3) != 0 ||
+        (out.addressValue() < c.addressValue()+56 && c.addressValue() < out.addressValue()+bytes)) return false
+    val branches=if ((head&0x10000000) != 0) 4 else 1
+    // Upstream branch nodes are nonterminal; terminate through a leaf node.
+    if (branches == 4 && (head&0x80000000) != 0) return false
+    var anyNext=false
+    var i=0
+    while (i < 4) {
+        val next=c.loadU32(4+i*4)
+        if (i >= branches && next != 0) return false
+        if (next != 0) {
+            if (!p4RetentionAddressSpan(next,4)) return false
+            anyNext=true
+        }
+        i=i+1
+    }
+    if (((head&0x80000000) == 0) != anyNext) return false
+    var registerBytes=count*4
+    if (mode == 1) {
+        var selected=0
+        var highest=0
+        i=0
+        while (i < 128) {
+            if ((c.loadU32(32+(i/32)*4)&(1<<(i%32))) != 0) { selected=selected+1;highest=i+1 }
+            i=i+1
+        }
+        if (selected != count) return false
+        registerBytes=highest*4
+    }
+    if (mode < 2) {
+        if (((head&0x40000000) == 0 && !p4RetentionAddressSpan(c.loadU32(20),registerBytes)) ||
+            ((head&0x20000000) == 0 && !p4RetentionAddressSpan(c.loadU32(24),registerBytes)) ||
+            !p4RetentionAddressSpan(c.loadU32(28),count*4)) return false
+        // Backup storage may not overwrite the descriptor being traversed.
+        val memory=c.loadU32(28)
+        if (memory < out.addressValue()+bytes && out.addressValue() < memory+count*4) return false
+    } else if (!p4RetentionAddressSpan(c.loadU32(20),4)) return false
+    // All preflight finished: rejected configurations leave output untouched.
+    i=0
+    while (i < branches) { out.storeU32(4+i*4,c.loadU32(4+i*4));i=i+1 }
+    val body=4+branches*4
+    out.storeU32(body,c.loadU32(20))
+    out.storeU32(body+4,c.loadU32(if (mode < 2) 24 else 48))
+    out.storeU32(body+8,c.loadU32(if (mode < 2) 28 else 52))
+    if (mode == 1) {
+        i=0
+        while (i < 4) { out.storeU32(body+12+i*4,c.loadU32(32+i*4));i=i+1 }
+    }
+    out.storeU32(0,head);return true
+}

@@ -1,0 +1,67 @@
+import "../sdk/raw_buffer.ab"
+// Caller-owned64B session. Status1 prepared,2 running,3 cleanup required,4 closed.
+// Header: magic0/status4/channel8/desc12/count16/payload20/block24/cursor28,
+// actualrate32/preparation36/start40/stop44/pump48..55/possiblyrunning56.
+// Keep record/ring/pads/clocks exclusively owned through close. Close confirms
+// I2S stop+GDMA park, not pad restoration or shared clock shutdown. Prepared
+// pin routing stays installed; its old/new users remain caller-owned.
+trusted fun esp32s3PdmSessionValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,64) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x50444d31
+trusted fun esp32s3PdmSessionStatus(r: NativeBuffer): int = if (esp32s3PdmSessionValid(r)) r.loadU32(4) else 0
+trusted fun esp32s3PdmSessionRate(r: NativeBuffer): int = if (esp32s3PdmSessionValid(r)) r.loadU32(32) else 0
+trusted fun esp32s3PdmSessionBeginOwned(r: NativeBuffer,pins: PdmPins,slots: int,pcm: bool,downsample128: bool,
+    invertClock: bool,rate: int,source: int,sourceHz: int,bitDivider: int,channel: int,
+    descriptors: int,count: int,buffers: int,blockBytes: int,owner: u32,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 ||
+        !esp32s3GdmaRingLayoutValid(descriptors,count,buffers,blockBytes,blockBytes) ||
+        (r.addressValue() < descriptors+count*12 && descriptors < r.addressValue()+64) ||
+        (r.addressValue() < buffers+count*blockBytes && buffers < r.addressValue()+64)) return 0
+    if (r.loadU32(0) != 0 && (!esp32s3PdmSessionValid(r) || r.loadU32(4) != 4)) return 0
+    r.storeU32(0,0x50444d31);r.storeU32(4,3);r.storeU32(8,channel);r.storeU32(12,descriptors)
+    r.storeU32(16,count);r.storeU32(20,buffers);r.storeU32(24,blockBytes);r.storeU32(28,0)
+    r.storeU32(32,0);r.storeU32(36,0);r.storeU32(40,0);r.storeU32(44,0)
+    r.storeU32(48,0);r.storeU32(52,0);r.storeU32(56,0);r.storeU32(60,0)
+    val result=esp32s3PreparePdmReceiveDma(pins,slots,pcm,downsample128,invertClock,rate,source,sourceHz,bitDivider,channel,descriptors,count,buffers,blockBytes,owner)
+    r.storeU32(36,result|0)
+    if (!result.valid()) return 3
+    r.storeU32(32,result.sampleRate());r.storeU32(4,1);return 1
+}
+trusted fun esp32s3PdmSessionStartOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || esp32s3PdmSessionStatus(r) != 1 || polls < 1 || polls > 1000000) return 0
+    r.storeU32(4,3);r.storeU32(56,1)
+    val result=esp32s3I2sStartStream(0,false,r.loadU32(8),r.loadU32(12),polls)
+    r.storeU32(40,result)
+    if (result != 1) return 3
+    r.storeU32(4,2);return 2
+}
+trusted fun esp32s3PdmSessionReadOwned(r: NativeBuffer,buffer: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    if (!exclusive || esp32s3PdmSessionStatus(r) != 2 || polls < 1 || polls > 1000000) return Esp32S3GdmaPumpResult(2)
+    val desc=r.loadU32(12);val count=r.loadU32(16);val payload=r.loadU32(20)
+    val bytes=r.loadU32(24);val cursor=r.loadU32(28);val address=buffer.addressValue()
+    if (!esp32s3GdmaRingLayoutValid(desc,count,payload,bytes,bytes) || cursor >= count || !buffer.hasAddressRange(0,bytes) ||
+        (address < r.addressValue()+64 && r.addressValue() < address+bytes) ||
+        (address < desc+count*12 && desc < address+bytes) ||
+        (address < payload+count*bytes && payload < address+bytes)) return Esp32S3GdmaPumpResult(2)
+    var result=esp32s3GdmaPumpBlock(r.loadU32(8),false,desc,count,cursor,nativeBufferAt(address,bytes),0,polls)
+    if (result.status() == 1) {
+        val next=if (cursor+1 == count) 0 else cursor+1
+        if (result.transferredBytes() != bytes || result.nextIndex() != next) result=Esp32S3GdmaPumpResult((result&~255)|8)
+        else r.storeU32(28,next)
+    }
+    r.storeU32(48,result&4294967295);r.storeU32(52,result>>>32)
+    if (result.status() != 1 && result.status() != 3) r.storeU32(4,3)
+    return result
+}
+trusted fun esp32s3PdmSessionCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    val status=esp32s3PdmSessionStatus(r)
+    if (!exclusive || status < 1 || status > 4 || polls < 1 || polls > 1000000) return 0
+    if (status == 4) return 4
+    r.storeU32(4,3)
+    if (r.loadU32(56) != 0) {
+        val stopped=esp32s3I2sStopStream(0,false,r.loadU32(8),polls)
+        r.storeU32(44,stopped)
+        if (stopped != 1) return 3
+        r.storeU32(56,0)
+    }
+    r.storeU32(4,4);return 4
+}

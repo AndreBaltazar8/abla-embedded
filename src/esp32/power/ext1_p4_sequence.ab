@@ -1,0 +1,74 @@
+import "abla/runtime/scalar"
+// P4 PMU layouts1/3:16 RTC pads, per-pin wake level (not S3 all-low mode).
+// Caller owns global EXT1 configuration and selected LP pads, pins PMU/LP
+// power, and excludes sleep entry/LP writers throughout lease lifetime.
+// No pad routing, holds, wake-trigger enable, status clearing or sleep entry.
+type P4Ext1Wake=int
+fun P4Ext1Wake.status(): int = this&255
+fun P4Ext1Wake.hasSnapshot(): bool = (this&(1<<41)) != 0
+trusted fun p4Ext1Field(offset: int,mask: u32,value: u32): bool {
+    val before=p4Ext1Read(offset)
+    p4Ext1Write(offset,(before&(u32(0xffffffff)^mask))|(value&mask))
+    return (p4Ext1Read(offset)&mask) == (value&mask)
+}
+//1configured2invalid/unsupported3statusclearbusy4partialwrite5closed6parked.
+// Snapshot: original selection16@8,level16@24,filter40,owned41.
+// Capture and disable before taking LP pad leases. Keep this original snapshot
+// until pads have been restored; configuring must never recapture the state.
+trusted fun esp32p4Ext1ParkOwned(exclusive: bool): P4Ext1Wake {
+    if (!exclusive) return P4Ext1Wake(2)
+    val selected=p4Ext1Read(492)
+    if (selected > u32(65535)) return P4Ext1Wake(2)
+    val control=p4Ext1Read(500)
+    if ((control&u32(0x40000000)) != u32(0)) return P4Ext1Wake(3)
+    val token=(1<<41)|(int(selected)<<8)|(int(p4Ext1Read(488)&u32(65535))<<24)|(int(control>>u32(31))<<40)
+    if (!p4Ext1Field(492,u32(65535),u32(0))) return P4Ext1Wake(token|4)
+    return P4Ext1Wake(token|6)
+}
+// Park again before restoring child pads. A failed park retains the snapshot;
+// callers must not release pads or clocks until this returns status6.
+trusted fun P4Ext1Wake.parkOwned(exclusive: bool): P4Ext1Wake {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 5) return this
+    val token=this&(~255)
+    if ((p4Ext1Read(500)&u32(0x40000000)) != u32(0)) return P4Ext1Wake(token|3)
+    if (!p4Ext1Field(492,u32(65535),u32(0))) return P4Ext1Wake(token|4)
+    return P4Ext1Wake(token|6)
+}
+// Call only after all selected pads are ready. Invalid requests preserve the
+// live lease and its cleanup information without touching hardware.
+trusted fun P4Ext1Wake.configureOwned(selection: u32,highLevels: u32,filter: bool,exclusive: bool): P4Ext1Wake {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 5) return this
+    val token=this&(~255)
+    if (selection == u32(0) || selection > u32(65535) || (highLevels&~selection) != u32(0)) return P4Ext1Wake(token|2)
+    if ((p4Ext1Read(500)&u32(0x40000000)) != u32(0)) return P4Ext1Wake(token|3)
+    if ((p4Ext1Read(492) != u32(0) && !p4Ext1Field(492,u32(65535),u32(0))) ||
+        !p4Ext1Field(488,u32(65535),highLevels) ||
+        !p4Ext1Field(500,u32(0x80000000),if (filter) u32(0x80000000) else u32(0)) ||
+        !p4Ext1Field(492,u32(65535),selection)) return P4Ext1Wake(token|4)
+    return P4Ext1Wake(token|1)
+}
+trusted fun esp32p4Ext1OpenOwned(selection: u32,highLevels: u32,filter: bool,exclusive: bool): P4Ext1Wake {
+    if (!exclusive || selection == u32(0) || selection > u32(65535) || (highLevels&~selection) != u32(0)) return P4Ext1Wake(2)
+    val parked=esp32p4Ext1ParkOwned(true)
+    if (parked.status() != 6) return parked
+    return parked.configureOwned(selection,highLevels,filter,true)
+}
+trusted fun P4Ext1Wake.closeOwned(exclusive: bool): P4Ext1Wake {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 5) return this
+    val token=this&(~255)
+    if ((p4Ext1Read(500)&u32(0x40000000)) != u32(0)) return P4Ext1Wake(token|3)
+    if (!p4Ext1Field(492,u32(65535),u32(0)) ||
+        !p4Ext1Field(488,u32(65535),u32((this>>>24)&65535)) ||
+        !p4Ext1Field(500,u32(0x80000000),u32((this>>>40)&1)<<u32(31)) ||
+        !p4Ext1Field(492,u32(65535),u32((this>>>8)&65535))) return P4Ext1Wake(token|4)
+    return P4Ext1Wake(token|5)
+}
+// Snapshot before explicit acknowledgment. No automatic clearing during open.
+trusted fun esp32p4Ext1WakeStatus(): u32 = p4Ext1Read(496)&u32(65535)
+// Dedicated exclusive clear pulse per IDF LL: assert then deassert bit30,
+// preserving filter and other bits. This irreversibly acknowledges status.
+trusted fun esp32p4Ext1AcknowledgeOwned(exclusive: bool): bool {
+    if (!exclusive) return false
+    if (!p4Ext1Field(500,u32(0x40000000),u32(0x40000000))) return false
+    return p4Ext1Field(500,u32(0x40000000),u32(0))
+}

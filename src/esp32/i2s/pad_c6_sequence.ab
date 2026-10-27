@@ -1,0 +1,64 @@
+import "../gpio_c6_sequence.ab"
+import "./clock_c6_sequence.ab"
+// Single-pad lease. Roles: 0/1 MCLK out/in, 2/3 TX BCLK out/in,
+// 4/5 TX WS out/in, 6/7 RX BCLK out/in, 8/9 RX WS out/in,
+// 10 TX data, 11 RX data, 12 TX data1. Caller owns signal routes and pad,
+// stopped peers/DMA/ETM and board reservations; GPIO/IOMUX clocks pinned.
+// Entry requires GPIO-controlled OE off. Restore never re-enables old output.
+// Snapshot mux15@8,route12@23,OD35,latch36,pin5@37,role4@42,
+// old input route9@46, valid55. Status1ready2invalid3admission4partial
+// 5restored6restore failure. Retain lease on partial failure.
+type C6I2sPad=int
+fun C6I2sPad.status(): int = this&255
+fun c6I2sPadSignal(role: int): int = if (role < 0 || role > 12) -1 else if (role < 6) 12+role/2 else if (role < 10) 13+role/2 else if (role < 12) 15 else 18
+trusted fun c6I2sPadAdmission(pin: int): bool {
+    if (!esp32C6GpioNumberValid(pin) || (c6I2sClockRead(0)&u32(3)) != u32(1) || !c6I2sStopped()) return false
+    val bit=u32(1)<<u32(pin)
+    return (c6GpioRead(0x600960e8)&u32(3)) == u32(1) &&
+        (c6GpioRead(0x600960ec)&u32(0x400000)) != u32(0) &&
+        ((c6GpioRead(0x600960ec)>>u32(20))&u32(3)) != u32(0) &&
+        (c6GpioRead(0x6009162c)&u32(1)) != u32(0) &&
+        (c6GpioRead(0x600b102c)&bit) == u32(0) &&
+        (pin >= 8 || (c6GpioRead(0x600b1028)&bit) == u32(0)) &&
+        ((pin != 12 && pin != 13) || (c6GpioRead(0x6000f018)&u32(16384)) == u32(0))
+}
+trusted fun c6I2sPadOpenOwned(pin: int,role: int,exclusive: bool): C6I2sPad {
+    val signal=c6I2sPadSignal(role)
+    if (!exclusive || !esp32C6GpioNumberValid(pin) || signal < 0) return C6I2sPad(2)
+    if (!c6I2sPadAdmission(pin)) return C6I2sPad(3)
+    val bit=u32(1)<<u32(pin)
+    val route=c6GpioRead(0x60091554+pin*4)
+    if ((c6GpioRead(0x60091020)&bit) != u32(0) || (route&u32(1536)) != u32(512)) return C6I2sPad(3)
+    val input=(role&1) != 0
+    val token=(1<<55)|(pin<<37)|(role<<42)|
+        (int(c6GpioRead(0x60090004+pin*4)&u32(32767))<<8)|(int(route&u32(2047))<<23)|
+        (int((c6GpioRead(0x60091074+pin*4)>>u32(2))&u32(1))<<35)|
+        (int((c6GpioRead(0x60091004)>>u32(pin))&u32(1))<<36)|
+        (if (input) int(c6GpioRead(0x60091154+signal*4)&u32(255))<<46 else 0)
+    if (esp32C6GpioConfigureOwned(pin,false,false,false,input,0,true) != 1) return C6I2sPad(token|4)
+    if (input) {
+        if (!c6GpioField(0x60091154+signal*4,u32(255),u32(128|pin))) return C6I2sPad(token|4)
+    } else {
+        if (!c6GpioField(0x60091554+pin*4,u32(2047),u32(512|signal))) return C6I2sPad(token|4)
+        c6GpioWrite(0x60091024,bit)
+        if ((c6GpioRead(0x60091020)&bit) == u32(0)) return C6I2sPad(token|4)
+    }
+    return C6I2sPad(token|1)
+}
+trusted fun C6I2sPad.closeOwned(exclusive: bool): C6I2sPad {
+    if (!exclusive || this < 0 || (this&~0xffffffffffffff) != 0 || (this&(1<<55)) == 0 || (this.status() != 1 && this.status() != 4 && this.status() != 6)) return this
+    val token=this&~255
+    val pin=(token>>>37)&31;val role=(token>>>42)&15
+    if (c6I2sPadSignal(role) < 0 || !c6I2sPadAdmission(pin)) return C6I2sPad(token|6)
+    val bit=u32(1)<<u32(pin)
+    c6GpioWrite(0x60091028,bit)
+    if ((c6GpioRead(0x60091020)&bit) != u32(0) || !c6GpioField(0x60091554+pin*4,u32(1536),u32(512))) return C6I2sPad(token|6)
+    val high=((token>>>36)&1) != 0
+    esp32C6GpioWriteOwned(pin,high)
+    if (((c6GpioRead(0x60091004)&bit) != u32(0)) != high ||
+        !c6GpioField(0x60091074+pin*4,u32(4),u32((token>>>35)&1)<<u32(2)) ||
+        !c6GpioField(0x60090004+pin*4,u32(29570),u32(token>>>8)&u32(29570)) ||
+        !c6GpioField(0x60091554+pin*4,u32(2047),u32(token>>>23)&u32(2047))) return C6I2sPad(token|6)
+    if ((role&1) != 0 && !c6GpioField(0x60091154+c6I2sPadSignal(role)*4,u32(255),u32(token>>>46)&u32(255))) return C6I2sPad(token|6)
+    return C6I2sPad(token|5)
+}

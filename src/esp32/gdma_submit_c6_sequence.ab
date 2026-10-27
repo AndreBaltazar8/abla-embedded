@@ -1,0 +1,47 @@
+import "./gdma_tx_channel_c6_sequence.ab"
+import "./gdma_ring_c6_sequence.ab"
+import "./sdk/raw_buffer.ab"
+//16B retained submission:tag0,state4,channel8,head12. Fresh zero tag required.
+// State3 head-write-failed,4 START-issued; neither allows automatic resubmit.
+// Caller owns channel/trigger, joined IRQ/ETM, pinned SRAM/PMS/clocks and all
+// descriptor/payload memory until STOP/drain/events/acquisition finish.
+// TX only, single-word mode. No C5 memory-window or separate-head registers.
+//1START-issued2invalid3clock4busy5config7descriptor8head-readback failure.
+// A write-trigger START cannot be proven by immediate readback; 1 is NOT
+// proof of active or completed DMA, even if the command was silently lost.
+fun c6GdmaSubmissionStorage(r: NativeBuffer): bool = r.hasAddressRange(0,16) &&
+    (r.addressValue()&3) == 0 && (r.addressValue()+16 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6GdmaSubmitTxOwned(r: NativeBuffer,channel: int,peripheral: int,descriptors: int,
+    count: int,buffers: int,stride: int,bytes: int,circular: bool,exclusive: bool): int {
+    if (!exclusive || !c6GdmaSubmissionStorage(r) || r.loadU32(0) != 0 || c6GdmaTxBase(channel) < 0 ||
+        (peripheral != 0 && peripheral != 2 && peripheral != 3 && peripheral != 6 && peripheral != 7 && peripheral != 9) ||
+        !c6GdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    val address=r.addressValue()
+    if ((address < descriptors+count*12 && descriptors < address+16) ||
+        (address < buffers+(count-1)*stride+bytes && buffers < address+16)) return 2
+    if (!c6GdmaClocksReady()) return 3
+    if (!c6GdmaTxParked(channel)) return 4
+    val base=c6GdmaTxBase(channel)
+    if ((c6GdmaRead(base)&u32(62)) != u32(12) || (c6GdmaRead(base+4)&u32(4096)) == u32(0) ||
+        (c6GdmaRead(base+48)&u32(63)) != u32(peripheral)) return 5
+    c6GdmaDescriptorFence()
+    var index=0
+    while (index < count) {
+        val at=descriptors+index*12
+        val expected=u32(0xc0000000)|u32(bytes)|(u32(bytes)<<u32(12))
+        val next=if (index+1 < count) at+12 else if (circular) descriptors else 0
+        if (c6GdmaDescriptorRead(at) != expected || c6GdmaDescriptorRead(at+4) != u32(buffers+index*stride) ||
+            c6GdmaDescriptorRead(at+8) != u32(next)) return 7
+        index=index+1
+    }
+    r.storeU32(0,0x43364453);r.storeU32(4,3);r.storeU32(8,channel);r.storeU32(12,descriptors)
+    val link=base+16
+    val head=(c6GdmaRead(link)&~u32(0x7fffff))|u32(descriptors&0xfffff)
+    c6GdmaWrite(link,head)
+    if ((c6GdmaRead(link)&u32(0x7fffff)) != u32(descriptors&0xfffff)) return 8
+    c6GdmaDescriptorFence()
+    r.storeU32(4,4)
+    c6GdmaDescriptorFence()
+    c6GdmaWrite(link,(c6GdmaRead(link)&~u32(0x700000))|u32(0x200000))
+    return 1
+}

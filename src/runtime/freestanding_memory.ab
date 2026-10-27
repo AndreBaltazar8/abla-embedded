@@ -1,4 +1,5 @@
 import "abla/unsafe/memory"
+import "abla/unsafe/mmio"
 
 // Freestanding byte and C-string primitives. These are scalar Abla loops so
 // LLVM can specialize ordinary internal uses. The exports below exist only as
@@ -11,6 +12,11 @@ trusted fun freestandingLoadByte(address: u32): int =
 @inline
 trusted fun freestandingStoreByte(address: u32, value: int): void =
     ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), value & 255)
+
+@inline
+trusted fun freestandingLoadWord(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
 
 trusted fun freestandingCopy(
     destination: u32,
@@ -50,6 +56,46 @@ trusted fun freestandingSet(
     value: i32,
     count: u32
 ): u32 {
+    // Classic ESP32 may satisfy a 32-bit/internal heap request from IRAM.
+    // Byte stores fault there, so preserve exact memset semantics with aligned
+    // word stores and read-modify-write only for partial boundary words.
+    if (destination >= u32(0x40070000) &&
+        destination < u32(0x400c0000)) {
+        val byte = u32(value) & u32(255)
+        val word = byte | (byte << u32(8)) |
+            (byte << u32(16)) | (byte << u32(24))
+        var address = destination
+        var remaining = count
+
+        while (remaining != u32(0) && (address & u32(3)) != u32(0)) {
+            val aligned = address & ~u32(3)
+            val shift = (address & u32(3)) << u32(3)
+            val mask = u32(255) << shift
+            val updated = (freestandingLoadWord(aligned) & ~mask) |
+                (byte << shift)
+            ablaUnsafeVolatileStoreU32(int(aligned), int(updated))
+            address = address + u32(1)
+            remaining = remaining - u32(1)
+        }
+        while (remaining >= u32(4)) {
+            ablaUnsafeVolatileStoreU32(int(address), int(word))
+            address = address + u32(4)
+            remaining = remaining - u32(4)
+        }
+        while (remaining != u32(0)) {
+            val shift = (address & u32(3)) << u32(3)
+            val mask = u32(255) << shift
+            val updated = (freestandingLoadWord(address & ~u32(3)) & ~mask) |
+                (byte << shift)
+            ablaUnsafeVolatileStoreU32(
+                int(address & ~u32(3)), int(updated)
+            )
+            address = address + u32(1)
+            remaining = remaining - u32(1)
+        }
+        return destination
+    }
+
     var index = u32(0)
     while (index < count) {
         freestandingStoreByte(destination + index, int(value))
@@ -58,9 +104,25 @@ trusted fun freestandingSet(
     destination
 }
 
+// Security-sensitive clearing must remain observable even when LLVM proves
+// that the buffer is dead immediately afterwards.
+trusted fun freestandingSecureZero(address: u32, count: u32): u32 {
+    var index = u32(0)
+    while (index < count) {
+        ablaUnsafeVolatileStoreU8(int(address + index), 0)
+        index = index + u32(1)
+    }
+    address
+}
+
 trusted fun freestandingZero(destination: u32, count: u32): void {
     val ignored = freestandingSet(destination, i32(0), count)
     return
+}
+
+trusted fun freestandingZeroValue(destination: u32, count: u32): u32 {
+    freestandingZero(destination, count)
+    destination
 }
 
 trusted fun freestandingCompare(

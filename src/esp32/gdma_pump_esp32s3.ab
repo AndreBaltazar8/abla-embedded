@@ -1,0 +1,47 @@
+import "./sdk/raw_buffer.ab"
+
+// status:1 transferred,2 invalid,3 not ready within poll budget,4 DMA error,
+// 5 descriptor metadata,6 CPU-buffer bounds,7 post-copy rearm failure.
+// Low8 status, next12 transferred bytes, next12 next index, high10 raw events.
+// After argument validation, failure keeps the original cursor (status2 has
+// no valid cursor); on status7 a copy DID occur but DMA
+// ownership was not returned. No allocation, hidden restart or IRQ counting.
+type Esp32S3GdmaPumpResult = int
+fun Esp32S3GdmaPumpResult.status(): int = this & 255
+fun Esp32S3GdmaPumpResult.transferredBytes(): int = (this >>> 8) & 4095
+fun Esp32S3GdmaPumpResult.nextIndex(): int = (this >>> 20) & 4095
+fun Esp32S3GdmaPumpResult.events(): int = (this >>> 32) & 1023
+
+// Caller exclusively owns the channel/ring and CPU buffer, disjoint from all
+// ring payloads. Use polls=1 for nonblocking event-loop integration. A budget
+// is MMIO/ownership attempts, not microseconds. Stop/park before recovery.
+trusted fun esp32s3GdmaPumpBlock(channel: int, transmit: bool, descriptors: int,
+    count: int, index: int, buffer: NativeBuffer, transmitBytes: int, polls: int): Esp32S3GdmaPumpResult {
+    if (channel < 0 || channel > 4 || count < 1 || count > 4095 || index < 0 || index >= count ||
+        descriptors < 0x3fc88000 || descriptors > 0x3fd00000 - count * 12 || (descriptors & 3) != 0 ||
+        polls < 1 || polls > 1000000 || (transmit && (transmitBytes < 1 || transmitBytes > 4095)) ||
+        (!transmit && transmitBytes != 0)) return Esp32S3GdmaPumpResult(2)
+    val cursor = index << 20
+    if (buffer.capacity() == 0 || !buffer.hasAddressRange(0, buffer.capacity()) ||
+        (transmit && !buffer.hasAddressRange(0, transmitBytes))) return Esp32S3GdmaPumpResult(cursor | 6)
+    if (buffer.addressValue() < descriptors + count * 12 &&
+        buffer.addressValue() + buffer.capacity() > descriptors) return Esp32S3GdmaPumpResult(cursor | 6)
+    val descriptor = descriptors + index * 12
+    var attempt = 0
+    while (attempt < polls) {
+        val events = esp32s3GdmaEvents(channel, transmit)
+        if (events < 0 || esp32s3GdmaEventErrors(events, transmit) != 0)
+            return Esp32S3GdmaPumpResult(cursor | 4 | ((events & 1023) << 32))
+        val transferred = esp32s3GdmaTransferBuffer(descriptor, buffer, transmit, transmitBytes, transmit)
+        if (transferred > 0) {
+            val next = if (index + 1 == count) 0 else index + 1
+            return Esp32S3GdmaPumpResult(1 | (transferred << 8) | (next << 20))
+        }
+        if (transferred != -2) {
+            val status = if (transferred == -4) 6 else if (transferred == -5) 7 else 5
+            return Esp32S3GdmaPumpResult(cursor | status)
+        }
+        attempt = attempt + 1
+    }
+    Esp32S3GdmaPumpResult(cursor | 3)
+}

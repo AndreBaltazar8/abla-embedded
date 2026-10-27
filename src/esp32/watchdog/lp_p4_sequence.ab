@@ -1,0 +1,99 @@
+// P4 LP watchdog, both layouts. Caller exclusively owns watchdog policy,
+// excludes both CPUs/LP CPU/interrupt writers, and pins the LP clock/access.
+// No implicit reset suppression or timeout policy. CONFIG0 normal enable and
+// flashboot enable are INDEPENDENT. Super-WDT registers are never touched.
+// Status1 success,2invalid,3running,4already unlocked,5readback failure.
+// Bit8 additionally means protection could not be restored; retain ownership.
+// Feeding/ack success means command issued, not a measured timer/IRQ outcome.
+trusted fun p4LpWatchdogFinish(status: int): int {
+    p4LpWatchdogWrite(24,0)
+    return status|(if (p4LpWatchdogRead(24) == 0x50d83aa1) 256 else 0)
+}
+trusted fun p4LpWatchdogBegin(): int {
+    if (p4LpWatchdogRead(24) == 0x50d83aa1) return 4
+    p4LpWatchdogWrite(24,0x50d83aa1)
+    if (p4LpWatchdogRead(24) != 0x50d83aa1) return p4LpWatchdogFinish(5)
+    return 1
+}
+trusted fun p4LpWatchdogState(): int = p4LpWatchdogRead(0)
+trusted fun p4LpWatchdogRunning(): bool = (p4LpWatchdogState()&0x80001000) != 0
+// Effective ticks, exact (no silent stage0 round-down), or -1 invalid.
+// Stage0 eFuse multiplier is 2,4,8,16. Other stages use raw32bit ticks.
+fun p4LpWatchdogHold(stage: int,ticks: int,delay: int): int {
+    if (stage < 0 || stage > 3 || delay < 0 || delay > 3 || ticks < 1) return -1
+    if (stage != 0) return if (ticks <= 4294967295) ticks else -1
+    val shift=delay+1
+    val multiplier=int(u32(1)<<u32(shift))
+    if ((ticks>>>32) >= multiplier || (ticks&(multiplier-1)) != 0) return -1
+    // RV32 word shifts, avoiding compiler support-library calls for wide shifts.
+    return int((u32(ticks)>>>u32(shift))|(u32(ticks>>>32)<<u32(32-shift)))
+}
+// Configure only while BOTH enable modes are off. Writes hold before action;
+// partial failure is retained in hardware, never auto-started or rolled back.
+// action0off/1interrupt/2CPUreset/3systemreset/4RTCreset. Ticks stay explicit
+// even for action0; enabling/reset targets/IRQ delivery are separate calls.
+trusted fun p4LpWatchdogConfigureStageOwned(stage: int,ticks: int,action: int): int {
+    if (stage < 0 || stage > 3 || action < 0 || action > 4 || ticks < 1) return 2
+    val hold=p4LpWatchdogHold(stage,ticks,if (stage == 0) p4LpWatchdogDelay() else 0)
+    if (hold < 0) return 2
+    val prior=p4LpWatchdogState()
+    if ((prior&0x80001000) != 0) return 3
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    val offset=4+stage*4
+    p4LpWatchdogWrite(offset,hold)
+    if (p4LpWatchdogRead(offset) != hold) return p4LpWatchdogFinish(5)
+    val shift=28-stage*3
+    val next=(prior&(4294967295^int(u32(7)<<u32(shift))))|int(u32(action)<<u32(shift))
+    p4LpWatchdogWrite(0,next)
+    return p4LpWatchdogFinish(if (p4LpWatchdogState() == next) 1 else 5)
+}
+// Explicit handoff: preserve stage actions, holds, reset targets and lengths.
+// Disabling either mode does not disable the other. Caller establishes valid
+// stages/clock/IRQ/reset policy BEFORE enabling, or replacement protection
+// BEFORE clearing inherited flashboot protection. No feed hidden in this call.
+trusted fun p4LpWatchdogEnableOwned(normal: bool,flashboot: bool): int {
+    val prior=p4LpWatchdogState()
+    val next=(prior&0x7fffefff)|(if (normal) 0x80000000 else 0)|(if (flashboot) 4096 else 0)
+    if (prior == next) return 1
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    p4LpWatchdogWrite(0,next)
+    return p4LpWatchdogFinish(if (p4LpWatchdogState() == next) 1 else 5)
+}
+trusted fun p4LpWatchdogFeedOwned(): int {
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    p4LpWatchdogWrite(20,0x80000000)
+    return p4LpWatchdogFinish(1)
+}
+// No analog chip-reset width exists on P4: do not expose fake no-op controls.
+// CPU/system reset lengths codes0..7 =100/200/300/400/500/800/1600/3200ns.
+trusted fun p4LpWatchdogResetPolicyOwned(cpu0: bool,cpu1: bool,pauseSleep: bool,cpuLength: int,systemLength: int): int {
+    if (cpuLength < 0 || cpuLength > 7 || systemLength < 0 || systemLength > 7) return 2
+    val prior=p4LpWatchdogState()
+    if ((prior&0x80001000) != 0) return 3
+    val next=(prior&0xfff811ff)|(cpuLength<<16)|(systemLength<<13)|
+        (if (cpu0) 2048 else 0)|(if (cpu1) 1024 else 0)|(if (pauseSleep) 512 else 0)
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    p4LpWatchdogWrite(0,next)
+    return p4LpWatchdogFinish(if (p4LpWatchdogState() == next) 1 else 5)
+}
+// Only LP watchdog bit0; preserve independent super-WDT interrupt bit1.
+// IRQ handler/routing/lifetime is caller-owned, not established here.
+trusted fun p4LpWatchdogInterruptEnabledOwned(enabled: bool): int {
+    val prior=p4LpWatchdogRead(44)
+    val next=(prior&0xfffffffe)|(if (enabled) 1 else 0)
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    p4LpWatchdogWrite(44,next)
+    return p4LpWatchdogFinish(if (p4LpWatchdogRead(44) == next) 1 else 5)
+}
+trusted fun p4LpWatchdogInterruptPending(): bool = (p4LpWatchdogRead(40)&1) != 0
+trusted fun p4LpWatchdogInterruptAcknowledgeOwned(): int {
+    val begin=p4LpWatchdogBegin()
+    if (begin != 1) return begin
+    p4LpWatchdogWrite(48,1)
+    return p4LpWatchdogFinish(1)
+}

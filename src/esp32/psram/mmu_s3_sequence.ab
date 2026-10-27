@@ -1,0 +1,65 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// S3 I/D buses SHARE all512 MMU entries. DBUS3c000000..3e000000,
+// page64KiB, invalidbit14, PSRAMbit15, physical page low14bits.
+// Acquire only invalid entries; never replace a live flash or PSRAM mapping.
+// Owner32+4*pages stores exact old invalid words:magic,phase,firstEntry,count,
+// firstPhysicalPage,cursor,physicalCapacity,reserved; snapshots@32.
+// Phases1mapping2ready3restoring4closed. Failures retain ownership/cursor.
+// Caller has drained and invalidated relevant I/D cache lines and suspended
+// both caches/peers/IRQ/DMA/allusers, owns this shared MMU range and physical
+// PSRAM. Entire call graph/stack/owner internal; retain exclusion until both
+// cache mapping and boot setup complete. This never enables/resumes caches.
+fun s3PsramMmuSpan(virtual: int,physical: int,bytes: int,capacity: int): bool =
+    virtual >= 0x3c000000 && virtual < 0x3e000000 && physical >= 0 &&
+    bytes >= 65536 && bytes <= 33554432 && capacity >= bytes && capacity <= 1073741824 &&
+    ((virtual|physical|bytes)&65535) == 0 && bytes <= 0x3e000000-virtual && physical <= capacity-bytes
+// 1mapped,2invalid/proof,3existing mapping conflict,4write/readback failure.
+@section(".iram1.abla.s3PsramMmuMap")
+trusted fun s3PsramMmuMapOwned(r: NativeBuffer,virtual: int,physical: int,bytes: int,capacity: int,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !s3PsramMmuSpan(virtual,physical,bytes,capacity)) return 2
+    val count=bytes>>>16;val first=(virtual-0x3c000000)>>>16;val page=physical>>>16
+    if (!r.hasAddressRange(0,32+count*4) || (r.addressValue()&3) != 0 || !s3PsramMmuStorageSafe(r.addressValue(),32+count*4)) return 2
+    if (r.loadU32(0) == 0) {
+        var index=0
+        while (index < count) {
+            val old=s3PsramMmuRead(first+index)
+            if ((old&16384) == 0) return 3
+            r.storeU32(32+index*4,old);index=index+1
+        }
+        r.storeU32(0,0x53334d4d);r.storeU32(4,1);r.storeU32(8,first);r.storeU32(12,count)
+        r.storeU32(16,page);r.storeU32(20,0);r.storeU32(24,capacity);r.storeU32(28,0)
+    } else if (r.loadU32(0) != 0x53334d4d || (r.loadU32(4) != 1 && r.loadU32(4) != 2) ||
+        r.loadU32(8) != first || r.loadU32(12) != count || r.loadU32(16) != page ||
+        r.loadU32(24) != capacity || r.loadU32(20) > count) return 2
+    if (r.loadU32(4) == 2) return 1
+    var index=r.loadU32(20)
+    while (index < count) {
+        val value=32768+page+index
+        s3PsramMmuWrite(first+index,value)
+        if (s3PsramMmuRead(first+index) != value) return 4
+        index=index+1;r.storeU32(20,index)
+    }
+    r.storeU32(4,2);return 1
+}
+// Same drained/invalidated cache and global exclusion proof required before
+// unmapping. Returns5closed,2invalid/proof,4retry retaining all ownership.
+@section(".iram1.abla.s3PsramMmuClose")
+trusted fun s3PsramMmuCloseOwned(r: NativeBuffer,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x53334d4d) return 2
+    val count=r.loadU32(12);val first=r.loadU32(8);val phase=r.loadU32(4)
+    if (count < 1 || count > 512 || first > 512-count || phase < 1 || phase > 4 || r.loadU32(20) > count ||
+        !r.hasAddressRange(0,32+count*4) || !s3PsramMmuStorageSafe(r.addressValue(),32+count*4)) return 2
+    if (phase == 4) return 5
+    var index=0
+    while (index < count) { if ((r.loadU32(32+index*4)&16384) == 0) return 2;index=index+1 }
+    if (phase != 3) { r.storeU32(4,3);r.storeU32(20,0) }
+    index=r.loadU32(20)
+    while (index < count) {
+        val old=r.loadU32(32+index*4)
+        s3PsramMmuWrite(first+index,old)
+        if (s3PsramMmuRead(first+index) != old) return 4
+        index=index+1;r.storeU32(20,index)
+    }
+    r.storeU32(4,4);return 5
+}

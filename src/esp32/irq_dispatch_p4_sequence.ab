@@ -1,0 +1,59 @@
+import "../esp32/sdk/raw_buffer.ab"
+// Per-core272B table: magic0,core4,inCallback8,lastFault12;32 slots of
+// callback/context at16+8*(line-16). Integer-only callback ABI matches entry.
+// Caller owns table/code/context lifetimes; initializes fresh storage only.
+// No scheduler, allocation or implicit pending clear. Handlers acknowledge
+// their source (and edge pending latch when applicable) before returning.
+type P4IrqDispatch = int
+fun p4IrqDispatchAt(storage: NativeBuffer): P4IrqDispatch =
+    if (storage.hasAddressRange(0,272) && (storage.addressValue()&3) == 0) P4IrqDispatch(storage|0) else P4IrqDispatch(0)
+fun P4IrqDispatch.buffer(): NativeBuffer = NativeBuffer(this|0)
+trusted fun P4IrqDispatch.valid(): bool = this.buffer().hasAddressRange(0,272) && (this.buffer().addressValue()&3) == 0 &&
+    this.buffer().loadU32(0) == 0x50344952 && this.buffer().loadU32(4) < 2
+trusted fun P4IrqDispatch.initialize(core: int): bool {
+    if (!this.buffer().hasAddressRange(0,272) || (this.buffer().addressValue()&3) != 0 || core < 0 || core > 1) return false
+    var offset=8
+    while (offset < 272) { this.buffer().storeU32(offset,0); offset=offset+4 }
+    this.buffer().storeU32(4,core); this.buffer().storeU32(0,0x50344952); return true
+}
+// 1changed,2invalid,3busy/wrongcore/enabled line/unexpected registration.
+// Core-local updates with MIEoff+line disabled, never during a callback.
+trusted fun P4IrqDispatch.setOwned(line: int,expected: int,handler: int,context: int): int {
+    if (!this.valid() || line < 16 || line > 47 || expected < 0 || expected > 4294967294 || (expected&1) != 0 ||
+        handler < 0 || handler > 4294967294 || (handler&1) != 0 || context < 0 || context > 4294967295) return 2
+    if (p4DispatchCore() != this.buffer().loadU32(4) || !p4DispatchMasked() || p4DispatchLineEnabled(line) || this.buffer().loadU32(8) != 0) return 3
+    val offset=16+(line-16)*8
+    if (this.buffer().loadU32(offset) != expected) return 3
+    this.buffer().storeU32(offset,0)
+    p4DispatchFence()
+    this.buffer().storeU32(offset+4,if (handler == 0) 0 else context)
+    p4DispatchFence()
+    this.buffer().storeU32(offset,handler); return 1
+}
+// 1handled,2invalid frame/table/core,3missing handler,4nested/not masked.
+// Frame cannot alias table; on failure retains lastFault=(line<<8)|status.
+trusted fun P4IrqDispatch.dispatchOwned(frame: NativeBuffer,line: int,core: int): int {
+    if (!this.valid()) return 2
+    var result=2
+    val base=this.buffer().addressValue()
+    if (line >= 16 && line <= 47 && core == this.buffer().loadU32(4) && core == p4DispatchCore() &&
+        frame.hasAddressRange(0,144) && (frame.addressValue()&15) == 0 &&
+        (frame.addressValue()+144 <= base || frame.addressValue() >= base+272)) {
+        result=4
+        if (p4DispatchMasked() && this.buffer().loadU32(8) == 0) {
+            val offset=16+(line-16)*8
+            val handler=this.buffer().loadU32(offset)
+            result=3
+            if (handler != 0) {
+                this.buffer().storeU32(8,1)
+                p4DispatchFence()
+                p4DispatchCall(handler,frame.addressValue(),line,core,this.buffer().loadU32(offset+4))
+                p4DispatchFence()
+                this.buffer().storeU32(8,0)
+                result=1
+            }
+        }
+    }
+    if (result != 1) this.buffer().storeU32(12,((line&255)<<8)|result)
+    return result
+}

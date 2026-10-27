@@ -1,0 +1,94 @@
+import "./cpll_p4_sequence.ab"
+// Prepared CPU/bus clock lease, following rtc_clk_cpu_freq_to_xtal and the
+// APB->SYS->MEM->CPU upscaling order. No PLL power ownership or calibration:
+// close requires recovered source (actual analog bytes + END/STOP for CPLL).
+// Caller excludes peer CPU/IRQs/DMA/peripheral clock users and global update,
+// pins XTAL40, the original non-PLL source and analog bus, runs internally, updates its timekeeping/ROM
+// delay metadata separately, and keeps the record until closed. Same hart.
+// Supports SDK integer CPU profiles: PLL360/400 divided1/2/4, XTAL divided
+//1..255 with MEM/APB1/2 and SYS1, RC_FAST20 with all dividers1. Rejects unknown
+// fractional bus settings rather than rely on hardware divider correction.
+// Record48B: magic,next,last,detail,source,cpuBits,memSysBits,apbBits,
+// sourceMHz,revision,hart,reserved. Steps1..7 park,8parked,9..21restore,22closed.
+// Results1parked2invalid3prerequisite4write5pending6closed. Failed/pending
+// updates keep the record and never reissue a triggered divider update.
+trusted fun p4CpuClockResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun p4CpuClockField(address: int,mask: int,value: int): bool {
+    // Never echo the WT divider-update bit during a field write.
+    val old=p4CpuClockRead(address)&(if (address == 0x500e6004) 0xffffffef else 0xffffffff)
+    p4CpuClockWrite(address,(old&(0xffffffff^mask))|value)
+    return (p4CpuClockRead(address)&mask) == value
+}
+trusted fun p4CpuClockPllMatches(mhz: int,revision: int,polls: int): bool {
+    if (!p4AnalogClockReady() || (p4AnalogRead(52)&1) == 0 ||
+        (p4CpuClockRead(0x50111040)&0x04000000) == 0) return false
+    val ref=p4AnalogRegisterOwned(0x67,2,0,false,polls)
+    val div=if ((ref&255) == 1) p4AnalogRegisterOwned(0x67,3,0,false,polls) else 0
+    return (ref&255) == 1 && ((ref>>>8)&15) == 0 && (div&255) == 1 && ((div>>>8)&255) == p4CpllDivider(mhz,revision)
+}
+trusted fun esp32p4CpuClockContinueOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,48) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x5034434b || r.loadU32(4) < 1 || r.loadU32(4) > 22) return 2
+    if (r.loadU32(40) != int(p4CpllHart())) return 3
+    if (r.loadU32(4) == 22) return 6
+    if ((p4CpuClockRead(0x50111040)&4) == 0) return p4CpuClockResult(r,3,0)
+    if (r.loadU32(4) > 1 && (p4CpuClockRead(0x50111040)&3) != 0) return p4CpuClockResult(r,3,1)
+    while (true) {
+        val step=r.loadU32(4)
+        if (step == 8) return p4CpuClockResult(r,1,0)
+        if (step == 22) return p4CpuClockResult(r,6,0)
+        if (step == 7 || step == 11 || step == 14 || step == 17 || step == 20) {
+            var remaining=polls
+            while ((p4CpuClockRead(0x500e6004)&16) != 0) {
+                remaining=remaining-1
+                if (remaining == 0) return p4CpuClockResult(r,5,step)
+            }
+        } else if (step == 6 || step == 10 || step == 13 || step == 16 || step == 19) {
+            r.storeU32(4,step+1)
+            p4CpuClockFence()
+            p4CpuClockWrite(0x500e6004,(p4CpuClockRead(0x500e6004)&0xffffffef)|16)
+            continue
+        } else {
+            if ((p4CpuClockRead(0x500e6004)&16) != 0) return p4CpuClockResult(r,5,step)
+            if (step == 21 && r.loadU32(16) == 1 &&
+                ((p4CpuClockRead(0x500e60bc)&12) != 12 || !p4CpuClockPllMatches(r.loadU32(32),r.loadU32(36),polls))) return p4CpuClockResult(r,3,21)
+            val address=if (step == 1 || step == 21) 0x50111040 else if (step == 2 || step == 18) 0x500e6004 else if (step == 5 || step == 9) 0x500e600c else 0x500e6008
+            val mask=if (step == 1 || step == 21) 3 else if (step == 2 || step == 18) 0x1fffffe0 else if (step == 5 || step == 9) 0x00ff0000 else if (step == 3 || step == 15) 255 else 0xff000000
+            val value=if (step <= 5) 0 else if (step == 21) r.loadU32(16) else if (step == 18) r.loadU32(20) else if (step == 9) r.loadU32(28) else r.loadU32(24)&mask
+            if (!p4CpuClockField(address,mask,value)) return p4CpuClockResult(r,4,step)
+        }
+        r.storeU32(4,step+1)
+    }
+    return 2
+}
+trusted fun esp32p4CpuClockOpenOwned(r: NativeBuffer,sourceMHz: int,revision: int,polls: int,exclusive: bool): int {
+    if (!exclusive || revision < 0 || revision > 399 || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,48) ||
+        (r.addressValue()&3) != 0 || r.loadU32(0) != 0 || p4CpllHart() > u32(1)) return 2
+    val root=p4CpuClockRead(0x50111040);val cpu=p4CpuClockRead(0x500e6004)
+    val mem=p4CpuClockRead(0x500e6008);val apb=p4CpuClockRead(0x500e600c)
+    val source=root&3;val divisor=((cpu>>>5)&255)+1
+    if ((root&4) == 0 || (cpu&16) != 0) return 3
+    if (source > 2 || (cpu&0x1fffe000) != 0 || divisor > 255 || (mem&0xffffff00) != 0 || (mem&255) > 1 ||
+        (apb&0xff00ffff) != 0 || ((apb>>>16)&255) > 1 || (p4CpuClockRead(0x500e6010)&255) != 0) return 2
+    if (source == 1) {
+        if ((sourceMHz != 360 && sourceMHz != 400) || (divisor != 1 && divisor != 2 && divisor != 4) ||
+            (mem&255) != (if (divisor == 1) 1 else 0) || ((apb>>>16)&255) != (if (divisor == 4) 0 else 1)) return 2
+        if (!p4CpuClockPllMatches(sourceMHz,revision,polls)) return 3
+    } else if ((source == 0 && sourceMHz != 40) || (source == 2 && (sourceMHz != 20 || divisor != 1 || mem != 0 || apb != 0))) return 2
+    r.storeU32(0,0x5034434b);r.storeU32(4,1);r.storeU32(8,0);r.storeU32(12,0);r.storeU32(16,source)
+    r.storeU32(20,cpu&0x1fffffe0);r.storeU32(24,mem&0xff0000ff);r.storeU32(28,apb&0x00ff0000)
+    r.storeU32(32,sourceMHz);r.storeU32(36,revision);r.storeU32(40,int(p4CpllHart()));r.storeU32(44,0)
+    return esp32p4CpuClockContinueOwned(r,polls,true)
+}
+trusted fun esp32p4CpuClockCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    val current=esp32p4CpuClockContinueOwned(r,polls,exclusive)
+    if (current != 1) return current
+    // Calibrate while CPU is still undivided XTAL40, not after restoring the
+    // old CPU divider (which would invalidate calibration's 10us timebase).
+    if (r.loadU32(16) == 1 && ((p4CpuClockRead(0x500e60bc)&12) != 12 ||
+        !p4CpuClockPllMatches(r.loadU32(32),r.loadU32(36),polls))) return p4CpuClockResult(r,3,8)
+    r.storeU32(4,9)
+    return esp32p4CpuClockContinueOwned(r,polls,true)
+}

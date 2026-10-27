@@ -1,0 +1,73 @@
+import "./transaction_c5_sequence.ab"
+import "./async_c5_sequence.ab"
+// Caller-exclusive64B record. Low32B transfer context; master64@32, gate40,
+// owner44, state48 (1active,bit8CS attempted,2terminal), status52, report56,tag60.
+// Same canonical gate for ALL SPI2 users. Pin RX/context until completion and
+// explicit recovery after failures. RX is provisional until result.valid().
+// SpiTransactionResult(0) means pending; all terminal statuses match transfer().
+trusted fun c5SpiAsyncTransactionValid(context: NativeBuffer): bool =
+    c5SpiBufferValid(context,64) && (context.addressValue()&3) == 0 && context.loadU32(60) == 0x43535431
+trusted fun esp32C5SpiAsyncTransactionInitialize(context: NativeBuffer): bool {
+    if (!c5SpiBufferValid(context,64) || (context.addressValue()&3) != 0) return false
+    var offset=0;while (offset < 60) { context.storeU32(offset,0);offset=offset+4 }
+    context.storeU32(60,0x43535431);return true
+}
+trusted fun c5SpiAsyncTransactionSave(context: NativeBuffer,status: int,report: int): SpiTransactionResult {
+    context.storeU32(48,2);context.storeU32(52,status);context.storeU32(56,report)
+    return SpiTransactionResult((status<<32)|report)
+}
+trusted fun c5SpiAsyncTransactionFinish(context: NativeBuffer,report: int): SpiTransactionResult {
+    val gate=peripheralGateAt(context.loadU32(40));val owner=u32(context.loadU32(44))
+    // Observe ownership before any GPIO/MMIO. Never clean up another user's bus.
+    if (gate.word().compareExchange(owner,owner) != owner) return c5SpiAsyncTransactionSave(context,5,report|(1<<24))
+    var detail=report
+    var healthy=false
+    if ((context.loadU32(48)&256) != 0) {
+        val master=Esp32C5SpiMaster(context.loadU32(32)|(context.loadU32(36)<<32))
+        val cs=master.pins().pinAt(3)
+        if (esp32C5SpiCpuIdleOwned() && c5SpiManualSelectReady(cs)) {
+            if (c5SpiSelectLevel(cs,true)) healthy=report == 257
+            else detail=detail|(12<<16)|(1<<24)
+        } else detail=detail|(1<<24)
+    }
+    if (!gate.finish(owner,healthy)) return c5SpiAsyncTransactionSave(context,5,detail)
+    return c5SpiAsyncTransactionSave(context,if (healthy) 1 else 6,detail)
+}
+// No setup/hold delay yet: matches the existing C5 blocking transaction.
+// Validation and busy/faulted admission leave the record and hardware intact.
+trusted fun Esp32C5SpiMaster.beginTransferAsync(context: NativeBuffer,gate: PeripheralGate,owner: u32,
+    tx: NativeBuffer,rx: NativeBuffer,bytes: int,now: u32,budget: u32,receive: bool = true): SpiTransactionResult {
+    if (!c5SpiAsyncTransactionValid(context) || !this.ready() || this.pins().pinAt(1) >= 29 ||
+        (receive && this.pins().pinAt(2) >= 29) || !c5SpiGateValid(gate) || gate.word().address() > 4294967292 ||
+        !gate.bufferDisjoint(context,64) || !c5SpiBufferValid(tx,bytes) || !gate.bufferDisjoint(tx,bytes) ||
+        (receive && (!c5SpiBufferValid(rx,bytes) || !gate.bufferDisjoint(rx,bytes))) ||
+        budget == u32(0) || budget > u32(0x7fffffff)) return SpiTransactionResult(3<<32)
+    if ((context.loadU32(48)&255) == 1) return SpiTransactionResult(2<<32)
+    val address=context.addressValue()
+    if ((tx.addressValue() < address+64 && address < tx.addressValue()+bytes) ||
+        (receive && rx.addressValue() < address+64 && address < rx.addressValue()+bytes)) return SpiTransactionResult(3<<32)
+    val admitted=gate.tryBegin(owner)
+    if (admitted != 0) return SpiTransactionResult((if (admitted == 1) 2 else if (admitted == 2) 4 else 3)<<32)
+    context.storeU32(32,this&0xffffffff);context.storeU32(36,this>>>32)
+    context.storeU32(40,gate.word().address());context.storeU32(44,int(owner))
+    context.storeU32(48,1);context.storeU32(52,0);context.storeU32(56,0)
+    if (!c5SpiMasterDataReady(this,receive)) return c5SpiAsyncTransactionFinish(context,13)
+    context.storeU32(48,257)
+    if (!c5SpiSelectLevel(this.pins().pinAt(3),false)) return c5SpiAsyncTransactionFinish(context,11)
+    val low=nativeBufferAt(address,32)
+    esp32C5SpiAsyncInitialize(low)
+    val result=esp32C5SpiAsyncBeginOwned(low,tx,rx,bytes,now,budget,receive)
+    if (result != 0) return c5SpiAsyncTransactionFinish(context,result)
+    return SpiTransactionResult(0)
+}
+trusted fun esp32C5SpiAsyncTransactionPoll(context: NativeBuffer,now: u32): SpiTransactionResult {
+    if (!c5SpiAsyncTransactionValid(context)) return SpiTransactionResult(3<<32)
+    val state=context.loadU32(48)&255
+    if (state == 2) return SpiTransactionResult((context.loadU32(52)<<32)|context.loadU32(56))
+    if (state != 1) return SpiTransactionResult(3<<32)
+    val gate=peripheralGateAt(context.loadU32(40));val owner=u32(context.loadU32(44))
+    if (gate.word().compareExchange(owner,owner) != owner) return c5SpiAsyncTransactionSave(context,5,1<<24)
+    val report=esp32C5SpiAsyncPollOwned(nativeBufferAt(context.addressValue(),32),now)
+    if (report == 0) return SpiTransactionResult(0)
+    return c5SpiAsyncTransactionFinish(context,report)
+}

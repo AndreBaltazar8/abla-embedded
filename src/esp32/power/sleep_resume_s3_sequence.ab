@@ -1,0 +1,56 @@
+import "../sdk/raw_buffer.ab"
+// Caller stores returned progress in retained internal RAM before retrying.
+// Phase bits: clock1, analog2, MSPI4, UART8. Status:0new,1complete,
+// 2clock-timeout retryable,3MSPI acquisition retryable,4manual recovery needed,
+// 5invalid inputs. Detail is absolute clock error or MSPI status.
+type Esp32S3SleepResume = int
+fun esp32S3SleepResumeStart(): Esp32S3SleepResume = Esp32S3SleepResume(1<<40)
+fun Esp32S3SleepResume.phase(): int = this & 15
+fun Esp32S3SleepResume.status(): int = (this>>>4) & 15
+fun Esp32S3SleepResume.apbHertz(): int = (this>>>8) & 0x7FFFFFF
+fun Esp32S3SleepResume.detail(): int = (this>>>35) & 31
+fun Esp32S3SleepResume.complete(): bool = this.phase() == 15 && this.status() == 1
+@inline
+fun Esp32S3SleepResume.valid(): bool {
+    val phase=this.phase()
+    return (this & (1<<40)) != 0 && (this & ~0x1FFFFFFFFFF) == 0 &&
+        (phase == 0 || phase == 1 || phase == 3 || phase == 7 || phase == 15) &&
+        this.status() <= 5 && (if (phase == 0) this.apbHertz() == 0 else this.apbHertz() > 0 && this.apbHertz() <= 80000000)
+}
+@inline
+fun esp32S3SleepResumeResult(phase: int,status: int,apb: int,detail: int): Esp32S3SleepResume =
+    Esp32S3SleepResume((1<<40) | phase | (status<<4) | (apb<<8) | ((detail & 31)<<35))
+
+// Restores an already prepared light-sleep cycle, including rejected sleep.
+// Both cores/interrupts and all clients remain quiescent. Caller retains all
+// original snapshots; MSPI record must be active until its successful restore.
+// Do not retry status4: cache/PLL state requires explicit owner recovery.
+// Final APB Hz is for software clock bookkeeping before releasing clients.
+@section(".iram1.abla.s3SleepResume")
+trusted fun esp32S3SleepResumeOwned(progress: Esp32S3SleepResume,clock: Esp32S3ClockState,bias: Esp32S3ClockBias,analog: Esp32S3AnalogSleepState,mspi: NativeBuffer,uarts: Esp32S3SleepUarts,polls: int): Esp32S3SleepResume {
+    if (!progress.valid()) return esp32S3SleepResumeResult(0,5,0,0)
+    if (progress.complete() || progress.status() == 4) return progress
+    var phase=progress.phase()
+    var apb=progress.apbHertz()
+    if (!mspi.hasAddressRange(0,56) || (mspi.addressValue() & 3) != 0 ||
+        !uarts.ready() || polls <= 0 || polls > 0x7FFFFFFF) return esp32S3SleepResumeResult(phase,5,apb,0)
+    if ((phase & 1) == 0) {
+        val result=esp32S3ClockResumeFromXtalOwned(clock,bias,polls)
+        if (result <= 0) return esp32S3SleepResumeResult(phase,if (result == -3) 2 else 4,apb,-result)
+        apb=result; phase=1
+    }
+    if ((phase & 2) == 0) {
+        esp32S3AnalogSleepRestoreOwned(analog)
+        phase=3
+    }
+    if ((phase & 4) == 0) {
+        val result=esp32S3MspiLowEndOwned(mspi,polls)
+        if (result != 1) return esp32S3SleepResumeResult(phase,if (result >= 2 && result <= 5) 3 else 4,apb,result)
+        phase=7
+    }
+    if ((phase & 8) == 0) {
+        uarts.resumeOwned()
+        phase=15
+    }
+    esp32S3SleepResumeResult(phase,1,apb,0)
+}

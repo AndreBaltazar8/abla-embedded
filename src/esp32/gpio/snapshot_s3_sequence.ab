@@ -1,0 +1,46 @@
+import "./snapshot_s3_logic.ab"
+// Compact snapshot of the digital fields changed by GPIO matrix routing:
+// mux[14:7]8, matrixout12@8,openDrain20,outputEnable21,outputLatch22,pin6@23,
+// valid29. Raw drive bits are retained, including GPIO17/18's reversed mapping.
+// Does not capture RTC/USB ownership, hold, sleep configuration or the GLOBAL
+// input-signal matrix. Those must be separately owned/saved by the peripheral.
+trusted fun esp32S3GpioSnapshotOwned(pin: int,quiescentOwners: bool): S3GpioSnapshot {
+    if (!quiescentOwners || !espChipS3().gpioOutputValid(pin)) return S3GpioSnapshot(0)
+    val bank=esp32S3GpioBankOffset(pin)
+    val shift=pin&31
+    return S3GpioSnapshot((1<<29)|(pin<<23)|((esp32S3PinStateRead(esp32S3GpioMuxAddress(pin))>>7)&255)|
+        ((esp32S3PinStateRead(0x60004554+pin*4)&4095)<<8)|
+        (((esp32S3PinStateRead(0x60004074+pin*4)>>2)&1)<<20)|
+        (((esp32S3PinStateRead(0x60004020+bank)>>shift)&1)<<21)|
+        (((esp32S3PinStateRead(0x60004004+bank)>>shift)&1)<<22))
+}
+trusted fun esp32S3PinStateField(address: int,mask: int,value: int): bool {
+    esp32S3PinStateWrite(address,(esp32S3PinStateRead(address)&~mask)|(value&mask))
+    return (esp32S3PinStateRead(address)&mask) == (value&mask)
+}
+// Both prior and temporary peripheral owners must remain quiescent throughout
+// restore; caller owns pad/mux/SYSTEM RMW serialization. Return1restored2invalid
+// 3notquiescent4readbackfailure. Failure preserves the snapshot for retry and
+// may leave partial configuration: never treat it as permission to release.
+trusted fun S3GpioSnapshot.restoreOwned(quiescentOwners: bool): int {
+    if (!this.valid()) return 2
+    if (!quiescentOwners) return 3
+    val pin=this.pin()
+    val bank=esp32S3GpioBankOffset(pin)
+    val bit=1<<(pin&31)
+    val route=0x60004554+pin*4
+    // Disable GPIO OE first, then select it for the matrix output. Peripheral
+    // OE can otherwise bypass a disabled GPIO enable latch during restoration.
+    esp32S3PinStateWrite(0x60004028+bank,bit)
+    if ((esp32S3PinStateRead(0x60004020+bank)&bit) != 0) return 4
+    if (!esp32S3PinStateField(route,3072,1024)) return 4
+    val high=(this&(1<<22)) != 0
+    esp32S3PinStateWrite((if (high) 0x60004008 else 0x6000400c)+bank,bit)
+    if (((esp32S3PinStateRead(0x60004004+bank)&bit) != 0) != high) return 4
+    if (!esp32S3PinStateField(0x60004074+pin*4,4,((this>>20)&1)<<2)) return 4
+    if (!esp32S3PinStateField(esp32S3GpioMuxAddress(pin),0x7f80,(this&255)<<7)) return 4
+    if (!esp32S3PinStateField(route,4095,(this>>8)&4095)) return 4
+    if ((this&(1<<21)) != 0) esp32S3PinStateWrite(0x60004024+bank,bit)
+    if (((esp32S3PinStateRead(0x60004020+bank)&bit) != 0) != ((this&(1<<21)) != 0)) return 4
+    return 1
+}

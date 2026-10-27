@@ -1,0 +1,63 @@
+import "./configuration_logic.ab"
+import "./command_s3_logic.ab"
+import "./fifo_esp32s3.ab"
+import "./timing_esp32s3.ab"
+import "../gpio_esp32s3.ab"
+
+// Caller holds the system-wide RCC critical section on BOTH cores and owns
+// this peripheral with software users quiesced (including fault recovery).
+// Kept separate from pad setup so that the shared lock
+// need only cover these three register updates, never a bus transaction.
+trusted fun esp32S3I2cResetClockedControllerLocked(port: int): bool {
+    if (port < 0 || port > 1) return false
+    val mask = if (port == 0) u32(128) else u32(262144)
+    esp32S3I2cTimingField(0x600c0018, mask, mask)
+    esp32S3I2cTimingField(0x600c0020, mask, mask)
+    esp32S3I2cTimingField(0x600c0020, mask, u32(0))
+    true
+}
+
+// Caller owns a reset, bus-clock-enabled controller and the digital pads.
+// RTC/USB ownership must have been released. XTAL frequency is supplied by
+// the board/clock layer; no hard-coded APB clock assumption enters timing.
+trusted fun esp32S3I2cSetupMaster(port: int, sda: int, scl: int,
+    xtalHz: u32, busHz: u32, internalPulls: bool = true, filter: int = 7): bool {
+    val timing = esp32S3I2cTiming(xtalHz, busHz)
+    if (!espChipS3().i2cMasterConfigurationValid(port, sda, scl) ||
+        !timing.valid() || filter < 0 || filter > 15) return false
+    val base = esp32S3I2cControllerAddress(port)
+    // Source XTAL(bit20=0), active bit21. Clear inherited fractional divider.
+    esp32S3I2cTimingField(base + 0x54, u32(0x3fffff), u32(0x200000))
+    // Master, open-drain peripheral outputs, MSB-first, no arbitration,
+    // ACK RX-full level low. Preserve unrelated control bits.
+    esp32S3I2cTimingField(base + 4, u32(0x3fb), u32(0x113))
+    // FIFO access with protection enabled; reset both FIFOs explicitly.
+    esp32S3I2cTimingField(base + 0x18, u32(0x4400), u32(0x4000))
+    esp32S3I2cResetFifos(port)
+    val filterBits = if (filter == 0) 0 else filter | (filter << 4) | 768
+    esp32S3I2cTimingField(base + 0x50, u32(1023), u32(filterBits))
+    // Polling driver owns all interrupt state on this reset controller.
+    mmioStoreU32(base + 0x28, 0)
+    mmioStoreU32(base + 0x24, 0x3ffff)
+    var index = 0
+    while (index < 8) {
+        esp32S3I2cWriteCommand(port, index, esp32S3I2cCommand(4, 0))
+        index = index + 1
+    }
+    esp32S3I2cRoutePad(scl, 89 + port * 2, internalPulls)
+    esp32S3I2cRoutePad(sda, 90 + port * 2, internalPulls)
+    esp32S3I2cConfigureTiming(port, timing)
+}
+
+// Called only after validation above; input and output share the same signal
+// index on S3. Release the GPIO latch before selecting open-drain output.
+trusted fun esp32S3I2cRoutePad(number: int, signal: int, internalPulls: bool): void {
+    val p = pin(number)
+    p.write(true)
+    p.input()
+    p.setPull(internalPulls, false)
+    gpio_set_direction(i32(number), i32(7))
+    esp32S3GpioUpdate(0x60004554 + number * 4, 4095, signal)
+    esp32S3GpioUpdate(0x60004154 + signal * 4, 255, 128 | number)
+    return
+}

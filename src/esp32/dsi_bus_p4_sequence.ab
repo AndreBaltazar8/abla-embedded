@@ -1,0 +1,62 @@
+import "./dsi_clock_p4_sequence.ab"
+import "./dsi_start_p4_sequence.ab"
+// One scalar owns the DSI peripheral clocks/digital controller, NOT shared
+// source PLLs or analog/panel supplies. Caller has acquired/pinned sources,
+// supplied actual post-reference-divider frequency and settled the supply.
+// Serialize the whole lifecycle with exclusive host/bridge ownership and RCC
+// critical section. Always assign returned state; never duplicate ownership.
+type Esp32P4DsiBus = int
+// 0 closed,1 ready for commands,2 invalid,3 clocks already active/refused,
+// 4 digital startup failed,5 digital shutdown busy,6 shutdown readback failed.
+fun Esp32P4DsiBus.status(): int = this&15
+fun Esp32P4DsiBus.ready(): bool = this.status() == 1
+fun Esp32P4DsiBus.ownsClocks(): bool = (this&16) != 0
+fun Esp32P4DsiBus.ownsDigital(): bool = (this&32) != 0
+fun Esp32P4DsiBus.lastTransport(): DsiCommandResult = DsiCommandResult((this>>>8)&4503599627370495)
+
+trusted fun esp32P4DsiOpenOwned(hwVersion: int,lanes: int,cfgSource: int,refSource: int,referenceDiv: int,referenceKhz: int,laneKbps: int,channel: int,forceHs: bool,polls: int): Esp32P4DsiBus {
+    // Validate digital arguments before the destructive RCC reset.
+    if ((hwVersion != 1 && hwVersion != 3) || lanes < 1 || lanes > 2 ||
+        channel < 0 || channel > 3 || polls < 1 || polls > 1000000) return Esp32P4DsiBus(2)
+    val plan=esp32P4DsiChoosePllKbps(referenceKhz,laneKbps)
+    if (!plan.valid()) return Esp32P4DsiBus(2)
+    val rate=int((u32(referenceKhz)*u32(plan.multiplier())+u32(plan.divider()-1))/u32(plan.divider()))
+    if (rate < 80000 || rate > 1500000) return Esp32P4DsiBus(2)
+    val clocks=esp32P4DsiClockStartOwned(hwVersion,cfgSource,refSource,referenceDiv)
+    // RCC-only partial setup: no digital command or DMA was issued. Remember
+    // quiescence so close retries never read an APB block that may be gated.
+    if (clocks == 4) return Esp32P4DsiBus(4|16|64)
+    if (clocks != 1) return Esp32P4DsiBus(if (clocks == 2) 2 else 3)
+    val digital=esp32P4DsiStartDigitalOwned(hwVersion,lanes,referenceKhz,laneKbps,channel,forceHs,polls)
+    Esp32P4DsiBus((if (digital.hostComplete()) 1 else 4)|16|
+        (if (digital.digitalOwned()) 32 else 0)|((digital&4503599627370495)<<8))
+}
+
+trusted fun Esp32P4DsiBus.closeOwned(polls: int): Esp32P4DsiBus {
+    if (!this.ownsClocks()) return this
+    if (polls < 1 || polls > 1000000) return this
+    var state=this|0
+    if (this.ownsDigital()) {
+        // An enabled video bridge may still own DMA. Never gate or reset it
+        // here. Caller must stop/quiesce display transfers first.
+        if ((p4DsiBridgeRead(4)&u32(1)) != u32(0) || !esp32P4DsiWaitIdleOwned(polls))
+            return Esp32P4DsiBus((state&(-16))|5)
+        esp32P4DsiPhyStopOwned()
+        if ((p4DsiRead(4)&u32(1)) != u32(0) || (p4DsiRead(160)&u32(1)) != u32(0))
+            return Esp32P4DsiBus((state&(-16))|6)
+        state=(state&(-33))|64
+    }
+    // If digital start refused a pre-existing owner, even though our RCC
+    // start succeeded, retain clocks rather than cutting power underneath it.
+    if ((state&64) == 0) {
+        if ((p4DsiBridgeRead(4)&u32(1)) != u32(0) || (p4DsiRead(4)&u32(1)) != u32(0) ||
+            (p4DsiRead(160)&u32(1)) != u32(0)) return Esp32P4DsiBus((state&(-16))|5)
+        state=state|64
+    }
+    // Bit6 remembers verified quiescence: a failed clock-gate readback may
+    // already have removed APB access, so cleanup retry must use RCC only.
+    esp32P4DsiClockStopOwned()
+    if ((p4DsiClockRead(60)&u32(131)) != u32(0) || (p4DsiClockRead(24)&u32(4096)) != u32(0))
+        return Esp32P4DsiBus((state&(-16))|6)
+    Esp32P4DsiBus(0)
+}

@@ -1,0 +1,50 @@
+// P4 HP I2C0/1, IDF6 i2c_ll.h and HP_SYS_CLKRST hw_ver1/3. Not LP I2C.
+// Both sources (0XTAL,1RC_FAST) must already be stable/pinned. Caller owns
+// selected controller/pads and serializes shared RCC RMW across both cores.
+// No source startup, reference counter or reset; existing config is retained.
+fun p4I2cBase(port: int): int = 0x500c4000+port*4096
+trusted fun p4I2cField(address: int,mask: u32,value: u32): bool {
+    val before=p4I2cRead(address)
+    val desired=(before&(u32(0xffffffff)^mask))|(value&mask)
+    if (before != desired) p4I2cWrite(address,desired)
+    return (p4I2cRead(address)&mask) == (value&mask)
+}
+trusted fun p4I2cIdle(port: int): bool =
+    (p4I2cRead(p4I2cBase(port)+8)&u32(16)) == u32(0) &&
+    (p4I2cRead(p4I2cBase(port)+4)&u32(32)) == u32(0)
+type P4I2cClock=int
+fun P4I2cClock.status(): int = this&255
+fun P4I2cClock.hasSnapshot(): bool = (this&4096) != 0
+// Original APB8/controller9/source10; port11/owned12. 1ready2invalid3reset
+// 4busy5readback6closed. Keep token after failure, retry close until6.
+trusted fun esp32p4I2cClockOpenOwned(port: int,source: int,exclusive: bool): P4I2cClock {
+    if (!exclusive || port < 0 || port > 1 || source < 0 || source > 1) return P4I2cClock(2)
+    if ((p4I2cRead(0x500e60c4)&(u32(1)<<u32(22-port))) != u32(0)) return P4I2cClock(3)
+    val apb=(p4I2cRead(0x500e601c)>>u32(12+port))&u32(1)
+    if (apb != u32(0) && !p4I2cIdle(port)) return P4I2cClock(4)
+    // BOTH source/controller gates live in CTRL10; only port1 divider uses11.
+    val shift=u32(port*26)
+    val clocks=(p4I2cRead(0x500e6040)>>shift)&u32(3)
+    val token=(int(apb)<<8)|(int(clocks>>u32(1))<<9)|(int(clocks&u32(1))<<10)|(port<<11)|4096
+    if (!p4I2cField(0x500e601c,u32(1)<<u32(12+port),u32(1)<<u32(12+port)) ||
+        !p4I2cField(0x500e6040,u32(2)<<shift,u32(0)) ||
+        !p4I2cField(0x500e6040,u32(1)<<shift,u32(source)<<shift) ||
+        !p4I2cField(0x500e6040,u32(2)<<shift,u32(2)<<shift)) return P4I2cClock(token|5)
+    return P4I2cClock(token|1)
+}
+trusted fun P4I2cClock.closeOwned(exclusive: bool): P4I2cClock {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 6) return this
+    val token=this&0x1f00
+    val port=(this>>11)&1
+    if ((p4I2cRead(0x500e601c)&(u32(1)<<u32(12+port))) != u32(0) && !p4I2cIdle(port)) return P4I2cClock(token|4)
+    val shift=u32(port*26)
+    if (!p4I2cField(0x500e6040,u32(2)<<shift,u32(0)) ||
+        !p4I2cField(0x500e6040,u32(1)<<shift,(u32(this>>10)&u32(1))<<shift) ||
+        !p4I2cField(0x500e6040,u32(2)<<shift,(u32(this>>9)&u32(1))<<(shift+u32(1))) ||
+        !p4I2cField(0x500e601c,u32(1)<<u32(12+port),(u32(this>>8)&u32(1))<<u32(12+port))) return P4I2cClock(token|5)
+    return P4I2cClock(token|6)
+}
+trusted fun esp32p4I2cClockReady(port: int): bool = port >= 0 && port <= 1 &&
+    (p4I2cRead(0x500e60c4)&(u32(1)<<u32(22-port))) == u32(0) &&
+    (p4I2cRead(0x500e601c)&(u32(1)<<u32(12+port))) != u32(0) &&
+    (p4I2cRead(0x500e6040)&(u32(2)<<u32(port*26))) != u32(0)

@@ -1,0 +1,59 @@
+import "abla/runtime/scalar"
+// GPSPI2 only, NOT flash/cache MSPI. Caller owns stopped controller, no DMA,
+// IRQ or competing PCR writers, and a stable pinned XTAL/PLL160/RC/PLL120 source.
+// Borrow existing gates, preserve source/divider/reset. No reset pulse.
+// Status0closed1ready2unowned/invalid3reset4source5APB6readyTimeout
+// 7function8busyClose9functionClose10APBclose. Ownership bits8APB,9function.
+type Esp32C5SpiClock=int
+fun Esp32C5SpiClock.status(): int = this&255
+fun Esp32C5SpiClock.ready(): bool = this.status() == 1
+fun Esp32C5SpiClock.ownedGates(): int = (this>>>8)&3
+trusted fun c5SpiClockField(address: int,mask: u32,on: bool): bool {
+    val before=c5SpiRead(address)
+    c5SpiWrite(address,if (on) before|mask else before&~mask)
+    return ((c5SpiRead(address)&mask) != u32(0)) == on
+}
+trusted fun esp32C5SpiClockOpenOwned(exclusiveStableStopped: bool,polls: int = 1000): Esp32C5SpiClock {
+    if (!exclusiveStableStopped || polls < 1 || polls > 1000000) return Esp32C5SpiClock(2)
+    val bus=c5SpiRead(0x600960c4)
+    val functional=c5SpiRead(0x600960c8)
+    if ((bus&u32(2)) != u32(0)) return Esp32C5SpiClock(3)
+    // C5 selector3 is PLL120, unlike C61 where it is reserved.
+    var state=0
+    if ((bus&u32(1)) == u32(0)) {
+        state=state|256
+        if (!c5SpiClockField(0x600960c4,u32(1),true)) return Esp32C5SpiClock(state|5)
+    }
+    var left=polls
+    while (left > 0 && (c5SpiRead(0x600960c4)&u32(4)) == u32(0)) left=left-1
+    if (left == 0) return Esp32C5SpiClock(state|6)
+    if ((functional&u32(0x400000)) == u32(0)) {
+        state=state|512
+        if (!c5SpiClockField(0x600960c8,u32(0x400000),true)) return Esp32C5SpiClock(state|7)
+    }
+    return Esp32C5SpiClock(state|1)
+}
+// Conservative CPU-master admission. Does not clear sticky IRQ status or
+// repair an active DMA/slave configuration. All controller reads need APB.
+trusted fun esp32C5SpiCpuIdleOwned(): bool {
+    if ((c5SpiRead(0x600960c4)&u32(7)) != u32(5)) return false
+    return (c5SpiRead(0x60081000)&u32(0x01800000)) == u32(0) &&
+        (c5SpiRead(0x60081030)&u32(0x18000000)) == u32(0) &&
+        c5SpiRead(0x60081034) == u32(0) &&
+        (c5SpiRead(0x600810e0)&u32(0x0c000000)) == u32(0)
+}
+trusted fun Esp32C5SpiClock.closeOwned(exclusiveChildrenStopped: bool): Esp32C5SpiClock {
+    if (!exclusiveChildrenStopped || this < 0 || (this&~1023) != 0 || this.status() > 10) return this
+    var state=this&768
+    if (state == 0) return Esp32C5SpiClock(0)
+    // A disabled APB may be an attempted-but-unapplied acquisition. If enabled,
+    // require observable idle before stopping any clock underneath controller.
+    if ((c5SpiRead(0x600960c4)&u32(1)) != u32(0) && !esp32C5SpiCpuIdleOwned()) return Esp32C5SpiClock(state|8)
+    if ((state&512) != 0) {
+        if (!c5SpiClockField(0x600960c8,u32(0x400000),false)) return Esp32C5SpiClock(state|9)
+        state=state&~512
+    }
+    if ((state&256) != 0 && !c5SpiClockField(0x600960c4,u32(1),false)) return Esp32C5SpiClock(state|10)
+    return Esp32C5SpiClock(0)
+}
+

@@ -1,0 +1,37 @@
+import "./sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Requires successful acquire for this block; CPU owns descriptor/payload,
+// initialized replacement TX bytes (or consumed RX), same ring layout/lifetime.
+// Global cache engine and whole lines exclusively owned. NO invalidation here:
+// that would discard replacement audio. Validate metadata before any mutation.
+// Low byte1 published,2 invalid/unowned,3 DMA-owned,4 malformed,
+// 5 payload flush failed,6 descriptor flush failed. Cache status bits8..15.
+// Bit16 means ownerDMA has been stored and may already be visible via eviction:
+// on status6 DO NOT retry/reacquire/edit/free; stop/park and resolve cache engine
+// before recovery. Success also gives up CPU access. No restart/ack implied.
+trusted fun esp32p4AhbGdmaRearmBlockOwned(descriptors: int,count: int,buffers: int,
+    stride: int,bytes: int,index: int,transmit: bool,circular: bool,polls: int,exclusive: bool): int {
+    if (!exclusive || index < 0 || index >= count || polls < 1 || polls > 1000000 ||
+        !esp32p4AhbGdmaRingLayoutValid(descriptors,count,buffers,stride,bytes)) return 2
+    val descriptor=descriptors+index*64
+    val payload=buffers+index*stride
+    val last=index+1 == count
+    val expectedNext=if (last) (if (circular) descriptors else 0) else descriptor+64
+    val flags=p4AhbRearmLoad(descriptor)
+    if ((flags & 0x80000000) != 0) return 3
+    val length=(flags >>> 12) & 4095
+    if ((flags & 4095) != bytes || (flags & 0x3f000000) != 0 || length < 1 || length > bytes ||
+        (transmit && length != bytes) || p4AhbRearmLoad(descriptor+4) != payload ||
+        p4AhbRearmLoad(descriptor+8) != expectedNext) return 4
+    p4AhbRearmFence()
+    val dataSync=p4AhbRearmFlush(nativeBufferAt(payload,stride),stride,polls)
+    if (dataSync != 1) return 5 | (dataSync << 8)
+    p4AhbRearmFence()
+    val nextFlags=bytes | 0x80000000 | (if (transmit) (bytes << 12) | (if (circular || last) 0x40000000 else 0) else 0)
+    p4AhbRearmStore(descriptor,nextFlags)
+    p4AhbRearmFence()
+    val descriptorSync=p4AhbRearmFlush(nativeBufferAt(descriptor,64),64,polls)
+    if (descriptorSync != 1) return 6 | (descriptorSync << 8) | 65536
+    p4AhbRearmFence()
+    return 65537
+}

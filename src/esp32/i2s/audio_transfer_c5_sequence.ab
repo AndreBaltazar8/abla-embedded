@@ -1,0 +1,47 @@
+import "./audio_setup_c5_sequence.ab"
+import "./dma_abort_c5_sequence.ab"
+// Pair a176B setup lease with a140B finite-transfer record. Caller keeps this
+// exact pair exclusively owned and immutable except through these APIs, plus
+// initialized TX bytes/owned RX SRAM. Neither record may overlap DMA memory.
+// Success from finish means transfer acquired/stopped/events handled and all
+// owned setup resources restored; physical codec/sound validation is separate.
+fun c5AudioTransferRecordsValid(setup: NativeBuffer,transfer: NativeBuffer): bool = c5AudioSetupStorage(setup) && c5I2sDmaFiniteStorage(transfer) &&
+    (setup.addressValue()+176 <= transfer.addressValue() || transfer.addressValue()+140 <= setup.addressValue())
+trusted fun c5AudioTransferBeginOwned(setup: NativeBuffer,transfer: NativeBuffer,descriptors: int,count: int,buffers: int,stride: int,bytes: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioTransferRecordsValid(setup,transfer) || setup.loadU32(0) != 0x43354155 || setup.loadU32(4) != 2 ||
+        !c5AhbGdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    val address=setup.addressValue()
+    if ((address < descriptors+count*12 && descriptors < address+176) || (address < buffers+(count-1)*stride+bytes && buffers < address+176)) return 2
+    val dma=setup.loadU32(72)|(setup.loadU32(76)<<32)
+    if ((dma&(1<<50)) == 0 || (dma&255) != 1) return 2
+    return c5I2sDmaFiniteBeginOwned(transfer,(dma>>>47)&3,(dma&(1<<49)) != 0,descriptors,count,buffers,stride,bytes,polls,true)
+}
+trusted fun c5AudioTransferPairValid(setup: NativeBuffer,transfer: NativeBuffer): bool {
+    if (!c5AudioTransferRecordsValid(setup,transfer) || setup.loadU32(0) != 0x43354155 || transfer.loadU32(0) != 0x43354946) return false
+    // Hardware admission fails before the start tag exists. Only that precise
+    // failure (or its completed abort) may use the retained channel identity.
+    if (transfer.loadU32(16) != 0x43354944 && !(transfer.loadU32(16) == 0 &&
+        transfer.loadU32(8) == 0x10003 && (transfer.loadU32(4) == 6 || transfer.loadU32(4) == 8))) return false
+    val dma=setup.loadU32(72)|(setup.loadU32(76)<<32)
+    return (dma&(1<<50)) != 0 && ((dma>>>47)&3) == transfer.loadU32(28) &&
+        ((dma&(1<<49)) != 0) == (transfer.loadU32(32) != 0)
+}
+// Returns1finished/released2invalid4error5pending8FIFO-not-empty. Error leaves
+// resources retained; use abort with explicit discard policy instead of finish.
+trusted fun c5AudioTransferFinishOwned(setup: NativeBuffer,transfer: NativeBuffer,budget: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AudioTransferPairValid(setup,transfer) || (setup.loadU32(4) != 2 && setup.loadU32(4) != 5 && setup.loadU32(4) != 6)) return 2
+    val result=c5I2sDmaFinitePollOwned(transfer,budget,polls,true)
+    if (result != 1) return result
+    val closed=c5AudioSetupCloseOwned(setup,polls,true)
+    return if (closed == 6) 1 else closed
+}
+// Abort does not turn failure into successful playback. Returns1 means only
+// that the stopped/discard policy was met and resources restored; inspect
+// transfer error8/events12. No automatic descriptor OWNER rewrite.
+trusted fun c5AudioTransferAbortOwned(setup: NativeBuffer,transfer: NativeBuffer,polls: int,exclusive: bool,discard: bool): int {
+    if (!exclusive || !c5AudioTransferPairValid(setup,transfer)) return 2
+    val result=c5I2sDmaFiniteAbortOwned(transfer,polls,true,discard)
+    if (result != 1) return result
+    val closed=c5AudioSetupCloseOwned(setup,polls,true)
+    return if (closed == 6) 1 else closed
+}

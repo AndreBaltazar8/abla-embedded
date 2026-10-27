@@ -1,0 +1,62 @@
+import "../sdk/raw_buffer.ab"
+// Caller-owned immutable job table, 16 bytes per addressed phase:
+// address7@0,reading@1,reserved16@2,count32@4,payload32@8,reserved32@12.
+// Every phase begins START/repeated START; only the final phase emits STOP.
+// Reads NACK their final byte even before a repeated START. Zero-byte writes
+// are address probes; zero-byte reads are invalid. No implicit allocation.
+trusted fun i2cJobSet(jobs: NativeBuffer,index: int,address: int,reading: bool,payload: NativeBuffer,count: int): bool {
+    if (index < 0 || index >= 64 || !jobs.hasAddressRange(index*16,16) || address < 0 || address > 127 ||
+        count < (if (reading) 1 else 0) || count > 65535 || !payload.hasAddressRange(0,count)) return false
+    jobs.storeU32(index*16,address|(if (reading) 256 else 0)); jobs.storeU32(index*16+4,count)
+    jobs.storeU32(index*16+8,payload.addressValue()); jobs.storeU32(index*16+12,0)
+    return true
+}
+trusted fun i2cJobsValid(jobs: NativeBuffer,count: int): bool {
+    if (count < 1 || count > 64 || !jobs.hasAddressRange(0,count*16)) return false
+    var i=0
+    while (i < count) {
+        val flags=jobs.loadU32(i*16)
+        val bytes=jobs.loadU32(i*16+4)
+        val payload=nativeBufferAt(jobs.loadU32(i*16+8),bytes)
+        if ((flags&~383) != 0 || jobs.loadU32(i*16+12) != 0 || bytes > 65535 || ((flags&256) != 0 && bytes == 0) ||
+            !payload.hasAddressRange(0,bytes)) return false
+        if (bytes > 0 && payload.addressValue() < jobs.addressValue()+count*16 && jobs.addressValue() < payload.addressValue()+bytes) return false
+        var j=0
+        while (j < i) {
+            val other=jobs.loadU32(j*16+8)
+            val length=jobs.loadU32(j*16+4)
+            if (bytes > 0 && length > 0 && payload.addressValue() < other+length && other < payload.addressValue()+bytes) return false
+            j=j+1
+        }
+        i=i+1
+    }
+    return true
+}
+// Checked complete admission before hardware. Backend hooks share one cycle
+// deadline across all FIFO chunks. Return native1success,3..8errors; partial
+// reads/writes and held bus on error require caller recovery, never retry.
+trusted fun i2cJobsRunOwned(port: int,jobs: NativeBuffer,count: int,budget: u32): int {
+    if (port < 0 || port > 1 || budget == u32(0) || budget > u32(0x7fffffff) || !i2cJobsValid(jobs,count)) return 7
+    val fifo=i2cJobsFifoBytes(port)
+    if (fifo != 16 && fifo != 32) return 7
+    val started=i2cJobsCounter()
+    var i=0
+    var continued=false
+    while (i < count) {
+        val reading=(jobs.loadU32(i*16)&256) != 0
+        val bytes=jobs.loadU32(i*16+4)
+        var offset=0
+        var first=true
+        while (first || offset < bytes) {
+            val capacity=fifo-(if (!reading && first) 1 else 0)
+            val chunk=if (bytes-offset < capacity) bytes-offset else capacity
+            val end=offset+chunk == bytes
+            val finish=end && i+1 == count
+            val result=i2cJobsChunk(port,jobs.load(i*16),nativeBufferAt(jobs.loadU32(i*16+8)+offset,chunk),chunk,reading,first,finish,continued,started,budget,reading && end)
+            if (result != (if (finish) 1 else 2)) return if (result <= 2) 6 else result
+            offset=offset+chunk; first=false; continued=true
+        }
+        i=i+1
+    }
+    return 1
+}

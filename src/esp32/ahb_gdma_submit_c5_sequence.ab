@@ -1,0 +1,51 @@
+import "./ahb_gdma_channel_c5_sequence.ab"
+import "./ahb_gdma_ring_c5_sequence.ab"
+import "./sdk/raw_buffer.ab"
+// 16B retained RAM submission record: tag0,state4,channel8,TX12.
+// Fresh zero tag required; state3 head-write-failed,4 START-issued. No retry
+// through this record: keep it and descriptor/payload ownership until stopped,
+// events handled and data acquired. Explicit new lifecycle uses fresh storage.
+// Caller owns channel/trigger, SRAM/PMS/windows and entire chain/payload;
+// peripheral requests stopped until submission. Internal SRAM only.
+// Returns1START-issued2invalid3clock4busy5config6window7descriptor8head-write.
+// START WT cannot be proven by immediate readback; success is not completion.
+fun c5AhbGdmaSubmissionStorage(r: NativeBuffer): bool = r.hasAddressRange(0,16) && (r.addressValue()&3) == 0 && (r.addressValue()+16 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c5AhbGdmaSubmitOwned(r: NativeBuffer,channel: int,tx: bool,peripheral: int,descriptors: int,count: int,buffers: int,stride: int,bytes: int,circular: bool,exclusive: bool): int {
+    if (!exclusive || !c5AhbGdmaSubmissionStorage(r) || r.loadU32(0) != 0 || channel < 0 || channel > 2 || !c5AhbGdmaPeripheralValid(peripheral) ||
+        !c5AhbGdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    // Submission bookkeeping must not alias memory that hardware will own.
+    val record=r.addressValue()
+    if ((record < descriptors+count*12 && descriptors < record+16) ||
+        (record < buffers+(count-1)*stride+bytes && buffers < record+16)) return 2
+    if (!c5AhbGdmaChannelClocks()) return 3
+    if (!c5AhbGdmaChannelParked(channel,tx)) return 4
+    val base=c5AhbGdmaChannelBase(channel,tx)
+    val conf=c5AhbGdmaRead(base)
+    if ((conf&u32(if (tx) 2 else 18)) != u32(0) || (tx && (conf&u32(12)) != u32(12)) ||
+        (c5AhbGdmaRead(base+4)&u32(4096)) == u32(0) || (c5AhbGdmaRead(base+48)&u32(63)) != u32(peripheral)) return 5
+    val mode=int((conf>>u32(if (tx) 8 else 6))&u32(3))
+    val alignment=if (mode == 0) 4 else 8*(1<<mode)
+    if (((buffers|stride|bytes)&(alignment-1)) != 0) return 5
+    val low=int(c5AhbGdmaRead(0x3c4));val high=int(c5AhbGdmaRead(0x3c8))
+    // End-exclusive check is conservative for either endpoint convention.
+    if (low > descriptors || low > buffers || high < descriptors+count*12 || high < buffers+(count-1)*stride+bytes) return 6
+    c5AhbGdmaDescriptorFence()
+    var index=0
+    while (index < count) {
+        val at=descriptors+index*12
+        val expected=u32(0x80000000)|u32(bytes)|(if (tx) u32(0x40000000)|(u32(bytes)<<u32(12)) else u32(0))
+        val next=if (index+1 < count) at+12 else if (circular) descriptors else 0
+        if (c5AhbGdmaDescriptorRead(at) != expected || c5AhbGdmaDescriptorRead(at+4) != u32(buffers+index*stride) || c5AhbGdmaDescriptorRead(at+8) != u32(next)) return 7
+        index=index+1
+    }
+    r.storeU32(0,0x43354453);r.storeU32(4,3);r.storeU32(8,channel);r.storeU32(12,if (tx) 1 else 0)
+    val head=0x3ac+channel*4+(if (tx) 12 else 0)
+    c5AhbGdmaWrite(head,u32(descriptors))
+    if (c5AhbGdmaRead(head) != u32(descriptors)) return 8
+    c5AhbGdmaDescriptorFence()
+    // Record the obligation BEFORE submitting a potentially instant command.
+    r.storeU32(4,4)
+    c5AhbGdmaDescriptorFence()
+    c5AhbGdmaWrite(base+16,(c5AhbGdmaRead(base+16)&~u32(if (tx) 7 else 14))|u32(if (tx) 2 else 4))
+    return 1
+}

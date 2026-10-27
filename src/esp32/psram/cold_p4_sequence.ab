@@ -1,0 +1,96 @@
+import "../sdk/raw_buffer.ab"
+// Internal48B record: magic0,phase4,MPLL8,clock12,reset16,old source/div20,
+// identity24/28,profile32,error36,failed phase40,source ownership44.
+// Caller owns record/scratch/work, both controllers/pads/analog/RCC and peers.
+// XTAL40 and upstream analog160MHz must be stable. Chip powered/settled and
+// current read latency supplied explicitly; controller reset is NOT chip reset.
+// Keeps BOTH ports at20MHz: phase8 means configured at low speed, NOT trained,
+// cache mapped, AXI accessible or externally tested. No fast clock switch.
+// Returns1success2invalid3record state4subsystem failure (details in record).
+// All resource results stored before checking. Do not reinitialize a live or
+// failed record. Cleanup does not undo pad/chip modes or claim fresh chip state.
+fun p4PsramColdStorage(record: NativeBuffer): bool = record.hasAddressRange(0,48) && (record.addressValue()&3) == 0 && p4PsramCommandStorageSafe(record.addressValue(),48)
+trusted fun p4PsramColdInitializeOwned(record: NativeBuffer): bool {
+    if (!p4PsramColdStorage(record)) return false
+    var offset=0
+    while (offset < 48) { record.storeU32(offset,0); offset=offset+4 }
+    record.storeU32(0,0x50345053)
+    return true
+}
+trusted fun p4PsramColdFailure(record: NativeBuffer,stage: int,error: int): int {
+    record.storeU32(36,error); record.storeU32(40,stage); return 4
+}
+fun p4PsramColdDisjoint(a: int,alen: int,b: int,blen: int): bool = a+alen <= b || b+blen <= a
+trusted fun p4PsramColdStartOwned(record: NativeBuffer,mhz: int,hex16: bool,currentDummy: int,scratch: NativeBuffer,work: NativeBuffer,polls: int): int {
+    if (!p4PsramColdStorage(record) || !p4PsramProfileValid(mhz) || currentDummy < 0 || currentDummy > 64 || polls < 1 || polls > 1000000 ||
+        !scratch.hasAddressRange(0,2) || !work.hasAddressRange(0,100) || (work.addressValue()&3) != 0 ||
+        !p4PsramCommandStorageSafe(scratch.addressValue(),2) || !p4PsramCommandStorageSafe(work.addressValue(),100)) return 2
+    val r=record.addressValue(); val s=scratch.addressValue(); val w=work.addressValue()
+    if (!p4PsramColdDisjoint(r,48,s,2) || !p4PsramColdDisjoint(r,48,w,100) || !p4PsramColdDisjoint(s,2,w,100)) return 2
+    if (record.loadU32(0) != 0x50345053 || record.loadU32(4) != 0 || record.loadU32(8) != 0 || record.loadU32(12) != 0 || record.loadU32(16) != 0 || record.loadU32(44) != 0) return 3
+    record.storeU32(32,mhz)
+    record.storeU32(20,p4PsramClockRead(48)&0x00ff3000)
+    record.storeU32(4,1)
+    val pll=p4MpllStartColdOwned(p4PsramProfileMpllMHz(mhz),40,polls)
+    record.storeU32(8,pll|0)
+    if (!pll.ready()) return p4PsramColdFailure(record,1,pll|0)
+    record.storeU32(4,2); record.storeU32(44,1)
+    var result=p4PsramClockSelectOwned((record.loadU32(20)>>>12)&3,1,1)
+    if (result != 1) return p4PsramColdFailure(record,2,result)
+    record.storeU32(4,3)
+    val clock=p4PsramClockOpenOwned(1,1)
+    record.storeU32(12,clock|0)
+    if (!clock.ready()) return p4PsramColdFailure(record,3,clock|0)
+    record.storeU32(4,4)
+    val reset=clock.resetControllerOwned(polls)
+    record.storeU32(16,reset|0)
+    if (reset.status() != 1) return p4PsramColdFailure(record,4,reset|0)
+    record.storeU32(4,5)
+    val slowDiv=if (mhz == 80) 16 else if (mhz == 250) 25 else 20
+    result=clock.prepareApControllerOwned(slowDiv,slowDiv,2,polls)
+    if (result != 1) return p4PsramColdFailure(record,5,result)
+    record.storeU32(4,6)
+    val identity=p4PsramApplyProfileOwned(mhz,hex16,currentDummy,scratch,work)
+    record.storeU32(24,identity|0); record.storeU32(28,(identity|0)>>>32)
+    if (!identity.matchesProfile(mhz,hex16)) return p4PsramColdFailure(record,6,identity.status())
+    record.storeU32(4,7)
+    result=p4PsramMappedConfigureOwned(p4PsramProfileReadDummy(mhz),p4PsramProfileWriteDummy(mhz),hex16,polls)
+    if (result != 1) return p4PsramColdFailure(record,7,result)
+    record.storeU32(4,8); record.storeU32(36,0); record.storeU32(40,0)
+    return 1
+}
+// Exclude all new users before closing. An unfinished reset is released first;
+// incomplete clock opening may need completion before safe idle inspection.
+// No AXI stop here: callers that enabled memory must shut it down explicitly.
+trusted fun p4PsramColdCloseOwned(record: NativeBuffer,polls: int): int {
+    if (!p4PsramColdStorage(record) || polls < 1 || polls > 1000000) return 2
+    if (record.loadU32(0) != 0x50345053 || record.loadU32(4) > 10) return 3
+    record.storeU32(4,9)
+    if ((record.loadU32(16)&768) != 0) {
+        val reset=P4PsramReset(record.loadU32(16)).releaseOwned()
+        record.storeU32(16,reset|0)
+        if (reset.status() != 1) return p4PsramColdFailure(record,10,reset|0)
+    }
+    if ((record.loadU32(12)&1792) != 0) {
+        var clock=P4PsramClockOwner(record.loadU32(12))
+        if (!clock.ready() && (clock&0x200000) == 0) {
+            clock=clock.resumeOwned(); record.storeU32(12,clock|0)
+            if (!clock.ready()) return p4PsramColdFailure(record,11,clock|0)
+        }
+        clock=clock.closeOwned(polls); record.storeU32(12,clock|0)
+        if (clock.status() != 0) return p4PsramColdFailure(record,11,clock|0)
+    }
+    if (record.loadU32(44) != 0) {
+        val old=record.loadU32(20)
+        val result=p4PsramClockSelectOwned((p4PsramClockRead(48)>>>12)&3,(old>>>12)&3,((old>>>16)&255)+1)
+        if (result != 1) return p4PsramColdFailure(record,12,result)
+        record.storeU32(44,0)
+    }
+    if ((record.loadU32(8)&0x1f000000) != 0) {
+        val pll=P4MpllOwner(record.loadU32(8)).closeOwned(polls)
+        record.storeU32(8,pll|0)
+        if (pll.status() != 0) return p4PsramColdFailure(record,13,pll|0)
+    }
+    record.storeU32(36,0); record.storeU32(40,0)
+    return 1
+}

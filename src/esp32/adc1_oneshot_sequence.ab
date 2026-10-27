@@ -1,0 +1,72 @@
+// Classic ESP32 RTC ADC1 transaction primitive, from IDF v6.0.2 ADC LL.
+// Caller exclusively owns ADC1 and selected analog pad, has already prepared
+// power/settling/clock/attenuation/Hall state and RTC software controller, and
+// excludes DMA/ULP/cross-core changes. Does NOT acquire those resources.
+// ADC2/WiFi registers are never accessed. No cancellation or forced success.
+// Low8:1success2invalid3controller/config4busy5readback6timeout7invalidraw.
+// Start bit8 means a write was attempted: retain ownership on partial failure.
+// Finish success contains raw<<8. A timeout leaves conversion/channel intact;
+// retry finish, not start, and never power down while conversion may run.
+trusted fun esp32Adc1Prepared(): bool {
+    val control=esp32Adc1Read(0)
+    return (control&0x18000000) == 0x10000000 &&
+        ((control>>16)&3) == (esp32Adc1Read(44)&3) &&
+        (esp32Adc1Read(84)&0x80040000) == 0x80040000
+}
+trusted fun esp32Adc1StartOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 7 || polls < 1 || polls > 1000000) return 2
+    if (!esp32Adc1Prepared()) return 3
+    val before=esp32Adc1Read(84)
+    if ((before&0x30000) == 0x20000) return 4
+    var remaining=polls
+    while ((esp32Adc1Read(60)&0x3fc00000) != 0) {
+        remaining=remaining-1
+        if (remaining == 0) return 4
+    }
+    // Only force bits and the selected channel bitmap are written; lower
+    // data/done bits are read-only. Clear START, then generate the rising edge.
+    val selected=0x80040000|((1<<channel)<<19)
+    esp32Adc1Write(84,selected)
+    if ((esp32Adc1Read(84)&0xfffe0000) != selected) return 261
+    esp32Adc1Write(84,selected|0x20000)
+    return if ((esp32Adc1Read(84)&0xfffe0000) == (selected|0x20000)) 257 else 261
+}
+trusted fun esp32Adc1FinishOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 7 || polls < 1 || polls > 1000000) return 2
+    if (!esp32Adc1Prepared()) return 3
+    val selected=0x80060000|((1<<channel)<<19)
+    var remaining=polls
+    while (remaining > 0) {
+        val sample=esp32Adc1Read(84)
+        if ((sample&0xfffe0000) != selected) return 3
+        if ((sample&0x10000) != 0 && (esp32Adc1Read(60)&0x3fc00000) == 0) {
+            val bits=(esp32Adc1Read(0)>>16)&3
+            val maximum=if (bits == 0) 511 else if (bits == 1) 1023 else if (bits == 2) 2047 else 4095
+            val raw=sample&65535
+            return if (raw > maximum) 7 else (raw<<8)|1
+        }
+        remaining=remaining-1
+    }
+    return 6
+}
+// Join a conversion before releasing its channel selection. Includes partial
+// START-write recovery; no reset/cancel. Call before returning the SAR lease.
+// Low8:1detached2invalid3foreigncontroller/channel5readback6stillpending.
+// Does not restore digital pin output, alter calibration or gate shared power.
+trusted fun esp32Adc1ReleaseOwned(channel: int,polls: int): int {
+    if (channel < 0 || channel > 7 || polls < 1 || polls > 1000000) return 2
+    val selected=(1<<channel)<<19
+    var remaining=polls
+    while (remaining > 0) {
+        if ((esp32Adc1Read(0)&0x8000000) != 0) return 3
+        val sample=esp32Adc1Read(84)
+        val pads=sample&0x7ff80000
+        if ((sample&0x80040000) != 0x80040000 || (pads != 0 && pads != selected)) return 3
+        if ((sample&0x30000) != 0x20000 && (esp32Adc1Read(60)&0x3fc00000) == 0) {
+            esp32Adc1Write(84,0x80040000)
+            return if ((esp32Adc1Read(84)&0xfffe0000) == 0x80040000) 1 else 5
+        }
+        remaining=remaining-1
+    }
+    return 6
+}

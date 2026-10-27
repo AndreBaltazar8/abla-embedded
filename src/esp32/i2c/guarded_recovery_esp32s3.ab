@@ -1,0 +1,51 @@
+import "../../peripheral_gate.ab"
+import "./rcc_reset_esp32s3.ab"
+import "./routing_s3_logic.ab"
+
+trusted fun esp32S3I2cConfiguredPinsMatch(port: int, sda: int, scl: int): bool {
+    if (!espChipS3().i2cMasterConfigurationValid(port, sda, scl)) return false
+    val clockSignal = 89 + port * 2
+    val dataSignal = clockSignal + 1
+    return esp32S3I2cPinRouteValid(scl, clockSignal,
+        u32(mmioLoadU32(esp32S3GpioMuxAddress(scl))),
+        u32(mmioLoadU32(0x60004154 + clockSignal * 4)),
+        u32(mmioLoadU32(0x60004554 + scl * 4))) &&
+        esp32S3I2cPinRouteValid(sda, dataSignal,
+            u32(mmioLoadU32(esp32S3GpioMuxAddress(sda))),
+            u32(mmioLoadU32(0x60004154 + dataSignal * 4)),
+            u32(mmioLoadU32(0x60004554 + sda * 4)))
+}
+
+// Passive external-bus check for an exclusively owned SINGLE-MASTER bus.
+// Does not drive either line or claim to detect another master's idle gaps.
+// Standard-mode tBUF is4.7us;5us also covers faster supported bus modes.
+trusted fun esp32S3I2cBusReleased(port: int, sda: int, scl: int): bool {
+    if (!esp32S3I2cConfiguredPinsMatch(port, sda, scl)) return false
+    val base = esp32S3I2cControllerAddress(port)
+    if ((mmioLoadU32(base + 8) & 16) != 0 || !pin(sda).read() || !pin(scl).read()) return false
+    esp_rom_delay_us(u32(5))
+    (mmioLoadU32(base + 8) & 16) == 0 && pin(sda).read() && pin(scl).read()
+}
+
+// Canonical controller gate and global RCC word must be distinct. Caller owns
+// a single-master bus and its configured pins/clocks. A stuck slave is not
+// forced clear here: no GPIO pulses or STOP are generated. Return1 only when
+// reset AND passive line-release checks succeed. Otherwise fault stays latched.
+// 7 invalid setup/arguments,9 recovery/RCC claim unavailable,10 bus still held,
+// 11 ownership invariant violation. Waiting happens after RCC lock release.
+trusted fun esp32S3I2cRecoverGuarded(gate: PeripheralGate, rcc: AtomicU32,
+    owner: u32, port: int, sda: int, scl: int): int {
+    if (!gate.word().valid() || !rcc.valid() || gate.word().address() == rcc.address() ||
+        !peripheralOwnerValid(owner) ||
+        !espChipS3().i2cMasterConfigurationValid(port, sda, scl)) return 7
+    if (!gate.tryBeginRecovery(owner)) return 9
+    var result = 7
+    if (esp32S3I2cConfiguredPinsMatch(port, sda, scl)) {
+        result = 9
+        if (esp32S3I2cResetWithRccLock(port, rcc, owner, true)) {
+            result = if (esp32S3I2cBusReleased(port, sda, scl)) 1 else 10
+        }
+    }
+    if (!gate.finishRecovery(owner, result == 1)) return 11
+    result
+}

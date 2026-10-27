@@ -1,0 +1,50 @@
+import "./run_c6_sequence.ab"
+import "../gdma_submit_c6_sequence.ab"
+import "../gdma_submit_rx_c6_sequence.ab"
+// 72B retained RAM: tag0,state4,primary8,channel12,TX16,descriptors20,
+// count24,buffers28,stride32,bytes36,circular40,update64@44,phase52,
+// actual DMA submission record56..71. State1started4failed5update-pending.
+// Caller supplies prepared clocks/pads/standard format/codec, reset FIFOs and
+// configured DMA channel. TX defaults preserve existing callers; RX requires
+// RXEOF bytes matching each descriptor. Own both directions, DMA/ETM/IRQ,
+// SRAM and TX contents/RX destinations for the complete lifetime.
+// Begin builds the ring, publishes UPDATE, submits DMA, then starts I2S.
+// Only pending UPDATE is resumable; no automatic START retry after submission.
+// This is start orchestration, NOT stop/cleanup or proof of transferred audio.
+fun c6I2sDmaStartStorage(r: NativeBuffer): bool = r.hasAddressRange(0,72) && (r.addressValue()&3) == 0 && (r.addressValue()+72 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6I2sDmaStartFailure(r: NativeBuffer,code: int): int { r.storeU32(8,code);r.storeU32(4,4);return 4 }
+trusted fun c6I2sDmaStartAdvanceOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6I2sDmaStartStorage(r) || r.loadU32(0) != 0x43364944 || r.loadU32(4) != 5 || r.loadU32(52) != 1 || polls < 1 || polls > 1000000) return 2
+    val update=C6I2sUpdate(r.loadU32(44)|(r.loadU32(48)<<32)).waitOwned(polls,true)
+    r.storeU32(44,update|0);r.storeU32(48,update>>>32)
+    if (update.status() == 5) return 5
+    if (!update.complete()) return c6I2sDmaStartFailure(r,0x20000|update.status())
+    r.storeU32(52,2)
+    val submission=nativeBufferAt(r.addressValue()+56,16)
+    val submitted=if (r.loadU32(16) != 0) c6GdmaSubmitTxOwned(submission,r.loadU32(12),3,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),r.loadU32(40) != 0,true)
+        else c6GdmaSubmitRxOwned(submission,r.loadU32(12),3,r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),r.loadU32(36),r.loadU32(40) != 0,true)
+    if (submitted != 1) return c6I2sDmaStartFailure(r,0x30000|submitted)
+    r.storeU32(52,3)
+    val started=c6I2sStartUpdatedOwned(update,true)
+    if (started != 1) return c6I2sDmaStartFailure(r,0x40000|started)
+    r.storeU32(4,1);return 1
+}
+trusted fun c6I2sDmaStartBeginOwned(r: NativeBuffer,channel: int,descriptors: int,count: int,buffers: int,stride: int,bytes: int,circular: bool,polls: int,exclusive: bool,tx: bool=true): int {
+    if (!exclusive || !c6I2sDmaStartStorage(r) || r.loadU32(0) != 0 || channel < 0 || channel > 2 || polls < 1 || polls > 1000000 || !c6GdmaRingValid(descriptors,count,buffers,stride,bytes)) return 2
+    val address=r.addressValue()
+    if ((address < descriptors+count*12 && descriptors < address+72) || (address < buffers+(count-1)*stride+bytes && buffers < address+72)) return 2
+    if (!c6I2sUpdateClocks(tx) || !c6I2sStopped() || !c6GdmaClocksReady() || !(if (tx) c6GdmaTxParked(channel) else c6GdmaRxParked(channel))) return 3
+    if (!tx && (c6I2sRead(0x64)&u32(4095)) != u32(bytes)) return 3
+    r.storeU32(0,0x43364944);r.storeU32(4,4);r.storeU32(8,0);r.storeU32(12,channel);r.storeU32(16,if (tx) 1 else 0)
+    r.storeU32(20,descriptors);r.storeU32(24,count);r.storeU32(28,buffers);r.storeU32(32,stride);r.storeU32(36,bytes);r.storeU32(40,if (circular) 1 else 0)
+    var at=44
+    while (at < 72) { r.storeU32(at,0);at=at+4 }
+    val built=c6GdmaRingBuildOwned(descriptors,count,buffers,stride,bytes,tx,circular,true)
+    if (built != 1) return c6I2sDmaStartFailure(r,0x10000|built)
+    val update=c6I2sUpdateBeginOwned(0,tx,polls,true)
+    r.storeU32(44,update|0);r.storeU32(48,update>>>32)
+    if (update.status() != 1 && update.status() != 5) return c6I2sDmaStartFailure(r,0x20000|update.status())
+    r.storeU32(52,1);r.storeU32(4,5)
+    if (!update.complete()) return 5
+    return c6I2sDmaStartAdvanceOwned(r,polls,true)
+}

@@ -1,0 +1,111 @@
+import "./guarded_recovery_esp32s3.ab"
+import "./poll_esp32s3.ab"
+
+// Snapshot only fields changed below: complete output matrix, latch, enable,
+// open-drain. Input matrix, mux/input-enable, pulls and drive stay untouched.
+trusted fun esp32S3I2cClearPinCapture(number: int): int {
+    val bank = esp32S3GpioBankOffset(number)
+    val bit = number & 31
+    val latch = (mmioLoadU32(0x60004004 + bank) >>> bit) & 1
+    val enabled = (mmioLoadU32(0x60004020 + bank) >>> bit) & 1
+    val drain = (mmioLoadU32(0x60004074 + number * 4) >>> 2) & 1
+    (mmioLoadU32(0x60004554 + number * 4) & 4294967295) |
+        (latch << 32) | (enabled << 33) | (drain << 34)
+}
+
+trusted fun esp32S3I2cClearPinRestore(number: int, saved: int): void {
+    val bank = esp32S3GpioBankOffset(number)
+    val mask = 1 << (number & 31)
+    // Release GPIO drive before returning the line to the reset peripheral.
+    pin(number).write(true)
+    mmioStoreU32(0x60004028 + bank, mask)
+    mmioStoreU32(0x60004554 + number * 4, saved & 4294967295)
+    pin(number).setOpenDrain(((saved >>> 34) & 1) != 0)
+    pin(number).write(((saved >>> 32) & 1) != 0)
+    mmioStoreU32((if (((saved >>> 33) & 1) != 0) 0x60004024 else 0x60004028) + bank, mask)
+    return
+}
+
+trusted fun esp32S3I2cClearWaitClock(scl: int, started: u32, budget: u32): bool {
+    while (esp32S3I2cReadCounter() - started < budget) {
+        if (pin(scl).read()) return true
+        esp_rom_delay_us(u32(1))
+    }
+    false
+}
+
+// EXPLICIT single-master bus-clear operation. The caller owns the controller
+// and pads, has reset it and released RCC, and authorizes clocking its slaves.
+// Never use after arbitration loss while another master may own the bus.
+// At most nine recovery clocks plus STOP. One CPU-cycle deadline covers all
+// clock stretching; saved GPIO state is restored on every post-capture path.
+trusted fun esp32S3I2cClearStuckBusOwned(port: int, sda: int, scl: int, budget: u32): bool {
+    if (budget == u32(0) || budget > u32(0x7fffffff) ||
+        !esp32S3I2cConfiguredPinsMatch(port, sda, scl)) return false
+    if (esp32S3I2cBusReleased(port, sda, scl)) return true
+    val savedData = esp32S3I2cClearPinCapture(sda)
+    val savedClock = esp32S3I2cClearPinCapture(scl)
+    val started = esp32S3I2cReadCounter()
+    // Establish open drain before routing the GPIO latch; never drive high.
+    pin(sda).write(true)
+    pin(scl).write(true)
+    gpio_set_direction(i32(sda), i32(7))
+    gpio_set_direction(i32(scl), i32(7))
+    esp32S3GpioUpdate(0x60004554 + sda * 4, 4095, 1280)
+    esp32S3GpioUpdate(0x60004554 + scl * 4, 4095, 1280)
+    pin(scl).write(false)
+    esp_rom_delay_us(u32(5))
+    var healthy = true
+    var pulses = 0
+    while (healthy && !pin(sda).read() && pulses < 9) {
+        pin(scl).write(true)
+        healthy = esp32S3I2cClearWaitClock(scl, started, budget)
+        if (healthy) {
+            esp_rom_delay_us(u32(5))
+            pin(scl).write(false)
+            esp_rom_delay_us(u32(5))
+        }
+        pulses = pulses + 1
+    }
+    if (healthy) {
+        // SDA changes low while SCL is low, then rises only after actual SCL
+        // release. Setting the output latch high alone is not clock-release proof.
+        pin(sda).write(false)
+        pin(scl).write(true)
+        healthy = esp32S3I2cClearWaitClock(scl, started, budget)
+        if (healthy) {
+            esp_rom_delay_us(u32(5))
+            pin(sda).write(true)
+            esp_rom_delay_us(u32(5))
+            healthy = pin(sda).read() && pin(scl).read() &&
+                esp32S3I2cReadCounter() - started < budget
+        }
+    }
+    esp32S3I2cClearPinRestore(scl, savedClock)
+    esp32S3I2cClearPinRestore(sda, savedData)
+    healthy && esp32S3I2cBusReleased(port, sda, scl)
+}
+
+// Explicit opt-in recovery that may CLOCK SLAVES on an owned single-master
+// bus. Ordinary RecoverGuarded stays passive. Never call while another master
+// can own the bus (including immediately after arbitration loss).
+// The fault gate stays exclusively recovery-owned through reset, GPIO pulses,
+// restoration and release checks. RCC is never held during external waits.
+// 1=recovered,7=invalid,9=claim/reset unavailable,10=clear failed,
+// 11=ownership invariant violated. Failure never reopens transfer admission.
+trusted fun esp32S3I2cRecoverAndClearGuarded(gate: PeripheralGate, rcc: AtomicU32,
+    owner: u32, port: int, sda: int, scl: int, budget: u32): int {
+    if (!gate.word().valid() || !rcc.valid() || gate.word().address() == rcc.address() ||
+        !peripheralOwnerValid(owner) || budget == u32(0) || budget > u32(0x7fffffff) ||
+        !espChipS3().i2cMasterConfigurationValid(port, sda, scl)) return 7
+    if (!gate.tryBeginRecovery(owner)) return 9
+    var result = 7
+    if (esp32S3I2cConfiguredPinsMatch(port, sda, scl)) {
+        result = 9
+        if (esp32S3I2cResetWithRccLock(port, rcc, owner, true)) {
+            result = if (esp32S3I2cClearStuckBusOwned(port, sda, scl, budget)) 1 else 10
+        }
+    }
+    if (!gate.finishRecovery(owner, result == 1)) return 11
+    result
+}

@@ -1,0 +1,63 @@
+import "../sdk/raw_buffer.ab"
+// Contiguous PSRAM MMU lease,1..1024 pages. NO AXI/cache/allocator activation.
+// Caller owns virtual+physical spans, excludes peers/DMA/aliases, flushes and
+// invalidates old mappings, pins controller/clocks/encryption configuration.
+// Before close: flush all users, stop AXI; unmapping while active is refused
+// by MMU primitive. Never clear unknown entries or auto-rollback a failure.
+// Internal40B: magic0,phase4,virtual8,physical12,pages16,capacity20,attempted24,
+// entryFlags28,error32,index36. phase0fresh1mapping2mapped3closing4closed.
+// Complete vacant-range preflight precedes first mapping. Each attempted page
+// is recorded BEFORE write; reverse cleanup retains progress on failure.
+fun p4PsramRangeStorage(record: NativeBuffer): bool = record.hasAddressRange(0,40) && (record.addressValue()&3) == 0 && p4PsramCommandStorageSafe(record.addressValue(),40)
+trusted fun p4PsramRangeInitializeOwned(record: NativeBuffer): bool {
+    if (!p4PsramRangeStorage(record)) return false
+    var offset=0
+    while (offset < 40) { record.storeU32(offset,0); offset=offset+4 }
+    record.storeU32(0,0x50345247); return true
+}
+trusted fun p4PsramRangeFailure(record: NativeBuffer,index: int,error: int): int {
+    record.storeU32(32,error); record.storeU32(36,index); return 4
+}
+trusted fun p4PsramRangeMapOwned(record: NativeBuffer,address: int,physical: int,pages: int,capacity: int,polls: int): int {
+    if (!p4PsramRangeStorage(record) || p4PsramMmuIndex(address) < 0 || pages < 1 || pages > 1024 ||
+        pages > ((0x4c000000-address)>>>16) || capacity < 65536 || capacity > 67108864 || physical < 0 ||
+        (physical&65535) != 0 || physical > capacity || (pages<<16) > capacity-physical || polls < 1 || polls > 1000000) return 2
+    if (record.loadU32(0) != 0x50345247 || record.loadU32(4) != 0 || record.loadU32(24) != 0) return 3
+    var index=0
+    while (index < pages) {
+        val prior=p4PsramMmuReadOwned(address+(index<<16),polls)
+        if (prior != 1) return p4PsramRangeFailure(record,index,if ((prior&255) == 1) 6 else prior&255)
+        index=index+1
+    }
+    record.storeU32(8,address); record.storeU32(12,physical); record.storeU32(16,pages); record.storeU32(20,capacity)
+    record.storeU32(28,0xc00|(if (p4PsramMmuEncryptionEnabled()) 0x1000 else 0)); record.storeU32(4,1)
+    index=0
+    while (index < pages) {
+        record.storeU32(24,index+1)
+        val result=p4PsramMmuMapOwned(address+(index<<16),physical+(index<<16),capacity,0,polls)
+        if ((result&255) != 1) return p4PsramRangeFailure(record,index,result&255)
+        val expected=((physical>>>16)+index)|record.loadU32(28)
+        if ((result>>>8) != expected) return p4PsramRangeFailure(record,index,8)
+        index=index+1
+    }
+    record.storeU32(4,2); record.storeU32(32,0); record.storeU32(36,0); return 1
+}
+trusted fun p4PsramRangeUnmapOwned(record: NativeBuffer,polls: int): int {
+    if (!p4PsramRangeStorage(record) || polls < 1 || polls > 1000000) return 2
+    if (record.loadU32(0) != 0x50345247 || record.loadU32(4) > 4 || record.loadU32(24) > record.loadU32(16)) return 3
+    record.storeU32(4,3)
+    while (record.loadU32(24) > 0) {
+        val index=record.loadU32(24)-1
+        val address=record.loadU32(8)+(index<<16)
+        val expected=((record.loadU32(12)>>>16)+index)|record.loadU32(28)
+        val prior=p4PsramMmuReadOwned(address,polls)
+        if ((prior&255) != 1) return p4PsramRangeFailure(record,index,prior&255)
+        if ((prior>>>8) != 0) {
+            if ((prior>>>8) != expected) return p4PsramRangeFailure(record,index,6)
+            val result=p4PsramMmuUnmapOwned(address,expected,polls)
+            if ((result&255) != 1) return p4PsramRangeFailure(record,index,result&255)
+        }
+        record.storeU32(24,index)
+    }
+    record.storeU32(4,4); record.storeU32(32,0); record.storeU32(36,0); return 1
+}

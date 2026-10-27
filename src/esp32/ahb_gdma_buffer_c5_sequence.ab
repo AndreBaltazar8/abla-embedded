@@ -1,0 +1,46 @@
+import "./ahb_gdma_events_c5_sequence.ab"
+import "./ahb_gdma_ring_c5_sequence.ab"
+// SRAM-only block acquisition:status8,length12@8,raw events8@24.
+// 1CPU-owned2invalid3clock/IRQ/unknown-event4DMA-error5DMA-owned6descriptor.
+// Caller owns channel/ring lifetime, excludes CPU/ISR writers, enables owner
+// checking and TX writeback. No ack/stop/restart or payload access on failure.
+type C5AhbGdmaBuffer=int
+fun C5AhbGdmaBuffer.status(): int = this&255
+fun C5AhbGdmaBuffer.bytes(): int = (this>>>8)&4095
+fun C5AhbGdmaBuffer.events(): int = (this>>>24)&255
+trusted fun c5AhbGdmaAcquireOwned(channel: int,tx: bool,descriptors: int,count: int,buffers: int,stride: int,bytes: int,index: int,circular: bool,exclusive: bool): C5AhbGdmaBuffer {
+    if (!exclusive || channel < 0 || channel > 2 || index < 0 || index >= count || !c5AhbGdmaRingValid(descriptors,count,buffers,stride,bytes)) return C5AhbGdmaBuffer(2)
+    val first=c5AhbGdmaEventsReadOwned(channel,tx,true)
+    if (first.status() != 1) return C5AhbGdmaBuffer(3)
+    val evidence=first.raw()<<24
+    if (first.errors() != 0) return C5AhbGdmaBuffer(evidence|4)
+    val at=descriptors+index*12
+    val control=c5AhbGdmaDescriptorRead(at)
+    if ((control&u32(0x80000000)) != u32(0)) return C5AhbGdmaBuffer(evidence|5)
+    // Observe DMA's owner release before reading metadata or payload.
+    c5AhbGdmaDescriptorFence()
+    val length=int((control>>u32(12))&u32(4095))
+    val next=if (index+1 < count) at+12 else if (circular) descriptors else 0
+    if ((control&u32(4095)) != u32(bytes) || (control&u32(0x3f000000)) != u32(0) || length > bytes ||
+        (tx && (length != bytes || (control&u32(0x40000000)) == u32(0))) ||
+        c5AhbGdmaDescriptorRead(at+4) != u32(buffers+index*stride) || c5AhbGdmaDescriptorRead(at+8) != u32(next)) return C5AhbGdmaBuffer(evidence|6)
+    val second=c5AhbGdmaEventsReadOwned(channel,tx,true)
+    if (second.status() != 1) return C5AhbGdmaBuffer(evidence|3)
+    val combined=(first.raw()|second.raw())<<24
+    if (second.errors() != 0) return C5AhbGdmaBuffer(combined|4)
+    c5AhbGdmaDescriptorFence()
+    return C5AhbGdmaBuffer(combined|(length<<8)|1)
+}
+// After acquire, caller consumed RX or initialized replacement TX bytes.
+// Returns acquire failure unchanged, or 65537 meaning ownership publication
+// attempted. No post-owner readback: DMA can immediately consume/write back.
+// Do not retry/edit/free after publication; working SRAM and fences assumed.
+trusted fun c5AhbGdmaRearmOwned(channel: int,tx: bool,descriptors: int,count: int,buffers: int,stride: int,bytes: int,index: int,circular: bool,exclusive: bool): int {
+    val acquired=c5AhbGdmaAcquireOwned(channel,tx,descriptors,count,buffers,stride,bytes,index,circular,exclusive)
+    if (acquired.status() != 1) return acquired|0
+    val control=u32(bytes)|u32(0x80000000)|(if (tx) (u32(bytes)<<u32(12))|u32(0x40000000) else u32(0))
+    c5AhbGdmaDescriptorFence()
+    c5AhbGdmaDescriptorWrite(descriptors+index*12,control)
+    c5AhbGdmaDescriptorFence()
+    return 65537
+}

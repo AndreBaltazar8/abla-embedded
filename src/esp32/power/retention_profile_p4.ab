@@ -1,0 +1,97 @@
+import "./retention_clock_p4.ab"
+import "./retention_uart_p4.ab"
+import "./retention_cache_p4.ab"
+import "./retention_system_p4.ab"
+import "./retention_systimer_p4.ab"
+import "./retention_mspi_p4.ab"
+import "./retention_iomux_p4.ab"
+import "./retention_list_p4.ab"
+// Ordered system-retention configs, not an activated graph. IDF inserts later
+// batches ahead of earlier batches at equal priority; preserves order WITHIN
+// each batch. Priority0 clocks; priority5 UART/cache/HPsystem/interrupts;
+// priority6 PVT/PAU/systimer/PSRAM/flash/IOMUX. UART=-1 disables console.
+// PVT/PSRAM flags must match the actual configured consumers. This does not
+// cover independently registered driver retention or CPU/rail context.
+fun esp32p4RetentionProfileCount(uart: int,psram: bool,pvt: bool): int =
+    if (uart < -1 || uart > 4) 0 else 58+(if (uart >= 0) 3 else 0)+(if (psram) 14 else 0)+(if (pvt) 1 else 0)
+// Internal group in upper bits, local node low8; -1 invalid.
+fun p4RetentionProfileNode(uart: int,psram: bool,pvt: bool,index: int): int {
+    if (index < 0 || index >= esp32p4RetentionProfileCount(uart,psram,pvt)) return -1
+    var n=index
+    if (n < 9) return n
+    n=n-9
+    if (uart >= 0) { if (n < 3) return 256+n;n=n-3 }
+    if (n < 12) return 512+n
+    n=n-12
+    if (n == 0) return 770
+    n=n-1
+    if (n < 2) return 768+n
+    n=n-2
+    if (pvt) { if (n == 0) return 772;n=n-1 }
+    if (n == 0) return 771
+    n=n-1
+    if (n < 19) return 1024+n
+    n=n-19
+    if (psram) { if (n < 14) return 1280+n;n=n-14 }
+    if (n < 8) return 1536+n
+    return 1792+n-8
+}
+fun p4RetentionProfileWords(key: int): int {
+    val group=key>>>8;val n=key&255
+    if (group == 0) return if (n == 4) 60 else 0
+    if (group == 1) return if (n == 0) 22 else 0
+    if (group == 2) return esp32p4RetentionCacheWords(n)
+    if (group == 3) return esp32p4RetentionSystemWords(n)
+    if (group == 4) return esp32p4RetentionSystimerWords(n)
+    if (group == 5 || group == 6) return esp32p4RetentionMspiWords(group == 5,n)
+    return esp32p4RetentionIomuxWords(n)
+}
+// Build-min revision, NOT runtime detected silicon revision. Flash also owns
+// entry3 when build-min is exactly300. Graph routing must preserve this; a
+// single linear entry0 list is not the complete revision300 graph.
+fun esp32p4RetentionProfileEntries(uart: int,psram: bool,pvt: bool,index: int,minimumRevision: int): int {
+    val key=p4RetentionProfileNode(uart,psram,pvt,index)
+    if (key < 0 || minimumRevision < 0 || minimumRevision > 399) return 0
+    return if ((key>>>8) == 6) esp32p4RetentionMspiEntries(false,minimumRevision) else 1
+}
+trusted fun p4RetentionProfileConfig(c: NativeBuffer,key: int,uart: int,storage: int): bool {
+    val g=key>>>8;val n=key&255
+    if (g == 0) return esp32p4RetentionClockConfig(c,n,storage,0)
+    if (g == 1) return esp32p4RetentionUartConfig(c,uart,n,storage,0)
+    if (g == 2) return esp32p4RetentionCacheConfig(c,n,storage,0)
+    if (g == 3) return esp32p4RetentionSystemConfig(c,n,storage,0)
+    if (g == 4) return esp32p4RetentionSystimerConfig(c,n,storage,0)
+    if (g == 5 || g == 6) return esp32p4RetentionMspiConfig(c,g == 5,n,storage,0)
+    return esp32p4RetentionIomuxConfig(c,n,storage,0)
+}
+// Caller-owned retained buffers. Pack backing words without padding/heap.
+// Returns config count,0 invalid. All failures leave configs and backing
+// untouched;56B scratch is disposable. Does not publish or encode next links.
+trusted fun esp32p4RetentionProfileConfigs(configs: NativeBuffer,backing: NativeBuffer,scratch: NativeBuffer,uart: int,psram: bool,pvt: bool): int {
+    val count=esp32p4RetentionProfileCount(uart,psram,pvt)
+    if (count == 0 || !configs.hasAddressRange(0,count*56) || !scratch.hasAddressRange(0,56) ||
+        (configs.addressValue()&3) != 0 || (scratch.addressValue()&3) != 0) return 0
+    var words=0
+    var i=0
+    while (i < count) { words=words+p4RetentionProfileWords(p4RetentionProfileNode(uart,psram,pvt,i));i=i+1 }
+    val bytes=words*4
+    if (!backing.hasAddressRange(0,bytes) || !p4RetentionAddressSpan(backing.addressValue(),bytes) ||
+        p4RetentionRangesOverlap(configs.addressValue(),count*56,backing.addressValue(),bytes) ||
+        p4RetentionRangesOverlap(configs.addressValue(),count*56,scratch.addressValue(),56) ||
+        p4RetentionRangesOverlap(backing.addressValue(),bytes,scratch.addressValue(),56)) return 0
+    // Validate actual builders before changing any caller output config.
+    var used=0
+    i=0
+    while (i < count) {
+        val key=p4RetentionProfileNode(uart,psram,pvt,i);val size=p4RetentionProfileWords(key)*4
+        if (!p4RetentionProfileConfig(scratch,key,uart,if (size == 0) 0 else backing.addressValue()+used)) return 0
+        used=used+size;i=i+1
+    }
+    used=0;i=0
+    while (i < count) {
+        val key=p4RetentionProfileNode(uart,psram,pvt,i);val size=p4RetentionProfileWords(key)*4
+        if (!p4RetentionProfileConfig(nativeBufferAt(configs.addressValue()+i*56,56),key,uart,if (size == 0) 0 else backing.addressValue()+used)) return 0
+        used=used+size;i=i+1
+    }
+    return count
+}

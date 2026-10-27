@@ -1,0 +1,44 @@
+import "./clock_p4_sequence.ab"
+import "./command_s3_logic.ab"
+import "../sdk/raw_buffer.ab"
+// P4 HP controllers have32-byte FIFOs,8 commands, S3/C5 opcode/count fields.
+// Caller owns paused controller/FIFO/commands (including retained-bus END),
+// excludes interrupt/DMA/other-core FIFO users. No transaction started here.
+trusted fun p4I2cFifoReady(port: int): bool = esp32p4I2cClockReady(port) &&
+    (p4I2cRead(p4I2cBase(port)+4)&u32(0x113)) == u32(0x110) &&
+    (p4I2cRead(p4I2cBase(port)+24)&u32(0x7c00)) == u32(0x4000)
+// Status1queued2invalid3not-ready4capacity5readback/count fault.
+trusted fun esp32p4I2cWriteCommandOwned(port: int,index: int,command: u32,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || index < 0 || index >= 8 || !esp32S3I2cCommandValid(command)) return 2
+    if (!p4I2cFifoReady(port)) return 3
+    val address=p4I2cBase(port)+88+index*4
+    p4I2cWrite(address,command)
+    return if (p4I2cRead(address) == command) 1 else 5
+}
+// FIFO copies validate the complete span/count before the first destructive
+// access. Result bytes8..13 = accesses attempted, NOT delivered/ACKed bytes.
+// A count/readback fault may have consumed data: don't replay the whole copy.
+trusted fun esp32p4I2cWriteFifoOwned(port: int,buffer: NativeBuffer,count: int,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || count > 32 || !buffer.hasAddressRange(0,count)) return 2
+    if (count == 0) return 1
+    if (!p4I2cFifoReady(port)) return 3
+    val base=p4I2cBase(port)
+    val used=esp32S3I2cTxCount(p4I2cRead(base+8))
+    if (used > 32 || count > 32-used) return 4
+    var index=0
+    while (index < count) { p4I2cWrite(base+28,u32(buffer.load(index)));index=index+1 }
+    val after=esp32S3I2cTxCount(p4I2cRead(base+8))
+    return (count<<8)|(if (after == used+count) 1 else 5)
+}
+trusted fun esp32p4I2cReadFifoOwned(port: int,buffer: NativeBuffer,count: int,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || count > 32 || !buffer.hasAddressRange(0,count)) return 2
+    if (count == 0) return 1
+    if (!p4I2cFifoReady(port)) return 3
+    val base=p4I2cBase(port)
+    val ready=esp32S3I2cRxCount(p4I2cRead(base+8))
+    if (ready > 32 || count > ready) return 4
+    var index=0
+    while (index < count) { buffer.store(index,int(p4I2cRead(base+28)&u32(255)));index=index+1 }
+    val after=esp32S3I2cRxCount(p4I2cRead(base+8))
+    return (count<<8)|(if (after == ready-count) 1 else 5)
+}

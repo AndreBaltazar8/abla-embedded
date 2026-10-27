@@ -1,0 +1,104 @@
+import "./power/sleep_record_c5.ab"
+// C5 timing shadows: target0flash SPI0,1flash SPI1,2PSRAM SPI0.
+// All publish through SPI0 TIMING_CALI.UPDATE, including SPI1/PSRAM.
+// Flash SPI1 DIN_MODE/DIN_NUM copies are meaningless: both flash controllers
+// use SPI0 delay registers and SPI0 timing clock (IDF tuning_scheme_impl).
+// No tuning search, user dummy/protocol change, DLL change, clock switch or
+// cache IO here. Caller supplies already-qualified mode/num/extra settings.
+@section(".iram1.abla.c5MspiTimingBase")
+fun c5MspiTimingBase(target: int): int = if (target == 1) 0x60003180 else if (target == 2) 0x60002190 else 0x60002180
+@section(".iram1.abla.c5MspiTimingReady")
+trusted fun c5MspiTimingReady(): bool {
+    val gate=c5MspiRead(0x60096018);val clock=c5MspiRead(0x6009601c)
+    return (gate&11) == 9 && (clock&0xc00) == 0x400 && ((clock>>>8)&3) < 3 &&
+        (((clock>>>8)&3) != 2 || (gate&4) != 0)
+}
+@section(".iram1.abla.c5MspiTimingField")
+trusted fun c5MspiTimingField(address: int,mask: int,value: int): bool {
+    var prior=c5MspiRead(address)
+    // Mixed R/W + WT: don't accidentally publish shadows on an ordinary
+    // field update. PSRAM bit6 is not UPDATE and must remain untouched.
+    if (address == 0x60002180 || address == 0x60003180) prior=prior&~64
+    c5MspiWrite(address,(prior&~mask)|(value&mask))
+    (c5MspiRead(address)&mask) == (value&mask)
+}
+@section(".iram1.abla.c5MspiTimingPublish")
+trusted fun c5MspiTimingPublish(): void {
+    // UPDATE has no readable acknowledgement. Preserve other mixed-register
+    // fields; do not claim verification of the WT's physical completion.
+    c5MspiWrite(0x60002180,c5MspiRead(0x60002180)|64)
+    return
+}
+//48B:tag0,status4,apply stage8,target12,mode bits16,num bits20,cal bits24,
+// saved mode28/num32/cal36,close stage40,saved shared flash clock44 for target1.
+//1published2invalid3partial4closed, internal5closing. Fresh tag zero; immutable
+// plan across retries. No observations/transactions between shadow writes.
+// Caller owns both controllers/global latch and all pending timing shadows,
+// has caches suspended, no DMA/flash commands and retained code/stack/data.
+// Partial writes retain ownership; retry or Close before any memory access.
+@section(".iram1.abla.c5MspiTimingApply")
+trusted fun esp32C5MspiTimingOwned(record: NativeBuffer,target: int,mode: int,num: int,extra: int,exclusiveCacheOff: bool): int {
+    if (!exclusiveCacheOff || !record.hasAddressRange(0,48) || (record.addressValue()&3) != 0 ||
+        target < 0 || target > 2 || mode < 0 || mode > 6 || num < 0 || num > 3 || extra < 0 || extra > 7) return 2
+    val modes=mode*0x1249249;val nums=num*0x15555
+    val cal=1|(if (extra > 0) 2 else 0)|(extra<<2)
+    val tag=c5SleepRecordRead(record,0)
+    if (tag != 0 && tag != 0x434d5431) return 2
+    if (tag != 0) {
+        if (c5SleepRecordRead(record,12) != target || c5SleepRecordRead(record,16) != modes ||
+            c5SleepRecordRead(record,20) != nums || c5SleepRecordRead(record,24) != cal) return 2
+        if (c5SleepRecordRead(record,4) == 1) return 1
+        if (c5SleepRecordRead(record,4) != 3 || c5SleepRecordRead(record,8) > 2) return 2
+    }
+    if (!c5MspiTimingReady()) return if (tag == 0) 2 else 3
+    val address=c5MspiTimingBase(target)
+    val delayAddress=if (target == 1) 0x60002180 else address
+    val calMask=if (target == 1) 30 else 31
+    if (tag == 0) {
+        c5SleepRecordWrite(record,12,target);c5SleepRecordWrite(record,16,modes);c5SleepRecordWrite(record,20,nums);c5SleepRecordWrite(record,24,cal)
+        c5SleepRecordWrite(record,28,c5MspiRead(delayAddress+4)&0x7ffffff);c5SleepRecordWrite(record,32,c5MspiRead(delayAddress+8)&0x3ffff)
+        c5SleepRecordWrite(record,36,c5MspiRead(address)&calMask)
+        c5SleepRecordWrite(record,44,if (target == 1) c5MspiRead(0x60002180)&1 else 0)
+        c5SleepRecordWrite(record,40,0);c5SleepRecordWrite(record,8,0)
+        c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x434d5431)
+    }
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        if (!c5MspiTimingField(delayAddress+4,0x7ffffff,modes)) return 3
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        if (!c5MspiTimingField(delayAddress+8,0x3ffff,nums)) return 3
+        c5SleepRecordWrite(record,8,2)
+    }
+    if (target == 1 && !c5MspiTimingField(0x60002180,1,1)) return 3
+    if (!c5MspiTimingField(address,calMask,cal)) return 3
+    c5MspiTimingPublish()
+    c5SleepRecordWrite(record,8,3);c5SleepRecordWrite(record,4,1)
+    1
+}
+@section(".iram1.abla.c5MspiTimingClose")
+trusted fun esp32C5MspiTimingCloseOwned(record: NativeBuffer,exclusiveCacheOff: bool): int {
+    if (!exclusiveCacheOff || !record.hasAddressRange(0,48) || (record.addressValue()&3) != 0 || c5SleepRecordRead(record,0) != 0x434d5431) return 2
+    val state=c5SleepRecordRead(record,4)
+    if (state == 4) return 4
+    if ((state != 1 && state != 3 && state != 5) || c5SleepRecordRead(record,40) > 2 || c5SleepRecordRead(record,12) > 2) return 2
+    c5SleepRecordWrite(record,4,5)
+    if (!c5MspiTimingReady()) return 3
+    val target=c5SleepRecordRead(record,12)
+    val address=c5MspiTimingBase(target);val stage=c5SleepRecordRead(record,40)
+    val delayAddress=if (target == 1) 0x60002180 else address
+    if (stage <= 0) {
+        if (!c5MspiTimingField(address,if (target == 1) 30 else 31,c5SleepRecordRead(record,36))) return 3
+        if (target == 1 && !c5MspiTimingField(0x60002180,1,c5SleepRecordRead(record,44))) return 3
+        c5SleepRecordWrite(record,40,1)
+    }
+    if (stage <= 1) {
+        if (!c5MspiTimingField(delayAddress+8,0x3ffff,c5SleepRecordRead(record,32))) return 3
+        c5SleepRecordWrite(record,40,2)
+    }
+    if (!c5MspiTimingField(delayAddress+4,0x7ffffff,c5SleepRecordRead(record,28))) return 3
+    c5MspiTimingPublish()
+    c5SleepRecordWrite(record,40,3);c5SleepRecordWrite(record,4,4)
+    4
+}

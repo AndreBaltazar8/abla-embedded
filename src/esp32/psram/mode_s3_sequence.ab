@@ -1,0 +1,66 @@
+import "./command_s3_sequence.ab"
+// OPI PSRAM MR0/1,MR2/3,MR4,MR8 snapshot in six bytes, little endian.
+// Source protocol: IDF6 esp32s3/esp_psram_impl_octal.c. These operations require
+// the command transport's clock/pad/cache/IRAM/exclusion prerequisites.
+type S3PsramIdentity=int
+fun S3PsramIdentity.valid(): bool = this >= 0 && this <= 281474976710655
+fun S3PsramIdentity.vendor(): int = if (this.valid()) (this>>>8)&31 else -1
+fun S3PsramIdentity.knownVendor(): bool = this.vendor() == 13 || this.vendor() == 26
+fun S3PsramIdentity.good(): bool = this.valid() && (this&(1<<23)) != 0
+// Physical density, NOT mapped/available heap size. Unknown vendors remain
+// visible to the caller (IDF warns rather than rejecting them automatically).
+fun S3PsramIdentity.physicalBytes(): int {
+    if (!this.valid()) return 0
+    val density=(this>>>16)&7
+    return if (density == 1) 4194304 else if (density == 3) 8388608 else if (density == 5) 16777216 else if (density == 7) 33554432 else if (density == 6) 67108864 else 0
+}
+trusted fun s3PsramIdentityFrom(snapshot: NativeBuffer): S3PsramIdentity {
+    if (!snapshot.hasAddressRange(0,6)) return S3PsramIdentity(-1)
+    return S3PsramIdentity(snapshot.loadU32(0)|(snapshot.load(4)<<32)|(snapshot.load(5)<<40))
+}
+fun s3PsramModeBuffers(scratch: NativeBuffer,work: NativeBuffer): bool =
+    scratch.hasAddressRange(0,8) && work.hasAddressRange(0,100) && (work.addressValue()&3) == 0 &&
+    s3PsramCommandStorageSafe(scratch.addressValue(),8) && s3PsramCommandStorageSafe(work.addressValue(),100) &&
+    (scratch.addressValue()+8 <= work.addressValue() || work.addressValue()+100 <= scratch.addressValue())
+// Configure non-ECC default MR0: fixed latency bit5, read latency2 bits2..4,
+// drive strength0. Preserve reserved bits6..7 and adjacent MR1. Verify the
+// actual two-byte readback, not merely ROM completion. 1verified,2invalid,
+// 3/4transport failure,5readback mismatch. Failed write/readback may leave
+// changed device state; caller retains ownership and must recover/reinitialize.
+@section(".iram1.abla.s3PsramConfigureMode")
+trusted fun s3PsramConfigureModeOwned(scratch: NativeBuffer,work: NativeBuffer,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !s3PsramModeBuffers(scratch,work)) return 2
+    val pair=nativeBufferAt(scratch.addressValue(),2)
+    var result=s3PsramCommandOwned(0x4040,0,8,pair,2,work)
+    if (result != 1) return result
+    val expected=(pair.load(0)&192)|40|(pair.load(1)<<8)
+    pair.storeU16(0,expected)
+    result=s3PsramCommandOwned(0xc0c0,0,0,pair,2,work)
+    if (result != 1) return result
+    val check=nativeBufferAt(scratch.addressValue()+2,2)
+    result=s3PsramCommandOwned(0x4040,0,8,check,2,work)
+    if (result != 1) return result
+    return if ((check.load(0)|(check.load(1)<<8)) == expected) 1 else 5
+}
+// All four hardware reads succeed before publishing any snapshot byte.
+// The output also stays internal while caches are unavailable. Scratch/work
+// are temporary and may change on failure; output remains caller's old value.
+@section(".iram1.abla.s3PsramReadIdentity")
+trusted fun s3PsramReadIdentityOwned(output: NativeBuffer,scratch: NativeBuffer,work: NativeBuffer,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || !s3PsramModeBuffers(scratch,work) || !output.hasAddressRange(0,6) ||
+        !s3PsramCommandStorageSafe(output.addressValue(),6) ||
+        (output.addressValue() < scratch.addressValue()+8 && scratch.addressValue() < output.addressValue()+6) ||
+        (output.addressValue() < work.addressValue()+100 && work.addressValue() < output.addressValue()+6)) return 2
+    var index=0
+    while (index < 4) {
+        val address=if (index < 3) index*2 else 8
+        val offset=if (index < 3) index*2 else 5
+        val length=if (index < 2) 2 else 1
+        val result=s3PsramCommandOwned(0x4040,address,8,nativeBufferAt(scratch.addressValue()+offset,length),length,work)
+        if (result != 1) return result
+        index=index+1
+    }
+    index=0
+    while (index < 6) { output.store(index,scratch.load(index));index=index+1 }
+    return 1
+}

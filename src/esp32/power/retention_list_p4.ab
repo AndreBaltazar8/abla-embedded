@@ -1,0 +1,83 @@
+import "./retention_descriptor_p4.ab"
+fun p4RetentionRangesOverlap(a: int,an: int,b: int,bn: int): bool = a < b+bn && b < a+an
+// Assemble disconnected terminal configs into one dense linear PAU list.
+// Caller supplies exclusive configs[count*56], output and36B scratch. No heap.
+// Validates ALL nodes before touching output; scratch may change on failure.
+// Input configs remain unchanged. Returns exact output bytes,0 invalid.
+// Branches/prelinked nodes are intentionally rejected by this LINEAR builder;
+// the descriptor encoder separately supports four-way hardware branches.
+// Backup buffers must be mutually disjoint and outside output/scratch.
+// Register semantics, domain ordering/entry routing, retained memory capability
+// and cache publication remain caller responsibilities. No PAU activation.
+// P4 WAIT cache erratum: each executing WAIT is followed by a masked WRITE
+// and WAIT of the complemented value in PMU_DATE (IDF sleep_retention.c).
+// Caller also owns PMU_DATE scratch bits throughout hardware execution.
+// Bit31 is CLK_EN, not scratch: reject active WAIT masks using that bit.
+// Zero-mask and both-skipped WAITs do not need cache poisoning.
+fun p4RetentionWaitPoison(head: int,mask: int): bool =
+    ((head>>>16)&15) == 3 && (head&0x60000000) != 0x60000000 && mask != 0
+trusted fun esp32p4RetentionListEncode(out: NativeBuffer,configs: NativeBuffer,scratch: NativeBuffer,count: int): int {
+    if (count < 1 || count > 1024 || !configs.hasAddressRange(0,count*56) || !scratch.hasAddressRange(0,36) ||
+        (configs.addressValue()&3) != 0 || (scratch.addressValue()&3) != 0 || (out.addressValue()&3) != 0) return 0
+    var total=0
+    var i=0
+    while (i < count) {
+        val head=configs.loadU32(i*56)
+        if ((head&0x90000000) != 0x80000000) return 0
+        val poison=p4RetentionWaitPoison(head,configs.loadU32(i*56+52))
+        if (poison && (configs.loadU32(i*56+52)&0x80000000) != 0) return 0
+        total=total+p4RetentionDescriptorBytes(head)+(if (poison) 40 else 0);i=i+1
+    }
+    if (!out.hasAddressRange(0,total) ||
+        p4RetentionRangesOverlap(out.addressValue(),total,configs.addressValue(),count*56) ||
+        p4RetentionRangesOverlap(out.addressValue(),total,scratch.addressValue(),36) ||
+        p4RetentionRangesOverlap(scratch.addressValue(),36,configs.addressValue(),count*56)) return 0
+    i=0
+    while (i < count) {
+        val c=nativeBufferAt(configs.addressValue()+i*56,56)
+        if (!esp32p4RetentionDescriptorEncode(scratch,c)) return 0
+        val head=c.loadU32(0)
+        if (((head>>>16)&15) < 2) {
+            val address=c.loadU32(28);val bytes=(head&1023)*4
+            if (p4RetentionRangesOverlap(address,bytes,out.addressValue(),total) ||
+                p4RetentionRangesOverlap(address,bytes,scratch.addressValue(),36)) return 0
+            var j=0
+            while (j < i) {
+                val old=configs.loadU32(j*56)
+                if (((old>>>16)&15) < 2 && p4RetentionRangesOverlap(address,bytes,configs.loadU32(j*56+28),(old&1023)*4)) return 0
+                j=j+1
+            }
+        }
+        i=i+1
+    }
+    // Under caller exclusion the second encoder pass cannot invalidate the
+    // completed preflight. Internal next addresses point only to node heads.
+    var offset=0
+    i=0
+    while (i < count) {
+        val c=nativeBufferAt(configs.addressValue()+i*56,56)
+        val head=c.loadU32(0);val bytes=p4RetentionDescriptorBytes(head)
+        val node=nativeBufferAt(out.addressValue()+offset,bytes)
+        if (!esp32p4RetentionDescriptorEncode(node,c)) return 0
+        val poison=p4RetentionWaitPoison(head,c.loadU32(52))
+        if (i+1 < count || poison) {
+            node.storeU32(4,out.addressValue()+offset+bytes)
+            node.storeU32(0,head&0x7fffffff)
+        }
+        offset=offset+bytes
+        if (poison) {
+            var extra=0
+            while (extra < 2) {
+                val terminal=i+1 == count && extra == 1
+                out.storeU32(offset+4,if (terminal) 0 else out.addressValue()+offset+20)
+                out.storeU32(offset+8,0x501153fc)
+                out.storeU32(offset+12,c.loadU32(48)^0xffffffff)
+                out.storeU32(offset+16,c.loadU32(52))
+                out.storeU32(offset,(head&0x60000000)|((2+extra)<<16)|(if (terminal) 0x80000000 else 0))
+                offset=offset+20;extra=extra+1
+            }
+        }
+        i=i+1
+    }
+    return total
+}

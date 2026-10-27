@@ -1,0 +1,373 @@
+import "multi_heap_primitives_esp32.ab"
+import "../memory/heap_alignment_esp32.ab"
+import "../shared_storage_esp32.ab"
+import "../../runtime/freestanding_memory.ab"
+import "../../xtensa/cpu.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+
+@inline
+trusted fun esp32HeapCapsBaseLoad(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
+
+@inline
+trusted fun esp32HeapCapsBaseStore(
+    address: u32,
+    value: u32
+): void = ablaUnsafeStoreU32(
+    nativePointerFromAddress(int(address)), int(value)
+)
+
+@inline
+fun esp32HeapCapsAddressInRange(
+    address: u32,
+    begin: u32,
+    end: u32
+): bool = address >= begin && address <= end
+
+@inline
+trusted fun esp32HeapCapsBaseFirstHeap(): u32 =
+    esp32HeapCapsBaseLoad(esp32Data_registered_heaps_d5e1318ad9)
+
+@inline
+trusted fun esp32HeapCapsBaseNextHeap(heap: u32): u32 =
+    esp32HeapCapsBaseLoad(heap + u32(32))
+
+@inline
+trusted fun esp32HeapCapsBaseAllCapabilities(heap: u32): u32 =
+    esp32HeapCapsBaseLoad(heap) |
+    esp32HeapCapsBaseLoad(heap + u32(4)) |
+    esp32HeapCapsBaseLoad(heap + u32(8))
+
+trusted fun esp32HeapCapsBaseFindContainingHeap(memory: u32): u32 {
+    var heap = esp32HeapCapsBaseFirstHeap()
+    while (heap != u32(0)) {
+        if (esp32HeapCapsBaseLoad(heap + u32(28)) != u32(0) &&
+            memory >= esp32HeapCapsBaseLoad(heap + u32(12)) &&
+            memory < esp32HeapCapsBaseLoad(heap + u32(16))) return heap
+        heap = esp32HeapCapsBaseNextHeap(heap)
+    }
+    u32(0)
+}
+
+@inline
+fun esp32HeapCapsIsExecutableAlias(memory: u32): bool =
+    esp32HeapCapsAddressInRange(
+        memory, u32(1074397184), u32(1074528255)
+    ) || esp32HeapCapsAddressInRange(
+        memory, u32(1074528256), u32(1074536447)
+    )
+
+@inline
+fun esp32HeapCapsHeapHasExecutableAlias(heap: u32): bool {
+    val start = esp32HeapCapsBaseLoad(heap + u32(12))
+    return esp32HeapCapsAddressInRange(
+        start, u32(1073610752), u32(1073741823)
+    ) || esp32HeapCapsAddressInRange(
+        start, u32(1073217536), u32(1073225727)
+    )
+}
+
+trusted fun esp32HeapCapsDramAllocationToIram(
+    memory: u32,
+    length: u32
+): u32 {
+    val end = memory + length - u32(4)
+    if ((memory & u32(3)) != u32(0) ||
+        (end & u32(3)) != u32(0)) ablaRuntimeTrap()
+    val aliasMetadata = u32(2148139004) - end
+    esp32HeapCapsBaseStore(aliasMetadata, memory)
+    aliasMetadata + u32(4)
+}
+
+@inline
+trusted fun esp32HeapCapsBaseAllocateFromHeap(
+    handle: u32,
+    size: u32,
+    alignment: u32,
+    offset: u32
+): u32 = if (alignment <= u32(4))
+    esp32MultiHeapMalloc(handle, size)
+else esp32MultiHeapAlignedAllocateOffset(
+    handle, size, alignment, offset
+)
+
+@section(".iram1.1.abla.esp32HeapCapsFree")
+trusted fun esp32HeapCapsFree(memoryValue: u32): void {
+    if (memoryValue == u32(0)) return
+    var memory = memoryValue
+    if (esp32HeapCapsIsExecutableAlias(memory)) {
+        memory = esp32HeapCapsBaseLoad(memory - u32(4))
+    }
+    val heap = esp32HeapCapsBaseFindContainingHeap(memory)
+    if (heap == u32(0)) ablaRuntimeTrap()
+    esp32MultiHeapFree(esp32HeapCapsBaseLoad(heap + u32(28)), memory)
+    return
+}
+
+trusted fun esp32HeapCapsFreeValue(memory: u32): u32 {
+    esp32HeapCapsFree(memory)
+    u32(0)
+}
+
+@section(".iram1.3.abla.esp32HeapCapsAlignedAllocateBase")
+trusted fun esp32HeapCapsAlignedAllocateBase(
+    alignmentValue: u32,
+    sizeValue: u32,
+    capabilitiesValue: u32
+): u32 {
+    val arguments = u32(nativeStackAllocate(12))
+    esp32HeapCapsBaseStore(arguments, alignmentValue)
+    esp32HeapCapsBaseStore(arguments + u32(4), sizeValue)
+    esp32HeapCapsBaseStore(arguments + u32(8), capabilitiesValue)
+    esp32HeapAdjustAlignmentToHardware(
+        arguments, arguments + u32(4), arguments + u32(8)
+    )
+    val alignment = esp32HeapCapsBaseLoad(arguments)
+    var size = esp32HeapCapsBaseLoad(arguments + u32(4))
+    var capabilities = esp32HeapCapsBaseLoad(arguments + u32(8))
+    if (size == u32(0) || size > u32(4194304)) return u32(0)
+
+    val executable = (capabilities & u32(1)) != u32(0)
+    if (executable) {
+        if ((capabilities & u32(12)) != u32(0)) return u32(0)
+        capabilities = capabilities | u32(2)
+    }
+    if ((capabilities & u32(2)) != u32(0)) {
+        size = (size + u32(3)) & ~u32(3)
+    }
+
+    var priority = u32(0)
+    while (priority < u32(3)) {
+        var heap = esp32HeapCapsBaseFirstHeap()
+        while (heap != u32(0)) {
+            val handle = esp32HeapCapsBaseLoad(heap + u32(28))
+            if (handle != u32(0) &&
+                (esp32HeapCapsBaseLoad(heap + (priority << u32(2))) &
+                    capabilities) != u32(0) &&
+                (esp32HeapCapsBaseAllCapabilities(heap) & capabilities) ==
+                    capabilities) {
+                if (executable && esp32HeapCapsHeapHasExecutableAlias(heap)) {
+                    val dram = esp32HeapCapsBaseAllocateFromHeap(
+                        handle, size + u32(4), alignment, u32(0)
+                    )
+                    if (dram != u32(0)) {
+                        return esp32HeapCapsDramAllocationToIram(
+                            dram, size + u32(4)
+                        )
+                    }
+                } else {
+                    val memory = esp32HeapCapsBaseAllocateFromHeap(
+                        handle, size, alignment, u32(0)
+                    )
+                    if (memory != u32(0)) return memory
+                }
+            }
+            heap = esp32HeapCapsBaseNextHeap(heap)
+        }
+        priority = priority + u32(1)
+    }
+    u32(0)
+}
+
+// Startup variant. Core 1 may be awake but must still be parked outside the
+// heap and scheduler; executable-alias allocations remain on the normal path.
+trusted fun esp32HeapCapsAllocateBeforeScheduler(
+    size: u32,
+    capabilities: u32
+): u32 {
+    if (size == u32(0) || (capabilities & u32(1)) != u32(0)) return u32(0)
+    var priority = u32(0)
+    while (priority < u32(3)) {
+        var heap = esp32HeapCapsBaseFirstHeap()
+        while (heap != u32(0)) {
+            val handle = esp32HeapCapsBaseLoad(heap + u32(28))
+            if (handle != u32(0) &&
+                (esp32HeapCapsBaseLoad(heap + (priority << u32(2))) &
+                    capabilities) != u32(0) &&
+                (esp32HeapCapsBaseAllCapabilities(heap) & capabilities) ==
+                    capabilities) {
+                val memory = esp32MultiHeapMallocBeforeScheduler(handle, size)
+                if (memory != u32(0)) return memory
+            }
+            heap = esp32HeapCapsBaseNextHeap(heap)
+        }
+        priority = priority + u32(1)
+    }
+    return u32(0)
+}
+
+@inline
+trusted fun esp32HeapCapsAllocateInterruptStartup(
+    size: u32,
+    capabilities: u32
+): u32 {
+    if (size == u32(0) || (capabilities & u32(1)) != u32(0)) return u32(0)
+    var priority = u32(0)
+    while (priority < u32(3)) {
+        var heap = esp32HeapCapsBaseFirstHeap()
+        while (heap != u32(0)) {
+            val handle = esp32HeapCapsBaseLoad(heap + u32(28))
+            if (handle != u32(0) &&
+                (esp32HeapCapsBaseLoad(heap + (priority << u32(2))) &
+                    capabilities) != u32(0) &&
+                (esp32HeapCapsBaseAllCapabilities(heap) & capabilities) ==
+                    capabilities) {
+                val memory = esp32MultiHeapMallocInterruptStartup(handle, size)
+                if (memory != u32(0)) return memory
+            }
+            heap = esp32HeapCapsBaseNextHeap(heap)
+        }
+        priority = priority + u32(1)
+    }
+    return u32(0)
+}
+
+trusted fun esp32HeapCapsFreeBeforeScheduler(memoryValue: u32): void {
+    if (memoryValue == u32(0)) return
+    var memory = memoryValue
+    if (esp32HeapCapsIsExecutableAlias(memory)) {
+        memory = esp32HeapCapsBaseLoad(memory - u32(4))
+    }
+    val heap = esp32HeapCapsBaseFindContainingHeap(memory)
+    if (heap == u32(0)) ablaRuntimeTrap()
+    esp32MultiHeapFreeBeforeScheduler(
+        esp32HeapCapsBaseLoad(heap + u32(28)), memory
+    )
+    return
+}
+
+@inline
+trusted fun esp32HeapCapsSchedulerRunning(): bool {
+    val core = cpuCoreId()
+    return esp32HeapCapsBaseLoad(
+        esp32Data_port_xSchedulerRunning_2618692451 + (core << u32(2))
+    ) != u32(0)
+}
+
+// System initializers and driver APIs share heap_caps_malloc. Before the
+// scheduler starts, use the same TLSF allocation and accounting without the
+// FreeRTOS heap lock; once the current core is scheduled, preserve the normal
+// synchronized path.
+@inline
+trusted fun esp32HeapCapsAllocateForCurrentLifecycle(
+    size: u32,
+    capabilities: u32
+): u32 = if (!esp32HeapCapsSchedulerRunning() &&
+    (capabilities & u32(1)) == u32(0))
+    esp32HeapCapsAllocateBeforeScheduler(size, capabilities)
+else esp32HeapCapsMallocBase(size, capabilities)
+
+@section(".iram1.4.abla.esp32HeapCapsMallocBase")
+trusted fun esp32HeapCapsMallocBase(
+    size: u32,
+    capabilities: u32
+): u32 {
+    // FreeRTOS/libc use the fixed INTERNAL|8BIT pair.  On classic ESP32 that
+    // pair needs no executable alias, task-owner prefix, or alignment rewrite.
+    // Keeping it here avoids the generic argument scratch frame and exposes
+    // the whole dominant allocation path to LLVM.
+    if (capabilities == u32(2052)) {
+        if (size == u32(0) || size > u32(4194304)) return u32(0)
+        var priority = u32(0)
+        while (priority < u32(3)) {
+            var heap = esp32HeapCapsBaseFirstHeap()
+            while (heap != u32(0)) {
+                val handle = esp32HeapCapsBaseLoad(heap + u32(28))
+                if (handle != u32(0) &&
+                    (esp32HeapCapsBaseLoad(
+                        heap + (priority << u32(2))
+                    ) & capabilities) != u32(0) &&
+                    (esp32HeapCapsBaseAllCapabilities(heap) & capabilities) ==
+                        capabilities) {
+                    val memory = esp32MultiHeapMalloc(handle, size)
+                    if (memory != u32(0)) return memory
+                }
+                heap = esp32HeapCapsBaseNextHeap(heap)
+            }
+            priority = priority + u32(1)
+        }
+        return u32(0)
+    }
+    return esp32HeapCapsAlignedAllocateBase(
+        u32(4), size, capabilities
+    )
+}
+
+@section(".iram1.5.abla.esp32HeapCapsReallocateBase")
+trusted fun esp32HeapCapsReallocateBase(
+    memoryValue: u32,
+    sizeValue: u32,
+    capabilitiesValue: u32
+): u32 {
+    val arguments = u32(nativeStackAllocate(12))
+    esp32HeapCapsBaseStore(arguments, u32(4))
+    esp32HeapCapsBaseStore(arguments + u32(4), sizeValue)
+    esp32HeapCapsBaseStore(arguments + u32(8), capabilitiesValue)
+    esp32HeapAdjustAlignmentToHardware(
+        arguments, arguments + u32(4), arguments + u32(8)
+    )
+    val alignment = esp32HeapCapsBaseLoad(arguments)
+    val size = esp32HeapCapsBaseLoad(arguments + u32(4))
+    val capabilities = esp32HeapCapsBaseLoad(arguments + u32(8))
+
+    if (memoryValue == u32(0)) {
+        return esp32HeapCapsAlignedAllocateBase(
+            alignment, size, capabilities
+        )
+    }
+    if (size == u32(0)) {
+        esp32HeapCapsFree(memoryValue)
+        return u32(0)
+    }
+    if (size > u32(4194304)) return u32(0)
+
+    val executableAlias = esp32HeapCapsIsExecutableAlias(memoryValue)
+    val allocatorMemory = if (executableAlias)
+        esp32HeapCapsBaseLoad(memoryValue - u32(4))
+    else memoryValue
+    val heap = esp32HeapCapsBaseFindContainingHeap(allocatorMemory)
+    if (heap == u32(0)) ablaRuntimeTrap()
+    val handle = esp32HeapCapsBaseLoad(heap + u32(28))
+    val compatible = (
+        esp32HeapCapsBaseAllCapabilities(heap) & capabilities
+    ) == capabilities
+
+    if (compatible && !executableAlias && alignment <= u32(4)) {
+        val resized = esp32MultiHeapReallocate(handle, memoryValue, size)
+        if (resized != u32(0)) return resized
+    }
+
+    val replacement = esp32HeapCapsAlignedAllocateBase(
+        alignment, size, capabilities
+    )
+    if (replacement == u32(0)) return u32(0)
+    val oldSize = esp32MultiHeapGetAllocatedSize(
+        handle, allocatorMemory
+    )
+    if (oldSize == u32(0)) ablaRuntimeTrap()
+    freestandingCopy(
+        replacement,
+        memoryValue,
+        if (oldSize < size) oldSize else size
+    )
+    esp32HeapCapsFree(memoryValue)
+    replacement
+}
+
+@section(".iram1.abla.esp32HeapCapsCallocBase")
+trusted fun esp32HeapCapsCallocBase(
+    count: u32,
+    size: u32,
+    capabilities: u32
+): u32 {
+    val totalWide = u64(count) * u64(size)
+    if (totalWide > u64(4294967295)) return u32(0)
+    val total = u32(totalWide)
+    val memory = esp32HeapCapsMallocBase(total, capabilities)
+    if (memory != u32(0)) {
+        freestandingSet(memory, i32(0), total)
+    }
+    memory
+}

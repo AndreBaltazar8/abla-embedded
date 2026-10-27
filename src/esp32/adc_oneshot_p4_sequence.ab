@@ -1,0 +1,120 @@
+import "./adc_power_p4_sequence.ab"
+// ESP-IDF6 esp32p4 adc_ll.h. ADC2 logical channels0..5 use SAR pads2..7,
+// including attenuation fields; ADC1 channels0..7 use pads0..7.
+fun esp32p4AdcChannelValid(unit: int,channel: int): bool =
+    channel >= 0 && ((unit == 1 && channel < 8) || (unit == 2 && channel < 6))
+fun p4AdcRtcBase(unit: int): int = if (unit == 1) 0x50127000 else 0x50127024
+fun p4AdcPadIndex(unit: int,channel: int): int = channel+(if (unit == 2) 2 else 0)
+trusted fun esp32p4AdcPowered(unit: int): bool {
+    if (!esp32p4AdcClocksReady()) return false
+    val shift=u32(if (unit == 1) 26 else 28)
+    val lpShift=u32(if (unit == 1) 0 else 2)
+    return (p4AdcRead(0x500de000)&((u32(3)<<shift)|u32(32))) == ((u32(3)<<shift)|u32(32)) &&
+        ((p4AdcRead(0x5012703c)>>lpShift)&u32(3)) == u32(3)
+}
+// Scalar snapshot of only changed fields; caller retains even on failure.
+// Whole ADC complex exclusively owned, all former users stopped. Pad setup,
+// analog trim/calibration and settling are separate REQUIRED prerequisites.
+// Clock divider1..255, attenuation0..3. No reset or conversion started.
+type P4AdcController=int
+fun P4AdcController.status(): int = this&255
+fun P4AdcController.hasSnapshot(): bool = (this&(1<<41)) != 0
+// 1ready2invalid/unowned3power4busy5readback6closed.
+trusted fun esp32p4AdcControllerOpenOwned(unit: int,channel: int,attenuation: int,divider: int,exclusive: bool): P4AdcController {
+    if (!exclusive || !esp32p4AdcChannelValid(unit,channel) || attenuation < 0 || attenuation > 3 || divider < 1 || divider > 255) return P4AdcController(2)
+    if (!esp32p4AdcPowered(unit)) return P4AdcController(3)
+    if (!esp32p4AdcStopped()) return P4AdcController(4)
+    val base=p4AdcRtcBase(unit)
+    val reader=p4AdcRead(base)
+    val inv=u32(if (unit == 1) 28 else 29)
+    val at=u32(p4AdcPadIndex(unit,channel)*2)
+    // ADC2 PWDET capacitor tuning default4 is also part of RTC setup in
+    // adc_oneshot_hal_setup. Preserve it with routing on controller close.
+    val cct=int(((p4AdcRead(base+16)>>u32(28))&u32(7))*u32(unit-1))
+    val saved=int(reader&u32(255))|(int((reader>>inv)&u32(1))<<8)|
+        (int(p4AdcRead(base+16)>>u32(31))<<9)|
+        (int(p4AdcRead(base+12)>>u32(18))<<10)|
+        (int((p4AdcRead(base+20)>>at)&u32(3))<<24)|
+        ((unit-1)<<26)|(channel<<27)|
+        (cct<<30)
+    val token=(saved<<8)|(1<<41)
+    if (!p4AdcField(base,u32(255)|(u32(1)<<inv),u32(divider)) ||
+        !p4AdcField(base+16,if (unit == 1) u32(0x80000000) else u32(0xf0000000),if (unit == 1) u32(0) else u32(0xc0000000)) ||
+        !p4AdcField(base+12,u32(0xfffc0000),u32(0x80040000)) ||
+        !p4AdcField(base+20,u32(3)<<at,u32(attenuation)<<at)) return P4AdcController(token|5)
+    return P4AdcController(token|1)
+}
+trusted fun P4AdcController.closeOwned(exclusive: bool): P4AdcController {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 6) return this
+    val token=this&(0x3ffffffffff^255)
+    val saved=(this>>>8)&0x1ffffffff
+    val unit=((saved>>>26)&1)+1
+    val channel=(saved>>>27)&7
+    if (!esp32p4AdcPowered(unit)) return P4AdcController(token|3)
+    if (!esp32p4AdcStopped()) return P4AdcController(token|4)
+    val base=p4AdcRtcBase(unit)
+    val inv=u32(if (unit == 1) 28 else 29)
+    val at=u32(p4AdcPadIndex(unit,channel)*2)
+    if (!p4AdcField(base+20,u32(3)<<at,(u32(saved>>>24)&u32(3))<<at) ||
+        !p4AdcField(base+12,u32(0xfffc0000),(u32(saved>>>10)&u32(0x3fff))<<u32(18)) ||
+        !p4AdcField(base+16,if (unit == 1) u32(0x80000000) else u32(0xf0000000),
+            ((u32(saved>>>9)&u32(1))<<u32(31))|(if (unit == 2) (u32(saved>>>30)&u32(7))<<u32(28) else u32(0))) ||
+        !p4AdcField(base,u32(255)|(u32(1)<<inv),(u32(saved)&u32(255))|((u32(saved>>>8)&u32(1))<<inv))) return P4AdcController(token|5)
+    return P4AdcController(token|6)
+}
+trusted fun esp32p4AdcOneshotPrepared(unit: int): bool {
+    if (!esp32p4AdcPowered(unit)) return false
+    val base=p4AdcRtcBase(unit)
+    return (p4AdcRead(base)&(u32(1)<<u32(if (unit == 1) 28 else 29))) == u32(0) &&
+        (p4AdcRead(base+16)&u32(0x80000000)) == (if (unit == 1) u32(0) else u32(0x80000000)) &&
+        (p4AdcRead(base+12)&u32(0x80040000)) == u32(0x80040000)
+}
+// Split start/join/release: timeout retains ownership, never silently cancels
+// or restarts. Finish status1 includes raw12-bit result at8 (NOT millivolts).
+// Status2invalid3config4busy5readback6pending7badraw. Start attempted flag8.
+trusted fun esp32p4AdcOneshotStartOwned(unit: int,channel: int,exclusive: bool): int {
+    if (!exclusive || !esp32p4AdcChannelValid(unit,channel)) return 2
+    if (!esp32p4AdcOneshotPrepared(unit)) return 3
+    if (!esp32p4AdcStopped()) return 4
+    val address=p4AdcRtcBase(unit)+12
+    val selected=u32(0x80040000)|(u32(1)<<u32(19+p4AdcPadIndex(unit,channel)))
+    p4AdcWrite(address,selected)
+    if ((p4AdcRead(address)&u32(0xfffe0000)) != selected) return 261
+    p4AdcWrite(address,selected|u32(0x20000))
+    return if ((p4AdcRead(address)&u32(0xfffe0000)) == (selected|u32(0x20000))) 257 else 261
+}
+trusted fun esp32p4AdcOneshotFinishOwned(unit: int,channel: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !esp32p4AdcChannelValid(unit,channel) || polls < 1 || polls > 1000000) return 2
+    if (!esp32p4AdcOneshotPrepared(unit)) return 3
+    val address=p4AdcRtcBase(unit)+12
+    val selected=u32(0x80060000)|(u32(1)<<u32(19+p4AdcPadIndex(unit,channel)))
+    var left=polls
+    while (left > 0) {
+        val sample=p4AdcRead(address)
+        if ((sample&u32(0xfffe0000)) != selected) return 3
+        if ((sample&u32(0x10000)) != u32(0)) {
+            val raw=sample&u32(65535)
+            return if (raw > u32(4095)) 7 else (int(raw)<<8)|1
+        }
+        left=left-1
+    }
+    return 6
+}
+trusted fun esp32p4AdcOneshotReleaseOwned(unit: int,channel: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !esp32p4AdcChannelValid(unit,channel) || polls < 1 || polls > 1000000) return 2
+    if (!esp32p4AdcOneshotPrepared(unit)) return 3
+    val address=p4AdcRtcBase(unit)+12
+    val pad=u32(1)<<u32(19+p4AdcPadIndex(unit,channel))
+    var left=polls
+    while (left > 0) {
+        val sample=p4AdcRead(address)
+        val pads=sample&u32(0x7ff80000)
+        if (pads != u32(0) && pads != pad) return 3
+        if ((sample&u32(0x30000)) != u32(0x20000)) {
+            p4AdcWrite(address,u32(0x80040000))
+            return if ((p4AdcRead(address)&u32(0xfffe0000)) == u32(0x80040000)) 1 else 5
+        }
+        left=left-1
+    }
+    return 6
+}

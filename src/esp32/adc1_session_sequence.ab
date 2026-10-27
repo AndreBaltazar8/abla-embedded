@@ -1,0 +1,67 @@
+// Classic ESP32 ADC1 session. Caller owns selected pad plus ADC1/Hall/LNA,
+// excludes ULP/DMA/sleep/reconfiguration, serializes shared SAR register RMW,
+// and obeys Esp32SarPower's upstream/exclusive lifetime contract. Returned
+// values replace the sole authoritative owner; copies are not new leases.
+// Does not own external sensor/divider power. Pins stay analog after close.
+// bits8..10 channel,11..12 width-9,13..14 attenuation,16..29 SAR lease,
+// bit30 configured,31 start attempted,32..43 raw,44 raw valid,
+// bit45 final-controller-write unverified; low8 status.
+// 0closed1success2invalid3power4pad5config6loststate7start8pending/finish
+// 9invalidraw10release11powerclose. Never hide partial ownership in an error.
+type Esp32Adc1Session = int
+fun Esp32Adc1Session.bits(): int = this
+fun Esp32Adc1Session.status(): int = this&255
+fun Esp32Adc1Session.channel(): int = (this>>8)&7
+fun Esp32Adc1Session.width(): int = 9+((this>>11)&3)
+fun Esp32Adc1Session.attenuation(): int = (this>>13)&3
+fun Esp32Adc1Session.pending(): bool = (this&2147483648) != 0
+fun Esp32Adc1Session.ready(): bool = (this&3221225472) == 1073741824
+fun Esp32Adc1Session.raw(): int = if ((this&17592186044416) != 0) (this>>32)&4095 else -1
+trusted fun esp32Adc1SessionOpenOwned(channel: int,width: int,attenuation: int,exclusivePower: bool,polls: int): Esp32Adc1Session {
+    if (channel < 0 || channel > 7 || width < 9 || width > 12 || attenuation < 0 || attenuation > 3 || polls < 1 || polls > 1000000) return Esp32Adc1Session(2)
+    var flags=(channel<<8)|((width-9)<<11)|(attenuation<<13)
+    val power=esp32SarPowerOpenOwned(exclusivePower)
+    flags=flags|(power.bits()<<16)
+    if (!power.powered()) return Esp32Adc1Session(flags|3)
+    if (esp32Adc1PadConfigureOwned(channel) != 1) return Esp32Adc1Session(flags|4)
+    val configured=esp32Adc1ConfigureOwned(channel,width,attenuation,polls)
+    if (configured != 1) return Esp32Adc1Session(flags|(if (configured == 2309) (1<<45) else 0)|5)
+    return Esp32Adc1Session(flags|1073741824|1)
+}
+// Caller must wait for supply/pad/external RC settling AFTER open. No guessed
+// fixed delay or "powered register means settled analog" assumption here.
+trusted fun Esp32Adc1Session.startAfterSettlingOwned(polls: int): Esp32Adc1Session {
+    val flags=this&(4294967040|(1<<45))
+    if (!this.ready() || polls < 1 || polls > 1000000) return Esp32Adc1Session(flags|2)
+    if (!esp32Adc1SessionHardwareMatches(this.channel(),this.width(),this.attenuation())) return Esp32Adc1Session(flags|6)
+    val result=esp32Adc1StartOwned(this.channel(),polls)
+    val pending=if ((result&256) != 0) 2147483648 else 0
+    return Esp32Adc1Session(flags|pending|(if ((result&255) == 1) 1 else 7))
+}
+trusted fun Esp32Adc1Session.pollOwned(polls: int): Esp32Adc1Session {
+    val flags=this&(4294967040|(1<<45))
+    if (!this.pending() || polls < 1 || polls > 1000000) return Esp32Adc1Session(flags|2)
+    if (!esp32Adc1SessionHardwareMatches(this.channel(),this.width(),this.attenuation())) return Esp32Adc1Session(flags|6)
+    val result=esp32Adc1FinishOwned(this.channel(),polls)
+    if ((result&255) == 1) return Esp32Adc1Session((flags&2147483647)|17592186044416|(((result>>8)&4095)<<32)|1)
+    if ((result&255) == 7) return Esp32Adc1Session((flags&2147483647)|9)
+    return Esp32Adc1Session(flags|8)
+}
+trusted fun Esp32Adc1Session.closeOwned(polls: int): Esp32Adc1Session {
+    var flags=this&(4294967040|(1<<45))
+    if (polls < 1 || polls > 1000000) return Esp32Adc1Session(this&(-256)|2)
+    if ((flags&(1<<45)) != 0) {
+        // Complete a dropped final config write under the original ownership
+        // contract before release. Preserve this obligation across retries.
+        if (esp32Adc1ConfigureOwned(this.channel(),this.width(),this.attenuation(),polls) != 1) return Esp32Adc1Session(flags|10)
+        flags=(flags&4294967295)|1073741824
+    }
+    if ((flags&3221225472) != 0) {
+        if (!esp32Adc1SessionHardwareMatches(this.channel(),this.width(),this.attenuation())) return Esp32Adc1Session(flags|6)
+        if (esp32Adc1ReleaseOwned(this.channel(),polls) != 1) return Esp32Adc1Session(flags|10)
+        flags=flags&1073741823
+    }
+    val power=Esp32SarPower((flags>>16)&16383).closeOwned()
+    flags=(flags&65535)|(power.bits()<<16)
+    return if (power.status() == 0) Esp32Adc1Session(0) else Esp32Adc1Session(flags|11)
+}

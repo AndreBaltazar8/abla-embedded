@@ -1,0 +1,45 @@
+// Classic ESP32 shared SAR/PWDET power, IDF sar_ctrl_ll.h. All callers must
+// serialize SENS register RMW with ADC/Hall/WiFi across cores. NOT a software
+// reference counter for unrelated external drivers: they must participate in
+// the same ownership protocol. Never claim exclusive=true while WiFi/ULP/DMA
+// or another ADC user can acquire/use this supply during the lease.
+type Esp32SarPower = int
+fun Esp32SarPower.bits(): int = this
+fun Esp32SarPower.status(): int = this&255
+fun Esp32SarPower.powered(): bool = this.status() == 1
+// status0closed1powered2invalid3exclusive-required4readback5busy6state-lost.
+// bit8 changed/attempted,bit9 borrowed; original power mode in bits12..13.
+// POWERED only means the force-on register read back: not analog settling or
+// voltage proof. Higher-level acquisition must preserve analog timing waits.
+trusted fun esp32SarPowerField(mode: int): bool {
+    esp32SarPowerWrite(12,(esp32SarPowerRead(12)&0xfff3ffff)|(mode<<18))
+    return ((esp32SarPowerRead(12)>>18)&3) == mode
+}
+trusted fun esp32SarPowerOpenOwned(exclusive: bool): Esp32SarPower {
+    val mode=(esp32SarPowerRead(12)>>18)&3
+    // Borrowing requires the upstream owner to pin force-on through our lease.
+    if (mode == 3) return Esp32SarPower(513)
+    if (mode == 1) return Esp32SarPower(2)
+    if (!exclusive) return Esp32SarPower(3)
+    val flags=256|(mode<<12)
+    return Esp32SarPower(flags|(if (esp32SarPowerField(3)) 1 else 4))
+}
+trusted fun Esp32SarPower.closeOwned(): Esp32SarPower {
+    val flags=this&0x3300
+    if ((flags&256) == 0) {
+        // Borrowed close must NEVER write or power down someone else's supply.
+        if ((flags&512) != 0 && ((esp32SarPowerRead(12)>>18)&3) != 3) return Esp32SarPower(flags|6)
+        return Esp32SarPower(0)
+    }
+    val original=(flags>>12)&3
+    val mode=(esp32SarPowerRead(12)>>18)&3
+    if (mode != 3 && mode != original) return Esp32SarPower(flags|6)
+    // Caller must have returned all child leases and excluded PWDET/DMA/ULP.
+    // These extra guards reject visible pending RTC conversions, not prove
+    // that all analog clients are idle. Failed close retains the power lease.
+    if ((esp32SarPowerRead(60)&0x3fc00000) != 0 ||
+        (esp32SarPowerRead(84)&0x30000) == 0x20000 ||
+        (esp32SarPowerRead(148)&0x30000) == 0x20000) return Esp32SarPower(flags|5)
+    if (mode == original) return Esp32SarPower(0)
+    return if (esp32SarPowerField(original)) Esp32SarPower(0) else Esp32SarPower(flags|4)
+}

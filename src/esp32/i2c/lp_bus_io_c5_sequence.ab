@@ -1,0 +1,49 @@
+import "./lp_bus_c5_sequence.ab"
+trusted fun Esp32C5LpI2cBusState.overlaps(buffer: NativeBuffer,count: int): bool =
+    count > 0 && buffer.addressValue() < this.buffer().addressValue()+64 &&
+        this.buffer().addressValue() < buffer.addressValue()+count
+// Identity is checked AFTER gate acquisition, closing the reopen/transfer
+// race. A stale request cannot fault or change the current bus's last result.
+// Raw transfers use current hardware timing, including changes by device IO.
+// Device-specific timing must be established separately under ownership.
+trusted fun Esp32C5LpI2cBusState.transferOwned(epoch: int,owner: u32,address: int,output: NativeBuffer,written: int,
+    input: NativeBuffer,read: int,budget: u32,prefix: int = -1): int {
+    if (!this.valid() || !peripheralOwnerValid(owner) || epoch <= 0 || epoch > 2147483647 ||
+        address < 0 || address > 127 || !output.hasAddressRange(0,written) || !input.hasAddressRange(0,read) ||
+        this.overlaps(output,written) || this.overlaps(input,read) ||
+        budget == u32(0) || budget > u32(0x7FFFFFFF) || prefix < -1 || prefix > 255) return 7
+    val gate=this.gate()
+    val admission=gate.tryBegin(owner)
+    if (admission == 1) return 9
+    if (admission == 2) return 10
+    if (admission != 0) return 7
+    if (!this.matches(epoch)) {
+        if (!gate.finish(owner,true)) return 11
+        return 7
+    }
+    val result=c5LpI2cBusTransfer(address,output,written,input,read,budget,prefix)
+    this.buffer().storeU32(48,result)
+    if (!gate.finish(owner,result == 1)) return 11
+    result
+}
+// Recovery is generation-bound too; stale clients never reset a new bus.
+// Scratch must avoid ALL64B of live state, not only its atomic word.
+trusted fun Esp32C5LpI2cBusState.recoverOwned(epoch: int,owner: u32,scratch: NativeBuffer): int {
+    if (!this.valid() || !peripheralOwnerValid(owner) || epoch <= 0 || epoch > 2147483647 ||
+        !scratch.hasAddressRange(0,56) || (scratch.addressValue()&3) != 0 ||
+        this.overlaps(scratch,56)) return 7
+    val gate=this.gate()
+    if (!gate.tryBeginRecovery(owner)) return 9
+    if (!this.matches(epoch)) {
+        if (!gate.finishRecovery(owner,false)) return 11
+        return 7
+    }
+    val buffer=this.buffer()
+    val sda=buffer.loadU32(16)
+    val scl=buffer.loadU32(20)
+    val result=c5LpI2cBusRecover(sda,scl,scratch)
+
+    buffer.storeU32(48,result)
+    if (!gate.finishRecovery(owner,result == 1)) return 11
+    result
+}

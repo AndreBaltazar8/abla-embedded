@@ -1,0 +1,346 @@
+import "../../xtensa/assembly.ab"
+import "abla/unsafe/memory"
+
+// The classic ESP32 ROM formatter supports characters, strings, pointers and
+// signed/unsigned 32- and 64-bit integers. Its variadic ABI entry is the only
+// target-specific part; parsing and formatting below are ordinary Abla IR.
+
+@inline
+trusted fun esp32RomPrintfLoad8(address: u32): u32 = u32(
+    ablaUnsafeLoadU8(nativePointerFromAddress(int(address)))
+)
+
+@inline
+trusted fun esp32RomPrintfLoad32(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
+
+// Return the selected address in the low word and the next va-list byte
+// offset in the high word. Offsets 4..24 address saved a3..a7. Xtensa's ABI
+// uses 36/40 when crossing to the caller's 32/64-bit overflow arguments.
+@inline
+fun esp32RomPrintfArgumentAddress(
+    overflowBase: u32,
+    registerBase: u32,
+    offset: u32,
+    bytes: u32
+): u64 {
+    var aligned = offset
+    if (bytes == u32(8)) aligned = (aligned + u32(7)) & u32(4294967288)
+    var next = aligned + bytes
+    var base = registerBase
+    if (next > u32(24)) {
+        if (aligned <= u32(24)) {
+            next = if (bytes == u32(8)) u32(40) else u32(36)
+        }
+        base = overflowBase
+    }
+    val address = base + next - bytes
+    u64(address) | (u64(next) << u64(32))
+}
+
+@inline
+trusted fun esp32RomPrintfCallbacksInstalled(): bool =
+    ablaUnsafeVolatileLoadU32(1073405972) != 0 ||
+        ablaUnsafeVolatileLoadU32(1073405968) != 0
+
+@inline
+trusted fun esp32RomPrintfEmit(character: u32): void =
+    esp32RomOutputToChannels(character & u32(255))
+
+trusted fun esp32RomPrintfEmitRepeated(character: u32, count: u32): void {
+    var remaining = count
+    while (remaining != u32(0)) {
+        esp32RomPrintfEmit(character)
+        remaining = remaining - u32(1)
+    }
+}
+
+@inline
+fun esp32RomPrintfDigit(value: u32, upper: bool): u32 =
+    if (value < u32(10)) value + u32(48) else
+        value + (if (upper) u32(55) else u32(87))
+
+fun esp32RomPrintfDigitCount(value: u64, base: u64): u32 {
+    var remaining = value
+    var count = u32(1)
+    while (remaining >= base) {
+        remaining = remaining / base
+        count = count + u32(1)
+    }
+    count
+}
+
+trusted fun esp32RomPrintfEmitUnsigned(
+    value: u64,
+    base: u64,
+    upper: bool
+): void {
+    var divisor = u64(1)
+    while (divisor <= value / base) divisor = divisor * base
+    var remaining = value
+    while (divisor != u64(0)) {
+        val digit = u32(remaining / divisor)
+        esp32RomPrintfEmit(esp32RomPrintfDigit(digit, upper))
+        remaining = remaining - u64(digit) * divisor
+        divisor = divisor / base
+    }
+}
+
+trusted fun esp32RomPrintfUnsigned(
+    value: u64,
+    base: u64,
+    upper: bool,
+    negative: bool,
+    pointer: bool,
+    width: u32,
+    left: bool,
+    zero: bool
+): u32 {
+    val digits = esp32RomPrintfDigitCount(value, base)
+    val prefix = (if (negative) u32(1) else u32(0)) +
+        (if (pointer) u32(2) else u32(0))
+    val occupied = digits + prefix
+    val padding = if (width > occupied) width - occupied else u32(0)
+
+    if (!left && !zero) esp32RomPrintfEmitRepeated(u32(32), padding)
+    if (negative) esp32RomPrintfEmit(u32(45))
+    if (pointer) {
+        esp32RomPrintfEmit(u32(48))
+        esp32RomPrintfEmit(u32(120))
+    }
+    if (!left && zero) esp32RomPrintfEmitRepeated(u32(48), padding)
+    esp32RomPrintfEmitUnsigned(value, base, upper)
+    if (left) esp32RomPrintfEmitRepeated(u32(32), padding)
+    occupied + padding
+}
+
+trusted fun esp32RomPrintfStringLength(address: u32): u32 {
+    if (address == u32(0)) return u32(6)
+    var length = u32(0)
+    while (esp32RomPrintfLoad8(address + length) != u32(0)) {
+        length = length + u32(1)
+    }
+    length
+}
+
+@inline
+fun esp32RomPrintfNullCharacter(index: u32): u32 =
+    if (index == u32(0)) u32(40) else
+        if (index == u32(1)) u32(110) else
+        if (index == u32(2)) u32(117) else
+        if (index == u32(3)) u32(108) else
+        if (index == u32(4)) u32(108) else u32(41)
+
+trusted fun esp32RomPrintfString(
+    address: u32,
+    width: u32,
+    left: bool,
+    zero: bool
+): u32 {
+    val length = esp32RomPrintfStringLength(address)
+    val padding = if (width > length) width - length else u32(0)
+    if (!left) {
+        esp32RomPrintfEmitRepeated(if (zero) u32(48) else u32(32), padding)
+    }
+    var index = u32(0)
+    while (index < length) {
+        esp32RomPrintfEmit(
+            if (address == u32(0)) esp32RomPrintfNullCharacter(index)
+            else esp32RomPrintfLoad8(address + index)
+        )
+        index = index + u32(1)
+    }
+    if (left) esp32RomPrintfEmitRepeated(u32(32), padding)
+    length + padding
+}
+
+// Typed body reached by the generic Xtensa variadic-entry adapter.
+@section(".iram1.0.abla.esp32RomPrintfFormat")
+trusted fun esp32RomPrintfFormat(
+    formatAddress: u32,
+    overflowBase: u32,
+    registerBase: u32,
+    initialOffset: u32
+): u32 {
+    if (!esp32RomPrintfCallbacksInstalled()) return u32(0)
+
+    var offset = initialOffset
+    var cursor = formatAddress
+    var written = u32(0)
+    var character = esp32RomPrintfLoad8(cursor)
+    while (character != u32(0)) {
+        if (character != u32(37)) {
+            esp32RomPrintfEmit(character)
+            written = written + u32(1)
+            cursor = cursor + u32(1)
+        } else {
+            cursor = cursor + u32(1)
+            character = esp32RomPrintfLoad8(cursor)
+            var left = false
+            var zero = false
+            var flags = true
+            while (flags) {
+                if (character == u32(45)) {
+                    left = true
+                    cursor = cursor + u32(1)
+                    character = esp32RomPrintfLoad8(cursor)
+                } else if (character == u32(48)) {
+                    zero = true
+                    cursor = cursor + u32(1)
+                    character = esp32RomPrintfLoad8(cursor)
+                } else flags = false
+            }
+
+            var width = u32(0)
+            while (character >= u32(48) && character <= u32(57)) {
+                width = width * u32(10) + character - u32(48)
+                cursor = cursor + u32(1)
+                character = esp32RomPrintfLoad8(cursor)
+            }
+            if (character == u32(46)) {
+                // The classic ROM implementation treats precision as numeric
+                // zero padding and otherwise only consumes its digits.
+                zero = true
+                cursor = cursor + u32(1)
+                character = esp32RomPrintfLoad8(cursor)
+                while (character >= u32(48) && character <= u32(57)) {
+                    cursor = cursor + u32(1)
+                    character = esp32RomPrintfLoad8(cursor)
+                }
+            }
+
+            var wide = false
+            if (character == u32(108)) {
+                cursor = cursor + u32(1)
+                character = esp32RomPrintfLoad8(cursor)
+                if (character == u32(108)) {
+                    wide = true
+                    cursor = cursor + u32(1)
+                    character = esp32RomPrintfLoad8(cursor)
+                }
+            }
+
+            val signed = character == u32(100) || character == u32(68)
+            val decimal = signed || character == u32(117) ||
+                character == u32(85)
+            val hexadecimal = character == u32(120) ||
+                character == u32(88) || character == u32(112)
+            if (decimal || hexadecimal) {
+                val bytes = if (wide) u32(8) else u32(4)
+                val selected = esp32RomPrintfArgumentAddress(
+                    overflowBase, registerBase, offset, bytes
+                )
+                val argumentAddress = u32(selected)
+                offset = u32(selected >> u64(32))
+                var value = u64(esp32RomPrintfLoad32(argumentAddress))
+                if (wide) {
+                    value = value | (u64(
+                        esp32RomPrintfLoad32(argumentAddress + u32(4))
+                    ) << u64(32))
+                }
+                var negative = false
+                if (signed) {
+                    negative = if (wide)
+                        (value & (u64(1) << u64(63))) != u64(0)
+                    else (u32(value) & u32(2147483648)) != u32(0)
+                    if (negative) {
+                        value = if (wide) u64(0) - value else
+                            u64(u32(0) - u32(value))
+                    }
+                }
+                val pointer = character == u32(112)
+                if (pointer && width < u32(10)) width = u32(10)
+                written = written + esp32RomPrintfUnsigned(
+                    value,
+                    if (decimal) u64(10) else u64(16),
+                    character == u32(88),
+                    negative,
+                    pointer,
+                    width,
+                    left,
+                    zero || pointer
+                )
+            } else if (character == u32(99) || character == u32(67)) {
+                val selected = esp32RomPrintfArgumentAddress(
+                    overflowBase, registerBase, offset, u32(4)
+                )
+                offset = u32(selected >> u64(32))
+                val value = esp32RomPrintfLoad32(u32(selected)) & u32(255)
+                val padding = if (width > u32(1)) width - u32(1) else u32(0)
+                if (!left) esp32RomPrintfEmitRepeated(
+                    if (zero) u32(48) else u32(32), padding
+                )
+                esp32RomPrintfEmit(value)
+                if (left) esp32RomPrintfEmitRepeated(u32(32), padding)
+                written = written + u32(1) + padding
+            } else if (character == u32(115) || character == u32(83)) {
+                val selected = esp32RomPrintfArgumentAddress(
+                    overflowBase, registerBase, offset, u32(4)
+                )
+                offset = u32(selected >> u64(32))
+                written = written + esp32RomPrintfString(
+                    esp32RomPrintfLoad32(u32(selected)), width, left, zero
+                )
+            } else if (character == u32(37)) {
+                esp32RomPrintfEmit(character)
+                written = written + u32(1)
+            } else {
+                esp32RomPrintfEmit(u32(37))
+                written = written + u32(1)
+                if (character != u32(0)) {
+                    esp32RomPrintfEmit(character)
+                    written = written + u32(1)
+                }
+            }
+            if (character != u32(0)) cursor = cursor + u32(1)
+        }
+        character = esp32RomPrintfLoad8(cursor)
+    }
+    written
+}
+
+// Optimizer-visible entry used by recovered Abla callers. It materializes the
+// same register-save and overflow areas as the windowed ABI adapter, but all
+// argument words remain ordinary SSA values and the naked entry is prunable.
+trusted fun esp32RomPrintfArguments(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val arguments = u32(nativeStackAllocate(72))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(4))), int(a3))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(8))), int(a4))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(12))), int(a5))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(16))), int(a6))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(20))), int(a7))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(32))), int(stack0))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(36))), int(stack1))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(40))), int(stack2))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(44))), int(stack3))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(48))), int(stack4))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(52))), int(stack5))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(56))), int(stack6))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(60))), int(stack7))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(64))), int(stack8))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(arguments + u32(68))), int(stack9))
+    return esp32RomPrintfFormat(a2, arguments, arguments, u32(4))
+}
+
+// Original ABI symbol: esp_rom_printf / ets_printf.
+@naked
+trusted fun esp32RomPrintf(): void =
+    $xtensa variadicEntry {esp32RomPrintfFormat}

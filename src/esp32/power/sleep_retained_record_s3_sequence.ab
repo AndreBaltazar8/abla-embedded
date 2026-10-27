@@ -1,0 +1,96 @@
+import "../sdk/raw_buffer.ab"
+// Extends the normal104byte prepared record to128bytes: retention state104
+// (1armed,2released), USB/SAR tokens108 low/high bytes (0restored), I/D plans112/120.
+// Stages9armed,10entering,11returned. USB Serial/JTAG ownership is required;
+// preparation disconnects USB and does not preserve in-flight USB traffic.
+// The ordinary record resume refuses these stages: retained resources must be
+// released before normal analog/MSPI/UART restoration. Caller owns all three
+// buffers, quiescent peers/interrupts, and complete wake/power configuration.
+@section(".iram1.abla.s3SleepRecordArm")
+trusted fun esp32S3SleepRecordArmRetentionOwned(record: NativeBuffer,cpu: NativeBuffer,tags: NativeBuffer,i: Esp32S3TagPlan,d: Esp32S3TagPlan,small: bool,monitorActive: bool): int {
+    if (!record.hasAddressRange(0,128) || (record.addressValue() & 3) != 0 || !esp32S3RetentionBuffersValid(cpu,tags,i,d)) return 0
+    val base=record.addressValue()
+    val tagSize=esp32S3TagBufferBytes(i,d)
+    if (!(base+128 <= cpu.addressValue() || cpu.addressValue()+8800 <= base) ||
+        !(base+128 <= tags.addressValue() || tags.addressValue()+tagSize <= base)) return 0
+    if (esp32S3MspiStateRead(base) != 0x53504C50 || esp32S3MspiStateRead(base+4) != 3) return 0
+    val result=esp32S3RetentionArmOwned(cpu,tags,i,d,small)
+    if (result != 1) return result+3
+    esp32S3MspiStateStore64(base+112,i | 0)
+    esp32S3MspiStateStore64(base+120,d | 0)
+    esp32S3MspiStateWrite(base+104,1)
+    val usb=esp32S3SleepUsbSerialPrepareOwned() | 0
+    esp32S3MspiStateWrite(base+108,usb)
+    val sar=esp32S3SleepSarPrepareOwned(monitorActive) | 0
+    esp32S3MspiStateWrite(base+108,usb | (sar<<8))
+    esp32S3MspiStateWrite(base+4,9)
+    1
+}
+@section(".iram1.abla.s3SleepRetainedEnter")
+trusted fun esp32S3SleepRetainedRecordEnterOwned(record: NativeBuffer,wake: int,reject: int): int {
+    if (!record.hasAddressRange(0,128) || (record.addressValue() & 3) != 0) return -3
+    val base=record.addressValue()
+    if (esp32S3MspiStateRead(base) != 0x53504C50 || esp32S3MspiStateRead(base+4) != 9 || esp32S3MspiStateRead(base+104) != 1) return -3
+    esp32S3MspiStateWrite(base+4,10)
+    val result=esp32S3LightSleepSuspendedOwned(wake,reject)
+    esp32S3MspiStateWrite(base+4,11 | ((result & 255)<<8))
+    result
+}
+// Resume clock first, matching IDF misc_modules_wake_prepare ordering, then
+// restore USB/SAR, release retention BEFORE analog/MSPI/UART. Errors leave snapshots
+// and stage intact for explicit retry; status4/detail16+ denotes that failure.
+@section(".iram1.abla.s3SleepRetainedResume")
+trusted fun esp32S3SleepRetainedRecordResumeOwned(record: NativeBuffer,polls: int): Esp32S3SleepResume {
+    if (!record.hasAddressRange(0,128) || (record.addressValue() & 3) != 0) return esp32S3SleepResumeResult(0,5,0,0)
+    val base=record.addressValue()
+    if (esp32S3MspiStateRead(base) != 0x53504C50) return esp32S3SleepResumeResult(0,5,0,0)
+    val state=esp32S3MspiStateRead(base+4)
+    val stage=state & 255
+    // Stage3 owns only the ordinary clock/MSPI/UART snapshots: retention
+    // admission may have failed, or the caller cancelled before arming it.
+    if (stage == 3 || stage == 4 || stage == 7) return esp32S3SleepRecordResumeOwned(record,polls)
+    if (stage != 9 && stage != 11) return esp32S3SleepResumeResult(0,5,0,0)
+    var progress=Esp32S3SleepResume(esp32S3MspiStateLoad64(base+40))
+    if (!progress.valid() || polls <= 0 || polls > 0x7FFFFFFF) return esp32S3SleepResumeResult(0,5,0,0)
+    if (progress.status() == 4) return progress
+    val owned=esp32S3MspiStateRead(base+104)
+    if (owned != 1 && owned != 2) return esp32S3SleepResumeResult(0,5,0,0)
+    val peripherals=esp32S3MspiStateRead(base+108)
+    val usb=Esp32S3SleepUsbSerial(peripherals & 255)
+    val sar=(peripherals>>>8) & 255
+    if ((peripherals & ~65535) != 0 || (sar != 0 && sar != 4 && sar != 5)) return esp32S3SleepResumeResult(0,5,0,0)
+    if ((usb | 0) != 0 && !usb.valid()) return esp32S3SleepResumeResult(0,5,0,0)
+    if (progress.phase() == 0) {
+        val apb=esp32S3ClockResumeFromXtalOwned(Esp32S3ClockState(esp32S3MspiStateLoad64(base+8)),Esp32S3ClockBias(esp32S3MspiStateLoad64(base+32)),polls)
+        if (apb <= 0) {
+            val failure=esp32S3SleepResumeResult(0,if (apb == -3) 2 else 4,0,-apb)
+            esp32S3MspiStateStore64(base+40,failure | 0)
+            return failure
+        }
+        progress=esp32S3SleepResumeResult(1,0,apb,0)
+        esp32S3MspiStateStore64(base+40,progress | 0)
+    }
+    if (progress.phase() != 1) return esp32S3SleepResumeResult(progress.phase(),5,progress.apbHertz(),0)
+    if ((usb | 0) != 0) {
+        if (!esp32S3SleepUsbSerialRestoreOwned(usb)) return esp32S3SleepResumeResult(1,4,progress.apbHertz(),20)
+        // Persist before later cleanup can fail; never replay a restored token.
+        esp32S3MspiStateWrite(base+108,sar<<8)
+    }
+    if (sar != 0) {
+        if (!esp32S3SleepSarRestoreOwned(Esp32S3SleepSar(sar))) return esp32S3SleepResumeResult(1,4,progress.apbHertz(),21)
+        esp32S3MspiStateWrite(base+108,0)
+    }
+    if (owned == 1) {
+        val i=Esp32S3TagPlan(esp32S3MspiStateLoad64(base+112))
+        val d=Esp32S3TagPlan(esp32S3MspiStateLoad64(base+120))
+        // Only entry result0 means actual wake. Result1 is hardware rejection:
+        // CPU/cache state was not lost, so use cancellation without post-wake
+        // cache invalidation, just as for negative pre-entry failures.
+        val beforeEntry=stage == 9 || (state & 0xFF00) != 0
+        val result=if (beforeEntry) (if (esp32S3RetentionCancelOwned(i,d)) 1 else 0) else esp32S3RetentionFinishOwned(i,d)
+        if (result != 1) return esp32S3SleepResumeResult(1,4,progress.apbHertz(),16+result)
+        esp32S3MspiStateWrite(base+104,2)
+    }
+    esp32S3MspiStateWrite(base+4,4 | (state & 0xFF00))
+    esp32S3SleepRecordResumeOwned(record,polls)
+}

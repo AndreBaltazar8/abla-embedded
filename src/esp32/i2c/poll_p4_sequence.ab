@@ -1,0 +1,51 @@
+import "./fifo_p4_sequence.ab"
+import "./status_s3_logic.ab"
+// One queued <=32TX/32RX command batch. Exclusive polling owner, stable CPU
+// clock and RUNNING cycle counter required. Continue only this owner's END
+// batch; no other client may queue/consume anything between calls.
+// Common result0pending1STOP2END3NACK4arbitration5timeout6FIFO7invalid8busy.
+// Errors NEVER synthesize STOP/reset: another master may own the wire after
+// arbitration loss. Caller retains resources and explicitly recovers.
+trusted fun esp32p4I2cRunBatchOwned(port: int,lastCommand: int,budget: u32,continuation: bool,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || lastCommand < 0 || lastCommand >= 8 || budget == u32(0) || budget > u32(0x7fffffff)) return 7
+    return esp32p4I2cRunBatchUntilOwned(port,lastCommand,p4I2cCounter(),budget,continuation,true)
+}
+// Shared absolute deadline entry for streaming: validation/queue work does
+// not obtain a fresh budget at each FIFO boundary.
+trusted fun esp32p4I2cRunBatchUntilOwned(port: int,lastCommand: int,started: u32,budget: u32,continuation: bool,exclusive: bool): int {
+    if (!exclusive || port < 0 || port > 1 || lastCommand < 0 || lastCommand >= 8 || budget == u32(0) || budget > u32(0x7fffffff)) return 7
+    if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+    if (!p4I2cFifoReady(port)) return 7
+    val base=p4I2cBase(port)
+    if ((p4I2cRead(base+40)&u32(0x7ffff)) != u32(0)) return 7
+    var index=0
+    var writeCount=0
+    var readCount=0
+    var terminal=0
+    while (index <= lastCommand) {
+        val command=p4I2cRead(base+88+index*4)
+        if (!esp32S3I2cCommandValid(command)) return 7
+        val operation=int((command>>u32(11))&u32(7))
+        if (operation == 1) writeCount=writeCount+int(command&u32(255))
+        if (operation == 3) readCount=readCount+int(command&u32(255))
+        if (index < lastCommand && (operation == 2 || operation == 4)) return 7
+        if (index == lastCommand) terminal=operation
+        index=index+1
+    }
+    if ((terminal != 2 && terminal != 4) || writeCount > 32 || readCount > 32) return 7
+    val status=p4I2cRead(base+8)
+    if (!continuation && (status&u32(16)) != u32(0)) return 8
+    if (continuation && (p4I2cRead(base+32)&u32(8)) == u32(0)) return 7
+    if (esp32S3I2cTxCount(status) != writeCount || esp32S3I2cRxCount(status) != 0) return 7
+    if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+    p4I2cWrite(base+36,u32(0x7ffff))
+    p4I2cWrite(base+4,p4I2cRead(base+4)|u32(2048))
+    p4I2cWrite(base+4,p4I2cRead(base+4)|u32(32))
+    while (true) {
+        val result=esp32S3I2cPollResult(p4I2cRead(base+32),terminal == 2)
+        if (result >= 3) return result
+        if (result != 0 && (p4I2cRead(base+88+lastCommand*4)&u32(0x80000000)) != u32(0)) return result
+        if (esp32S3I2cDeadlineExpired(started,p4I2cCounter(),budget)) return 5
+    }
+    return 5
+}

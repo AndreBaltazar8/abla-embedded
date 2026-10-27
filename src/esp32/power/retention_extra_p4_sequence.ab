@@ -1,0 +1,65 @@
+import "./retention_links_p4_sequence.ab"
+import "./retention_timeout_p4_sequence.ab"
+// Software entry3 execution. Caller owns a nonzero validated entry3 graph,
+// cache-published descriptors/backing, clocks/timeouts, and excludes ALL
+// PMU/ETM/software triggers and graph mutations. Execute from retained RAM.
+// Record24B: magic,state,oldControl,oldAon,result,reserved.
+// States1prepared(no START issued),2issued,3done,4closed.
+// Results1issued2invalid3clock4preflight5setup6pending7engineError8closed
+// 9cleanup. Poll never starts/restarts/acks. Error/timeout retain resources;
+// external recovery must prove idle before close is allowed after an error.
+trusted fun p4RetentionExtraControl(value: u32): bool {
+    // Only documented RW bits; never echo WT START/START_MAC or RO flow.
+    p4RetentionPauWrite(0,value&u32(0x370))
+    return (p4RetentionPauRead(0)&u32(0x370)) == (value&u32(0x370))
+}
+trusted fun p4RetentionExtraAon(value: u32): bool {
+    p4RetentionLpWrite(344,(p4RetentionLpRead(344)&u32(0x7fffffff))|(value&u32(0x80000000)))
+    return (p4RetentionLpRead(344)&u32(0x80000000)) == (value&u32(0x80000000))
+}
+trusted fun esp32p4RetentionExtraBeginOwned(r: NativeBuffer,backup: bool,exclusivePublished: bool): int {
+    if (!exclusivePublished || !r.hasAddressRange(0,24) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    if (!p4RetentionClockReady()) return 3
+    val entry=int(p4RetentionPauRead(24))
+    if (entry == 0 || !p4RetentionLinkAddressValid(entry) ||
+        (entry < r.addressValue()+24 && r.addressValue() < entry+4) ||
+        (p4RetentionPauRead(0)&u32(7)) != u32(0) || (p4RetentionPauRead(52)&u32(2)) != u32(0)) return 4
+    val old=p4RetentionPauRead(0)&u32(0x370)
+    val aon=p4RetentionLpRead(344)&u32(0x80000000)
+    r.storeU32(0,0x50345831);r.storeU32(4,1);r.storeU32(8,int(old));r.storeU32(12,int(aon));r.storeU32(16,0);r.storeU32(20,0)
+    if (!p4RetentionExtraAon(u32(0))) { r.storeU32(16,5);return 5 }
+    // Clear only stale DONE. Never silently discard a prior engine error.
+    p4RetentionPauWrite(56,u32(1))
+    if ((p4RetentionPauRead(52)&u32(3)) != u32(0)) { r.storeU32(16,5);return 5 }
+    val control=(old&u32(0x300))|u32(96)|(if (backup) u32(16) else u32(0))
+    if (!p4RetentionExtraControl(control)) { r.storeU32(16,5);return 5 }
+    // Ownership is recorded BEFORE the WT command; missing completion must
+    // not permit reissuance or freeing graph buffers.
+    r.storeU32(4,2)
+    p4RetentionExtraFence()
+    p4RetentionPauWrite(0,control|u32(8))
+    return 1
+}
+trusted fun esp32p4RetentionExtraPollOwned(r: NativeBuffer,polls: int,exclusiveIssued: bool): int {
+    if (!exclusiveIssued || !r.hasAddressRange(0,24) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50345831 || r.loadU32(4) != 2 || polls < 1 || polls > 1000000) return 2
+    val result=esp32p4RetentionWaitOwned(polls,true)
+    r.storeU32(16,result)
+    if ((result&255) == 1) { p4RetentionExtraFence();r.storeU32(4,3);return 1 }
+    return if ((result&255) == 6) 6 else if ((result&255) == 3) 3 else 7
+}
+trusted fun esp32p4RetentionExtraCloseOwned(r: NativeBuffer,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !r.hasAddressRange(0,24) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0x50345831) return 2
+    val state=r.loadU32(4)
+    if (state == 4) return 8
+    if (state < 1 || state > 3) return 2
+    // For state2, exclusiveIdle must come from independent engine recovery,
+    // never from a timeout, START readback, or this API's mere return.
+    if (!p4RetentionClockReady()) return 3
+    if (!p4RetentionExtraControl(u32(r.loadU32(8)))) return 9
+    if (state == 3) {
+        p4RetentionPauWrite(56,u32(1))
+        if ((p4RetentionPauRead(52)&u32(1)) != u32(0)) return 9
+    }
+    if (!p4RetentionExtraAon(u32(r.loadU32(12)))) return 9
+    r.storeU32(4,4);return 8
+}

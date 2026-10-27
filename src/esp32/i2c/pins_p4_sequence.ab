@@ -1,0 +1,98 @@
+import "../gpio_p4_sequence.ab"
+import "../gpio/snapshot_p4_sequence.ab"
+import "./fifo_p4_sequence.ab"
+// HP I2C0/1 use SCL68/70 and SDA69/71, bidirectional open-drain.
+// Caller owns both pads, their former HP/LP users and both controller input
+// routes; all former users and IRQ/DMA are stopped, holds released, GPIO/LP
+// clocks pinned. Board reservations (flash/PSRAM etc.) remain caller-owned.
+// A retained aligned40B record stores magic/state/error/port, two pad scalar
+// snapshots and two input selections. Keep record and ownership after faults.
+// Status0 invalid,1 ready,2 closed,3 partial/retry close,4 controller not idle.
+trusted fun p4I2cPinsRecordValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,40) && (r.addressValue()&3) == 0 &&
+    r.loadU32(0) == 0x49325050 && r.loadU32(12) <= 1
+trusted fun p4I2cPinsSaved(r: NativeBuffer,index: int): P4GpioSnapshot =
+    P4GpioSnapshot(r.loadU32(16+index*8)|(r.loadU32(20+index*8)<<32))
+trusted fun esp32p4I2cPinsCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !p4I2cPinsRecordValid(r)) return 0
+    if (r.loadU32(4) == 2) return 2
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 3) return 0
+    val port=r.loadU32(12)
+    if (!p4I2cFifoReady(port) || !p4I2cIdle(port)) return 4
+    if (!p4I2cPinsSaved(r,0).valid() || !p4I2cPinsSaved(r,1).valid() ||
+        p4I2cPinsSaved(r,0).pin() == p4I2cPinsSaved(r,1).pin() ||
+        r.loadU32(32) > 255 || r.loadU32(36) > 255) return 0
+    var heldIndex=0
+    while (heldIndex < 2) {
+        val saved=p4I2cPinsSaved(r,heldIndex)
+        if (esp32P4GpioIndividualHoldOwned(if (((saved|0)&(1<<38)) != 0) 3 else 1,saved.pin()) != 0) return 4
+        heldIndex=heldIndex+1
+    }
+    r.storeU32(4,3)
+    // Park BOTH outputs first; never restore a former output while the other
+    // pad is still driven by this controller. No STOP or reset on a busy bus.
+    var i=0
+    while (i < 2) {
+        val pin=p4I2cPinsSaved(r,i).pin()
+        val bit=u32(1)<<u32(pin&31)
+        val enable=if (pin < 32) 32 else 44
+        p4GpioWrite(enable+8,bit)
+        if ((p4GpioRead(enable)&bit) != u32(0) || !p4GpioField(1368+pin*4,u32(3072),u32(1024))) {
+            r.storeU32(8,16+i);return 3
+        }
+        i=i+1
+    }
+    i=0
+    while (i < 2) {
+        if (!p4GpioField(344+(68+port*2+i)*4,u32(255),u32(r.loadU32(32+i*4)))) {
+            r.storeU32(8,32+i);return 3
+        }
+        i=i+1
+    }
+    i=0
+    while (i < 2) {
+        if (p4I2cPinsSaved(r,i).restoreOwned(true) != 1) { r.storeU32(8,48+i);return 3 }
+        i=i+1
+    }
+    r.storeU32(8,0);r.storeU32(4,2);return 2
+}
+trusted fun esp32p4I2cPinsOpenOwned(r: NativeBuffer,port: int,sda: int,scl: int,pullup: bool,layout: int,exclusive: bool): int {
+    if (!exclusive || !r.hasAddressRange(0,40) || (r.addressValue()&3) != 0 ||
+        port < 0 || port > 1 || sda < 0 || sda > 54 || scl < 0 || scl > 54 || sda == scl ||
+        (layout != 1 && layout != 3)) return 0
+    if (r.loadU32(0) != 0 && (!p4I2cPinsRecordValid(r) || r.loadU32(4) != 2)) return 0
+    if (!p4I2cFifoReady(port) || !p4I2cIdle(port)) return 4
+    // Capture both before any MMIO writes. A held second pad must not leave
+    // the first pad changed or overwrite a live cleanup record.
+    val clock=esp32p4GpioSnapshotOwned(scl,layout,true)
+    val data=esp32p4GpioSnapshotOwned(sda,layout,true)
+    if (!clock.valid() || !data.valid()) return 0
+    r.storeU32(16,(clock|0)&0xffffffff);r.storeU32(20,(clock|0)>>>32)
+    r.storeU32(24,(data|0)&0xffffffff);r.storeU32(28,(data|0)>>>32)
+    r.storeU32(32,int(p4GpioRead(344+(68+port*2)*4)&u32(255)))
+    r.storeU32(36,int(p4GpioRead(344+(69+port*2)*4)&u32(255)))
+    r.storeU32(0,0x49325050);r.storeU32(4,3);r.storeU32(8,0);r.storeU32(12,port)
+    var i=0
+    while (i < 2) {
+        val pin=if (i == 0) scl else sda
+        if (esp32P4GpioConfigureOwned(pin,false,true,true,true,if (pullup) 1 else 0) != 1) {
+            r.storeU32(8,1+i);return 3
+        }
+        i=i+1
+    }
+    i=0
+    while (i < 2) {
+        val pin=if (i == 0) scl else sda
+        val signal=68+port*2+i
+        if (!p4GpioField(344+signal*4,u32(255),u32(128|pin)) ||
+            !p4GpioField(1368+pin*4,u32(4095),u32(signal))) {
+            r.storeU32(8,4+i);return 3
+        }
+        val enable=if (pin < 32) 32 else 44
+        val bit=u32(1)<<u32(pin&31)
+        p4GpioWrite(enable+4,bit)
+        if ((p4GpioRead(enable)&bit) == u32(0)) { r.storeU32(8,8+i);return 3 }
+        i=i+1
+    }
+    r.storeU32(4,1);return 1
+}

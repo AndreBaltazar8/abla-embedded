@@ -1,0 +1,71 @@
+import "./sdk/raw_buffer.ab"
+// P4 cache sync registers: hw_ver1/ver3. The two writes per cache level follow
+// Espressif's esp_rom_cache_writeback_esp32p4.c workaround (IDF6).
+// Caller serializes the GLOBAL sync engine across cores/interrupts, pins cache
+// configuration, and prevents concurrent writes to the owned rounded region.
+// Original writeback API does not invalidate; explicit invalidate/flush APIs
+// below are DATA-only. None performs instruction sync or starts DMA.
+// Caller still supplies CPU memory barriers at publication/ownership boundaries.
+// Timeout retains sync-engine ownership until hardware completion/recovery.
+// 1 complete,2 invalid,3 busy/no writes,4 setup readback failure (an earlier
+// level may already be written back; the failing level is not triggered),
+// 5 command timeout/partial publication: never treat pixels as DMA-ready.
+fun esp32P4CacheWritebackSpan(buffer: NativeBuffer,bytes: int,l2Line: int): int {
+    if (bytes < 1 || (l2Line != 64 && l2Line != 128)) return 0
+    val address=buffer.addressValue()
+    var line=64
+    var end=1341915136 // 0x4ffc0000 internal RAM end
+    if (address >= 1207959552 && address < 1275068416) {
+        line=l2Line; end=1275068416 // PSRAM 0x48000000..0x4c000000
+    } else if (address < 1341128704 || address >= end) return 0 // 0x4ff00000
+    // Require ownership of whole cache lines, including any tail padding.
+    if ((address&(line-1)) != 0 || bytes > end-address) return 0
+    val rounded=(bytes+line-1)&(4294967295^(line-1))
+    if (rounded > end-address || !buffer.hasAddressRange(0,rounded)) return 0
+    return rounded
+}
+trusted fun esp32P4CacheWritebackOwned(buffer: NativeBuffer,bytes: int,l2Line: int,polls: int): int {
+    return esp32P4CacheDataSyncOwned(buffer,bytes,l2Line,polls,4)
+}
+// Flush dirty data and evict it so a later load cannot merely echo a dirty
+// cache line. P4's writeback-invalidate workaround also needs TWO commands.
+// Applies to DATA caches only, not instruction aliases. Caller excludes all
+// accesses/prefetch/refills and supplies barriers around ownership transfer.
+trusted fun esp32P4CacheWritebackInvalidateOwned(buffer: NativeBuffer,bytes: int,l2Line: int,polls: int): int = esp32P4CacheDataSyncOwned(buffer,bytes,l2Line,polls,8)
+// DESTRUCTIVE for dirty lines: only use after writeback or for disposable
+// owned data. L1 data before L2, matching the HAL's level ordering. This does
+// not invalidate instruction-cache aliases or establish a new MMU mapping.
+trusted fun esp32P4CacheInvalidateDataOwned(buffer: NativeBuffer,bytes: int,l2Line: int,polls: int): int = esp32P4CacheDataSyncOwned(buffer,bytes,l2Line,polls,1)
+trusted fun esp32P4CacheDataSyncOwned(buffer: NativeBuffer,bytes: int,l2Line: int,polls: int,operation: int): int {
+    if (polls < 1 || polls > 1000000 || (operation != 1 && operation != 4 && operation != 8)) return 2
+    val rounded=esp32P4CacheWritebackSpan(buffer,bytes,l2Line)
+    if (rounded == 0) return 2
+    val address=buffer.addressValue()
+    val external=address < 1341128704
+    if ((p4CacheSyncRead(152)&u32(15)) != u32(0)) return 3
+    var level=0
+    val levels=if (external) 2 else 1
+    while (level < levels) {
+        val map=if (level == 0) u32(16) else u32(32)
+        p4CacheSyncWrite(156,map)
+        p4CacheSyncWrite(160,u32(address))
+        p4CacheSyncWrite(164,u32(rounded))
+        if ((p4CacheSyncRead(156)&u32(63)) != map ||
+            p4CacheSyncRead(160) != u32(address) ||
+            (p4CacheSyncRead(164)&u32(268435455)) != u32(rounded)) return 4
+        var pass=0
+        while (pass < (if (operation == 1) 1 else 2)) {
+            p4CacheSyncWrite(152,u32(operation))
+            var remaining=polls
+            var done=false
+            while (remaining > 0 && !done) {
+                done=(p4CacheSyncRead(152)&u32(31)) == u32(16)
+                remaining=remaining-1
+            }
+            if (!done) return 5
+            pass=pass+1
+        }
+        level=level+1
+    }
+    return 1
+}

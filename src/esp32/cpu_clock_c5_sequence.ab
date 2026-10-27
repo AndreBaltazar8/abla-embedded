@@ -1,0 +1,53 @@
+// C5 clk_tree_ll CPU/AHB mux and rtc_clk_cpu_freq_to_* publication.
+// Scalar:source2@0,CPU divider-1 8@2,AHB divider-1 8@10,XTAL MHz7@18.
+// Sources are hardware mux values:0XTAL,1RC_FAST,2PLL160,3PLL240.
+// Does not enable/calibrate PLL, supply voltage/PVT, or arbitrate clock users.
+type C5CpuClock=int
+@section(".iram1.abla.c5CpuClockRoot")
+fun c5CpuClockRootMHz(plan: C5CpuClock): int = if ((plan&3) == 0) (plan>>18)&127 else if ((plan&3) == 1) 20 else if ((plan&3) == 2) 160 else 240
+fun C5CpuClock.rootMHz(): int = c5CpuClockRootMHz(this)
+@section(".iram1.abla.c5CpuClockValid")
+fun c5CpuClockValid(plan: C5CpuClock): bool {
+    if (plan < 0 || plan > 0x1ffffff || ((plan>>18)&127) != 40 && ((plan>>18)&127) != 48) return false
+    val cpu=((plan>>2)&255)+1;val ahb=((plan>>10)&255)+1;val root=c5CpuClockRootMHz(plan)
+    u32(root)%u32(cpu) == u32(0) && u32(ahb)%u32(cpu) == u32(0) && root <= 48*ahb
+}
+fun C5CpuClock.valid(): bool = c5CpuClockValid(this)
+@section(".iram1.abla.c5CpuClockMHz")
+fun c5CpuClockMHz(plan: C5CpuClock): int = if (c5CpuClockValid(plan)) int(u32(c5CpuClockRootMHz(plan))/u32(((plan>>2)&255)+1)) else -1
+fun C5CpuClock.cpuMHz(): int = c5CpuClockMHz(this)
+// Caller excludes other PCR writers and has stable source clocks/voltage.
+// Snapshot is register configuration, not measured source frequency.
+@section(".iram1.abla.c5CpuClockCapture")
+trusted fun esp32C5CpuClockCaptureOwned(exclusive: bool): C5CpuClock {
+    if (!exclusive || (c5CpuClockRead(0x144)&1) != 0) return C5CpuClock(-1)
+    val sys=c5CpuClockRead(0x110)
+    val captured=C5CpuClock(((sys>>16)&3)|((c5CpuClockRead(0x118)&255)<<2)|((c5CpuClockRead(0x11c)&255)<<10)|(((sys>>24)&127)<<18))
+    if (!c5CpuClockValid(captured) || (c5CpuClockRead(0x144)&1) != 0) return C5CpuClock(-1)
+    captured
+}
+// All code/stack/data must be retained internal memory; interrupts and clock
+// consumers quiesced. APLL/SPLL/PVT/charge pump preparation is caller-owned.
+//1published2invalid3busy4shadow-write-failure. On4, shadow registers may be
+// modified but no update requested: retain ownership and reapply saved plan.
+// No timeout after latch request: never resume users during a clock transition.
+@section(".iram1.abla.c5CpuClockApply")
+trusted fun esp32C5CpuClockApplyOwned(plan: C5CpuClock,exclusive: bool): int {
+    if (!exclusive || !c5CpuClockValid(plan)) return 2
+    if ((c5CpuClockRead(0x144)&1) != 0) return 3
+    val sys=c5CpuClockRead(0x110)
+    if (((sys>>24)&127) != ((plan>>18)&127)) return 2
+    val cpu=(plan>>2)&255;val ahb=(plan>>10)&255;val source=(plan&3)<<16
+    c5CpuClockWrite(0x118,(c5CpuClockRead(0x118)&~255)|cpu)
+    c5CpuClockWrite(0x11c,(c5CpuClockRead(0x11c)&~255)|ahb)
+    c5CpuClockWrite(0x110,(sys&~0x30000)|source)
+    if ((c5CpuClockRead(0x118)&255) != cpu || (c5CpuClockRead(0x11c)&255) != ahb || (c5CpuClockRead(0x110)&0x30000) != source) return 4
+    c5CpuClockWrite(0x144,1)
+    while ((c5CpuClockRead(0x144)&1) != 0) { }
+    c5CpuClockTicks(c5CpuClockMHz(plan))
+    1
+}
+trusted fun C5CpuClock.applyOwned(exclusive: bool): int = esp32C5CpuClockApplyOwned(this,exclusive)
+// Default undivided XTAL plan for sleep; does not release PLL references or
+// disable PVT. Saved original plan may be restored only after its source is ready.
+fun esp32C5CpuClockXtal(xtalMHz: int): C5CpuClock = if (xtalMHz == 40 || xtalMHz == 48) C5CpuClock(xtalMHz<<18) else C5CpuClock(-1)

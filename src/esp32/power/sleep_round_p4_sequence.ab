@@ -1,0 +1,74 @@
+import "./sleep_smp_p4_sequence.ab"
+// Coordinator lifecycle AFTER peer is backed in its installed IRQ boundary.
+// Own2168B aligned16: header64,policy388@64,pad12,clocks288@464,
+// session464@752,CPU816@1216,route24@2032,request48@2056,recovery64@2104.
+// Header magic,step,last,detail,config,graph,graphBytes,backing,backingBytes,
+// smp,generation,hart,abort,outcome,primary,reserved.
+// Config192B: revision,CPU MHz,MPLL MHz,flags(flash1/PSRAM2/regdma4),
+// EXT1 pins/levels/pull/filter,reject mask/enabled,minHP/protection,entry3,
+// PMU profile108@52,retention config32@160. Inputs pinned/immutable through done.
+// Requires internal retained code/stack/owners, published ROM wake code,
+// peer IRQ/SMP ownership and quiescent DMA/pads/rails. Does NOT acquire those.
+// Steps1route2policy3clocks4publication5banks6callback7invoke8recovery-open
+// 9bind-policy10recovery11done12unsafe-boundary13acknowledge. No re-entry after CPU loss.
+// Wake cause@60, reject cause@452, observed events@456, acknowledgement@460;
+// the latter three occupy padding after the policy child, not its lease.
+// Results1wake2reject3both4invalid7pending9childfailure10aborted11unsafe.
+fun p4RoundOverlap(a: NativeBuffer,an: int,b: NativeBuffer,bn: int): bool =
+    a.addressValue() < b.addressValue()+bn && b.addressValue() < a.addressValue()+an
+trusted fun p4RoundReport(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun p4RoundComplete(r: NativeBuffer): int {
+    val finished=p4RoundFinish(r)
+    if (finished != 1) return p4RoundReport(r,9,finished)
+    r.storeU32(4,11);return p4RoundReport(r,r.loadU32(52),0)
+}
+trusted fun esp32p4SleepRoundOpenOwned(r: NativeBuffer,c: NativeBuffer,graph: NativeBuffer,backing: NativeBuffer,smp: NativeBuffer,generation: int,exclusivePreparedPeer: bool): int {
+    if (!exclusivePreparedPeer || !r.hasAddressRange(0,2168) || (r.addressValue()&15) != 0 || r.loadU32(0) != 0 ||
+        !c.hasAddressRange(0,192) || (c.addressValue()&3) != 0 || !graph.hasAddressRange(0,20) || (graph.addressValue()&3) != 0 ||
+        !backing.hasAddressRange(0,4) || (backing.addressValue()&3) != 0 || !smp.hasAddressRange(0,4) || (smp.addressValue()&3) != 0 ||
+        !p4RoundConfigValid(c) || p4SmpHart() > u32(1) || (p4SmpStatus()&u32(8)) != u32(0)) return 4
+    if (p4RoundOverlap(r,2168,c,192) || p4RoundOverlap(r,2168,graph,graph.capacity()) ||
+        p4RoundOverlap(r,2168,backing,backing.capacity()) || p4RoundOverlap(r,2168,smp,4) ||
+        p4RoundOverlap(c,192,graph,graph.capacity()) || p4RoundOverlap(c,192,backing,backing.capacity()) || p4RoundOverlap(c,192,smp,4) ||
+        p4RoundOverlap(graph,graph.capacity(),backing,backing.capacity()) || p4RoundOverlap(graph,graph.capacity(),smp,4) || p4RoundOverlap(backing,backing.capacity(),smp,4)) return 4
+    val state=esp32p4SleepSmpObserve(smp,generation);val hart=int(p4SmpHart())
+    if (state.status() != 1 || state.stage() != 1 || state.coordinator() != hart || state.phase(hart) != 1 || state.phase(1-hart) != 2) return 4
+    var i=4
+    while (i < 2168) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x5034524e);r.storeU32(4,1);r.storeU32(16,c.addressValue())
+    r.storeU32(20,graph.addressValue());r.storeU32(24,graph.capacity());r.storeU32(28,backing.addressValue());r.storeU32(32,backing.capacity())
+    r.storeU32(36,smp.addressValue());r.storeU32(40,generation);r.storeU32(44,hart)
+    return 7
+}
+trusted fun esp32p4SleepRoundContinueOwned(r: NativeBuffer,polls: int,eventPolls: int,sourcesReady: bool,otherPolicyReady: bool,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || eventPolls < 1 || eventPolls > 1000000 ||
+        !r.hasAddressRange(0,2168) || (r.addressValue()&15) != 0 || r.loadU32(0) != 0x5034524e ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 13 || int(p4SmpHart()) != r.loadU32(44) || (p4SmpStatus()&u32(8)) != u32(0)) return 4
+    if (r.loadU32(4) == 11) return r.loadU32(52)
+    if (r.loadU32(4) == 12) return 11
+    if (r.loadU32(4) == 13) return p4RoundComplete(r)
+    while (r.loadU32(4) < 11) {
+        val step=r.loadU32(4)
+        val result=p4RoundStage(r,step,polls,eventPolls,sourcesReady,otherPolicyReady)
+        if (step == 10) {
+            if ((result >= 1 && result <= 3) || result == 10) {
+                r.storeU32(52,result);r.storeU32(4,13);return p4RoundComplete(r)
+            }
+            return p4RoundReport(r,if (result == 7) 7 else 9,result)
+        }
+        val success=if (step == 4) result == 12 else if (step == 6 || step == 8 || step == 9) result == 7
+            else if (step == 7) result == 6 || result == 7 else result == 1
+        if (success) { r.storeU32(4,step+1) }
+        else if ((step == 1 && result == 4) || (step == 3 && result == 4) || (step == 4 && result == 7)) return p4RoundReport(r,7,result)
+        else if (step < 7 || (step == 7 && (result == 2 || result == 3 || result == 5))) {
+            // No boundary was entered: preserve cause, use the common abort
+            // recovery owner, never retry Open on partially acquired children.
+            r.storeU32(56,(step<<8)|result);r.storeU32(48,1);r.storeU32(4,8)
+        } else if (step == 7) {
+            r.storeU32(4,12);return p4RoundReport(r,11,result)
+        } else return p4RoundReport(r,9,result)
+    }
+    return 4
+}

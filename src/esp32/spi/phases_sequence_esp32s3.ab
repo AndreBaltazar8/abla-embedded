@@ -1,0 +1,53 @@
+import "./buffer_sequence_esp32s3.ab"
+import "./transfer_sequence_esp32s3.ab"
+import "./phases_logic.ab"
+// Single-line MSB-first half-duplex command/address/dummy/data transaction.
+// Command0..16bits, address0..32bits, dummy0..256 clocks, data0..64bytes.
+// Direction0none/1TX/2RX; CS, initialized clock/mode/pads and exclusive bus
+// ownership remain caller responsibilities. No device command is synthesized.
+// Failure may leave the controller active; retain ownership and recover it.
+// Status/detail matches TransferOwned;10 means configuration readback failure.
+fun esp32s3SpiCommandWire(command: int,bits: int): int {
+    if (bits < 1 || bits > 16 || command < 0 || command >= (1<<bits)) return -1
+    val aligned=command<<(16-bits)
+    return ((aligned>>8)&255)|((aligned&255)<<8)
+}
+trusted fun esp32s3SpiPhasesOwned(peripheral: int,command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,polls: int,sharedDataLine: bool = false): int {
+    if (polls < 1 || polls > 1000000) return 2
+    val prepared=esp32s3SpiPhasesPrepareOwned(peripheral,command,commandBits,address,addressBits,dummy,direction,data,bytes,1,sharedDataLine)
+    if (prepared != 1) return prepared
+    return esp32s3SpiRunCpuOwned(peripheral,data,bytes,polls,direction == 2)
+}
+// Configuration/TX copy only: never issues UPDATE or START.
+// sharedDataLine selects hardware SIO for single-line RX only. Caller must
+// route MOSI with peripheral-controlled OE AND its SPID input, not SPIQ/MISO.
+// S3 IDF spi_ll_set_sio_mode: USER.SIO bit17; DOUTDIN must remain clear.
+trusted fun esp32s3SpiPhasesPrepareOwned(peripheral: int,command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,dataLines: int = 1,sharedDataLine: bool = false): int {
+    if ((dataLines != 1 && dataLines != 4) || (dataLines == 4 && direction != 1) ||
+        (sharedDataLine && (dataLines != 1 || direction != 2)) ||
+        !spiPhasesValid(command,commandBits,address,addressBits,dummy,direction,bytes) ||
+        !esp32s3SpiBufferRangeValid(peripheral,data,bytes)) return 2
+    val ready=esp32s3SpiExchangeReady(peripheral)
+    if (ready != 1) return ready
+    val base=esp32s3SpiBase(peripheral)
+    // Reject LSB encodings. Set lane width explicitly on EVERY transfer:
+    // previous quad traffic must not leak into a single-line command.
+    val control=esp32s3SpiRead(base+8)
+    if ((control&0x07800000) != 0) return 4
+    val lines=control&~0x1c7e0
+    esp32s3SpiWrite(base+8,lines)
+    if (esp32s3SpiRead(base+8) != lines) return 10
+    val user=(esp32s3SpiRead(base+0x10)&0x04fd8ffe)|(if (sharedDataLine) 0x20000 else 0)|(if (dataLines == 4) 0x2000 else 0)|(if (commandBits > 0) 0x80000000 else 0)|
+        (if (addressBits > 0) 0x40000000 else 0)|(if (dummy > 0) 0x20000000 else 0)|
+        (if (direction == 1) 0x08000000 else if (direction == 2) 0x10000000 else 0)
+    val user1=(esp32s3SpiRead(base+0x14)&0x07ffff00)|(if (addressBits > 0) (addressBits-1)<<27 else 0)|(if (dummy > 0) dummy-1 else 0)
+    val user2=(esp32s3SpiRead(base+0x18)&0x0fff0000)|(if (commandBits > 0) ((commandBits-1)<<28)|esp32s3SpiCommandWire(command,commandBits) else 0)
+    val wireAddress=if (addressBits > 0) address<<(32-addressBits) else 0
+    esp32s3SpiWrite(base+0x10,user); esp32s3SpiWrite(base+0x14,user1); esp32s3SpiWrite(base+0x18,user2); esp32s3SpiWrite(base+4,wireAddress)
+    if (esp32s3SpiRead(base+0x10) != user || esp32s3SpiRead(base+0x14) != user1 || esp32s3SpiRead(base+0x18) != user2 || esp32s3SpiRead(base+4) != wireAddress) return 10
+    val length=(esp32s3SpiRead(base+0x1c)&0xfffc0000)|(if (bytes > 0) bytes*8-1 else 0)
+    esp32s3SpiWrite(base+0x1c,length)
+    if (esp32s3SpiRead(base+0x1c) != length) return 10
+    if (direction == 1 && !esp32s3SpiWriteBufferOwned(peripheral,data,bytes)) return 5
+    return 1
+}

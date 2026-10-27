@@ -1,0 +1,87 @@
+import "./stream_tx_c6_sequence.ab"
+import "./dma_stop_c6_sequence.ab"
+// 64B retained:tag0,phase4,start8,streamCursor12,finalIndex16,events20,
+// acquisition cursor24,reserved28,stop24@32,last status56,reserved60.
+// Final buffer must already be CPU-acquired and fully filled. Seal its next
+// pointer to NULL before OWNER publication, then revoke all normal refills.
+// Remaining queued buffers precede that final buffer in the ring's order.
+// No reset/discard. After every buffer is acquired, join total EOF/GDMA FIFO,
+// I2S wire idle, stop/park, then acknowledge non-error events only.
+//1drained2invalid3latched error4blocked5pending. Descriptor link stays sealed;
+// rebuild only after all users are joined. Keep all memory/clocks on failure.
+fun c6I2sStreamDrainStorage(d: NativeBuffer): bool = d.hasAddressRange(0,64) && (d.addressValue()&3) == 0 && (d.addressValue()+64 <= 0x60000000 || d.addressValue() >= 0x60100000)
+trusted fun c6I2sStreamDrainLayout(r: NativeBuffer,q: NativeBuffer,d: NativeBuffer): bool {
+    if (!c6I2sDmaStartStorage(r) || r.loadU32(0) != 0x43364944 || r.loadU32(16) != 1 || r.loadU32(40) != 1 || r.loadU32(12) > 2 || !c6I2sStreamStorage(q) || !c6I2sStreamDrainStorage(d)) return false
+    val descriptors=r.loadU32(20);val count=r.loadU32(24);val buffers=r.loadU32(28);val stride=r.loadU32(32);val bytes=r.loadU32(36);val at=d.addressValue()
+    return count >= 2 && c6GdmaRingValid(descriptors,count,buffers,stride,bytes) &&
+        !(at < r.addressValue()+72 && r.addressValue() < at+64) && !(at < q.addressValue()+32 && q.addressValue() < at+64) &&
+        !(at < descriptors+count*12 && descriptors < at+64) && !(at < buffers+(count-1)*stride+bytes && buffers < at+64)
+}
+trusted fun c6I2sStreamDrainBeginOwned(r: NativeBuffer,q: NativeBuffer,d: NativeBuffer,finalPayloadPrepared: bool,exclusive: bool): int {
+    if (!exclusive || !finalPayloadPrepared || !c6I2sStreamBound(r,q) || q.loadU32(12) != 2 || !c6I2sStreamDrainLayout(r,q,d) || d.loadU32(0) != 0) return 2
+    var at=0
+    while (at < 64) { d.storeU32(at,0);at=at+4 }
+    d.storeU32(0,0x43364452);d.storeU32(4,1);d.storeU32(8,r.addressValue());d.storeU32(12,q.addressValue());d.storeU32(16,q.loadU32(8))
+    q.storeU32(12,5);return 5
+}
+trusted fun c6I2sStreamDrainPollOwned(r: NativeBuffer,q: NativeBuffer,d: NativeBuffer,budget: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6I2sStreamDrainLayout(r,q,d) || d.loadU32(0) != 0x43364452 || d.loadU32(8) != r.addressValue() || d.loadU32(12) != q.addressValue() ||
+        q.loadU32(0) != 0x43365354 || q.loadU32(4) != r.addressValue() || q.loadU32(12) != 5 || d.loadU32(16) != q.loadU32(8) || d.loadU32(16) >= r.loadU32(24) ||
+        (r.loadU32(4) != 1 && r.loadU32(4) != 6 && r.loadU32(4) != 7) || budget < 1 || budget > 1024 || polls < 1 || polls > 1000000) return 2
+    if (d.loadU32(4) == 7) return 1
+    if (d.loadU32(4) == 9) return 3
+    val channel=r.loadU32(12);val descriptors=r.loadU32(20);val count=r.loadU32(24);val buffers=r.loadU32(28);val stride=r.loadU32(32);val bytes=r.loadU32(36);val tail=d.loadU32(16)
+    if (d.loadU32(4) == 1) {
+        val link=descriptors+tail*12+8
+        val next=c6GdmaDescriptorRead(link)
+        val acquired=c6GdmaAcquireOwned(channel,true,descriptors,count,buffers,stride,bytes,tail,true,true,if (next == u32(0)) tail else -1)
+        d.storeU32(56,acquired.status());d.storeU32(20,d.loadU32(20)|acquired.events())
+        if (acquired.status() != 1) { d.storeU32(4,9);return 3 }
+        c6GdmaDescriptorWrite(link,u32(0))
+        if (c6GdmaDescriptorRead(link) != u32(0)) return 4
+        c6GdmaDescriptorFence()
+        d.storeU32(4,2)
+        val published=c6GdmaRearmOwned(channel,true,descriptors,count,buffers,stride,bytes,tail,true,true,tail)
+        if (published != 65537) { d.storeU32(56,published);d.storeU32(4,9);return 3 }
+        d.storeU32(4,3)
+    }
+    if (d.loadU32(4) == 3) {
+        var left=budget
+        while (left > 0 && d.loadU32(24) < count) {
+            val acquired=c6GdmaAcquireOwned(channel,true,descriptors,count,buffers,stride,bytes,d.loadU32(24),true,true,tail)
+            d.storeU32(56,acquired.status());d.storeU32(20,d.loadU32(20)|acquired.events())
+            if (acquired.status() == 5) return 5
+            if (acquired.status() != 1) { d.storeU32(4,9);return 3 }
+            d.storeU32(24,d.loadU32(24)+1);left=left-1
+        }
+        if (d.loadU32(24) != count) return 5
+        d.storeU32(4,4)
+    }
+    if (d.loadU32(4) == 4) {
+        val events=c6GdmaEventsReadOwned(channel,true,true)
+        d.storeU32(20,d.loadU32(20)|events.raw())
+        if (events.status() != 1) return 4
+        if (events.errors() != 0) { d.storeU32(4,9);return 3 }
+        if (!events.txTotalEof() || (c6GdmaRead(c6GdmaTxBase(channel)+8)&u32(2)) == u32(0)) return 5
+        if (!c6I2sUpdateClocks(true) || (c6I2sRead(0x24)&u32(0x2107)) != u32(0x2004)) return 4
+        var left=polls
+        while (left > 0 && (c6I2sRead(0x6c)&u32(1)) == u32(0)) left=left-1
+        if (left == 0) return 5
+        d.storeU32(4,5)
+    }
+    if (d.loadU32(4) == 5) {
+        val result=c6I2sDmaStopOwned(r,nativeBufferAt(d.addressValue()+32,24),polls,true)
+        if (result == 5 || result == 8) return 5
+        if (result != 1) return 4
+        d.storeU32(4,6)
+    }
+    if (d.loadU32(4) == 6) {
+        val events=c6GdmaEventsReadOwned(channel,true,true)
+        d.storeU32(20,d.loadU32(20)|events.raw())
+        if (events.status() != 1) return 4
+        if (events.errors() != 0) { d.storeU32(4,9);return 3 }
+        if (events.acknowledgeOwned(events.raw(),true) != 1) return 4
+        d.storeU32(4,7);return 1
+    }
+    return 2
+}

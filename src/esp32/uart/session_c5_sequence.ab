@@ -1,0 +1,74 @@
+import "./clock_c5_sequence.ab"
+import "./pin_owner_c5_sequence.ab"
+//96B RAM: tag0,status4,unit8,clock owner12,stage16,child result20,
+// reserved24/28,64B pin lease32. Unique caller-owned lifetime, no copying.
+//1ready2invalid3partial4closing5closed. Stages1clocks2config3pins.
+// Dedicated stopped UART/peers; caller pins source and GPIO clocks, serializes
+// PCR and users. Restores pads/owned gates, NOT prior baud/framing: no transparent
+// borrowing of a running console. Keep resources until close returns5.
+fun c5UartSessionStorage(record: NativeBuffer): bool =
+    record.hasAddressRange(0,96) && (record.addressValue()&3) == 0 &&
+    (record.addressValue()+96 <= 0x60000000 || record.addressValue() >= 0x60100000)
+trusted fun c5UartSessionOpenOwned(record: NativeBuffer,unit: int,source: int,sourceHz: int,
+    baud: int,tx: int,rx: int,dataBits: int,parity: int,stop: int,polls: int,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !c5UartSessionStorage(record) || record.loadU32(0) != 0 ||
+        unit < 0 || unit > 1 || source < 0 || source > 2 || c5SerialBaudPlan(sourceHz,baud) == 0 ||
+        !esp32C5GpioNumberValid(tx) || !esp32C5GpioNumberValid(rx) || tx == rx ||
+        dataBits < 5 || dataBits > 8 || parity < 0 || parity > 2 || stop < 1 || stop > 3 || polls < 1 || polls > 1000000) return 2
+    var at=0
+    while (at < 96) { record.storeU32(at,0);at=at+4 }
+    record.storeU32(0,0x43355553);record.storeU32(4,3);record.storeU32(8,unit);record.storeU32(16,1)
+    val clock=c5UartClockOpenOwned(unit,source,true,polls)
+    record.storeU32(12,clock|0);record.storeU32(20,clock.status())
+    if (!clock.ready()) return 3
+    record.storeU32(16,2)
+    val configured=serial(unit).configureOwned(sourceHz,baud,dataBits,parity,stop,polls)
+    record.storeU32(20,configured)
+    if (configured != 1) return 3
+    record.storeU32(16,3)
+    val pins=c5UartPinOwnerOpenOwned(nativeBufferAt(record.addressValue()+32,64),unit,tx,rx,true)
+    record.storeU32(20,pins)
+    if (pins != 1) return 3
+    record.storeU32(4,1);return 1
+}
+trusted fun c5UartSessionCloseOwned(record: NativeBuffer,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !c5UartSessionStorage(record) || record.loadU32(0) != 0x43355553) return 2
+    val state=record.loadU32(4)
+    if (state == 5) return 5
+    if (state != 1 && state != 3 && state != 4) return 2
+    record.storeU32(4,4)
+    val unit=record.loadU32(8)
+    // Even a wholly borrowed clock lease needs an idle session boundary.
+    if ((c5SerialBusRead(unit)&7) == 5 && (c5SerialRead(unit,12) != 0 ||
+        (c5SerialRead(unit,28)&0xff00ff) != 0 || (c5SerialRead(unit,112)&255) != 0 ||
+        (c5SerialRead(unit,152)&1) != 0)) return 4
+    val pins=nativeBufferAt(record.addressValue()+32,64)
+    if (pins.loadU32(0) != 0 && c5UartPinOwnerCloseOwned(pins,true) != 6) return 4
+    val clock=C5UartClockOwner(record.loadU32(12)).closeOwned(true)
+    record.storeU32(12,clock|0)
+    if (clock.status() != 0) return 4
+    record.storeU32(4,5);return 5
+}
+// Ready-session operations; caller still serializes users. Bounded writes do
+// not imply wire completion; explicit flush uses the same retained session.
+fun c5UartSessionReady(record: NativeBuffer): bool = c5UartSessionStorage(record) &&
+    record.loadU32(0) == 0x43355553 && record.loadU32(4) == 1 && record.loadU32(8) < 2
+trusted fun c5UartSessionWriteByte(record: NativeBuffer,value: int,polls: int): bool =
+    c5UartSessionReady(record) && serial(record.loadU32(8)).tryWriteByte(value,polls)
+trusted fun c5UartSessionReadByte(record: NativeBuffer): int =
+    if (c5UartSessionReady(record)) serial(record.loadU32(8)).tryReadByte() else -2
+trusted fun c5UartSessionFlush(record: NativeBuffer,polls: int): bool =
+    c5UartSessionReady(record) && serial(record.loadU32(8)).tryFlush(polls)
+// Explicit cache-on cleanup read, never a FIFO reset/discard. Caller stops RX
+// peer and joins IRQ/DMA/users; retain and process every returned byte before
+// retrying close. Normal session I/O stays withdrawn. -2invalid/not closing,
+// -3unsafe hardware state, -1empty,0..255 byte. No TX admission or reopening.
+trusted fun c5UartSessionDrainReadByteOwned(record: NativeBuffer,exclusiveStopped: bool): int {
+    if (!exclusiveStopped || !c5UartSessionStorage(record) || record.loadU32(0) != 0x43355553 ||
+        record.loadU32(4) != 4 || record.loadU32(8) > 1) return -2
+    val unit=record.loadU32(8)
+    if ((c5SerialBusRead(unit)&7) != 5 || (c5SerialClockRead(unit)&0x400000) == 0) return -3
+    if ((c5SerialRead(unit,136)&0xe000000) != 0x2000000 || c5SerialRead(unit,12) != 0 ||
+        (c5SerialRead(unit,152)&1) != 0 || (c5SerialRead(unit,112)&15) != 0) return -3
+    return serial(unit).tryReadByte()
+}

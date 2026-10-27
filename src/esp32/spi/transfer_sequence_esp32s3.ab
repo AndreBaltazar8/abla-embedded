@@ -1,0 +1,72 @@
+// Finite CPU-buffer full-duplex exchange, physical GPSPI2/3 only. Caller owns
+// the initialized powered master, stable clock/mode/bit order, single-line
+// pad routes and selected CS (or manually held GPIO CS). No ISR sharing.
+// Source/destination may overlap: TX is copied fully before RX writes begin.
+// Status low8:1 done,2 invalid,3 busy,4 unsupported mode,5 TX copy,
+// 6 UPDATE timeout,7 transaction timeout,8 RX copy,9 FIFO error.
+// Bit8 means START issued; bits17/18 retain RX-full/TX-empty error evidence.
+// Timeouts never reset/gate the controller or claim CS/storage is reusable.
+trusted fun esp32s3SpiExchangeReady(peripheral: int): int {
+    val base = esp32s3SpiBase(peripheral)
+    if (base == 0) return 2
+    if (!esp32s3SpiCpuBufferIdle(base)) return 3
+    if ((esp32s3SpiRead(base + 0xe0) & 0x04000000) != 0 ||
+        (esp32s3SpiRead(base + 0x30) & 0x00040000) != 0 ||
+        (esp32s3SpiRead(base + 0x34) & 0x61000) != 0) return 4
+    1
+}
+
+trusted fun esp32s3SpiExchangeOwned(peripheral: int, source: NativeBuffer,
+    destination: NativeBuffer, bytes: int, polls: int): int =
+    esp32s3SpiTransferOwned(peripheral, source, destination, bytes, polls, true)
+
+// Transmit-only: no receive phase, destination storage, or receive-RAM copy.
+// Same initialization, exclusive ownership, completion and failure contract.
+trusted fun esp32s3SpiTransmitOwned(peripheral: int, source: NativeBuffer,
+    bytes: int, polls: int): int =
+    esp32s3SpiTransferOwned(peripheral, source, NativeBuffer(0), bytes, polls, false)
+
+trusted fun esp32s3SpiTransferOwned(peripheral: int, source: NativeBuffer,
+    destination: NativeBuffer, bytes: int, polls: int, receive: bool): int {
+    if (bytes < 1 || polls < 1 || polls > 1000000 ||
+        !esp32s3SpiBufferRangeValid(peripheral, source, bytes) ||
+        (receive && !esp32s3SpiBufferRangeValid(peripheral, destination, bytes))) return 2
+    val base = esp32s3SpiBase(peripheral)
+    val ready = esp32s3SpiExchangeReady(peripheral)
+    if (ready != 1) return ready
+    // Byte-only full duplex, low64-byte window, no command/address/dummy/SIO.
+    val user = esp32s3SpiRead(base + 0x10)
+    esp32s3SpiWrite(base + 0x10, (user & 0x04fd8ffe) |
+        (if (receive) 0x18000001 else 0x08000000))
+    val length = esp32s3SpiRead(base + 0x1c)
+    esp32s3SpiWrite(base + 0x1c, (length & 0xfffc0000) | (bytes * 8 - 1))
+    if (!esp32s3SpiWriteBufferOwned(peripheral, source, bytes)) return 5
+    return esp32s3SpiRunCpuOwned(peripheral,destination,bytes,polls,receive)
+}
+// Shared UPDATE/START/completion boundary after checked register/FIFO setup.
+trusted fun esp32s3SpiRunCpuOwned(peripheral: int,destination: NativeBuffer,bytes: int,polls: int,receive: bool): int {
+    val base=esp32s3SpiBase(peripheral)
+    esp32s3SpiWrite(base + 0x38, 0x61000)
+    esp32s3SpiWrite(base, 0x00800000)
+    var attempt = 0
+    while (attempt < polls && (esp32s3SpiRead(base) & 0x00800000) != 0) attempt = attempt + 1
+    if (attempt == polls) return 6
+    esp32s3SpiWrite(base, 0x01000000)
+    attempt = 0
+    while (attempt < polls) {
+        // A stale done event was cleared before UPDATE. Require both the
+        // completion event and quiescent command before reading receive RAM.
+        val events = esp32s3SpiRead(base + 0x3c)
+        // TRANS_DONE only means ended: USER1/2 can terminate on FIFO errors.
+        // Error wins even when DONE and an idle command are also observed.
+        if ((events & 0x60000) != 0) return 265 | (events & 0x60000)
+        if ((events & 4096) != 0 &&
+            (esp32s3SpiRead(base) & 0x01800000) == 0) {
+            if (receive && !esp32s3SpiReadBufferOwned(peripheral, destination, bytes)) return 264
+            esp32s3SpiWrite(base + 0x38, 4096)
+            return 257
+        }
+        attempt = attempt + 1
+    }
+    263
+}

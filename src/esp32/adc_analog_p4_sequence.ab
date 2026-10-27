@@ -1,0 +1,71 @@
+import "./adc_oneshot_p4_sequence.ab"
+import "./analog/register_p4_sequence.ab"
+// IDF6 esp32p4 regi2c_saradc.h + adc_ll.h. Global analog/RCC ownership is
+// REQUIRED across both CPUs/masters and all ADC/temperature/PWDET users.
+// Caller has pinned root analog clocks/routing ownership, SAR power and pads.
+// This does NOT obtain an efuse calibration code or produce millivolts.
+// initialCode must be the appropriate calibrated 12-bit code for this unit
+// and attenuation. Sample-cycle field is shared SAR1 register2 as in IDF LL.
+// DREF=4, sample=2, DTEST=0/ENT=1, external input (ground calibration off).
+type P4AdcAnalog=int
+fun P4AdcAnalog.status(): int = this&255
+fun P4AdcAnalog.detail(): int = (this>>>8)&255
+fun P4AdcAnalog.hasSnapshot(): bool = (this&(1<<41)) != 0
+// Six fields, packed into24 snapshot bits at16. Unit2 bit40, owned41.
+// Status1ready2invalid3snapshot-read failure4partial-write5closed6busy/power.
+// Detail is underlying bus status;7 means completed write/readback mismatch.
+fun p4AdcAnalogIndex(unit: int,field: int): int =
+    if (field == 0) 9 else if (field == 1) 2 else if (field == 5) 7
+    else (unit-1)*3+(if (field == 2) 2 else if (field == 3) 1 else 0)
+fun p4AdcAnalogLow(unit: int,field: int): int = if (field == 2) 4 else if (field == 5) (if (unit == 1) 5 else 7) else 0
+fun p4AdcAnalogWidth(field: int): int = if (field == 0) 5 else if (field == 1 || field == 2) 3 else if (field == 3) 4 else if (field == 4) 8 else 1
+fun p4AdcAnalogShift(field: int): int = if (field == 0) 0 else if (field == 1) 5 else if (field == 2) 8 else if (field == 3) 11 else if (field == 4) 15 else 23
+trusted fun p4AdcAnalogSet(unit: int,field: int,value: int,polls: int): int {
+    val index=p4AdcAnalogIndex(unit,field)
+    val low=p4AdcAnalogLow(unit,field)
+    val width=p4AdcAnalogWidth(field)
+    val written=p4AnalogRegisterMaskOwned(0x69,index,low,low+width-1,value,polls)
+    if ((written&255) != 1) return written&255
+    val read=p4AnalogRegisterOwned(0x69,index,0,false,polls)
+    if ((read&255) != 1) return read&255
+    return if (((u32(read)>>u32(8+low))&((u32(1)<<u32(width))-u32(1))) == u32(value)) 1 else 7
+}
+trusted fun esp32p4AdcAnalogOpenOwned(unit: int,initialCode: int,polls: int,exclusive: bool): P4AdcAnalog {
+    if (!exclusive || (unit != 1 && unit != 2) || initialCode < 0 || initialCode > 4095 || polls < 1 || polls > 1000000) return P4AdcAnalog(2)
+    if (!esp32p4AdcPowered(unit) || !esp32p4AdcStopped()) return P4AdcAnalog(6)
+    var saved=u32(0)
+    var field=0
+    // Read ALL originals before any analog write. Bus routing still remains
+    // owned after failure; a timeout never authorizes gating/resetting it.
+    while (field < 6) {
+        val read=p4AnalogRegisterOwned(0x69,p4AdcAnalogIndex(unit,field),0,false,polls)
+        if ((read&255) != 1) return P4AdcAnalog(3|((read&255)<<8))
+        saved=saved|(((u32(read)>>u32(8+p4AdcAnalogLow(unit,field)))&((u32(1)<<u32(p4AdcAnalogWidth(field)))-u32(1)))<<u32(p4AdcAnalogShift(field)))
+        field=field+1
+    }
+    val token=(int(saved)<<16)|((unit-1)<<40)|(1<<41)
+    field=0
+    while (field < 6) {
+        val value=if (field == 0) 16 else if (field == 1) 2 else if (field == 2) 4 else if (field == 3) initialCode>>>8 else if (field == 4) initialCode&255 else 0
+        val result=p4AdcAnalogSet(unit,field,value,polls)
+        if (result != 1) return P4AdcAnalog(token|4|(result<<8))
+        field=field+1
+    }
+    return P4AdcAnalog(token|1)
+}
+// Stop/join conversions BEFORE close. Reverse restoration leaves shared ENT
+// enabled until other fields have been restored. Retain on ANY close failure.
+trusted fun P4AdcAnalog.closeOwned(polls: int,exclusive: bool): P4AdcAnalog {
+    if (!exclusive || polls < 1 || polls > 1000000 || !this.hasSnapshot() || this.status() == 5) return this
+    val unit=((this>>>40)&1)+1
+    val token=this&(0x3ffffff0000)
+    if (!esp32p4AdcPowered(unit) || !esp32p4AdcStopped()) return P4AdcAnalog(token|6)
+    var field=5
+    while (field >= 0) {
+        val value=int((u32(this>>>16)>>u32(p4AdcAnalogShift(field)))&((u32(1)<<u32(p4AdcAnalogWidth(field)))-u32(1)))
+        val result=p4AdcAnalogSet(unit,field,value,polls)
+        if (result != 1) return P4AdcAnalog(token|4|(result<<8))
+        field=field-1
+    }
+    return P4AdcAnalog(token|5)
+}

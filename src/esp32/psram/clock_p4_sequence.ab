@@ -1,0 +1,76 @@
+import "./mapped_p4_sequence.ab"
+// Caller holds RCC/controller lifetime exclusion across CPUs/IRQ/DMA. Source
+// 0XTAL/1MPLL/2SPLL/3CPLL must already be stable and pinned for this lifetime.
+// No PLL start, reset, frequency switch, cache initialization or AXI enable.
+// Borrow existing gates; flags record attempted gates even on readback failure.
+// low8:0closed1ready2invalid3reset/config changed4SYS5PLL6CORE7busy8lostclock.
+// flags8SYS9PLL10CORE, source11..12, divider-1 at13..20, closing21.
+type P4PsramClockOwner = int
+fun P4PsramClockOwner.status(): int = this&255
+fun P4PsramClockOwner.ready(): bool = this.status() == 1
+fun P4PsramClockOwner.source(): int = (this>>>11)&3
+fun P4PsramClockOwner.divider(): int = ((this>>>13)&255)+1
+trusted fun p4PsramClockField(offset: int,mask: int,value: int): bool {
+    p4PsramClockWrite(offset,(p4PsramClockRead(offset)&(4294967295^mask))|value)
+    return (p4PsramClockRead(offset)&mask) == value
+}
+trusted fun P4PsramClockOwner.resumeOwned(): P4PsramClockOwner {
+    if (this < 0 || this > 0x1fffff || this.status() > 8) return this
+    var state=(this|0)&0x1fff00
+    if ((p4PsramClockRead(192)&0x02800000) != 0 ||
+        (p4PsramClockRead(48)&0x00ff3000) != (((this.divider()-1)<<16)|(this.source()<<12))) return P4PsramClockOwner(state|3)
+    if ((p4PsramClockRead(20)&0x80000000) == 0) {
+        state=state|256
+        if (!p4PsramClockField(20,0x80000000,0x80000000)) return P4PsramClockOwner(state|4)
+    }
+    if ((p4PsramClockRead(48)&0x4000) == 0) {
+        state=state|512
+        if (!p4PsramClockField(48,0x4000,0x4000)) return P4PsramClockOwner(state|5)
+    }
+    if ((p4PsramClockRead(48)&0x8000) == 0) {
+        state=state|1024
+        if (!p4PsramClockField(48,0x8000,0x8000)) return P4PsramClockOwner(state|6)
+    }
+    return P4PsramClockOwner(state|1)
+}
+trusted fun p4PsramClockOpenOwned(source: int,divider: int): P4PsramClockOwner {
+    if (source < 0 || source > 3 || divider < 1 || divider > 256) return P4PsramClockOwner(2)
+    return P4PsramClockOwner((source<<11)|((divider-1)<<13)).resumeOwned()
+}
+// Retain owner and exclusion through failed close; closing bit means the
+// controller was drained before any clock removal. Retrying close then needs
+// only RCC accesses, never reads a peripheral with its clock already removed.
+trusted fun P4PsramClockOwner.closeOwned(polls: int): P4PsramClockOwner {
+    if (this < 0 || this > 0x3fffff || this.status() > 8 || polls < 1 || polls > 1000000) return this
+    var state=(this|0)&0x3fff00
+    if ((state&1792) == 0) return P4PsramClockOwner(0)
+    if ((state&0x200000) == 0) {
+        if ((p4PsramClockRead(192)&0x02800000) != 0 ||
+            (p4PsramClockRead(48)&0x00ff3000) != (((this.divider()-1)<<16)|(this.source()<<12))) return P4PsramClockOwner(state|3)
+        if ((p4PsramClockRead(20)&0x80000000) == 0 || (p4PsramClockRead(48)&0xc000) != 0xc000) return P4PsramClockOwner(state|8)
+        if ((p4PsramMappedRead(60)&1) != 0 || (p4PsramMappedRead(4096)&0x400f0) != 0 || !p4PsramMappedWaitIdle(polls)) return P4PsramClockOwner(state|7)
+        state=state|0x200000
+    }
+    if ((state&1024) != 0) {
+        if (!p4PsramClockField(48,0x8000,0)) return P4PsramClockOwner(state|6)
+        state=state^1024
+    }
+    if ((state&512) != 0) {
+        if (!p4PsramClockField(48,0x4000,0)) return P4PsramClockOwner(state|5)
+        state=state^512
+    }
+    if ((state&256) != 0 && !p4PsramClockField(20,0x80000000,0)) return P4PsramClockOwner(state|4)
+    return P4PsramClockOwner(0)
+}
+// Explicit cold-module selection; both functional gates must be off. No
+// implicit disabling of live gates. Exclusion/pinned old and new sources owned
+// by caller; core divider is separate from each port's bus divider.
+trusted fun p4PsramClockSelectOwned(expectedSource: int,source: int,divider: int): int {
+    if (expectedSource < 0 || expectedSource > 3 || source < 0 || source > 3 || divider < 1 || divider > 256) return 2
+    val old=p4PsramClockRead(48)
+    if (((old>>>12)&3) != expectedSource) return 3
+    val wanted=(source<<12)|((divider-1)<<16)
+    if ((old&0x00ff3000) == wanted) return 1
+    if ((old&0xc000) != 0 || (p4PsramClockRead(192)&0x02800000) != 0) return 7
+    return if (p4PsramClockField(48,0x00ff3000,wanted)) 1 else 3
+}

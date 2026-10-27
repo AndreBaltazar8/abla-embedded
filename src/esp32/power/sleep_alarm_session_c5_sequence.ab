@@ -1,0 +1,54 @@
+import "./sleep_timed_wake_c5_sequence.ab"
+import "../rtc_alarm_control_c5_sequence.ab"
+import "../sdk/raw_buffer.ab"
+import "abla/unsafe/mmio"
+// 24B retained record: tag,status,original low/high target,captured cause,
+// cleanup stage. Begin results1armed2invalid3targetfailure4late; close5pending
+// or6closed. Every admitted begin owns the record until close, including3/4.
+// Caller owns INACTIVE comparator0 and snapshot0 throughout, and keeps PMU
+// timer wake routing/interrupt consumers excluded during cleanup. Never copies
+// live records. Restore target only: do not rearm an originally inactive alarm.
+// Old pending cause acknowledged by arm cannot be restored. New cause is saved
+// before cancel. IRQ enable, other comparator and overflow state stay untouched.
+@section(".iram1.abla.c5AlarmSessionRead")
+trusted fun c5AlarmSessionRead(base: int,offset: int): int = mmioLoadU32(base+offset)
+@section(".iram1.abla.c5AlarmSessionWrite")
+trusted fun c5AlarmSessionWrite(base: int,offset: int,value: int): void { mmioStoreU32(base+offset,value);return }
+@section(".iram1.abla.c5AlarmSessionBegin")
+trusted fun esp32C5SleepAlarmBeginOwned(record: NativeBuffer,deadline: int,lead: int,exclusiveInactive: bool): int {
+    if (!exclusiveInactive || !record.hasAddressRange(0,24) || (record.addressValue()&3) != 0 || deadline < 0 || deadline > 0xffffffffffff || lead < 16 || lead >= 0x800000000000) return 2
+    val base=record.addressValue()
+    if (c5AlarmSessionRead(base,0) != 0) return 2
+    c5AlarmSessionWrite(base,8,c5RtcTimerRead(0));c5AlarmSessionWrite(base,12,c5RtcTimerRead(4)&65535)
+    c5AlarmSessionWrite(base,16,0);c5AlarmSessionWrite(base,20,0)
+    c5AlarmSessionWrite(base,0,0x43415331)
+    val result=esp32C5TimedWakePrepareOwned(deadline,lead,true)
+    c5AlarmSessionWrite(base,4,result)
+    result
+}
+@section(".iram1.abla.c5AlarmSessionClose")
+trusted fun esp32C5SleepAlarmCloseOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,24) || (record.addressValue()&3) != 0) return 2
+    val base=record.addressValue()
+    if (c5AlarmSessionRead(base,0) != 0x43415331) return 2
+    val status=c5AlarmSessionRead(base,4)
+    if (status == 6) return 6
+    if ((status != 1 && status != 3 && status != 4 && status != 5) || c5AlarmSessionRead(base,20) > 2) return 2
+    // A late admission never touched the alarm; preserve its old pending cause.
+    if (status == 4) { c5AlarmSessionWrite(base,4,6);return 6 }
+    val stage=c5AlarmSessionRead(base,20)
+    c5AlarmSessionWrite(base,4,5)
+    if (stage == 0) {
+        c5AlarmSessionWrite(base,16,esp32C5RtcAlarmPendingOwned(0,true))
+        c5AlarmSessionWrite(base,20,1)
+    }
+    if (stage <= 1) {
+        if (!esp32C5RtcAlarmCancelOwned(0,true)) return 5
+        c5AlarmSessionWrite(base,20,2)
+    }
+    val high=(c5RtcTimerRead(4)&0x7fff0000)|c5AlarmSessionRead(base,12)
+    c5RtcTimerWrite(4,high);c5RtcTimerWrite(0,c5AlarmSessionRead(base,8))
+    if ((c5RtcTimerRead(4)&65535) != c5AlarmSessionRead(base,12) || c5RtcTimerRead(0) != c5AlarmSessionRead(base,8)) return 5
+    c5AlarmSessionWrite(base,4,6)
+    6
+}

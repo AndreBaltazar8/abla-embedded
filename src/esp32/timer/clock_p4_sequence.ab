@@ -1,0 +1,70 @@
+// P4 both layouts. One lifetime covering all SYSTIMER counters/alarms/ETM,
+// with caller-held RCC/shared-register exclusion across CPUs/IRQ writers.
+// Source0XTAL/1RC_FAST must already be selected and stable. No reset, source
+// change or counter start. CONF.CLK_EN is register-file gating, not a claim
+// that a counter is ticking. Already enabled gates are borrowed.
+// status low8:0closed1ready2invalid3reset/source4APB5register gate6busy7lostbus.
+// Bits8/9 attempted APB/register-gate ownership; bit10 expected source.
+type P4SystemTimerClockOwner = int
+fun P4SystemTimerClockOwner.status(): int = this&255
+fun P4SystemTimerClockOwner.ready(): bool = this.status() == 1
+fun P4SystemTimerClockOwner.source(): int = (this>>>10)&1
+trusted fun p4SystemTimerClockSource(): int = (p4SystemTimerClockRead(152)>>>29)&1
+trusted fun p4SystemTimerApbField(enabled: bool): bool {
+    val prior=p4SystemTimerClockRead(28)
+    p4SystemTimerClockWrite(28,if (enabled) prior|0x800000 else prior&0xff7fffff)
+    return ((p4SystemTimerClockRead(28)&0x800000) != 0) == enabled
+}
+trusted fun p4SystemTimerRegisterClockField(enabled: bool): bool {
+    val prior=p4SystemTimerRead(0)
+    p4SystemTimerWrite(0,if (enabled) prior|0x80000000 else prior&0x7fffffff)
+    return ((p4SystemTimerRead(0)&0x80000000) != 0) == enabled
+}
+trusted fun p4SystemTimerClockOpenOwned(source: int): P4SystemTimerClockOwner {
+    if (source < 0 || source > 1) return P4SystemTimerClockOwner(2)
+    var state=source<<10
+    if ((p4SystemTimerClockRead(196)&32) != 0 || p4SystemTimerClockSource() != source) return P4SystemTimerClockOwner(state|3)
+    if ((p4SystemTimerClockRead(28)&0x800000) == 0) {
+        state=state|256
+        if (!p4SystemTimerApbField(true)) return P4SystemTimerClockOwner(state|4)
+    }
+    if ((p4SystemTimerRead(0)&0x80000000) == 0) {
+        state=state|512
+        if (!p4SystemTimerRegisterClockField(true)) return P4SystemTimerClockOwner(state|5)
+    }
+    return P4SystemTimerClockOwner(state|1)
+}
+// Close only after all child users are stopped/joined and snapshots/LOAD
+// commands have completed. Hardware work/ETM/IRQ/pending bits additionally
+// prevent accidentally gating an active timebase; no implicit event ACK.
+trusted fun P4SystemTimerClockOwner.closeOwned(): P4SystemTimerClockOwner {
+    if (this < 0 || this > 2047 || this.status() > 7) return this
+    var flags=this&1792
+    if ((flags&768) == 0) return P4SystemTimerClockOwner(0)
+    val busOn=(p4SystemTimerClockRead(28)&0x800000) != 0
+    if (!busOn) {
+        if ((flags&512) != 0) return P4SystemTimerClockOwner(flags|7)
+        return P4SystemTimerClockOwner(0)
+    }
+    if ((p4SystemTimerClockRead(196)&32) != 0) return P4SystemTimerClockOwner(flags|3)
+    if ((p4SystemTimerRead(0)&0x61c00002) != 0 || ((p4SystemTimerRead(100)|p4SystemTimerRead(104))&7) != 0) return P4SystemTimerClockOwner(flags|6)
+    if ((flags&512) != 0) {
+        if (!p4SystemTimerRegisterClockField(false)) return P4SystemTimerClockOwner(flags|5)
+        flags=flags&1280
+    }
+    if ((flags&256) != 0 && !p4SystemTimerApbField(false)) return P4SystemTimerClockOwner(flags|4)
+    return P4SystemTimerClockOwner(0)
+}
+// Explicit cold-module source selection. Requires readable bus, no reset,
+// all counters/alarms/ETM/IRQs quiesced (and caller joins pending commands).
+// 1selected2invalid3stale source4bus/reset5busy6readback. No source start.
+trusted fun p4SystemTimerClockSelectOwned(expected: int,source: int): int {
+    if (expected < 0 || expected > 1 || source < 0 || source > 1) return 2
+    val prior=p4SystemTimerClockRead(152)
+    if (((prior>>>29)&1) != expected) return 3
+    if (expected == source) return 1
+    if ((p4SystemTimerClockRead(196)&32) != 0 || (p4SystemTimerClockRead(28)&0x800000) == 0) return 4
+    if ((p4SystemTimerRead(0)&0x61c00002) != 0 || ((p4SystemTimerRead(100)|p4SystemTimerRead(104))&7) != 0) return 5
+    p4SystemTimerClockWrite(152,(prior&0xdfffffff)|(source<<29))
+    return if (p4SystemTimerClockSource() == source) 1 else 6
+}

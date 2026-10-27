@@ -1,0 +1,82 @@
+// Owned S3 ADC1 session. Caller owns pad/ADC1/analog bus, excludes touch,
+// ULP/DMA/sleep/reconfiguration and obeys power/bus upstream or exclusive
+// lifetime contracts. Copies are not new leases: replace the owner each call.
+// External sensor power/RTC_FAST clock availability are caller prerequisites.
+// bits8..11channel,12..13atten,16..28power,29..41bus,42..53raw,
+// 54needs-detach,55start-attempted,56setup-ready,57raw-valid,
+// 58controller-write-unverified. Low8 status:
+// 0closed1success2invalid3power4bus5pad6config7analog8lost-state9start
+// 10pending/finish11invalidraw12detach13busclose14powerclose.
+type Esp32S3Adc1Session = int
+fun Esp32S3Adc1Session.bits(): int = this
+fun Esp32S3Adc1Session.status(): int = this&255
+fun Esp32S3Adc1Session.channel(): int = (this>>8)&15
+fun Esp32S3Adc1Session.attenuation(): int = (this>>12)&3
+fun Esp32S3Adc1Session.pending(): bool = (this&(1<<55)) != 0
+fun Esp32S3Adc1Session.ready(): bool = (this&((1<<55)|(1<<56))) == (1<<56)
+fun Esp32S3Adc1Session.raw(): int = if ((this&(1<<57)) != 0) (this>>42)&4095 else -1
+trusted fun esp32S3Adc1SessionOpenOwned(channel: int,calibration: Esp32S3AdcCalibration,exclusivePower: bool,exclusiveBus: bool,polls: int): Esp32S3Adc1Session {
+    if (channel < 0 || channel > 9 || !calibration.valid() || calibration.unit() != 1 || polls < 1 || polls > 1000000) return Esp32S3Adc1Session(2)
+    var flags=(channel<<8)|(calibration.attenuation()<<12)
+    val power=esp32S3AdcPowerOpenOwned(exclusivePower)
+    flags=flags|(power.bits()<<16)
+    if (!power.powered()) return Esp32S3Adc1Session(flags|3)
+    val bus=esp32S3AdcBusOpenOwned(exclusiveBus)
+    flags=flags|(bus.bits()<<29)
+    if (!bus.ready()) return Esp32S3Adc1Session(flags|4)
+    if (esp32S3Adc1PadConfigureOwned(channel) != 1) return Esp32S3Adc1Session(flags|5)
+    val configured=esp32S3Adc1ConfigureOwned(channel,calibration.attenuation(),polls)
+    // Final config stage attempted channel control: retain detach obligation
+    // even if its readback failed. Earlier stages do not write channel control.
+    if (configured == 1 || configured == 773) flags=flags|(1<<54)
+    if (configured == 773) flags=flags|(1<<58)
+    if (configured != 1) return Esp32S3Adc1Session(flags|6)
+    if (esp32S3AdcAnalogConfigureOwned(calibration) != 1) return Esp32S3Adc1Session(flags|7)
+    return Esp32S3Adc1Session(flags|(1<<56)|1)
+}
+// Caller waits supply/trim/pad/external RC settling AFTER successful open.
+// No universal hardcoded delay. Later calls preserve the same calibration.
+trusted fun Esp32S3Adc1Session.startAfterSettlingOwned(polls: int): Esp32S3Adc1Session {
+    var flags=this&(-256)
+    if (!this.ready() || polls < 1 || polls > 1000000) return Esp32S3Adc1Session(flags|2)
+    flags=flags&(-1^((4095<<42)|(1<<57)))
+    if (!esp32S3Adc1SessionHardwareMatches(this.channel(),this.attenuation())) return Esp32S3Adc1Session(flags|8)
+    val result=esp32S3Adc1StartOwned(this.channel(),polls)
+    if ((result&256) != 0) flags=flags|(1<<55)
+    return Esp32S3Adc1Session(flags|(if ((result&255) == 1) 1 else 9))
+}
+trusted fun Esp32S3Adc1Session.pollOwned(polls: int): Esp32S3Adc1Session {
+    val flags=this&(-256)
+    if (!this.pending() || polls < 1 || polls > 1000000) return Esp32S3Adc1Session(flags|2)
+    if (!esp32S3Adc1SessionHardwareMatches(this.channel(),this.attenuation())) return Esp32S3Adc1Session(flags|8)
+    val result=esp32S3Adc1FinishOwned(this.channel(),polls)
+    if ((result&255) == 1) return Esp32S3Adc1Session((flags&(-1^(1<<55)))|(1<<57)|(((result>>8)&4095)<<42)|1)
+    if ((result&255) == 7) return Esp32S3Adc1Session((flags&(-1^(1<<55)))|11)
+    return Esp32S3Adc1Session(flags|10)
+}
+trusted fun Esp32S3Adc1Session.closeOwned(polls: int): Esp32S3Adc1Session {
+    var flags=this&(-256)
+    if (polls < 1 || polls > 1000000) return Esp32S3Adc1Session(flags|2)
+    if ((flags&(1<<58)) != 0) {
+        // A dropped final config write may leave software force bits unset.
+        // Under the original exclusive ADC contract, finish the checked idle
+        // configuration before release. Keep this obligation across retries.
+        if (esp32S3Adc1ConfigureOwned(this.channel(),this.attenuation(),polls) != 1) return Esp32S3Adc1Session(flags|12)
+        flags=flags&(-1^(1<<58))
+    }
+    if ((flags&(1<<54)) != 0) {
+        // Release itself validates controller/channel/pending state. Do not
+        // require successful analog setup to recover a failed open.
+        if (esp32S3Adc1ReleaseOwned(this.channel(),polls) != 1) return Esp32S3Adc1Session(flags|12)
+    }
+    flags=flags&((1<<42)-256)
+    val bus=Esp32S3AdcBus((flags>>29)&8191).closeOwned()
+    flags=(flags&(-1^(8191<<29)))|(bus.bits()<<29)
+    if (bus.status() != 0) return Esp32S3Adc1Session(flags|13)
+    val power=Esp32S3AdcPower((flags>>16)&8191).closeOwned()
+    flags=(flags&(-1^(8191<<16)))|(power.bits()<<16)
+    return if (power.status() == 0) Esp32S3Adc1Session(0) else Esp32S3Adc1Session(flags|14)
+}
+// Supply the SAME immutable calibration passed to open; no nominal fallback.
+fun Esp32S3Adc1Session.millivolts(calibration: Esp32S3AdcCalibration): int =
+    if (this.raw() < 0 || !calibration.valid() || calibration.unit() != 1 || calibration.attenuation() != this.attenuation()) -1 else calibration.millivolts(this.raw())

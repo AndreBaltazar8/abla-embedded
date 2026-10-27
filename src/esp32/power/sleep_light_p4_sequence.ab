@@ -1,0 +1,108 @@
+import "./sleep_memory_p4_sequence.ab"
+import "./sleep_request_p4_sequence.ab"
+import "./sleep_resume_p4_sequence.ab"
+import "./sleep_marker_p4_sequence.ab"
+import "./sleep_revision_p4_sequence.ab"
+// Prepared LIGHT sleep with live MPLL PSRAM. Caller supplies validated PMU,
+// wake/retention/rail configuration and execution context; HP root must stay
+// on XTAL through revision0 resume and affected PLL consumers stay excluded;
+// this is not a board-level default sleep API. Both CPUs/IRQ/DMA are excluded.
+// Code/constants/stack/record stay in retained internal memory throughout.
+// After first writeback NO code may dirty/access PSRAM: the final writeback
+// can then drain only internal data while PSRAM is parked. Audit the final
+// linked entry tail for spills after writeback, not just this source.
+// Keep all outer leases until closed; never acknowledge events independently.
+// Record64B: magic,state,primary,cleanup,event,marker32,revision,revisionDone,memory32@32.
+// State1preparing2request-pending3resuming4closed5cache-pending6abortable.
+// Split-recovery API additionally uses8paused-request,7recovery-held. Ordinary
+// Continue rejects these states: caller must explicitly finish board/flash
+// recovery before ReleaseRecoveryOwned can release live memory and holds.
+// Results1wake2reject3both4invalid5memory-prepare6cache/preflight7pending
+// 8resume-blocked9memory-cleanup10aborted11marker12revision. Detail in primary/cleanup.
+trusted fun p4SleepLightRecordValid(r: NativeBuffer): bool =
+    r.hasAddressRange(0,64) && (r.addressValue()&3) == 0 && r.loadU32(0) == 0x50344c31
+trusted fun esp32p4SleepLightContinueOwned(r: NativeBuffer,polls: int,exclusivePrepared: bool): int {
+    if (!exclusivePrepared || polls < 1 || polls > 1000000 || !p4SleepLightRecordValid(r)) return 4
+    var state=r.loadU32(4)
+    if (state == 4) return if (r.loadU32(16) != 0) r.loadU32(16) else 10
+    if (state == 5) {
+        // A failed cache command can still finish. No reset, second command,
+        // memory release, or sleep request while the sync engine is busy.
+        if ((p4SleepCacheRead(152)&u32(15)) != u32(0)) return 7
+        p4SleepCacheFence();state=6;r.storeU32(4,6)
+    }
+    if (state == 2) {
+        val resumed=esp32p4SleepLightResumeBarrierOwned(polls,true)
+        if (resumed < 1 || resumed > 3) { r.storeU32(12,resumed);return if (resumed == 5) 7 else 8 }
+        r.storeU32(16,resumed);r.storeU32(4,3);state=3
+    }
+    if (state != 3 && state != 6) return 4
+    val memory=nativeBufferAt(r.addressValue()+32,32)
+    if (memory.loadU32(0) != 0) {
+        val closed=esp32p4SleepMemoryCloseOwned(memory,polls,true,true)
+        if (closed != 8) { r.storeU32(12,closed);return 9 }
+    }
+    if (state == 3 && r.loadU32(28) == 0) {
+        val fixed=esp32p4SleepRevisionFinishOwned(r.loadU32(24),polls,true)
+        if (fixed != 1) { r.storeU32(12,fixed);return 12 }
+        r.storeU32(28,1)
+    }
+    var marker=P4SleepMarker(r.loadU32(20))
+    if (marker.hasSnapshot()) {
+        marker=marker.closeOwned(true);r.storeU32(20,marker|0)
+        if (marker.status() != 4) { r.storeU32(12,11);return 11 }
+    }
+    r.storeU32(12,0);r.storeU32(4,4)
+    return if (state == 3) r.loadU32(16) else 10
+}
+trusted fun p4SleepLightStartPrepared(r: NativeBuffer,revision: int,regdmaBackup: bool,mhz: int,xtalMHz: int,polls: int,eventPolls: int,exclusivePrepared: bool,pauseRecovery: bool): int {
+    if (!exclusivePrepared || !r.hasAddressRange(0,64) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0 ||
+        revision < 0 || revision > 399 || (mhz != 320 && mhz != 400 && mhz != 500) || xtalMHz != 40 ||
+        polls < 1 || polls > 1000000 || eventPolls < 1 || eventPolls > 1000000) return 4
+    if ((p4SleepRequestRead(296)&u32(0x7fffffff)) == u32(0) || (p4SleepRequestRead(356)&u32(0xc0000000)) != u32(0)) return 4
+    var i=4
+    while (i < 64) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344c31);r.storeU32(4,1)
+    r.storeU32(24,revision)
+    val marker=esp32p4SleepMarkerOpenOwned(false,true)
+    r.storeU32(20,marker|0)
+    if (marker.status() != 1) { r.storeU32(8,11);r.storeU32(4,6);return 11 }
+    val clean=esp32p4SleepCacheWritebackOwned(polls,true)
+    if (clean != 1) { r.storeU32(8,clean);r.storeU32(4,5);return 6 }
+    val memory=esp32p4SleepMemoryOpenOwned(nativeBufferAt(r.addressValue()+32,32),revision,regdmaBackup,mhz,xtalMHz,polls,true)
+    if (memory != 1) { r.storeU32(8,memory);r.storeU32(4,6);return 5 }
+    // Store pending BEFORE the cache-clean final request; continuation never
+    // invokes this request again, including after an observation timeout.
+    r.storeU32(4,if (pauseRecovery) 8 else 2)
+    val requested=esp32p4SleepRequestPreparedOwned(polls,eventPolls,true)
+    if (requested >= 1 && requested <= 3) return if (pauseRecovery) esp32p4SleepLightAwaitRecoveryOwned(r,polls,true) else esp32p4SleepLightContinueOwned(r,polls,true)
+    r.storeU32(8,requested)
+    if (requested == 7) return 7
+    // Request primitive guarantees no SLEEP_REQ for these preflight failures.
+    r.storeU32(4,if ((requested&255) == 6) 5 else 6)
+    return 6
+}
+trusted fun esp32p4SleepLightStartPreparedOwned(r: NativeBuffer,revision: int,regdmaBackup: bool,mhz: int,xtalMHz: int,polls: int,eventPolls: int,exclusivePrepared: bool): int =
+    p4SleepLightStartPrepared(r,revision,regdmaBackup,mhz,xtalMHz,polls,eventPolls,exclusivePrepared,false)
+// Paused variant returns1..3 only after the wake/eFuse barrier; memory,
+// marker and pin holds remain owned, unlike the ordinary convenience API.
+// Delayed wake returns7. Pre-request failures retain ordinary abort cleanup.
+trusted fun esp32p4SleepLightStartPausedOwned(r: NativeBuffer,revision: int,regdmaBackup: bool,mhz: int,xtalMHz: int,polls: int,eventPolls: int,exclusivePrepared: bool): int =
+    p4SleepLightStartPrepared(r,revision,regdmaBackup,mhz,xtalMHz,polls,eventPolls,exclusivePrepared,true)
+trusted fun esp32p4SleepLightAwaitRecoveryOwned(r: NativeBuffer,polls: int,exclusivePrepared: bool): int {
+    if (!exclusivePrepared || polls < 1 || polls > 1000000 || !p4SleepLightRecordValid(r)) return 4
+    if (r.loadU32(4) == 7) return r.loadU32(16)
+    if (r.loadU32(4) != 8) return 4
+    val resumed=esp32p4SleepLightResumeBarrierOwned(polls,true)
+    if (resumed < 1 || resumed > 3) { r.storeU32(12,resumed);return if (resumed == 5) 7 else 8 }
+    r.storeU32(16,resumed);r.storeU32(4,7);r.storeU32(12,0);return resumed
+}
+// Explicit proof that required flash/board recovery finished. On memory or
+// revision/marker failure, retries do not rerun the external recovery phase.
+trusted fun esp32p4SleepLightReleaseRecoveryOwned(r: NativeBuffer,polls: int,exclusiveRecovered: bool): int {
+    if (!exclusiveRecovered || polls < 1 || polls > 1000000 || !p4SleepLightRecordValid(r)) return 4
+    val state=r.loadU32(4)
+    if (state != 7 && state != 3 && state != 4) return 4
+    if (state == 7) r.storeU32(4,3)
+    return esp32p4SleepLightContinueOwned(r,polls,true)
+}

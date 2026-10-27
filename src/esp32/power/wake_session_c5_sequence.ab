@@ -1,0 +1,108 @@
+import "./ext1_c5_sequence.ab"
+import "./wake_trigger_c5_sequence.ab"
+import "../gpio/lp_wake_pad_c5_sequence.ab"
+import "../gpio/lp_clock_lease_c5_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// Caller40B:tag0,status4,trigger8,selection16,pad24,closeStage32,word36:
+// pin3,clock lease12@3,observed wake status8@16,captured flag24.
+//1armed2waiting for inactive HIGH3invalid4partial failure5closed.
+// Caller owns pad/EXT1 and shared LP GPIO clocks, serializes PMU RMW, pins LP power and releases
+// global holds. No sleep entry, RTC/PM1 clears or
+// automatic retry of failed writes. Active-low source GPIO0..7 only.
+trusted fun c5WakeSessionLoad(record: NativeBuffer,offset: int): int = record.loadU32(offset)|(record.loadU32(offset+4)<<32)
+trusted fun c5WakeSessionStore(record: NativeBuffer,offset: int,value: int): void {
+    record.storeU32(offset,value&4294967295);record.storeU32(offset+4,value>>>32);return
+}
+trusted fun esp32C5WakeSessionStatus(record: NativeBuffer): int =
+    if (!record.hasAddressRange(0,40) || record.loadU32(0) != 0x43355731) 3 else record.loadU32(4)
+trusted fun c5WakeSessionResult(record: NativeBuffer,status: int): int { record.storeU32(4,status);return status }
+// Accumulated observed EXT1 causes before irreversible acknowledgments.
+// -1 means none captured yet,0 is a captured empty status. Retained on close.
+trusted fun esp32C5WakeSessionPreviousStatus(record: NativeBuffer): int =
+    if (esp32C5WakeSessionStatus(record) == 3 || (record.loadU32(36)&0x1000000) == 0) -1 else (record.loadU32(36)>>>16)&255
+// May be polled while waiting for the PM1/device source to release. Once armed,
+// call again immediately before sleep to detect reassertion and park safely.
+trusted fun esp32C5WakeSessionArmOwned(record: NativeBuffer): int {
+    val status=esp32C5WakeSessionStatus(record)
+    if ((status != 1 && status != 2) || record.loadU32(32) != 0) return status
+    val pad=C5WakePad(c5WakeSessionLoad(record,24))
+    var trigger=C5Ext1Trigger(c5WakeSessionLoad(record,8))
+    if (pad.levelOwned() != 1) {
+        trigger=trigger.parkOwned(true);c5WakeSessionStore(record,8,trigger|0)
+        return c5WakeSessionResult(record,if (trigger.status() == 5) 2 else 4)
+    }
+    if (status == 1) return 1
+    var selection=C5Ext1Wake(c5WakeSessionLoad(record,16))
+    selection=selection.parkOwned(true);c5WakeSessionStore(record,16,selection|0)
+    if (selection.status() != 6) return c5WakeSessionResult(record,4)
+    record.storeU32(36,record.loadU32(36)|(esp32C5Ext1WakeStatus()<<16)|0x1000000)
+    if (esp32C5Ext1AcknowledgeOwned(true) != 1) return c5WakeSessionResult(record,4)
+    selection=selection.configureOwned(int(u32(1)<<u32(record.loadU32(36)&7)),0,true,true)
+    c5WakeSessionStore(record,16,selection|0)
+    if (selection.status() != 1) return c5WakeSessionResult(record,4)
+    trigger=trigger.armOwned(true,true);c5WakeSessionStore(record,8,trigger|0)
+    if (trigger.status() != 1) return c5WakeSessionResult(record,4)
+    if (pad.levelOwned() != 1) {
+        trigger=trigger.parkOwned(true);c5WakeSessionStore(record,8,trigger|0)
+        return c5WakeSessionResult(record,if (trigger.status() == 5) 2 else 4)
+    }
+    c5WakeSessionResult(record,1)
+}
+trusted fun esp32C5WakeSessionOpenOwned(record: NativeBuffer,pin: int,exclusiveClocksAndHolds: bool): int {
+    if (!exclusiveClocksAndHolds || pin < 0 || pin > 7 || !record.hasAddressRange(0,40)) return 3
+    if (record.loadU32(0) == 0x43355731 && record.loadU32(4) != 5) return 3
+    var i=0;while (i < 40) { record.storeU32(i,0);i=i+4 }
+    record.storeU32(0,0x43355731);record.storeU32(36,pin)
+    val trigger=esp32C5Ext1TriggerParkOwned(true);c5WakeSessionStore(record,8,trigger|0)
+    if (trigger.status() != 5) return c5WakeSessionResult(record,4)
+    val selection=esp32C5Ext1ParkOwned(true);c5WakeSessionStore(record,16,selection|0)
+    if (selection.status() != 6) return c5WakeSessionResult(record,4)
+    val clocks=esp32C5LpClockOpenOwned(true);record.storeU32(36,pin|((clocks|0)<<3))
+    if (clocks.status() != 1) return c5WakeSessionResult(record,4)
+    val pad=esp32C5WakePadOpenOwned(pin,true);c5WakeSessionStore(record,24,pad|0)
+    if (pad.status() != 1) return c5WakeSessionResult(record,4)
+    record.storeU32(4,2)
+    esp32C5WakeSessionArmOwned(record)
+}
+// Retain each original snapshot and stage on failed cleanup; explicit repeated
+// close resumes that stage. Trigger off -> selection off -> pad restored ->
+// original clocks -> original selection -> original trigger. No previously closed child reopens.
+trusted fun esp32C5WakeSessionCloseOwned(record: NativeBuffer): int {
+    val status=esp32C5WakeSessionStatus(record)
+    if (status == 3 || status == 5) return status
+    var stage=record.loadU32(32)
+    if (stage > 5) return 3
+    while (stage < 6) {
+        var good=true
+        if (stage == 0 || stage == 5) {
+            var child=C5Ext1Trigger(c5WakeSessionLoad(record,8))
+            if (child.hasSnapshot()) {
+                child=if (stage == 0) child.parkOwned(true) else child.closeOwned(true)
+                c5WakeSessionStore(record,8,child|0)
+                good=child.status() == (if (stage == 0) 5 else 4)
+            }
+        } else if (stage == 1 || stage == 4) {
+            var child=C5Ext1Wake(c5WakeSessionLoad(record,16))
+            if (child.hasSnapshot()) {
+                child=if (stage == 1) child.parkOwned(true) else child.closeOwned(true)
+                c5WakeSessionStore(record,16,child|0)
+                good=child.status() == (if (stage == 1) 6 else 5)
+            }
+        } else if (stage == 2) {
+            var child=C5WakePad(c5WakeSessionLoad(record,24))
+            if (child.hasSnapshot()) {
+                child=child.closeOwned(true);c5WakeSessionStore(record,24,child|0)
+                good=child.status() == 5
+            }
+        } else {
+            var clocks=C5LpClockLease((record.loadU32(36)>>>3)&4095)
+            if (clocks.hasSnapshot()) {
+                clocks=clocks.closeOwned(true);record.storeU32(36,(record.loadU32(36)&0xffff0007)|((clocks|0)<<3))
+                good=clocks.status() == 4
+            }
+        }
+        if (!good) return c5WakeSessionResult(record,4)
+        stage=stage+1;record.storeU32(32,stage)
+    }
+    c5WakeSessionResult(record,5)
+}

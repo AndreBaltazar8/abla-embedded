@@ -1,0 +1,116 @@
+import "./sdk/raw_buffer.ab"
+import "./adc_frontend_c5_sequence.ab"
+import "./adc_pins_c5_sequence.ab"
+import "./adc_oneshot_c5_sequence.ab"
+import "./adc_curve_c5_logic.ab"
+import "./analog_clock_c5_sequence.ab"
+// Retained104B aligned4 RAM: tag0,state4,primary8,cleanup12,count16,Hz20,
+// calibration64@24,six resource64 tokens@32,conversion80,raw84,valid88,
+// source92,conversion-obligation96,analog-clock100. No heap or hidden task/refcount.
+// states1configured2pending3failure4closing5closed; returns1success2invalid
+// 3failure4pending5closed. All failures retain record/resources until close.
+// Caller exclusively owns ADC/PHY/TSENS/LP/PMU/analog masters/GPIO, pins
+// FE80/APB/analog160/GPIO/source roots and excludes sleep/interrupt use.
+// Session owns/borrows analog-master gate; its160MHz source is alreadyselected.
+// Cold init permission acknowledges loss of prior SAR/TSENS analog contents.
+fun c5AdcSessionRange(r: NativeBuffer): bool = r.hasAddressRange(0,104) && (r.addressValue()&3) == 0 &&
+    (r.addressValue()+104 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c5AdcSessionValid(r: NativeBuffer): bool = c5AdcSessionRange(r) && r.loadU32(0) == 0x43354144
+trusted fun c5AdcSessionLoad(r: NativeBuffer,at: int): int = r.loadU32(at)|(r.loadU32(at+4)<<32)
+trusted fun c5AdcSessionStore(r: NativeBuffer,at: int,value: int): void { r.storeU32(at,value);r.storeU32(at+4,value>>>32);return }
+trusted fun c5AdcSessionOpenOwned(r: NativeBuffer,calibration: C5AdcCalibration,source: int,sourceHz: int,exclusive: bool,coldSafe: bool): int {
+    if (!exclusive || !c5AdcSessionRange(r) || !calibration.valid() || calibration.channel() > 5 || source < 0 || source > 2 || c5AdcDefaultPulseMicros(sourceHz) < 0) return 2
+    if (r.loadU32(0) != 0) return 2
+    var offset=4
+    while (offset < 104) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x43354144);r.storeU32(4,3);r.storeU32(20,sourceHz);r.storeU32(92,source)
+    c5AdcSessionStore(r,24,calibration|0)
+    val master=c5AnalogClockOpen160Owned(true)
+    r.storeU32(100,master|0)
+    if (!master.ready()) { r.storeU32(8,0x80000|master.status());return 3 }
+    var stage=0
+    while (stage < 6) {
+        r.storeU32(16,stage+1)
+        val token=if (stage == 0) c5AdcClockOpenOwned(source,true)|0
+            else if (stage == 1) c5AdcFrontendOpenOwned(true,coldSafe)|0
+            else if (stage == 2) c5AdcPowerOpenOwned(true)|0
+            else if (stage == 3) c5AdcPadOpenOwned(calibration.channel(),true)|0
+            else if (stage == 4) c5AdcTrimOpenOwned(calibration,true)|0
+            else c5AdcControllerOpenOwned(calibration.channel(),calibration.attenuation(),true)|0
+        c5AdcSessionStore(r,32+stage*8,token)
+        if ((token&255) != 1) { r.storeU32(8,((stage+1)<<16)|(token&255));return 3 }
+        stage=stage+1
+    }
+    r.storeU32(4,1);return 1
+}
+// Explicit caller settling boundary: external sensor/RC settling is not
+// guessed by the framework. Revalidate routing and analog values before START.
+trusted fun c5AdcSessionStartAfterSettlingOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c5AdcSessionValid(r) || r.loadU32(4) != 1 || r.loadU32(96) != 0) return 2
+    val calibration=C5AdcCalibration(c5AdcSessionLoad(r,24))
+    val pin=calibration.channel()+1
+    if ((c5AnalogClockRead(0)&u32(4)) == u32(0) || (c5AnalogClockRead(4)&u32(4096)) == u32(0) || !c5AnalogClockIdle() ||
+        int((c5AdcClockRead(4)>>u32(20))&u32(3)) != r.loadU32(92) || !c5AdcPadAdmission(pin,true) ||
+        (c5GpioRead(0x60091034)&(u32(1)<<u32(pin))) != u32(0) ||
+        (c5GpioRead(0x60090000+pin*4)&u32(29570)) != u32(4096) ||
+        (c5AdcFrontendRead(0)&u32(0xa000)) != u32(0xa000) ||
+        (c5AdcFrontendRead(4)&u32(0xc000000)) != u32(0xc000000) ||
+        (c5AdcFrontendRead(8)&u32(0x1800000)) != u32(0x1800000) ||
+        c5AdcTrimField(0,0,7,-1) != (calibration.initCode()&255) ||
+        c5AdcTrimField(1,0,3,-1) != (calibration.initCode()>>>8) ||
+        c5AdcTrimField(2,4,6,-1) != 1 || c5AdcTrimField(2,0,2,-1) != 2 || c5AdcTrimField(8,1,1,-1) != 0) {
+        r.storeU32(4,3);r.storeU32(8,0x70003);return 3
+    }
+    r.storeU32(88,0);r.storeU32(96,1);r.storeU32(4,2)
+    val conversion=c5AdcConversionStartOwned(calibration.channel(),calibration.attenuation(),r.loadU32(20),true)
+    r.storeU32(80,conversion|0)
+    if ((conversion&16384) == 0) r.storeU32(96,0)
+    if (conversion.status() != 8) { r.storeU32(4,3);r.storeU32(8,0x70000|conversion.status());return 3 }
+    return 1
+}
+trusted fun c5AdcSessionPollOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AdcSessionValid(r) || polls < 1 || polls > 1000000 || r.loadU32(96) == 0 || r.loadU32(4) == 5) return 2
+    var conversion=C5AdcConversion(r.loadU32(80))
+    if ((conversion&8192) != 0 && r.loadU32(88) == 0) {
+        conversion=conversion.waitOwned(polls,true);r.storeU32(80,conversion|0)
+        if (conversion.status() == 8) return 4
+        if (conversion.status() != 1) { r.storeU32(12,0x70000|conversion.status());return 3 }
+        r.storeU32(84,conversion.raw());r.storeU32(88,1)
+    }
+    conversion=conversion.releaseOwned(true);r.storeU32(80,conversion|0)
+    if (conversion.status() != 7) { r.storeU32(12,0x70000|conversion.status());return if (conversion.status() == 8) 4 else 3 }
+    r.storeU32(96,0);r.storeU32(12,0)
+    if (r.loadU32(4) != 4) r.storeU32(4,if (r.loadU32(88) != 0) 1 else 3)
+    return 1
+}
+trusted fun c5AdcSessionRaw(r: NativeBuffer): int = if (!c5AdcSessionValid(r) || r.loadU32(88) == 0 || r.loadU32(96) != 0) -1 else r.loadU32(84)
+trusted fun c5AdcSessionMillivolts(r: NativeBuffer): int = if (c5AdcSessionRaw(r) < 0) -1 else C5AdcCalibration(c5AdcSessionLoad(r,24)).millivolts(c5AdcSessionRaw(r))
+trusted fun c5AdcSessionCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c5AdcSessionValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 5) return 5
+    r.storeU32(4,4)
+    if (r.loadU32(96) != 0) { val result=c5AdcSessionPollOwned(r,polls,true);if (result != 1) return result }
+    var stage=r.loadU32(16)-1
+    while (stage >= 0) {
+        val token=c5AdcSessionLoad(r,32+stage*8)
+        val hasLease=if (stage == 0) (token&768) != 0 || (token&255) == 1
+            else (token&(if (stage == 1) 8192 else if (stage == 2) 2048 else if (stage == 3) 1<<40 else if (stage == 4) 1<<24 else 1<<45)) != 0
+        if (hasLease) {
+            val closed=if (stage == 0) C5AdcClockOwner(token).closeOwned(true)|0
+                else if (stage == 1) C5AdcFrontend(token).closeOwned(true)|0
+                else if (stage == 2) C5AdcPowerOwner(token).closeOwned(true)|0
+                else if (stage == 3) C5AdcPad(token).closeOwned(true)|0
+                else if (stage == 4) C5AdcTrimOwner(token).closeOwned(true)|0
+                else C5AdcController(token).closeOwned(true)|0
+            c5AdcSessionStore(r,32+stage*8,closed)
+            if ((closed&255) != (if (stage == 3) 5 else 0)) { r.storeU32(12,((stage+1)<<16)|(closed&255));return 3 }
+        }
+        r.storeU32(16,stage);stage=stage-1
+    }
+    var master=C5AnalogClock(r.loadU32(100))
+    if ((master&512) != 0) {
+        master=master.closeOwned(true);r.storeU32(100,master|0)
+        if (master.status() != 0) { r.storeU32(12,0x80000|master.status());return 3 }
+    }
+    r.storeU32(12,0);r.storeU32(4,5);return 5
+}

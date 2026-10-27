@@ -1,0 +1,57 @@
+import "./pad_c5_sequence.ab"
+import "../sdk/raw_buffer.ab"
+// 48B aligned retained RAM: tag0,state4,primary8,outstanding12,4 pad tokens16.
+// BCLK,WS,data and optional MCLK (-1 absent), all distinct. Single direction
+// standard I2S; duplex shared-clock and second TX data use lower-level leases.
+// States/returns1ready2invalid3admission4partial5closing6closed.
+// Own all pads/routes/clock consumers and stopped I2S/GDMA/ETM throughout.
+// No hardware start/clock change; successful close releases pads only.
+fun c5I2sPinSessionStorage(r: NativeBuffer): bool = r.hasAddressRange(0,48) && (r.addressValue()&3) == 0 && (r.addressValue()+48 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c5I2sPinSessionSave(r: NativeBuffer,index: int,pad: C5I2sPad): void {
+    r.storeU32(16+index*8,pad|0);r.storeU32(20+index*8,pad>>>32);return
+}
+trusted fun c5I2sPinSessionOpenOwned(r: NativeBuffer,tx: bool,slave: bool,bclk: int,ws: int,data: int,mclk: int,mclkInput: bool,exclusive: bool): int {
+    if (!exclusive || !c5I2sPinSessionStorage(r) || r.loadU32(0) != 0 ||
+        !esp32C5GpioNumberValid(bclk) || !esp32C5GpioNumberValid(ws) || !esp32C5GpioNumberValid(data) || mclk < -1 || mclk > 28 ||
+        bclk == ws || bclk == data || ws == data || (mclk >= 0 && (mclk == bclk || mclk == ws || mclk == data))) return 2
+    val pins=bclk|(ws<<5)|(data<<10)|((mclk&31)<<15)
+    val count=if (mclk < 0) 3 else 4
+    var index=0
+    // Admission of every pad precedes the first side effect.
+    while (index < count) {
+        val pin=int((u32(pins)>>u32(index*5))&u32(31))
+        if (!c5I2sPadAdmission(pin) || (c5GpioRead(0x60091034)&(u32(1)<<u32(pin))) != u32(0) ||
+            (c5GpioRead(0x60091ad4+pin*4)&u32(3072)) != u32(1024)) return 3
+        index=index+1
+    }
+    r.storeU32(0,0x43354950);r.storeU32(4,4);r.storeU32(8,0);r.storeU32(12,0)
+    index=0
+    while (index < 4) { c5I2sPinSessionSave(r,index,C5I2sPad(0));index=index+1 }
+    index=0
+    while (index < count) {
+        val role=if (index < 2) (if (tx) 2 else 6)+index*2+(if (slave) 1 else 0) else if (index == 2) (if (tx) 10 else 11) else if (mclkInput) 1 else 0
+        val pad=c5I2sPadOpenOwned(int((u32(pins)>>u32(index*5))&u32(31)),role,true)
+        c5I2sPinSessionSave(r,index,pad)
+        if ((pad&(1<<55)) != 0) r.storeU32(12,r.loadU32(12)|int(u32(1)<<u32(index)))
+        if (pad.status() != 1) { r.storeU32(8,((index+1)<<8)|pad.status());return 4 }
+        index=index+1
+    }
+    r.storeU32(4,1);return 1
+}
+trusted fun c5I2sPinSessionCloseOwned(r: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !c5I2sPinSessionStorage(r) || r.loadU32(0) != 0x43354950) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) != 1 && r.loadU32(4) != 4 && r.loadU32(4) != 5) return 2
+    r.storeU32(4,5)
+    var index=3
+    while (index >= 0) {
+        if ((u32(r.loadU32(12))&(u32(1)<<u32(index))) != u32(0)) {
+            val pad=C5I2sPad(r.loadU32(16+index*8)|(r.loadU32(20+index*8)<<32)).closeOwned(true)
+            c5I2sPinSessionSave(r,index,pad)
+            if (pad.status() != 5) return 5
+            r.storeU32(12,int(u32(r.loadU32(12))&~(u32(1)<<u32(index))))
+        }
+        index=index-1
+    }
+    r.storeU32(4,6);return 6
+}

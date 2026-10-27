@@ -1,0 +1,161 @@
+import "./sleep_record_c5.ab"
+// Retained-CPU light-sleep lifecycle.792B retained record: header40,
+// immutable request68@40,optional memory-context address108,
+// preparation192@112,profile304@304,
+// alarm24@608,entry32@632,recovery128@664.
+// Request U32 words: power,clocks,calibration,slowQ19,fastQ19,minimumQ19,
+// signed modemCycles,signed pvtBias,flags(xtalFast1/lpFast2/inrush4/PVT8),
+// UARTmask,polls,deadline low/high,lead low/high,wakeMask,rejectMask.
+// When PVT is enabled, bias -1 selects captured live HP bias; an explicit
+// bias must equal that capture. Non-PVT profile callers keep explicit control.
+// Header:tag0,state4,stage8,signed entry outcome12 (-4 means no entry),
+// first failing stage16/result20,latest child24,cache token28/32,cleanup36.
+// Final deadline rejection records stage5/result4 with entry outcome-3;
+// normal recovery completes without claiming an entry or issuing sleep.
+// Return1complete (inspect outcome!),2invalid,3pending,4aborted before entry,
+//5chip suspended,6unsupported chip (state7/cache-off ownership retained).
+// Internal states3preparing,5aborting,6recovering,7waiting before entry with
+// caches suspended. Retry Continue only; never suspend caches a second time.
+// CPU/HP_AON/TOP/VDD_SPI power-down are rejected until their retention/MSPI
+// transitions are implemented here. Other clock/domain policies still need
+// caller-validated wake/slow-clock dependencies and quiescent radio/users.
+// Caller owns all affected hardware, inactive timer0 and cache initially on,
+// retained code/stack/record, valid manual voltage/ROM ticks and MSPI-safe
+// CPU transitions. No scheduler/interrupt users until COMPLETE/ABORTED.
+// Begin/profile calculation can use flash while cache is on. Continue and
+// its cache-off branch are retained; caller must also tolerate pending return
+// with cache suspended. No diagnostic IO, forced success or sleep timeout.
+@section(".iram1.abla.c5SleepCycleAbort")
+trusted fun c5SleepCycleAbort(record: NativeBuffer): int {
+    val base=record.addressValue();val stage=c5SleepRecordRead(record,36)
+    if (stage > 2) return 2
+    if (stage <= 0) {
+        if (c5SleepRecordRead(record,304) != 0) {
+            val result=c5SleepCycleProfileClose(nativeBufferAt(base+304,304))
+            c5SleepRecordWrite(record,24,result)
+            if (result != 4) return 3
+        }
+        c5SleepRecordWrite(record,36,1)
+    }
+    if (stage <= 1) {
+        if (c5SleepRecordRead(record,608) != 0) {
+            val result=c5SleepCycleAlarmClose(nativeBufferAt(base+608,24))
+            c5SleepRecordWrite(record,24,result)
+            if (result != 6) return 3
+        }
+        c5SleepRecordWrite(record,36,2)
+    }
+    if (c5SleepRecordRead(record,112) != 0) {
+        val result=c5SleepCyclePrepareCancel(nativeBufferAt(base+112,192))
+        c5SleepRecordWrite(record,24,result)
+        if (result != 4) return 3
+    }
+    c5SleepRecordWrite(record,4,4);c5SleepRecordWrite(record,36,3)
+    4
+}
+@section(".iram1.abla.c5SleepCycleFail")
+trusted fun c5SleepCycleFail(record: NativeBuffer,stage: int,result: int): int {
+    c5SleepRecordWrite(record,16,stage);c5SleepRecordWrite(record,20,result)
+    c5SleepRecordWrite(record,4,5)
+    c5SleepCycleAbort(record)
+}
+@section(".iram1.abla.c5SleepCycleContinue")
+trusted fun esp32C5SleepCycleContinueOwned(record: NativeBuffer,exclusive: bool): int {
+    if (!exclusive || !record.hasAddressRange(0,792) || (record.addressValue()&3) != 0 || c5SleepRecordRead(record,0) != 0x43594331) return 2
+    val base=record.addressValue()
+    // Separate volatile state observations prevent lowering this cache-off
+    // retry dispatch to a jump table in flash. Ownership excludes writers.
+    if (c5SleepRecordRead(record,4) == 1) return 1
+    if (c5SleepRecordRead(record,4) == 4) return 4
+    if (c5SleepRecordRead(record,4) == 5) return c5SleepCycleAbort(record)
+    if (c5SleepRecordRead(record,4) == 7) return c5SleepCycleEnterAfterCache(record)
+    if (c5SleepRecordRead(record,4) == 6) {
+        val result=c5SleepCycleRecovery(record)
+        c5SleepRecordWrite(record,24,result)
+        if (result != 1) return 3
+        c5SleepRecordWrite(record,4,1);return 1
+    }
+    return 2
+}
+// Start is reachable only from Begin, while cache is enabled. Public retries
+// never need to retain or revisit the flash-resident profile construction.
+@section(".iram1.abla.c5SleepCycleStart")
+trusted fun c5SleepCycleStart(record: NativeBuffer): int {
+    val base=record.addressValue()
+    val stage=c5SleepRecordRead(record,8)
+    if (stage <= 0) {
+        val prepared=c5SleepCyclePrepare(record)
+        c5SleepRecordWrite(record,24,prepared)
+        if (prepared != 1) {
+            // A pending preparation can already own changed clocks. Preserve
+            // its record and explicitly unwind rather than re-entering sleep.
+            return c5SleepCycleFail(record,1,prepared)
+        }
+        c5SleepRecordWrite(record,8,1)
+    }
+    if (stage <= 1) {
+        val configured=c5SleepCycleProfile(record)
+        c5SleepRecordWrite(record,24,configured)
+        if (configured != 1) return c5SleepCycleFail(record,2,configured)
+        c5SleepRecordWrite(record,8,2)
+    }
+    val armed=c5SleepCycleAlarm(record)
+    c5SleepRecordWrite(record,24,armed)
+    if (armed != 1) return c5SleepCycleFail(record,3,armed)
+    if (!c5SleepCycleTake(nativeBufferAt(base+112,192))) return c5SleepCycleFail(record,4,2)
+    // From this point preparation ownership belongs to recovery. Nothing
+    // below may re-enter the pre-cache profile/calibration branch.
+    val token=c5SleepCycleCacheSuspend()
+    c5SleepRecordWrite(record,28,token&0xffffffff);c5SleepRecordWrite(record,32,(token>>>32)&0xffffffff)
+    c5SleepRecordWrite(record,4,7)
+    c5SleepCycleEnterAfterCache(record)
+}
+// Entry composition may return internal -5 only before any sleep request:
+// retain ownership/token/outcome and poll its hardware precondition later.
+@section(".iram1.abla.c5SleepCycleEnterAfterCache")
+trusted fun c5SleepCycleEnterAfterCache(record: NativeBuffer): int {
+    val outcome=c5SleepCycleEntry(record)
+    if (outcome == -5) return 3
+    if (outcome == -6) return 5
+    if (outcome == -7) return 6
+    c5SleepRecordWrite(record,12,outcome)
+    c5SleepRecordWrite(record,4,6)
+    val result=c5SleepCycleRecovery(record)
+    c5SleepRecordWrite(record,24,result)
+    if (result != 1) return 3
+    c5SleepRecordWrite(record,4,1)
+    1
+}
+trusted fun c5SleepCycleRequestValid(request: NativeBuffer,requirePeriods: bool): bool {
+    if (!request.hasAddressRange(0,68)) return false
+    val power=request.loadU32(0);val flags=request.loadU32(32)
+    if (power > 1023 || (power&29) != 0 || request.loadU32(8) > 0x0fffffff ||
+        (requirePeriods && (request.loadU32(12) == 0 || request.loadU32(16) == 0)) ||
+        int(i32(request.loadU32(24))) < -1 || int(i32(request.loadU32(24))) > 1048575 ||
+        int(i32(request.loadU32(28))) < -1 || int(i32(request.loadU32(28))) > 31 ||
+        flags > 15 || request.loadU32(36) > 3 || request.loadU32(40) < 1 || request.loadU32(40) > 1000000 ||
+        request.loadU32(48) > 65535 || request.loadU32(56) > 32767 ||
+        (request.loadU32(52) < 16 && request.loadU32(56) == 0) ||
+        (request.loadU32(60)&16) == 0 || request.loadU32(64) > 0x7fffffff) return false
+    true
+}
+@section(".iram1.abla.c5SleepCycleBegin")
+trusted fun c5SleepCycleBeginContextOwned(record: NativeBuffer,request: NativeBuffer,exclusiveReady: bool,memoryContext: int): int {
+    if (!exclusiveReady || !record.hasAddressRange(0,792) || !c5SleepCycleRequestValid(request,true) ||
+        (record.addressValue()&3) != 0 || c5SleepRecordRead(record,0) != 0) return 2
+    val base=record.addressValue();val input=request.addressValue()
+    if (base < input+68 && input < base+792) return 2
+    var offset=0
+    while (offset < 68) { c5SleepRecordWrite(record,40+offset,request.loadU32(offset));offset=offset+4 }
+    c5SleepRecordWrite(record,8,0);c5SleepRecordWrite(record,12,-4)
+    c5SleepRecordWrite(record,16,0);c5SleepRecordWrite(record,20,0);c5SleepRecordWrite(record,24,0)
+    c5SleepRecordWrite(record,28,0);c5SleepRecordWrite(record,32,0);c5SleepRecordWrite(record,36,0)
+    c5SleepRecordWrite(record,112,0);c5SleepRecordWrite(record,304,0);c5SleepRecordWrite(record,608,0)
+    c5SleepRecordWrite(record,632,0);c5SleepRecordWrite(record,664,0)
+    c5SleepRecordWrite(record,108,memoryContext)
+    c5SleepRecordWrite(record,4,3);c5SleepRecordWrite(record,0,0x43594331)
+    c5SleepCycleStart(record)
+}
+@section(".iram1.abla.c5SleepCycleBeginPlain")
+trusted fun esp32C5SleepCycleBeginOwned(record: NativeBuffer,request: NativeBuffer,exclusiveReady: bool): int =
+    c5SleepCycleBeginContextOwned(record,request,exclusiveReady,0)

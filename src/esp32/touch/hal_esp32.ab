@@ -1,0 +1,230 @@
+import "../../runtime/freestanding_memory.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+
+// ESP32 touch-controller HAL (hardware version 1) in structured Abla.
+
+val esp32TouchSensBase = u32(0x3ff48800)
+val esp32TouchRtcIoBase = u32(0x3ff48400)
+val esp32TouchRtcControlBase = u32(0x3ff48000)
+val esp32TouchControl1 = esp32TouchSensBase + u32(0x58)
+val esp32TouchControl2 = esp32TouchSensBase + u32(0x84)
+val esp32TouchThresholdBase = esp32TouchSensBase + u32(0x5c)
+val esp32TouchRtcIoConfiguration = esp32TouchRtcIoBase + u32(0x90)
+val esp32TouchRtcInterruptClear = esp32TouchRtcControlBase + u32(0x48)
+val esp32TouchChannelCount = u32(10)
+val esp32TouchConfigurationSize = u32(28)
+
+// deep_slp_allow_pd, deep_slp_chan, slp_cfg[28], apply_slp_cfg.
+val esp32TouchSleepStateStorage = nativeStaticMutableU32s([
+    0, 0xffffffff, 0, 0, 0, 0, 0, 0, 0, 0
+])
+val esp32TouchSleepState = u32(esp32TouchSleepStateStorage)
+
+@inline
+trusted fun esp32TouchLoadU32(address: u32): u32 {
+    xtensaMemoryBarrier()
+    return u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+}
+
+@inline
+trusted fun esp32TouchStoreU32(address: u32, value: u32): void {
+    xtensaMemoryBarrier()
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+@inline
+trusted fun esp32TouchLoadU16(address: u32): u32 =
+    u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32TouchLoadU8(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32TouchStoreU8(address: u32, value: u32): void {
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+@inline
+trusted fun esp32TouchUpdate(
+    address: u32,
+    clearMask: u32,
+    setMask: u32
+): void {
+    esp32TouchStoreU32(
+        address, (esp32TouchLoadU32(address) & ~clearMask) | setMask
+    )
+    return
+}
+
+@inline
+fun esp32TouchHardwareChannel(channel: u32): u32 {
+    if (channel == u32(8)) return u32(9)
+    if (channel == u32(9)) return u32(8)
+    return channel
+}
+
+@inline
+fun esp32TouchThresholdRegister(channel: u32): u32 =
+    esp32TouchThresholdBase +
+        (esp32TouchHardwareChannel(channel) >>> u32(1)) * u32(4)
+
+trusted fun esp32TouchSetThreshold(channel: u32, threshold: u32): void {
+    if (channel >= esp32TouchChannelCount) ablaRuntimeTrap()
+    val hardwareChannel = esp32TouchHardwareChannel(channel)
+    val address = esp32TouchThresholdRegister(channel)
+    if ((hardwareChannel & u32(1)) != u32(0))
+        esp32TouchUpdate(address, u32(0xffff), threshold & u32(0xffff))
+    else esp32TouchUpdate(
+        address, u32(0xffff0000), (threshold & u32(0xffff)) << u32(16)
+    )
+    return
+}
+
+trusted fun esp32TouchThreshold(channel: u32): u32 {
+    if (channel >= esp32TouchChannelCount) ablaRuntimeTrap()
+    val hardwareChannel = esp32TouchHardwareChannel(channel)
+    val value = esp32TouchLoadU32(esp32TouchThresholdRegister(channel))
+    return if ((hardwareChannel & u32(1)) != u32(0))
+        value & u32(0xffff) else (value >>> u32(16)) & u32(0xffff)
+}
+
+// touch_hal_config_t layout for ESP32 v1:
+// u8 power wait; u16 measurement interval at +4; two trigger enums at +8/+12;
+// sample configuration pointer at +24. The sample contains duration at +0,
+// high voltage at +4, and low voltage at +8.
+trusted fun esp32TouchConfigureController(configuration: u32): void {
+    if (configuration == u32(0)) ablaRuntimeTrap()
+    val sample = esp32TouchLoadU32(configuration + u32(24))
+    if (sample == u32(0)) ablaRuntimeTrap()
+
+    esp32TouchUpdate(
+        esp32TouchControl1,
+        u32(0xff) << u32(16),
+        (esp32TouchLoadU8(configuration) & u32(0xff)) << u32(16)
+    )
+    esp32TouchUpdate(
+        esp32TouchControl2,
+        u32(0xffff) << u32(14),
+        (esp32TouchLoadU16(configuration + u32(4)) & u32(0xffff)) <<
+            u32(14)
+    )
+    esp32TouchUpdate(
+        esp32TouchControl1,
+        u32(1) << u32(24),
+        (esp32TouchLoadU32(configuration + u32(8)) & u32(1)) << u32(24)
+    )
+    esp32TouchUpdate(
+        esp32TouchControl1,
+        u32(1) << u32(25),
+        (esp32TouchLoadU32(configuration + u32(12)) & u32(1)) << u32(25)
+    )
+    esp32TouchUpdate(
+        esp32TouchControl1,
+        u32(0xffff),
+        esp32TouchLoadU16(sample)
+    )
+
+    val highLimit = esp32TouchLoadU32(sample + u32(4))
+    val lowLimit = esp32TouchLoadU32(sample + u32(8))
+    esp32TouchUpdate(
+        esp32TouchRtcIoConfiguration,
+        u32(3) << u32(29),
+        (highLimit & u32(3)) << u32(29)
+    )
+    esp32TouchUpdate(
+        esp32TouchRtcIoConfiguration,
+        u32(3) << u32(25),
+        ((highLimit >>> u32(2)) & u32(3)) << u32(25)
+    )
+    esp32TouchUpdate(
+        esp32TouchRtcIoConfiguration,
+        u32(3) << u32(27),
+        (lowLimit & u32(3)) << u32(27)
+    )
+    return
+}
+
+trusted fun esp32TouchSaveSleepConfiguration(
+    channel: u32,
+    configuration: u32,
+    allowPowerDown: u32
+): void {
+    esp32TouchStoreU32(esp32TouchSleepState + u32(4), channel)
+    esp32TouchStoreU8(esp32TouchSleepState, allowPowerDown)
+    if (configuration != u32(0)) {
+        freestandingCopy(
+            esp32TouchSleepState + u32(8),
+            configuration,
+            esp32TouchConfigurationSize
+        )
+        esp32TouchStoreU8(esp32TouchSleepState + u32(36), u32(1))
+    } else esp32TouchStoreU8(
+        esp32TouchSleepState + u32(36), u32(0)
+    )
+    return
+}
+
+trusted fun esp32TouchApplySleepConfiguration(): void {
+    if (esp32TouchLoadU8(
+        esp32TouchSleepState + u32(36)
+    ) == u32(0)) return
+
+    val thresholds = u32(nativeStackAllocate(40))
+    var channel = u32(0)
+    while (channel < esp32TouchChannelCount) {
+        esp32TouchStoreU32(
+            thresholds + channel * u32(4), esp32TouchThreshold(channel)
+        )
+        channel = channel + u32(1)
+    }
+    esp32TouchConfigureController(esp32TouchSleepState + u32(8))
+    channel = u32(0)
+    while (channel < esp32TouchChannelCount) {
+        esp32TouchSetThreshold(
+            channel,
+            esp32TouchLoadU32(thresholds + channel * u32(4))
+        )
+        channel = channel + u32(1)
+    }
+    return
+}
+
+trusted fun esp32TouchPrepareDeepSleep(): void {
+    esp32TouchApplySleepConfiguration()
+    esp32TouchUpdate(
+        esp32TouchRtcInterruptClear, u32(0), u32(1) << u32(6)
+    )
+    return
+}
+
+// Compatibility wrappers for the remaining lifted callers.
+trusted fun esp32RecoveredTouchHalConfigController(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32TouchConfigureController(a2)
+    return a2
+}
+
+trusted fun esp32RecoveredTouchHalSaveSleepConfig(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32TouchSaveSleepConfiguration(a2, a3, a4)
+    return a2
+}
+
+trusted fun esp32RecoveredTouchHalPrepareDeepSleep(
+    a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32,
+    stack0: u32, stack1: u32, stack2: u32, stack3: u32, stack4: u32,
+    stack5: u32, stack6: u32, stack7: u32, stack8: u32, stack9: u32
+): u32 {
+    esp32TouchPrepareDeepSleep()
+    return a2
+}

@@ -1,0 +1,58 @@
+import "../sdk/raw_buffer.ab"
+// Caller-owned104byte aligned retained internal record, header initially0.
+// Layout: magic0/stage4; clock8/analog16/UART24/bias32/resume40 u64;
+// embedded56byte MSPI record48. Stages1UART,2MSPI,3ready,7manual recovery.
+// Caller already owns peer/interrupt/scheduler/peripheral quiescence. This
+// prepares clocks only, NOT wake/power/retention registers or sleep entry.
+// Result0invalid/busy,1ready,2UARTfailure,3MSPIfailure safely undone,
+// 4clock failure safely undone,7manual recovery (keep all snapshots alive).
+// Safely undone results publish the same completed record as normal resume,
+// allowing board RTC/pad cleanup to verify restoration without replaying it.
+@section(".iram1.abla.s3SleepPrepareUndone")
+trusted fun esp32S3SleepPrepareUndoneOwned(base: int,clock: Esp32S3ClockState): void {
+    val mhz=esp32S3ClockResumeMegahertz(clock)
+    val apb=(if (mhz > 80) 80 else mhz)*1000000
+    esp32S3MspiStateStore64(base+40,esp32S3SleepResumeResult(15,1,apb,0) | 0)
+    esp32S3MspiStateWrite(base+4,6)
+    esp32S3MspiStateWrite(base,0)
+}
+@section(".iram1.abla.s3SleepPrepare")
+trusted fun esp32S3SleepPrepareOwned(record: NativeBuffer,bias: Esp32S3ClockBias,ports: int,flashOctal: bool,ramKind: int,protocol: int,romBaseline: int,polls: int): int {
+    if (!record.hasAddressRange(0,104) || (record.addressValue() & 3) != 0 ||
+        ((bias | 0) & ~0x1FFFFF) != 0 || ports < 0 || ports > 7 || polls <= 0 || polls > 0x7FFFFFFF ||
+        ramKind < -1 || ramKind > 3 || ramKind == 0 || ramKind == 1 || protocol < 0 || protocol > 63 ||
+        romBaseline < 0 || romBaseline > 63 || protocol+romBaseline > 63 || (flashOctal && (protocol != 0 || romBaseline != 0))) return 0
+    val base=record.addressValue()
+    if (esp32S3MspiStateRead(base) != 0) return 0
+    val clock=esp32S3ClockDecode(esp32S3ClockRead(0x600C0060),esp32S3ClockRead(0x600C0010),esp32S3ClockRead(0x600080C0))
+    if (esp32S3ClockResumeMegahertz(clock) == 0) return 0
+    val uarts=esp32S3SleepUartsPrepareOwned(ports,false,polls)
+    if (!uarts.ready()) return 2
+    esp32S3MspiStateStore64(base+8,clock | 0)
+    esp32S3MspiStateStore64(base+16,0)
+    esp32S3MspiStateStore64(base+24,uarts | 0)
+    esp32S3MspiStateStore64(base+32,bias | 0)
+    esp32S3MspiStateStore64(base+40,esp32S3SleepResumeStart() | 0)
+    esp32S3MspiStateWrite(base+48,0)
+    esp32S3MspiStateWrite(base+4,1)
+    esp32S3MspiStateWrite(base,0x53504C50)
+    val mspi=nativeBufferAt(base+48,56)
+    val lowered=esp32S3MspiLowBeginOwned(mspi,flashOctal,ramKind,protocol,romBaseline,polls)
+    if (lowered != 1) {
+        if (lowered == 7) { esp32S3MspiStateWrite(base+4,7); return 7 }
+        uarts.resumeOwned()
+        esp32S3SleepPrepareUndoneOwned(base,clock)
+        return 3
+    }
+    esp32S3MspiStateWrite(base+4,2)
+    val switched=esp32S3ClockToXtalOwned(bias.rtcLow(),bias.digitalLow(),true)
+    if (!switched.valid()) {
+        if (esp32S3MspiLowEndOwned(mspi,polls) != 1) { esp32S3MspiStateWrite(base+4,7); return 7 }
+        uarts.resumeOwned()
+        esp32S3SleepPrepareUndoneOwned(base,clock)
+        return 4
+    }
+    esp32S3MspiStateStore64(base+16,esp32S3AnalogSleepCaptureOwned() | 0)
+    esp32S3MspiStateWrite(base+4,3)
+    1
+}

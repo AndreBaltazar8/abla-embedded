@@ -1,0 +1,86 @@
+import "./sleep_cpu_aux_p4_sequence.ab"
+import "./sleep_clic_p4_sequence.ab"
+import "./sleep_fpu_p4_sequence.ab"
+// One per-hart retained owner:816B aligned16. Header32; auxiliary256@32,
+// CLIC220@288, padding4; FPU160@512; integer boundary144@672.
+// Header magic,state,hart,result,callbackResult,detail,revision,reserved.
+// Save auxiliary -> CLIC -> FP, then invoke the actual integer call boundary.
+// On wake/normal callback return, KEEP all banks owned until memory/cache
+// recovery is explicitly complete; close FP -> CLIC -> auxiliary (MHCR last).
+// Partial pre-entry saves can be unwound; an active/uncertain boundary cannot.
+// Same hart, MIEoff, integer-only soft-float retention path, retained internal
+// code/stack/record and stable protection mappings. Caller owns peer/IRQ/ROM
+// route/PMU/rails/cache/timekeeping; callback performs final writeback/request.
+// Callback/context must not overwrite owner. Open zeroes only fresh owned
+// storage. No sleep request is issued by Open/Close. Do not discard on failure.
+// States1..3saving4ready5boundaryactive6returned7..9closing10closed.
+// Results1ready2invalid3prerequisite4child-failure5boundary-refused6woke
+// 7callback-returned8closed9active. Header callbackResult retains full u32.
+trusted fun p4CpuRetainedRecord(r: NativeBuffer): bool = r.hasAddressRange(0,816) && (r.addressValue()&15) == 0
+fun p4CpuRetainedAux(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+32,256)
+fun p4CpuRetainedClic(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+288,220)
+fun p4CpuRetainedFpu(r: NativeBuffer): NativeBuffer = nativeBufferAt(r.addressValue()+512,160)
+fun esp32p4CpuRetainedCore(r: NativeBuffer): NativeBuffer =
+    if (p4CpuRetainedRecord(r)) nativeBufferAt(r.addressValue()+672,144) else nativeBufferAt(0,0)
+trusted fun p4CpuRetainedResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(12,result);r.storeU32(20,detail);return result
+}
+trusted fun p4CpuRetainedOwned(r: NativeBuffer): bool =
+    p4CpuRetainedHart() == u32(r.loadU32(8)) && (p4CpuRetainedStatus()&u32(8)) == u32(0)
+trusted fun esp32p4CpuRetainedContinueOwned(r: NativeBuffer,exclusiveHart: bool): int {
+    if (!exclusiveHart || !p4CpuRetainedRecord(r) || r.loadU32(0) != 0x50345243 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 4) return 2
+    if (!p4CpuRetainedOwned(r)) return 3
+    while (r.loadU32(4) < 4) {
+        val step=r.loadU32(4)
+        val result=if (step == 1) esp32p4CpuAuxSaveOwned(p4CpuRetainedAux(r),true)
+            else if (step == 2) esp32p4SleepClicSaveOwned(p4CpuRetainedClic(r),true)
+            else esp32p4SleepFpuSaveOwned(p4CpuRetainedFpu(r),true)
+        if (result != 1) return p4CpuRetainedResult(r,4,result)
+        r.storeU32(4,step+1)
+    }
+    return p4CpuRetainedResult(r,1,0)
+}
+trusted fun esp32p4CpuRetainedOpenOwned(r: NativeBuffer,revision: int,exclusiveHart: bool): int {
+    if (!exclusiveHart || !p4CpuRetainedRecord(r) || r.loadU32(0) != 0 || revision < 0 || revision > 399) return 2
+    val hart=p4CpuRetainedHart()
+    if (hart > u32(1) || (p4CpuRetainedStatus()&u32(8)) != u32(0)) return 3
+    var offset=4
+    while (offset < 816) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(0,0x50345243);r.storeU32(4,1);r.storeU32(8,int(hart));r.storeU32(24,revision)
+    return esp32p4CpuRetainedContinueOwned(r,true)
+}
+trusted fun esp32p4CpuRetainedInvokeOwned(r: NativeBuffer,callback: int,context: u32,exclusivePublished: bool): int {
+    if (!exclusivePublished || !p4CpuRetainedRecord(r) || r.loadU32(0) != 0x50345243 || r.loadU32(4) != 4) return 2
+    if (!p4CpuRetainedOwned(r)) return 3
+    r.storeU32(4,5)
+    val core=esp32p4CpuRetainedCore(r)
+    val result=p4CpuRetainedInvoke(core,callback,context,r.loadU32(24))
+    if (core.loadU32(0) == 0) {
+        r.storeU32(4,4)
+        return p4CpuRetainedResult(r,5,result)
+    }
+    if (core.loadU32(0) != 0x50344358 || core.loadU32(8) != r.loadU32(8) ||
+        (core.loadU32(4) != 2 && core.loadU32(4) != 3)) return p4CpuRetainedResult(r,9,result)
+    r.storeU32(16,core.loadU32(16));r.storeU32(4,6)
+    return p4CpuRetainedResult(r,if (core.loadU32(4) == 3) 6 else 7,0)
+}
+trusted fun esp32p4CpuRetainedCloseOwned(r: NativeBuffer,exclusiveCacheRecovered: bool): int {
+    if (!exclusiveCacheRecovered || !p4CpuRetainedRecord(r) || r.loadU32(0) != 0x50345243 ||
+        r.loadU32(4) < 1 || r.loadU32(4) > 10) return 2
+    if (!p4CpuRetainedOwned(r)) return 3
+    if (r.loadU32(4) == 5) return 9
+    if (r.loadU32(4) < 7) r.storeU32(4,7)
+    while (r.loadU32(4) < 10) {
+        val step=r.loadU32(4)
+        val child=if (step == 7) p4CpuRetainedFpu(r) else if (step == 8) p4CpuRetainedClic(r) else p4CpuRetainedAux(r)
+        if (child.loadU32(0) != 0 && child.loadU32(4) != 3) {
+            val result=if (step == 7) esp32p4SleepFpuRestoreOwned(child,true)
+                else if (step == 8) esp32p4SleepClicRestoreOwned(child,true)
+                else esp32p4CpuAuxRestoreOwned(child,true)
+            if (result != 4) return p4CpuRetainedResult(r,4,result)
+        }
+        r.storeU32(4,step+1)
+    }
+    return p4CpuRetainedResult(r,8,0)
+}

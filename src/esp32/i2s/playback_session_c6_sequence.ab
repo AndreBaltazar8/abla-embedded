@@ -1,0 +1,76 @@
+import "./audio_rate_c6_sequence.ab"
+import "./playback_finish_c6_sequence.ab"
+// 348B aligned retained RAM:tag0,state4,primary8,cleanup12,descriptors16,
+// count20,buffers24,stride28,bytes32,channel36,setup172@40,start72@212,
+// finish64@284. Caller exclusively owns these spans, pins, root clocks,
+// codec/GDMA/ETM/IRQ and initialized FIFOs until successful close.
+// Payload must already contain the requested stereo format. Buzzer uses
+// encodePcm16Stereo16 plus data=slot=WS=16, shift=false, BCLK=WS pin=-1.
+// States1setup pending2start pending3playing4drained5closing6closed7failed.
+// Cancellation extension owns states8cancelling9cancelled; poll9 returns8.
+// Returns1playing2invalid3failed4drained5pending6closed7temporarily blocked.
+// No heap, reset/discard, implicit retries of START or forced success.
+fun c6PlaybackStorage(r: NativeBuffer): bool = r.hasAddressRange(0,348) && (r.addressValue()&3) == 0 && (r.addressValue()+348 <= 0x60000000 || r.addressValue() >= 0x60100000)
+trusted fun c6PlaybackValid(r: NativeBuffer): bool = c6PlaybackStorage(r) && r.loadU32(0) == 0x43365053
+trusted fun c6PlaybackFail(r: NativeBuffer,detail: int): int { r.storeU32(8,detail);r.storeU32(4,7);return 3 }
+trusted fun c6PlaybackPollOwned(r: NativeBuffer,budget: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PlaybackValid(r) || budget < 1 || budget > 1024 || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) == 9) return 8
+    if (r.loadU32(4) == 7) return 3
+    if (r.loadU32(4) == 4) return 4
+    if (r.loadU32(4) == 1) {
+        val result=c6AudioSetupWaitOwned(nativeBufferAt(r.addressValue()+40,172),polls,true)
+        if (result == 5) return 5
+        if (result != 1) return c6PlaybackFail(r,0x10000|result)
+        r.storeU32(4,2)
+    }
+    val start=nativeBufferAt(r.addressValue()+212,72)
+    if (r.loadU32(4) == 2) {
+        val result=if (start.loadU32(0) == 0) c6I2sDmaStartBeginOwned(start,r.loadU32(36),r.loadU32(16),r.loadU32(20),r.loadU32(24),r.loadU32(28),r.loadU32(32),false,polls,true)
+            else c6I2sDmaStartAdvanceOwned(start,polls,true)
+        if (result == 5) return 5
+        if (result != 1) return c6PlaybackFail(r,0x20000|result)
+        r.storeU32(4,3);return 1
+    }
+    if (r.loadU32(4) == 3) {
+        val result=c6PlaybackFinishOwned(start,nativeBufferAt(r.addressValue()+284,64),budget,polls,true)
+        if (result == 5) return 5
+        if (result == 4) { r.storeU32(12,0x30004);return 7 }
+        if (result != 1) return c6PlaybackFail(r,0x30000|result)
+        r.storeU32(4,4);r.storeU32(12,0);return 4
+    }
+    return 2
+}
+trusted fun c6PlaybackOpenOwned(r: NativeBuffer,channel: int,source: int,rootHz: int,rateHz: int,fixedBclk: int,maxPpm: int,bclk: int,ws: int,data: int,mclk: int,dataBits: int,slotBits: int,wsWidth: int,shift: bool,descriptors: int,count: int,buffers: int,stride: int,bytes: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PlaybackStorage(r) || r.loadU32(0) != 0 || channel < 0 || channel > 2 || polls < 1 || polls > 1000000 || !c6GdmaRingValid(descriptors,count,buffers,stride,bytes) || c6I2sStereoFrameWord(dataBits,slotBits,wsWidth,shift) < 0) return 2
+    if ((u32(bytes)%u32(dataBits/4)) != u32(0)) return 2
+    val address=r.addressValue()
+    if ((address < descriptors+count*12 && descriptors < address+348) || (address < buffers+(count-1)*stride+bytes && buffers < address+348)) return 2
+    var at=0
+    while (at < 348) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43365053);r.storeU32(4,7)
+    r.storeU32(16,descriptors);r.storeU32(20,count);r.storeU32(24,buffers);r.storeU32(28,stride);r.storeU32(32,bytes);r.storeU32(36,channel)
+    val result=c6AudioSetupAtRateOwned(nativeBufferAt(address+40,172),channel,source,rootHz,rateHz,fixedBclk,maxPpm,bclk,ws,data,mclk,dataBits,slotBits,wsWidth,shift,polls,true)
+    if (result != 1 && result != 5) return c6PlaybackFail(r,0x10000|result)
+    r.storeU32(4,if (result == 5) 1 else 2)
+    if (result == 5) return 5
+    return c6PlaybackPollOwned(r,1,polls,true)
+}
+// Close is deliberately NOT cancellation. First poll to drained; failures
+// before a start record exists may close immediately. An active/failed transfer
+// requires explicit stop/error handling; retain record and payload meanwhile.
+trusted fun c6PlaybackCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PlaybackValid(r) || polls < 1 || polls > 1000000) return 2
+    if (r.loadU32(4) == 6) return 6
+    if (r.loadU32(4) == 9) return 6
+    if (r.loadU32(4) != 4 && r.loadU32(4) != 5 && !(r.loadU32(4) == 7 && r.loadU32(212) == 0)) return 2
+    r.storeU32(4,5)
+    val setup=nativeBufferAt(r.addressValue()+40,172)
+    if (setup.loadU32(0) != 0) {
+        val result=c6AudioSetupCloseOwned(setup,polls,true)
+        if (result == 5) return 5
+        if (result != 6) { r.storeU32(12,0x40000|result);return 7 }
+    }
+    r.storeU32(12,0);r.storeU32(4,6);return 6
+}

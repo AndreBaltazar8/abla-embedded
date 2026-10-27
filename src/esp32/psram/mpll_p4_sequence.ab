@@ -1,0 +1,107 @@
+import "../analog/register_p4_sequence.ab"
+// Cold MPLL only. Caller excludes ALL MPLL consumers and both analog masters,
+// owns RCC/PMU throughout, executes internally, and supplies verified XTAL40
+// plus a stable/pinned analog 160MHz source. Selects the analog-master clock
+// explicitly, but does not start its upstream source. No PSRAM/AXI activation.
+// Low8:0closed1calibrated2invalid3busy/powered4MMIO5analog6timeout.
+// stage8..15, analog error16..23; attempted ownership bits24power25root26bus
+// bit27calibration active, bit28owned analog clock selection (stage11).
+// Retain returned scalar on EVERY failure.
+// Calibration END is the hardware indication used by IDF, not an independent
+// frequency measurement or external-memory timing validation.
+type P4MpllOwner = int
+fun P4MpllOwner.status(): int = this&255
+fun P4MpllOwner.ready(): bool = this.status() == 1
+trusted fun p4MpllField(address: int,mask: int,value: int): bool {
+    p4MpllWrite(address,(p4MpllRead(address)&(4294967295^mask))|value)
+    return (p4MpllRead(address)&mask) == value
+}
+trusted fun p4MpllAnalogChecked(index: int,value: int,polls: int): int {
+    val written=p4AnalogRegisterOwned(0x63,index,value,true,polls)
+    if ((written&255) != 1) return written&255
+    val read=p4AnalogRegisterOwned(0x63,index,0,false,polls)
+    if ((read&255) != 1) return read&255
+    return if (((read>>>8)&255) == value) 1 else 7
+}
+trusted fun p4MpllStartColdOwned(mhz: int,xtalMHz: int,polls: int): P4MpllOwner {
+    if ((mhz != 320 && mhz != 400 && mhz != 500) || xtalMHz != 40 || polls < 1 || polls > 1000000) return P4MpllOwner(2)
+    // No live reprogramming, implicit reset, or borrowed PLL frequency claim.
+    if ((p4MpllRead(0x5011515c)&0x01000000) != 0 || (p4MpllRead(0x500e6030)&0xc000) != 0 ||
+        (p4MpllRead(0x50120008)&0x04000000) != 0) return P4MpllOwner(3)
+    // CAL_STOP defaults to0 even with analog power OFF. It is not a busy
+    // indication in that state; cold power ownership is the exclusion guard.
+    var state=1<<24
+    if (!p4MpllField(0x5011515c,0x01000000,0x01000000)) return P4MpllOwner(state|260)
+    if ((p4MpllRead(0x50111040)&0x10000000) == 0) {
+        state=state|(1<<25)
+        if (!p4MpllField(0x50111040,0x10000000,0x10000000)) return P4MpllOwner(state|516)
+    }
+    if ((p4MpllRead(0x50120000)&0x08000000) == 0) {
+        state=state|(1<<26)
+        if (!p4MpllField(0x50120000,0x08000000,0x08000000)) return P4MpllOwner(state|772)
+    }
+    if (!p4AnalogWaitIdle(0,polls) || !p4AnalogWaitIdle(4,polls)) return P4MpllOwner(state|1027)
+    if ((p4MpllRead(0x50124034)&1) == 0) {
+        state=state|(1<<28)
+        if (!p4MpllField(0x50124034,1,1)) return P4MpllOwner(state|2820)
+    }
+    return p4MpllCalibratePreparedOwned(mhz,polls,state)
+}
+// Internal shared calibration, with power/root/analog160MHz already pinned,
+// both analog masters idle and every MPLL consumer excluded by the caller.
+// Preserve cold-owner flags; warm resume supplies no cold power ownership.
+trusted fun p4MpllCalibratePreparedOwned(mhz: int,polls: int,ownerState: int): P4MpllOwner {
+    val state=ownerState|(1<<27)
+    if (!p4MpllField(0x500e60bc,512,0)) return P4MpllOwner(state|1028)
+    var read=p4AnalogRegisterOwned(0x63,3,0,false,polls)
+    if ((read&255) != 1) return P4MpllOwner(state|1285|((read&255)<<16))
+    var result=p4MpllAnalogChecked(3,((read>>>8)&255)|48,polls)
+    if (result != 1) return P4MpllOwner(state|1285|(result<<16))
+    read=p4AnalogRegisterOwned(0x63,1,0,false,polls)
+    if ((read&255) != 1) return P4MpllOwner(state|1541|((read&255)<<16))
+    val reset=(read>>>8)&255
+    result=p4MpllAnalogChecked(1,reset&223,polls)
+    if (result != 1) return P4MpllOwner(state|1541|(result<<16))
+    result=p4MpllAnalogChecked(1,reset|32,polls)
+    if (result != 1) return P4MpllOwner(state|1797|(result<<16))
+    // XTAL40: ((MHz/20-1)<<3)|1. Exact supported values also avoid an
+    // otherwise unnecessary RV32 wide-division runtime dependency.
+    result=p4MpllAnalogChecked(2,if (mhz == 320) 121 else if (mhz == 400) 153 else 193,polls)
+    if (result != 1) return P4MpllOwner(state|2053|(result<<16))
+    var remaining=polls
+    while (remaining > 0 && (p4MpllRead(0x500e60bc)&256) == 0) remaining=remaining-1
+    if (remaining == 0) return P4MpllOwner(state|2310)
+    if (!p4MpllField(0x500e60bc,512,512)) return P4MpllOwner(state|2564)
+    return P4MpllOwner((state&0x17000000)|1)
+}
+// Explicit abort/release only after consumer gates close. On analog timeout
+// wait for BOTH masters before touching calibration/power/clocks; if still
+// busy retain everything. Partial cleanup is retryable through retained flags.
+// Bus routing/analog configuration remain changed, under caller ownership.
+trusted fun P4MpllOwner.closeOwned(polls: int): P4MpllOwner {
+    if (this < 0 || this > 0x1fffffff || polls < 1 || polls > 1000000) return this
+    var state=(this|0)&0x1f000000
+    if (state == 0) return P4MpllOwner(0)
+    if ((p4MpllRead(0x500e6030)&0xc000) != 0) return P4MpllOwner(state|3)
+    if ((p4MpllRead(0x50120000)&0x08000000) != 0) {
+        if ((p4MpllRead(0x50120008)&0x04000000) != 0 || !p4AnalogWaitIdle(0,polls) || !p4AnalogWaitIdle(4,polls)) return P4MpllOwner(state|3)
+    } else if ((state&0x18000000) != 0) return P4MpllOwner(state|3)
+    if ((state&(1<<27)) != 0) {
+        if (!p4MpllField(0x500e60bc,512,512)) return P4MpllOwner(state|2564)
+        state=state^(1<<27)
+    }
+    if ((state&(1<<28)) != 0) {
+        if (!p4MpllField(0x50124034,1,0)) return P4MpllOwner(state|2820)
+        state=state^(1<<28)
+    }
+    if ((state&(1<<24)) != 0) {
+        if (!p4MpllField(0x5011515c,0x01000000,0)) return P4MpllOwner(state|260)
+        state=state^(1<<24)
+    }
+    if ((state&(1<<25)) != 0) {
+        if (!p4MpllField(0x50111040,0x10000000,0)) return P4MpllOwner(state|516)
+        state=state^(1<<25)
+    }
+    if ((state&(1<<26)) != 0 && !p4MpllField(0x50120000,0x08000000,0)) return P4MpllOwner(state|772)
+    return P4MpllOwner(0)
+}

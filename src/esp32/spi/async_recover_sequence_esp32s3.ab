@@ -1,0 +1,55 @@
+import "./phases_async_transaction_sequence_esp32s3.ab"
+// Recover an exclusively retained failed async request, never replay it.
+// Caller supplies its ORIGINAL peripheral/pins, stable clock source and safe
+// master profile; owns all pads, has stopped other clients/DMA and deselected
+// every OTHER device. Faulted queues stay halted and require explicit disposal
+// or reinitialization after all outstanding storage obligations are resolved.
+// This does not reset a wedged controller: failure retains the gate fault.
+// report16: stage0, initializer detail4, CS-high verified8, idle verified12.
+// Result1 recovered,2 invalid,3 recovery busy,4 CS,5 clock,6 idle timeout,
+// 7 initializer failure,8 ownership lost. Original context evidence preserved.
+trusted fun esp32s3SpiAsyncRecoverOwned(context: NativeBuffer,report: NativeBuffer,
+    peripheral: int,pins: SpiPins,source: int,pre: int,cycles: int,mode: int,
+    polls: int,exclusive: bool): int {
+    if (!exclusive || spiAsyncTransactionStatus(context) != 7 ||
+        !report.hasAddressRange(0,16) ||
+        !esp32s3SpiMemoryRangeValid(peripheral,context,64) ||
+        !esp32s3SpiMemoryRangeValid(peripheral,report,16) ||
+        (report.addressValue() < context.addressValue()+64 && context.addressValue() < report.addressValue()+16) ||
+        source < 0 || source > 1 || pre < 1 || pre > 16 || cycles < 1 || cycles > 64 ||
+        (cycles == 1 && pre != 1) || mode < 0 || mode > 3 || polls < 1 || polls > 1000000) return 2
+    val select=Pin(context.loadU32(44))
+    val gate=peripheralGateAt(context.loadU32(36))
+    val owner=u32(context.loadU32(40))
+    if (!esp32s3SpiMasterPinsValid(peripheral,pins,select) || !peripheralOwnerValid(owner) ||
+        !gate.bufferDisjoint(context,64) || !gate.bufferDisjoint(report,16)) return 2
+    // The original low-level payload, if present, must not alias the report.
+    if ((context.loadU32(0)&0xffffff00) == 0x53504100) {
+        if (context.load(5) != peripheral) return 2
+        val address=context.loadU32(8);val bytes=context.load(7)
+        if (bytes > 0 && report.addressValue() < address+bytes && address < report.addressValue()+16) return 2
+    }
+    if (!gate.tryBeginRecovery(owner)) return 3
+    report.storeU32(0,0);report.storeU32(4,0);report.storeU32(8,0);report.storeU32(12,0)
+    var result=1
+    if (!select.writeLevelOwned(true)) result=4
+    else {
+        report.storeU32(8,1);context.storeU32(52,0)
+        if (!esp32s3SpiEnableBusClock(peripheral,owner)) result=5
+        else {
+            var attempt=0
+            val base=esp32s3SpiBase(peripheral)
+            while (attempt < polls && !esp32s3SpiCpuBufferIdle(base)) attempt=attempt+1
+            if (attempt == polls) result=6
+            else {
+                report.storeU32(12,1)
+                val initialized=esp32s3SpiInitializeMasterOwned(peripheral,pins,select,source,pre,cycles,mode,owner,polls)
+                report.storeU32(4,initialized)
+                if (initialized != 1) result=7
+            }
+        }
+    }
+    if (!gate.finishRecovery(owner,result == 1)) result=8
+    report.storeU32(0,result)
+    return result
+}

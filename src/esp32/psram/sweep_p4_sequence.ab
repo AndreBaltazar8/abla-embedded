@@ -1,0 +1,82 @@
+import "../sdk/raw_buffer.ab"
+import "./tuning_values_p4.ab"
+// Destructive lower-lane read training only; caller reserves aligned128B at
+// byteOffset and owns chip/pads/clocks/analog/peers, with AXI closed. Capacity
+// and profile must be verified from the current device. ROM waits may hang;
+// keep watchdog recovery. Not full-width training or an allocator-ready proof.
+// Four pass masks in16B caller storage survive failure. Uses one fixed64B
+// address-dependent reference, written/read at20MHz BEFORE any fast reads.
+// Low8:1selected2invalid3operation4no window5retest; success phase8/index16;
+// failure stage8/subsystem16. Bit32 indicates failed low-speed restoration,
+// with restoration error40..55. Never return plain success after that failure.
+fun p4PsramSweepSpan(buffer: NativeBuffer,length: int,aligned: bool): bool = buffer.hasAddressRange(0,length) &&
+    (!aligned || (buffer.addressValue()&3) == 0) && p4PsramCommandStorageSafe(buffer.addressValue(),length)
+fun p4PsramSweepDisjoint(a: NativeBuffer,alen: int,b: NativeBuffer,blen: int): bool = a.addressValue()+alen <= b.addressValue() || b.addressValue()+blen <= a.addressValue()
+// Odd-stride byte permutation exercises high bits too, unlike index XOR a
+// constant over only64 positions. Each reference byte has a unique value.
+fun p4PsramSweepReferenceByte(index: int): int = (index*73+41)&255
+trusted fun p4PsramSweepReadReference(address: int,mhz: int,scratch: NativeBuffer,work: NativeBuffer): int {
+    var i=0
+    while (i < 64) { scratch.store(i,p4PsramSweepReferenceByte(i)^255); i=i+1 }
+    val result=p4PsramSweepCommand(false,address,mhz,scratch,work)
+    if (result != 1) return (result<<8)|3
+    i=0
+    while (i < 64) { if (scratch.load(i) != p4PsramSweepReferenceByte(i)) return 4; i=i+1 }
+    return 1
+}
+trusted fun p4PsramSweepFinish(result: int,slow: int,polls: int): int {
+    val restored=p4PsramSweepSpeed(slow,slow,polls)
+    return if (restored == 1) result else (if ((result&255) == 1) (result&(-256))|3 else result)|(1<<32)|((restored&65535)<<40)
+}
+trusted fun p4PsramReadSweepOwned(mhz: int,hex16: bool,capacity: int,byteOffset: int,scratch: NativeBuffer,work: NativeBuffer,passes: NativeBuffer,polls: int): int {
+    if (!p4PsramProfileValid(mhz) || capacity < 128 || capacity > 67108864 || byteOffset < 0 || byteOffset > capacity-128 || (byteOffset&127) != 0 || polls < 1 || polls > 1000000 ||
+        !p4PsramSweepSpan(scratch,64,false) || !p4PsramSweepSpan(work,100,true) || !p4PsramSweepSpan(passes,16,true) ||
+        !p4PsramSweepDisjoint(scratch,64,work,100) || !p4PsramSweepDisjoint(scratch,64,passes,16) || !p4PsramSweepDisjoint(work,100,passes,16)) return 2
+    var phase=0
+    while (phase < 4) { passes.storeU32(phase*4,0); phase=phase+1 }
+    val slow=if (mhz == 80) 16 else if (mhz == 250) 25 else 20
+    val fast=if (mhz == 20) 20 else if (mhz == 80) 4 else 2
+    val address=if (hex16) byteOffset>>>1 else byteOffset
+    var result=p4PsramSweepSpeed(slow,slow,polls)
+    if (result != 1) return p4PsramSweepFinish(3|(1<<8)|(result<<16),slow,polls)
+    result=p4PsramSweepCandidate(0,15,polls)
+    if (result != 1) return p4PsramSweepFinish(3|(2<<8)|(result<<16),slow,polls)
+    var i=0
+    while (i < 64) { scratch.store(i,p4PsramSweepReferenceByte(i)); i=i+1 }
+    result=p4PsramSweepCommand(true,address,mhz,scratch,work)
+    if (result != 1) return p4PsramSweepFinish(3|(3<<8)|(result<<16),slow,polls)
+    result=p4PsramSweepReadReference(address,mhz,scratch,work)
+    if (result != 1) return p4PsramSweepFinish(3|(4<<8)|(result<<16),slow,polls)
+    result=p4PsramSweepSpeed(slow,fast,polls)
+    if (result != 1) return p4PsramSweepFinish(3|(5<<8)|(result<<16),slow,polls)
+    phase=0
+    while (phase < 4) {
+        var candidate=0; var bit=1; var mask=0
+        while (candidate < 31) {
+            result=p4PsramSweepCandidate(phase,candidate,polls)
+            if (result != 1) return p4PsramSweepFinish(3|(6<<8)|(result<<16),slow,polls)
+            result=p4PsramSweepReadReference(address,mhz,scratch,work)
+            if ((result&255) == 3) return p4PsramSweepFinish(3|(7<<8)|(result<<16),slow,polls)
+            if (result == 1) mask=mask|bit
+            passes.storeU32(phase*4,mask)
+            bit=bit<<1; candidate=candidate+1
+        }
+        phase=phase+1
+    }
+    phase=0
+    var selected=-1
+    while (phase < 4 && selected < 0) {
+        selected=p4PsramTuningBestWindow(passes.loadU32(phase*4),31,2)
+        if (selected < 0) phase=phase+1
+    }
+    if (selected < 0) return p4PsramSweepFinish(4,slow,polls)
+    result=p4PsramSweepCandidate(phase,selected,polls)
+    if (result != 1) return p4PsramSweepFinish(3|(8<<8)|(result<<16),slow,polls)
+    i=0
+    while (i < 4) {
+        result=p4PsramSweepReadReference(address,mhz,scratch,work)
+        if (result != 1) return p4PsramSweepFinish(5|(9<<8)|(result<<16),slow,polls)
+        i=i+1
+    }
+    return p4PsramSweepFinish(1|(phase<<8)|(selected<<16),slow,polls)
+}

@@ -1,0 +1,124 @@
+import "./binary64_esp32.ab"
+
+// Freestanding IEEE-754 binary64 addition and subtraction. The u64 ABI is
+// word-for-word identical to Xtensa's soft-double ABI, while integer-only
+// implementation prevents LLVM from recursively requesting __adddf3.
+
+@inline
+fun esp32Binary64ShiftRightSticky(value: u64, count: i32): u64 {
+    if (count <= i32(0)) return value
+    if (count >= i32(64)) return if (value == u64(0)) u64(0) else u64(1)
+    val shift = u64(count)
+    val discarded = value & ((u64(1) << shift) - u64(1))
+    val result = value >>> shift
+    return if (discarded == u64(0)) result else result | u64(1)
+}
+
+trusted fun esp32Binary64Add(left: u64, right: u64): u64 {
+    val leftSign = left & esp32Binary64SignMask
+    val rightSign = right & esp32Binary64SignMask
+    val leftExponentBits = esp32Binary64Exponent(left)
+    val rightExponentBits = esp32Binary64Exponent(right)
+    var leftSignificand = esp32Binary64Fraction(left)
+    var rightSignificand = esp32Binary64Fraction(right)
+
+    if (leftExponentBits == u32(2047)) {
+        if (leftSignificand != u64(0)) return esp32Binary64QuietNanFrom(left)
+        if (rightExponentBits == u32(2047)) {
+            if (rightSignificand != u64(0)) {
+                return esp32Binary64QuietNanFrom(right)
+            }
+            if (leftSign != rightSign) return esp32Binary64QuietNan
+        }
+        return left
+    }
+    if (rightExponentBits == u32(2047)) {
+        if (rightSignificand != u64(0)) return esp32Binary64QuietNanFrom(right)
+        return right
+    }
+
+    val leftZero = leftExponentBits == u32(0) && leftSignificand == u64(0)
+    val rightZero = rightExponentBits == u32(0) && rightSignificand == u64(0)
+    if (leftZero && rightZero) {
+        return if (leftSign == rightSign) leftSign else u64(0)
+    }
+    if (leftZero) return right
+    if (rightZero) return left
+
+    var leftExponent = if (leftExponentBits == u32(0))
+        i32(1) else i32(leftExponentBits)
+    var rightExponent = if (rightExponentBits == u32(0))
+        i32(1) else i32(rightExponentBits)
+    if (leftExponentBits != u32(0)) {
+        leftSignificand = leftSignificand | esp32Binary64HiddenBit
+    }
+    if (rightExponentBits != u32(0)) {
+        rightSignificand = rightSignificand | esp32Binary64HiddenBit
+    }
+
+    // Keep the larger magnitude on the left so unlike-sign subtraction never
+    // underflows the unsigned significand.
+    var largeSign = leftSign
+    var largeExponent = leftExponent
+    var largeSignificand = leftSignificand
+    var smallSign = rightSign
+    var smallExponent = rightExponent
+    var smallSignificand = rightSignificand
+    if (rightExponent > leftExponent ||
+        (rightExponent == leftExponent && rightSignificand > leftSignificand)) {
+        largeSign = rightSign
+        largeExponent = rightExponent
+        largeSignificand = rightSignificand
+        smallSign = leftSign
+        smallExponent = leftExponent
+        smallSignificand = leftSignificand
+    }
+
+    var largeExtended = largeSignificand << u64(3)
+    val smallExtended = esp32Binary64ShiftRightSticky(
+        smallSignificand << u64(3), largeExponent - smallExponent
+    )
+    if (largeSign == smallSign) {
+        largeExtended = largeExtended + smallExtended
+        if ((largeExtended & (u64(1) << u64(56))) != u64(0)) {
+            largeExtended = esp32Binary64ShiftRightSticky(largeExtended, i32(1))
+            largeExponent = largeExponent + i32(1)
+        }
+    } else {
+        largeExtended = largeExtended - smallExtended
+        if (largeExtended == u64(0)) return u64(0)
+        while (largeExponent > i32(1) &&
+            (largeExtended & (u64(1) << u64(55))) == u64(0)) {
+            largeExtended = largeExtended << u64(1)
+            largeExponent = largeExponent - i32(1)
+        }
+    }
+
+    var rounded = largeExtended >>> u64(3)
+    val rounding = largeExtended & u64(7)
+    if (rounding > u64(4) ||
+        (rounding == u64(4) && (rounded & u64(1)) != u64(0))) {
+        rounded = rounded + u64(1)
+    }
+    if ((rounded & (u64(1) << u64(53))) != u64(0)) {
+        rounded = rounded >>> u64(1)
+        largeExponent = largeExponent + i32(1)
+    }
+    if (largeExponent >= i32(2047)) {
+        return largeSign | esp32Binary64Infinity
+    }
+
+    var encodedExponent = largeExponent
+    if (largeExponent == i32(1) && rounded < esp32Binary64HiddenBit) {
+        encodedExponent = i32(0)
+    }
+    return largeSign | (u64(encodedExponent) << u64(52)) |
+        (rounded & esp32Binary64FractionMask)
+}
+
+// Original ABI symbols: __adddf3 and __subdf3.
+trusted fun esp32RecoveredAdddf3(left: u64, right: u64): u64 =
+    esp32Binary64Add(left, right)
+
+trusted fun esp32RecoveredSubdf3(left: u64, right: u64): u64 =
+    esp32Binary64Add(left, right ^ esp32Binary64SignMask)

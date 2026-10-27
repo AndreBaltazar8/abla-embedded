@@ -1,0 +1,165 @@
+import "./ledc_pin_owner_c6_sequence.ab"
+import "./ledc_channel_c6_sequence.ab"
+//88B caller-owned record: tag0,status4,stage8,clock12,timer16,channel20,
+// resolution24,divider28,duty32,pin36,result40,close-phase44,pad lease40@48.
+// Whole LEDC exclusive lifetime: other channels disabled/timers paused, all
+// IRQ/ETM/PCR users joined and selected source/GPIO clocks pinned. Not a
+// per-channel allocator. Non-inverted output; caller qualifies board pin.
+// Caller supplies the actual pinned source frequency and calibrates/pins CPU
+// ROM delay timing before open or duty updates (C6 gamma requires 5us waits).
+//1ready2invalid3partial4closing5closed. Failure retains all child ownership;
+// no automatic reset/replay. Close before reusing fresh storage. After duty
+// updates, duty32/result40 describe the latest accepted update attempt.
+fun c6PwmSessionStorage(record: NativeBuffer): bool = record.hasAddressRange(0,88) &&
+    (record.addressValue()&3) == 0 && (record.addressValue()+88 <= 0x60000000 || record.addressValue() >= 0x60100000)
+trusted fun c6PwmTimerWait(timer: int,polls: int): bool {
+    var left=polls
+    while (left > 0) {
+        if ((c6LedcRead(160+timer*8)&0x4000000) == 0) return true
+        left=left-1
+    }
+    return false
+}
+trusted fun c6PwmSessionOpenOwned(record: NativeBuffer,source: int,sourceHz: int,hz: int,
+    resolution: int,timer: int,channel: int,pin: int,duty: int,polls: int,exclusive: bool): int {
+    val divider=c6LedcDividerForHz(sourceHz,hz,resolution)
+    if (!exclusive || !c6PwmSessionStorage(record) || record.loadU32(0) != 0 || divider < 0 ||
+        source < 1 || source > 3 || timer < 0 || timer > 3 || channel < 0 || channel > 5 ||
+        !esp32C6GpioNumberValid(pin) || duty < 0 || polls < 1 || polls > 1000000) return 2
+    val limit=int(u32(1)<<u32(resolution))
+    if (duty > limit || (resolution == 20 && duty == limit)) return 2
+    var at=0
+    while (at < 88) { record.storeU32(at,0);at=at+4 }
+    record.storeU32(0,0x43365057);record.storeU32(4,3);record.storeU32(8,1)
+    record.storeU32(16,timer);record.storeU32(20,channel);record.storeU32(24,resolution)
+    record.storeU32(28,divider);record.storeU32(32,duty);record.storeU32(36,pin)
+    val clock=c6LedcClockOpenOwned(source,true)
+    record.storeU32(12,clock|0);record.storeU32(40,clock.status())
+    if (!clock.ready()) return 3
+    record.storeU32(8,2)
+    var result=c6LedcTimerConfigurePausedOwned(timer,resolution,divider)
+    record.storeU32(40,result)
+    if (result != 1) return 3
+    if (!c6PwmTimerWait(timer,polls)) { record.storeU32(40,5);return 3 }
+    result=c6LedcTimerResumeOwned(timer);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,3)
+    result=c6LedcChannelStopOwned(channel,false,polls);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,4)
+    result=c6LedcPinOpenOwned(nativeBufferAt(record.addressValue()+48,40),pin,channel,false,true)
+    record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(8,5)
+    result=c6LedcChannelSetDutyOwned(channel,timer,duty,0,polls);record.storeU32(40,result)
+    if (result != 1) return 3
+    record.storeU32(4,1);return 1
+}
+// Update only the owned channel, keeping timer frequency and pad routing.
+// Admission failures leave the ready session intact. Partial writes/timeouts
+// withdraw further writes until checked completion or explicit cleanup.
+// Returns channel status1success2invalid3busy4readback5timeout6timer unavailable.
+trusted fun c6PwmSessionSetDutyOwned(record: NativeBuffer,duty: int,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PwmSessionStorage(record) || record.loadU32(0) != 0x43365057 ||
+        record.loadU32(4) != 1 || record.loadU32(8) != 5 || duty < 0 || polls < 1 || polls > 1000000) return 2
+    val timer=record.loadU32(16);val channel=record.loadU32(20)
+    if (timer > 3 || channel > 5 || (c6LedcClockRead(0)&3) != 1 ||
+        (c6LedcClockRead(4)&0x400000) == 0) return 6
+    // Reject a retuned timer: the scalar session's resolution/period still
+    // defines this channel's contract. Changing frequency is separate ownership.
+    if ((c6LedcRead(160+timer*8)&0x7fffff) != (record.loadU32(24)|(record.loadU32(28)<<5))) return 6
+    val result=c6LedcChannelSetDutyOwned(channel,timer,duty,0,polls)
+    if (result == 1 || result == 4 || result == 5) {
+        record.storeU32(32,duty);record.storeU32(40,result)
+        if (result != 1) record.storeU32(4,3)
+    }
+    return result
+}
+// Observe completion of a known timed-out initial or later duty update. Never
+// publish again. Actual-duty readback must match before ready is republished.
+trusted fun c6PwmSessionWaitDutyOwned(record: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PwmSessionStorage(record) || record.loadU32(0) != 0x43365057 ||
+        record.loadU32(4) != 3 || record.loadU32(8) != 5 || record.loadU32(40) != 5 ||
+        record.loadU32(20) > 5 || polls < 1 || polls > 1000000) return 2
+    if ((c6LedcClockRead(0)&3) != 1 || (c6LedcClockRead(4)&0x400000) == 0) return 6
+    val channel=record.loadU32(20)
+    val result=c6LedcChannelWaitOwned(channel,polls)
+    if (result != 1) return result
+    if ((c6LedcRead(channel*20+16)&0x1ffffff) != (record.loadU32(32)<<4)) return 4
+    record.storeU32(40,1);record.storeU32(4,1);return 1
+}
+// No discarded pending waveforms: wait for hardware completion, stop channel,
+// restore pad, pause owned timer, then release owned clocks. The original
+// startup result remains intact. Caller keeps clocks until return5.
+trusted fun c6PwmSessionCloseOwned(record: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || !c6PwmSessionStorage(record) || record.loadU32(0) != 0x43365057 || polls < 1 || polls > 1000000) return 2
+    val status=record.loadU32(4)
+    if (status == 5) return 5
+    if (status != 1 && status != 3 && status != 4) return 2
+    record.storeU32(4,4)
+    // Explicit isolated recovery owns phase4 until its one publication settles.
+    if (record.loadU32(44) == 4) return 4
+    val timer=record.loadU32(16);val channel=record.loadU32(20)
+    if (record.loadU32(8) >= 2 && record.loadU32(44) < 3) {
+        if ((c6LedcClockRead(0)&3) != 1 || (c6LedcClockRead(4)&0x400000) == 0 || !c6PwmTimerWait(timer,polls)) return 4
+        if (record.loadU32(44) == 0) {
+            if (c6LedcChannelWaitOwned(channel,polls) != 1) return 4
+            // Already inactive and idle-low needs no update on a paused timer.
+            if ((c6LedcRead(channel*20)&12) != 0) {
+                val stopped=c6LedcChannelStopOwned(channel,false,polls)
+                if (stopped != 1 && stopped != 5) return 4
+                record.storeU32(44,1)
+                if (stopped == 5) return 4
+            } else record.storeU32(44,1)
+        }
+        if (record.loadU32(44) == 1) {
+            if (c6LedcChannelWaitOwned(channel,polls) != 1) return 4
+            val pad=nativeBufferAt(record.addressValue()+48,40)
+            if (pad.loadU32(0) != 0 && c6LedcPinCloseOwned(pad,true) != 6) return 4
+            record.storeU32(44,2)
+        }
+        if (c6LedcTimerPauseOwned(timer) != 1) return 4
+        record.storeU32(44,3)
+    }
+    val clock=C6LedcClockOwner(record.loadU32(12)).closeOwned(true)
+    record.storeU32(12,clock|0)
+    if (clock.status() != 0) return 4
+    record.storeU32(4,5);return 5
+}
+// Explicit recovery for this session's timed-out static-duty publication.
+// NOT automatic cancellation or a general fade abort. Caller qualifies that
+// disconnecting the PWM pad (external safe bias) is safe and owns GPIO/LEDC
+// clocks, released global holds and all users. Isolation prevents a reissued
+// update from producing another external waveform. Never reset controller.
+// Phase4 records publication attempt BEFORE the write; retries only wait.
+trusted fun c6PwmSessionRecoverPublicationOwned(record: NativeBuffer,polls: int,
+    exclusive: bool,outputDisconnectSafe: bool): int {
+    if (!exclusive || !outputDisconnectSafe || !c6PwmSessionStorage(record) ||
+        record.loadU32(0) != 0x43365057 || record.loadU32(4) != 4 ||
+        record.loadU32(8) != 5 || record.loadU32(40) != 5 ||
+        (record.loadU32(44) != 0 && record.loadU32(44) != 4) || polls < 1 || polls > 1000000) return 2
+    val pin=record.loadU32(36);val channel=record.loadU32(20);val timer=record.loadU32(16)
+    if (!esp32C6GpioNumberValid(pin) || channel > 5 || timer > 3 ||
+        (c6LedcClockRead(0)&3) != 1 || (c6LedcClockRead(4)&0x400000) == 0 ||
+        (c6GpioRead(0x600960e8)&u32(3)) != u32(1) ||
+        (c6GpioRead(0x600960ec)&u32(0x400000)) == u32(0) ||
+        ((c6GpioRead(0x600960ec)>>u32(20))&u32(3)) == u32(0) ||
+        (c6GpioRead(0x6009162c)&u32(1)) == u32(0)) return 4
+    val bit=u32(1)<<u32(pin)
+    if ((c6GpioRead(0x600b102c)&bit) != u32(0) || (c6GpioRead(0x600b1028)&bit&u32(255)) != u32(0) ||
+        ((pin == 12 || pin == 13) && (c6GpioRead(0x6000f018)&u32(16384)) != u32(0)) ||
+        (c6GpioRead(0x60091554+pin*4)&u32(2047)) != u32(512|channel)) return 4
+    val offset=channel*20
+    if (record.loadU32(44) == 0) {
+        val config=c6LedcRead(offset)
+        if ((config&0x801f) != (4|timer) || (c6LedcRead(offset+12)&0x80000000) == 0 ||
+            (c6LedcRead(offset+8)&0x1ffffff) != (record.loadU32(32)<<4)) return 4
+        c6GpioWrite(0x60091028,bit)
+        if ((c6GpioRead(0x60091020)&bit) != u32(0)) return 4
+        record.storeU32(44,4)
+        c6LedcWrite(offset,(config&0xfffeffef)|16)
+    } else if ((c6GpioRead(0x60091020)&bit) != u32(0)) return 4
+    if (c6LedcChannelWaitOwned(channel,polls) != 1) return 4
+    record.storeU32(44,0)
+    return c6PwmSessionCloseOwned(record,polls,true)
+}

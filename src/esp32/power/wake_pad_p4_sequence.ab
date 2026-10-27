@@ -1,0 +1,54 @@
+import "../gpio_hold_p4_sequence.ab"
+import "abla/runtime/scalar"
+// LP GPIO0..15 input lease. Caller pins LP_GPIO/LP_IOMUX/IOMUX-APB clocks,
+// excludes sleep entry and former HP/LP/analog users, releases global holds.
+// Individual holds checked; no automatic clock, hold, PMU or trigger changes.
+// Snapshot mux11@8,LProute9@19,LPenable28,pin4@29,layout3@33,owned34.
+type P4WakePad=int
+fun P4WakePad.status(): int = this&255
+fun P4WakePad.hasSnapshot(): bool = (this&(1<<34)) != 0
+trusted fun p4WakePadField(address: int,mask: u32,value: u32): bool {
+    p4WakePadWrite(address,(p4WakePadRead(address)&(u32(0xffffffff)^mask))|(value&mask))
+    return (p4WakePadRead(address)&mask) == (value&mask)
+}
+trusted fun p4WakePadClocks(): bool = (p4WakePadRead(0x5012a000)&u32(1)) != u32(0) &&
+    (p4WakePadRead(0x5012b000)&u32(1)) != u32(0) && (p4WakePadRead(0x500e6020)&u32(8)) != u32(0)
+trusted fun p4WakePadPark(pin: int): bool {
+    val bit=u32(1)<<u32(pin)
+    p4WakePadWrite(0x5012a01c,bit)
+    if ((p4WakePadRead(0x5012a014)&bit) != u32(0)) return false
+    // LP_GPIO_OUT32 atfield3; GPIO OE override, both inversions cleared.
+    return p4WakePadField(0x5012a0f4+pin*4,u32(511),u32(258))
+}
+//1ready2invalid3held4clock5partialwrite6closed. Pull0none1up2down.
+trusted fun esp32p4WakePadOpenOwned(pin: int,pull: int,layout: int,exclusive: bool): P4WakePad {
+    if (!exclusive || pin < 0 || pin > 15 || pull < 0 || pull > 2 || (layout != 1 && layout != 3)) return P4WakePad(2)
+    if (!p4WakePadClocks()) return P4WakePad(4)
+    if (esp32P4GpioIndividualHoldOwned(layout,pin) != 0) return P4WakePad(3)
+    val mux=0x5012b008+pin*4
+    val token=(1<<34)|(if (layout == 3) 1<<33 else 0)|(pin<<29)|
+        (int(p4WakePadRead(mux)&u32(2047))<<8)|
+        (int(p4WakePadRead(0x5012a0f4+pin*4)&u32(511))<<19)|
+        (int((p4WakePadRead(0x5012a014)>>u32(pin))&u32(1))<<28)
+    if (!p4WakePadPark(pin)) return P4WakePad(token|5)
+    // Configure LP function1/input first while preserving the current owner.
+    // Disable sleep override; preserve drive strength bits0..1 and highbits.
+    val value=u32(1056)|(if (pull == 1) u32(8) else if (pull == 2) u32(4) else u32(0))
+    if (!p4WakePadField(mux,u32(2028),value) || !p4WakePadField(mux,u32(16),u32(16))) return P4WakePad(token|5)
+    return P4WakePad(token|1)
+}
+trusted fun P4WakePad.closeOwned(exclusive: bool): P4WakePad {
+    if (!exclusive || !this.hasSnapshot() || this.status() == 6) return this
+    val token=this&(~255)
+    val pin=(this>>>29)&15
+    if (!p4WakePadClocks()) return P4WakePad(token|4)
+    if (esp32P4GpioIndividualHoldOwned(if ((this&(1<<33)) != 0) 3 else 1,pin) != 0) return P4WakePad(token|3)
+    if (!p4WakePadPark(pin) ||
+        !p4WakePadField(0x5012b008+pin*4,u32(2047),u32((this>>>8)&2047)) ||
+        !p4WakePadField(0x5012a0f4+pin*4,u32(511),u32((this>>>19)&511))) return P4WakePad(token|5)
+    val enabled=(this&(1<<28)) != 0
+    val bit=u32(1)<<u32(pin)
+    if (enabled) p4WakePadWrite(0x5012a018,bit)
+    if (((p4WakePadRead(0x5012a014)&bit) != u32(0)) != enabled) return P4WakePad(token|5)
+    return P4WakePad(token|6)
+}

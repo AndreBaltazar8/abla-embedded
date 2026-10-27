@@ -1,0 +1,75 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Pure-Abla P4 L2 suspend sequence reconstructed from rev0 ROM118ee and
+// default internal table: autoload off/done, preload done, L1 sync+lock done,
+// L2 freeze(mode0)/unfreeze, then flash CLOSE_AXI. Register layout matches
+// hw_ver1/3; physical silicon validation remains required. NOT L1 shutdown,
+// PSRAM AXI gating, or proof that cache hits cannot access external data.
+// Caller owns predictor-off/current+peer cores/IRQ/DMA/cache users, completed
+// L1 dirty writeback, clocks and retained internal code/stack/record. Keep
+// these until close. No automatic timeout reset or resource release.
+// Record32B: magic,nextStep,oldAutoload,oldFreezeMode,oldCloseAXI,failure,
+// reserved[2]. Step13suspended16closed.1suspended2invalid3busy4write5pending
+// 6closed. Close completes outstanding suspend before restoring access;
+// caller must already have restored flash/PSRAM/MMU/pins/rails.
+trusted fun p4SleepL2Field(offset: int,mask: u32,value: u32): bool {
+    p4SleepL2Write(offset,(p4SleepL2Read(offset)&~mask)|(value&mask))
+    return (p4SleepL2Read(offset)&mask) == (value&mask)
+}
+trusted fun p4SleepL2Wait(offset: int,mask: u32,value: u32,polls: int): bool {
+    var left=polls
+    while (left > 0) { if ((p4SleepL2Read(offset)&mask) == value) return true;left=left-1 }
+    return false
+}
+trusted fun p4SleepL2Axi(value: u32): bool {
+    p4SleepL2FlashWrite((p4SleepL2FlashRead()&u32(0x7fffffff))|value)
+    return (p4SleepL2FlashRead()&u32(0x80000000)) == value
+}
+trusted fun esp32p4SleepL2ContinueOwned(r: NativeBuffer,polls: int,exclusiveInternal: bool): int {
+    if (!exclusiveInternal || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50343231 || r.loadU32(4) < 1 || r.loadU32(4) > 16) return 2
+    if (r.loadU32(4) == 16) return 6
+    if (r.loadU32(4) > 13) return 2
+    while (r.loadU32(4) < 13) {
+        val step=r.loadU32(4)
+        var ok=true
+        var waiting=false
+        if (step == 1) ok=p4SleepL2Field(692,u32(1),u32(0))
+        else if (step >= 2 && step <= 5) {
+            waiting=true
+            val offset=if (step == 2) 692 else if (step == 3) 680 else if (step == 4) 152 else 136
+            val mask=if (step <= 3) u32(2) else if (step == 4) u32(16) else u32(4)
+            ok=p4SleepL2Wait(offset,mask,mask,polls)
+        } else if (step == 6) ok=p4SleepL2Field(652,u32(1<<21),u32(0))
+        else if (step == 7) ok=p4SleepL2Field(652,u32(1<<20),u32(1<<20))
+        else if (step == 8 || step == 10) { waiting=true;ok=p4SleepL2Wait(652,u32(1<<22),if (step == 8) u32(1<<22) else u32(0),polls) }
+        else if (step == 9) ok=p4SleepL2Field(652,u32(1<<20),u32(0))
+        else if (step == 11) ok=p4SleepL2Field(652,u32(1<<21),u32(r.loadU32(12)))
+        else { p4SleepL2Fence();ok=p4SleepL2Axi(u32(0x80000000)) }
+        if (!ok) { r.storeU32(20,step);return if (waiting) 5 else 4 }
+        r.storeU32(4,step+1)
+    }
+    p4SleepL2Fence();r.storeU32(20,0);return 1
+}
+trusted fun esp32p4SleepL2OpenOwned(r: NativeBuffer,polls: int,exclusiveCleanInternal: bool): int {
+    if (!exclusiveCleanInternal || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    val freeze=p4SleepL2Read(652)
+    if ((freeze&u32(0x500000)) != u32(0)) return 3
+    r.storeU32(8,int(p4SleepL2Read(692)&u32(1)));r.storeU32(12,int(freeze&u32(1<<21)))
+    r.storeU32(16,int(p4SleepL2FlashRead()&u32(0x80000000)));r.storeU32(20,0);r.storeU32(24,0);r.storeU32(28,0)
+    r.storeU32(0,0x50343231);r.storeU32(4,1)
+    return esp32p4SleepL2ContinueOwned(r,polls,true)
+}
+trusted fun esp32p4SleepL2CloseOwned(r: NativeBuffer,polls: int,exclusiveMemoryRestored: bool): int {
+    if (!exclusiveMemoryRestored || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,32) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50343231 || r.loadU32(4) < 1 || r.loadU32(4) > 16) return 2
+    if (r.loadU32(4) == 16) return 6
+    if (r.loadU32(4) < 13) { val finished=esp32p4SleepL2ContinueOwned(r,polls,true);if (finished != 1) return finished }
+    if (r.loadU32(4) == 13) r.storeU32(4,14)
+    if (r.loadU32(4) == 14) {
+        if (!p4SleepL2Axi(u32(r.loadU32(16)))) { r.storeU32(20,14);return 4 }
+        p4SleepL2Fence();r.storeU32(4,15)
+    }
+    if (!p4SleepL2Field(692,u32(1),u32(r.loadU32(8)))) { r.storeU32(20,15);return 4 }
+    p4SleepL2Fence();r.storeU32(20,0);r.storeU32(4,16);return 6
+}

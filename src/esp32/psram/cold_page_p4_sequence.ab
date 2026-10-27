@@ -1,0 +1,52 @@
+import "../sdk/raw_buffer.ab"
+// Integrates configured cold PSRAM -> L2 initialization -> reserved mapped
+// page -> full-width verification. No flash-cache enable/flash MMU writes.
+// Caller owns ALL resources and cold/page records, all L2 SRAM being consumed,
+// complete internal live code/data/stack span, and excludes peers/IRQ/DMA/
+// external accesses/autoload/preload. Dirty caches already flushed/evicted.
+// Requires fresh initialized page record and cold phase8. Does not increase
+// clocks: success verifies one64KB page at current (normally20MHz) timing.
+// cold phase11cache attempted,12page attempted,13page verified. These prevent
+// ordinary cold close until this combined close drains/unmaps the page.
+// Cache geometry/SRAM reservation remains owned even after close; never hand
+// cache SRAM back to an allocator. No automatic rollback or retry on failure.
+trusted fun p4PsramColdPageStorage(cold: NativeBuffer,page: NativeBuffer): bool =
+    p4PsramColdStorage(cold) && p4PsramPageStorage(page) &&
+    (cold.addressValue()+48 <= page.addressValue() || page.addressValue()+48 <= cold.addressValue())
+trusted fun p4PsramColdPageOpenOwned(cold: NativeBuffer,page: NativeBuffer,layout: int,size: int,line: int,liveAddress: int,liveBytes: int,address: int,physical: int,polls: int): int {
+    if (!p4PsramColdPageStorage(cold,page) || !p4CacheSramSpanSafe(layout,size,liveAddress,liveBytes) ||
+        cold.addressValue() < liveAddress || cold.addressValue()+48 > liveAddress+liveBytes ||
+        page.addressValue() < liveAddress || page.addressValue()+48 > liveAddress+liveBytes ||
+        (line != 64 && line != 128) || p4PsramMmuIndex(address) < 0 || physical < 0 || (physical&65535) != 0 || polls < 1 || polls > 1000000) return 2
+    val profile=p4PsramColdPageProfile(cold)
+    if (profile == 0 || page.loadU32(0) != 0x50345047 || page.loadU32(4) != 0) return 3
+    val capacity=(profile>>>17)<<16
+    if (physical > capacity-65536) return 2
+    // Preflight vacant slot BEFORE destructive shared-cache configuration.
+    val prior=p4PsramMmuReadOwned(address,polls)
+    if (prior != 1) return p4PsramColdFailure(cold,15,if ((prior&255) == 1) 6 else prior&255)
+    cold.storeU32(4,11)
+    val cache=p4CacheL2InitializeColdOwned(layout,size,line,liveAddress,liveBytes,polls)
+    if (cache != 1) return p4PsramColdFailure(cold,16,cache)
+    cold.storeU32(4,12)
+    val opened=p4PsramPageOpenOwned(page,address,physical,capacity,line,profile&255,(profile>>>8)&255,(profile&65536) != 0,polls)
+    if (opened != 1) return p4PsramColdFailure(cold,17,opened)
+    val verified=p4PsramPageVerifyOwned(page,polls)
+    if (verified != 1) return p4PsramColdFailure(cold,18,verified)
+    cold.storeU32(4,13); cold.storeU32(36,0); cold.storeU32(40,0); return 1
+}
+trusted fun p4PsramColdPageCloseOwned(cold: NativeBuffer,page: NativeBuffer,polls: int): int {
+    if (!p4PsramColdPageStorage(cold,page) || polls < 1 || polls > 1000000) return 2
+    if (cold.loadU32(0) != 0x50345053) return 3
+    // Once page teardown succeeded, a partial clock/PLL close is retried
+    // through its existing owner without accessing a possibly unclocked MMU.
+    if (cold.loadU32(4) == 9 && page.loadU32(0) == 0x50345047 && page.loadU32(4) == 7) return p4PsramColdCloseOwned(cold,polls)
+    if (cold.loadU32(4) < 11 || cold.loadU32(4) > 13) return 3
+    // A timed-out cache initialization still owns the shared engine; do not
+    // gate PSRAM clocks until hardware completion is observed.
+    if ((p4CacheGeometryRead(152)&15) != 0) return p4PsramColdFailure(cold,19,3)
+    val closed=p4PsramPageCloseOwned(page,polls)
+    if (closed != 1) return p4PsramColdFailure(cold,19,closed)
+    cold.storeU32(4,8)
+    return p4PsramColdCloseOwned(cold,polls)
+}

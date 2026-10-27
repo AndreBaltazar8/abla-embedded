@@ -1,0 +1,409 @@
+import "tlsf_core_esp32.ab"
+import "tlsf_primitives_esp32.ab"
+import "../freertos/port_esp32.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+
+// Multi-heap operations whose semantics are ordinary memory and control flow.
+// Keeping these in Abla exposes the heap layout to LLVM and avoids using
+// Xtensa assembly for field access or ABI-only tail jumps.
+
+@inline
+trusted fun esp32MultiHeapLoadU32(address: u32): u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
+
+@inline
+trusted fun esp32MultiHeapStoreU32(address: u32, value: u32): void {
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+    return
+}
+
+trusted fun esp32MultiHeapGetBlockAddress(block: u32): u32 = block + u32(8)
+
+trusted fun esp32MultiHeapRegister(start: u32, size: u32): u32 {
+    if (start == u32(0) || size <= u32(19)) return u32(0)
+    val available = size - u32(20)
+    val control = esp32TlsfCreateWithPool(
+        start + u32(20), available, u32(0)
+    )
+    esp32MultiHeapStoreU32(start + u32(16), control)
+    if (control == u32(0)) return u32(0)
+    esp32MultiHeapStoreU32(start, u32(0))
+    val freeBytes = available - esp32TlsfSize(control)
+    esp32MultiHeapStoreU32(start + u32(4), freeBytes)
+    esp32MultiHeapStoreU32(start + u32(12), available)
+    esp32MultiHeapStoreU32(start + u32(8), freeBytes)
+    return start
+}
+
+trusted fun esp32MultiHeapGetFullBlockSize(heap: u32, memory: u32): u32 =
+    esp32MultiHeapGetAllocatedSize(heap, memory)
+
+trusted fun esp32MultiHeapGetAllocatedSize(heap: u32, memory: u32): u32 =
+    esp32TlsfBlockSize(memory)
+
+@inline
+trusted fun esp32MultiHeapBlockIsValid(heap: u32, block: u32): bool {
+    if (heap == u32(0) || block == u32(0)) return false
+    val pool = esp32TlsfGetPool(esp32MultiHeapLoadU32(heap + u32(16)))
+    val memory = esp32TlsfBlockToMemory(block)
+    memory >= pool && memory < pool + esp32MultiHeapLoadU32(heap + u32(12))
+}
+
+trusted fun esp32MultiHeapSetLock(heap: u32, lock: u32): void {
+    esp32MultiHeapStoreU32(heap, lock)
+    return
+}
+
+trusted fun esp32MultiHeapInternalLock(heap: u32): void {
+    val lock = esp32MultiHeapLoadU32(heap)
+    if (lock != u32(0)) {
+        esp32RecoveredXPortEnterCriticalTimeout(lock, u32(4294967295))
+    }
+    return
+}
+
+trusted fun esp32MultiHeapInternalUnlock(heap: u32): void {
+    val lock = esp32MultiHeapLoadU32(heap)
+    if (lock != u32(0)) esp32RecoveredVPortExitCritical(lock)
+    return
+}
+
+trusted fun esp32MultiHeapIsFree(block: u32): u32 =
+    esp32MultiHeapLoadU32(block + u32(4)) & u32(1)
+
+trusted fun esp32MultiHeapFreeSize(heap: u32): u32 =
+    if (heap == u32(0)) u32(0)
+    else esp32MultiHeapLoadU32(heap + u32(4))
+
+trusted fun esp32MultiHeapMinimumFreeSize(heap: u32): u32 =
+    if (heap == u32(0)) u32(0)
+    else esp32MultiHeapLoadU32(heap + u32(8))
+
+@inline
+trusted fun esp32MultiHeapMalloc(heap: u32, size: u32): u32 {
+    if (heap == u32(0) || size == u32(0)) return u32(0)
+    esp32MultiHeapInternalLock(heap)
+    val memory = esp32TlsfMalloc(
+        esp32MultiHeapLoadU32(heap + u32(16)), size
+    )
+    if (memory != u32(0)) {
+        val remaining = esp32MultiHeapLoadU32(heap + u32(4)) -
+            esp32TlsfBlockSize(memory) - esp32TlsfAllocationOverhead()
+        esp32MultiHeapStoreU32(heap + u32(4), remaining)
+        if (remaining < esp32MultiHeapLoadU32(heap + u32(8))) {
+            esp32MultiHeapStoreU32(heap + u32(8), remaining)
+        }
+    }
+    esp32MultiHeapInternalUnlock(heap)
+    return memory
+}
+
+// Before scheduling starts, core 1 is parked in startup synchronization and
+// cannot enter the heap. Keep the exact TLSF and accounting behavior without
+// paying for a lock that has no possible contender.
+trusted fun esp32MultiHeapMallocBeforeScheduler(
+    heap: u32,
+    size: u32
+): u32 {
+    if (heap == u32(0) || size == u32(0)) return u32(0)
+    val memory = esp32TlsfMalloc(
+        esp32MultiHeapLoadU32(heap + u32(16)), size
+    )
+    if (memory != u32(0)) {
+        val allocated = esp32TlsfBlockSize(memory)
+        val free = esp32MultiHeapLoadU32(heap + u32(4))
+        val remaining = free - allocated - esp32TlsfAllocationOverhead()
+        esp32MultiHeapStoreU32(heap + u32(4), remaining)
+        val minimum = esp32MultiHeapLoadU32(heap + u32(8))
+        if (remaining < minimum) {
+            esp32MultiHeapStoreU32(heap + u32(8), remaining)
+        }
+    }
+    return memory
+}
+
+@inline
+trusted fun esp32MultiHeapMallocInterruptStartup(
+    heap: u32,
+    size: u32
+): u32 {
+    if (heap == u32(0) || size == u32(0)) return u32(0)
+    val memory = esp32TlsfMallocInterruptStartup(
+        esp32MultiHeapLoadU32(heap + u32(16)), size
+    )
+    if (memory != u32(0)) {
+        val remaining = esp32MultiHeapLoadU32(heap + u32(4)) -
+            esp32TlsfBlockSize(memory) - esp32TlsfAllocationOverhead()
+        esp32MultiHeapStoreU32(heap + u32(4), remaining)
+        if (remaining < esp32MultiHeapLoadU32(heap + u32(8))) {
+            esp32MultiHeapStoreU32(heap + u32(8), remaining)
+        }
+    }
+    return memory
+}
+
+trusted fun esp32MultiHeapFreeBeforeScheduler(
+    heap: u32,
+    memory: u32
+): void {
+    if (heap == u32(0) || memory == u32(0)) return
+    if (!esp32MultiHeapBlockIsValid(
+        heap, esp32TlsfBlockFromMemory(memory)
+    )) ablaRuntimeTrap()
+    esp32MultiHeapStoreU32(
+        heap + u32(4),
+        esp32MultiHeapLoadU32(heap + u32(4)) +
+            esp32TlsfBlockSize(memory) + esp32TlsfAllocationOverhead()
+    )
+    esp32TlsfFree(esp32MultiHeapLoadU32(heap + u32(16)), memory)
+    return
+}
+
+trusted fun esp32MultiHeapAlignedFree(heap: u32, memory: u32): void {
+    if (heap == u32(0) || memory == u32(0)) return
+    if (!esp32MultiHeapBlockIsValid(
+        heap, esp32TlsfBlockFromMemory(memory)
+    )) ablaRuntimeTrap()
+    esp32MultiHeapInternalLock(heap)
+    esp32MultiHeapStoreU32(
+        heap + u32(4),
+        esp32MultiHeapLoadU32(heap + u32(4)) +
+            esp32TlsfBlockSize(memory) + esp32TlsfAllocationOverhead()
+    )
+    esp32TlsfFree(
+        esp32MultiHeapLoadU32(heap + u32(16)), memory
+    )
+    esp32MultiHeapInternalUnlock(heap)
+    return
+}
+
+trusted fun esp32MultiHeapResetMinimumFreeBytes(heap: u32): u32 {
+    esp32MultiHeapInternalLock(heap)
+    val oldMinimum = esp32MultiHeapLoadU32(heap + u32(8))
+    esp32MultiHeapStoreU32(heap + u32(8), esp32MultiHeapLoadU32(heap + u32(4)))
+    esp32MultiHeapInternalUnlock(heap)
+    return oldMinimum
+}
+
+trusted fun esp32MultiHeapGetFirstBlock(heap: u32): u32 {
+    if (heap == u32(0)) ablaRuntimeTrap()
+    esp32TlsfGetPool(esp32MultiHeapLoadU32(heap + u32(16))) - u32(4)
+}
+
+trusted fun esp32MultiHeapGetNextBlock(heap: u32, block: u32): u32 {
+    if (!esp32MultiHeapBlockIsValid(heap, block)) ablaRuntimeTrap()
+    val next = esp32TlsfNextBlock(block)
+    if (esp32TlsfHeaderBlockSize(next) == u32(0)) u32(0) else next
+}
+
+trusted fun esp32MultiHeapReallocate(
+    heap: u32,
+    memory: u32,
+    size: u32
+): u32 {
+    if (heap == u32(0)) ablaRuntimeTrap()
+    if (memory == u32(0)) return esp32MultiHeapMalloc(heap, size)
+    if (!esp32MultiHeapBlockIsValid(
+        heap, esp32TlsfBlockFromMemory(memory)
+    )) ablaRuntimeTrap()
+
+    esp32MultiHeapInternalLock(heap)
+    val previousSize = esp32TlsfBlockSize(memory)
+    val result = esp32TlsfReallocate(
+        esp32MultiHeapLoadU32(heap + u32(16)), memory, size
+    )
+    if (result != u32(0)) {
+        val remaining = esp32MultiHeapLoadU32(heap + u32(4)) +
+            previousSize - esp32TlsfBlockSize(result)
+        esp32MultiHeapStoreU32(heap + u32(4), remaining)
+        if (remaining < esp32MultiHeapLoadU32(heap + u32(8))) {
+            esp32MultiHeapStoreU32(heap + u32(8), remaining)
+        }
+    }
+    esp32MultiHeapInternalUnlock(heap)
+    result
+}
+
+trusted fun esp32MultiHeapAlignedAllocateOffset(
+    heap: u32,
+    size: u32,
+    alignment: u32,
+    offset: u32
+): u32 {
+    if (heap == u32(0) || size == u32(0) || alignment == u32(0) ||
+        (alignment & (alignment - u32(1))) != u32(0)) return u32(0)
+    esp32MultiHeapInternalLock(heap)
+    val result = esp32TlsfMemalignOffset(
+        esp32MultiHeapLoadU32(heap + u32(16)),
+        alignment, size, offset
+    )
+    if (result != u32(0)) {
+        val remaining = esp32MultiHeapLoadU32(heap + u32(4)) -
+            esp32TlsfBlockSize(result) - esp32TlsfAllocationOverhead()
+        esp32MultiHeapStoreU32(heap + u32(4), remaining)
+        if (remaining < esp32MultiHeapLoadU32(heap + u32(8))) {
+            esp32MultiHeapStoreU32(heap + u32(8), remaining)
+        }
+    }
+    esp32MultiHeapInternalUnlock(heap)
+    result
+}
+
+trusted fun esp32MultiHeapAlignedAllocate(
+    heap: u32,
+    size: u32,
+    alignment: u32
+): u32 = esp32MultiHeapAlignedAllocateOffset(
+    heap, size, alignment, u32(0)
+)
+
+trusted fun esp32MultiHeapCheck(heap: u32, printErrors: u32): u32 {
+    if (heap == u32(0)) ablaRuntimeTrap()
+    esp32MultiHeapInternalLock(heap)
+    val control = esp32MultiHeapLoadU32(heap + u32(16))
+    val valid = esp32TlsfCheck(control) == i32(0) &&
+        esp32TlsfCheckPool(esp32TlsfGetPool(control)) == i32(0)
+    esp32MultiHeapInternalUnlock(heap)
+    if (valid) u32(1) else u32(0)
+}
+
+trusted fun esp32MultiHeapWalk(
+    heap: u32,
+    walker: u32,
+    user: u32
+): void {
+    if (heap == u32(0)) ablaRuntimeTrap()
+    esp32MultiHeapInternalLock(heap)
+    esp32TlsfWalkPool(
+        esp32TlsfGetPool(esp32MultiHeapLoadU32(heap + u32(16))),
+        walker, user
+    )
+    esp32MultiHeapInternalUnlock(heap)
+    return
+}
+
+trusted fun esp32MultiHeapDump(heap: u32): void {
+    // Walking with the default callback keeps validation semantics without
+    // forcing a formatting/stdio dependency into every firmware image.
+    esp32MultiHeapWalk(heap, u32(0), u32(0))
+    return
+}
+
+trusted fun esp32MultiHeapGetInfo(heap: u32, information: u32): void {
+    var offset = u32(0)
+    while (offset < u32(28)) {
+        esp32MultiHeapStoreU32(information + offset, u32(0))
+        offset = offset + u32(4)
+    }
+    if (heap == u32(0)) return
+
+    esp32MultiHeapInternalLock(heap)
+    val control = esp32MultiHeapLoadU32(heap + u32(16))
+    var block = esp32TlsfGetPool(control) - u32(4)
+    var allocatedBlocks = u32(0)
+    var freeBlocks = u32(0)
+    var totalBlocks = u32(0)
+    var largestFreeBlock = u32(0)
+    while (esp32TlsfHeaderBlockSize(block) != u32(0)) {
+        val size = esp32TlsfHeaderBlockSize(block)
+        if (esp32TlsfBlockIsFree(block)) {
+            freeBlocks = freeBlocks + u32(1)
+            if (size > largestFreeBlock) largestFreeBlock = size
+        } else {
+            allocatedBlocks = allocatedBlocks + u32(1)
+        }
+        totalBlocks = totalBlocks + u32(1)
+        block = esp32TlsfNextBlock(block)
+    }
+    val freeBytes = esp32MultiHeapLoadU32(heap + u32(4))
+    val overhead = allocatedBlocks * esp32TlsfAllocationOverhead()
+    esp32MultiHeapStoreU32(information, freeBytes)
+    esp32MultiHeapStoreU32(
+        information + u32(4),
+        esp32MultiHeapLoadU32(heap + u32(12)) -
+            esp32TlsfSize(control) - freeBytes - overhead
+    )
+    esp32MultiHeapStoreU32(
+        information + u32(8), esp32TlsfFitSize(control, largestFreeBlock)
+    )
+    esp32MultiHeapStoreU32(
+        information + u32(12), esp32MultiHeapLoadU32(heap + u32(8))
+    )
+    esp32MultiHeapStoreU32(information + u32(16), allocatedBlocks)
+    esp32MultiHeapStoreU32(information + u32(20), freeBlocks)
+    esp32MultiHeapStoreU32(information + u32(24), totalBlocks)
+    esp32MultiHeapInternalUnlock(heap)
+    return
+}
+
+trusted fun esp32MultiHeapFindContainingBlock(
+    heap: u32,
+    memory: u32
+): u32 {
+    if (heap == u32(0)) return u32(0)
+    val result = esp32TlsfFindContainingBlock(
+        esp32TlsfGetPool(esp32MultiHeapLoadU32(heap + u32(16))), memory
+    )
+    if (result == u32(0)) ablaRuntimeTrap()
+    result
+}
+
+trusted fun esp32MultiHeapRestoreMinimumFreeBytes(heap: u32, minimum: u32): void {
+    esp32MultiHeapInternalLock(heap)
+    val current = esp32MultiHeapLoadU32(heap + u32(8))
+    esp32MultiHeapStoreU32(
+        heap + u32(8),
+        if (current < minimum) current else minimum
+    )
+    esp32MultiHeapInternalUnlock(heap)
+    return
+}
+
+// Source-level aliases replace assembly `jx` trampolines. LLVM can inline or
+// merge these once all callers are in the monolithic Abla module.
+trusted fun esp32MultiHeapGetBlockAddressImpl(block: u32): u32 =
+    esp32MultiHeapGetBlockAddress(block)
+
+trusted fun esp32MultiHeapGetAllocatedSizeImpl(heap: u32, memory: u32): u32 =
+    esp32MultiHeapGetAllocatedSize(heap, memory)
+
+trusted fun esp32MultiHeapRegisterImpl(start: u32, size: u32): u32 =
+    esp32MultiHeapRegister(start, size)
+
+trusted fun esp32MultiHeapMallocImpl(heap: u32, size: u32): u32 =
+    esp32MultiHeapMalloc(heap, size)
+
+trusted fun esp32MultiHeapFreeImpl(heap: u32, memory: u32): void {
+    esp32MultiHeapAlignedFree(heap, memory)
+    return
+}
+
+trusted fun esp32MultiHeapFree(heap: u32, memory: u32): void {
+    esp32MultiHeapAlignedFree(heap, memory)
+    return
+}
+
+trusted fun esp32MultiHeapReallocateImpl(heap: u32, memory: u32, size: u32): u32 =
+    esp32MultiHeapReallocate(heap, memory, size)
+
+trusted fun esp32MultiHeapAlignedAllocateImpl(
+    heap: u32,
+    size: u32,
+    alignment: u32
+): u32 = esp32MultiHeapAlignedAllocate(heap, size, alignment)
+
+trusted fun esp32MultiHeapFreeSizeImpl(heap: u32): u32 =
+    esp32MultiHeapFreeSize(heap)
+
+trusted fun esp32MultiHeapMinimumFreeSizeImpl(heap: u32): u32 =
+    esp32MultiHeapMinimumFreeSize(heap)
+
+trusted fun esp32MultiHeapGetInfoImpl(heap: u32, information: u32): void {
+    esp32MultiHeapGetInfo(heap, information)
+    return
+}
+
+trusted fun esp32MultiHeapFindContainingBlockImpl(heap: u32, memory: u32): u32 =
+    esp32MultiHeapFindContainingBlock(heap, memory)

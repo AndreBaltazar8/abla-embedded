@@ -1,0 +1,47 @@
+import "abla/runtime/scalar"
+// Borrowed, live MPLL-backed PSRAM handoff, NOT cold initialization or PLL
+// ownership. Caller excludes both CPUs/IRQ/DMA/refills and REGDMA changes,
+// writes back dirty memory first, and keeps code/constants/stack/token in
+// internal retained memory until close succeeds. No PSRAM access while owned.
+// Caller restores the original trained MPLL frequency before close; this
+// primitive never powers/reconfigures a PLL or initiates sleep itself.
+// Token: status8, old pin holds20@8, revision3 flag28, manual gates29, owned30.
+// 1parked 2invalid 3clock prerequisite 4drain timeout 5partial write 6closed.
+type P4SleepPsram=int
+fun P4SleepPsram.status(): int = this&255
+fun P4SleepPsram.hasSnapshot(): bool = (this&(1<<30)) != 0
+trusted fun p4SleepPsramClockField(mask: int,value: int): bool {
+    p4PsramClockWrite(48,(p4PsramClockRead(48)&(0xffffffff^mask))|value)
+    return (p4PsramClockRead(48)&mask) == value
+}
+trusted fun p4SleepPsramHoldField(value: int): bool {
+    p4SleepPsramHoldWrite((p4SleepPsramHoldRead()&0xfc00003f)|value)
+    return (p4SleepPsramHoldRead()&0x03ffffc0) == value
+}
+trusted fun esp32p4SleepPsramParkOwned(revision: int,regdmaBackup: bool,polls: int,exclusiveInternal: bool): P4SleepPsram {
+    if (!exclusiveInternal || revision < 0 || revision > 399 || polls < 1 || polls > 1000000) return P4SleepPsram(2)
+    if ((p4PsramClockRead(192)&0x02800000) != 0 || (p4PsramClockRead(20)&0x80000000) == 0 ||
+        (p4PsramClockRead(48)&0xf000) != 0xd000) return P4SleepPsram(3)
+    // Include command MSPI3 as well as mapped MSPI2's command and AXI FIFOs.
+    if ((p4PsramMappedRead(4096)&0x400f0) != 0 || !p4PsramMappedWaitIdle(polls)) return P4SleepPsram(4)
+    val holds=if (revision >= 300) (p4SleepPsramHoldRead()>>>6)&0xfffff else 0
+    val token=(1<<30)|(holds<<8)|(if (revision >= 300) 1<<28 else 0)|(if (!regdmaBackup) 1<<29 else 0)
+    // MSPI2/3 share source and gates: do not write them twice.
+    if (!p4SleepPsramClockField(0x3000,0)) return P4SleepPsram(token|5)
+    if (!regdmaBackup && !p4SleepPsramClockField(0xc000,0)) return P4SleepPsram(token|5)
+    if (revision >= 300 && !p4SleepPsramHoldField(0x03ffffc0)) return P4SleepPsram(token|5)
+    return P4SleepPsram(token|1)
+}
+// Explicit readiness attestation includes the original MPLL frequency/lock,
+// eFuse resume completion and REGDMA restoring gates when it owns them.
+// On failure retain the token; never release holds before source restoration.
+trusted fun P4SleepPsram.closeOwned(mpllRestored: bool,exclusiveInternal: bool): P4SleepPsram {
+    if (!exclusiveInternal || !mpllRestored || !this.hasSnapshot() || this.status() == 6) return this
+    val failed=P4SleepPsram((this&(~255))|5)
+    if ((p4PsramClockRead(192)&0x02800000) != 0 || (p4PsramClockRead(20)&0x80000000) == 0) return failed
+    if ((this&(1<<29)) != 0 && !p4SleepPsramClockField(0xc000,0xc000)) return failed
+    if ((p4PsramClockRead(48)&0xc000) != 0xc000) return failed
+    if (!p4SleepPsramClockField(0x3000,0x1000)) return failed
+    if ((this&(1<<28)) != 0 && !p4SleepPsramHoldField(((this>>>8)&0xfffff)<<6)) return failed
+    return P4SleepPsram((this&(~255))|6)
+}

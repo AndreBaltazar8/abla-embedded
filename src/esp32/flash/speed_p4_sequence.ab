@@ -1,0 +1,91 @@
+import "../sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+// Live SPLL480/core120 flash timing lease, the remaining high-speed MSPI
+// coordination path. Caller pins source/gates, excludes all flash/cache/
+// CPU/IRQ/DMA consumers, drains pending writes, and uses internal retained
+// code/stack/record throughout. This never erases/programs the flash chip.
+// Drain/close AXI -> both ports20MHz -> invalid-DQS mask -> zero DIN delays
+// and extra dummy -> ONE shared SPI0 update -> original AXI. Restore trained
+// timing first, shared update, old DQS masks/clocks, original AXI LAST.
+// No SPI1 timing-update bit exists: SPI0+180 bit6 latches BOTH ports.
+// No PSRAM timing, PLL setup, cache lifecycle or CPU-frequency change here.
+// Close requires original CPU/source timing recovered, pinned until complete.
+// Record56B: magic,next,result,detail; nine saved fields@16;reserved@52.
+// Steps1..12lower,13slow;14..25restore,26closed.1slow2invalid3clock4busy
+// 5write6updatePending7closed. Pending UPDATE is never reissued.
+fun p4FlashSpeedOffset(field: int): int = if (field == 0) 0x3c else if (field == 1) 0x14 else if (field == 2) 0x1014 else if (field == 3) 8 else if (field == 4) 0x1008 else if (field == 5) 0x184 else if (field == 6) 0x188 else if (field == 7) 0x180 else 0x1180
+fun p4FlashSpeedMask(field: int): int = if (field == 0) 0x80000001 else if (field <= 2) 0x80ffffff else if (field <= 4) 4 else if (field == 5) 0x07ffffff else if (field == 6) 0x0003ffff else 30
+trusted fun p4FlashSpeedReady(): bool = (p4FlashSpeedRccRead(20)&0x40000000) != 0 &&
+    (p4FlashSpeedRccRead(48)&0xfff) == 0x3d && (p4FlashSpeedRccRead(192)&0x01400000) == 0
+trusted fun p4FlashSpeedField(field: int,value: int): bool {
+    val offset=p4FlashSpeedOffset(field);val mask=p4FlashSpeedMask(field)
+    val old=p4FlashSpeedRead(offset)&(if (field == 7) 0xffffffbf else 0xffffffff)
+    p4FlashSpeedWrite(offset,(old&(mask^0xffffffff))|value)
+    return (p4FlashSpeedRead(offset)&mask) == value
+}
+trusted fun p4FlashSpeedResult(r: NativeBuffer,result: int,detail: int): int {
+    r.storeU32(8,result);r.storeU32(12,detail);return result
+}
+trusted fun esp32p4FlashSpeedContinueOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,56) || (r.addressValue()&3) != 0 ||
+        r.loadU32(0) != 0x50344653 || r.loadU32(4) < 1 || r.loadU32(4) > 26) return 2
+    if (r.loadU32(4) == 26) return 7
+    if (!p4FlashSpeedReady()) return p4FlashSpeedResult(r,3,0)
+    while (true) {
+        val step=r.loadU32(4)
+        if (step == 13) return p4FlashSpeedResult(r,1,0)
+        if (step == 26) return p4FlashSpeedResult(r,7,0)
+        if (step == 1 || step == 14) {
+            var remaining=polls
+            while ((p4FlashSpeedRead(0)&0x400f0) != 0 || (p4FlashSpeedRead(4096)&0x400f0) != 0 ||
+                (p4FlashSpeedRead(0x178)&0xfc000000) != 0xfc000000) {
+                remaining=remaining-1
+                if (remaining == 0) return p4FlashSpeedResult(r,4,step)
+            }
+            if (!p4FlashSpeedField(0,0x80000000)) return p4FlashSpeedResult(r,5,step)
+        } else {
+            if ((p4FlashSpeedRead(0x3c)&0x80000001) != 0x80000000) return p4FlashSpeedResult(r,4,step)
+            if (step == 10 || step == 19) {
+                r.storeU32(4,step+1);p4FlashSpeedFence()
+                p4FlashSpeedWrite(0x180,(p4FlashSpeedRead(0x180)&0xffffffbf)|64)
+                continue
+            } else if (step == 11 || step == 20) {
+                var remaining=polls
+                while ((p4FlashSpeedRead(0x180)&64) != 0) {
+                    remaining=remaining-1
+                    if (remaining == 0) return p4FlashSpeedResult(r,6,step)
+                }
+                p4FlashSpeedFence()
+            } else {
+                val field=if (step == 12 || step == 25) 0 else if (step < 10) step-1 else if (step <= 18) step-10 else if (step <= 22) step-18 else step-22
+                val value=if (field == 0 || step >= 15) r.loadU32(16+field*4) else if (field <= 2) 0x00050205 else if (field <= 4) 4 else 0
+                if (!p4FlashSpeedField(field,value)) return p4FlashSpeedResult(r,5,step)
+            }
+        }
+        r.storeU32(4,step+1)
+    }
+    return 2
+}
+trusted fun esp32p4FlashSpeedOpenOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    if (!exclusive || polls < 1 || polls > 1000000 || !r.hasAddressRange(0,56) || (r.addressValue()&3) != 0 || r.loadU32(0) != 0) return 2
+    if (!p4FlashSpeedReady()) return 3
+    if ((p4FlashSpeedRead(0x180)&64) != 0) return 4
+    var port=1
+    while (port <= 2) {
+        val clock=p4FlashSpeedRead(p4FlashSpeedOffset(port))&0x80ffffff
+        val div=if ((clock&0x80000000) != 0) 1 else ((clock>>>16)&255)+1
+        val expected=if (div == 1) 0x80000000 else ((div-1)<<16)|((div/2-1)<<8)|(div-1)
+        if ((div != 1 && (div&1) != 0) || clock != expected) return 2
+        port=port+1
+    }
+    r.storeU32(0,0x50344653);r.storeU32(4,1);r.storeU32(8,0);r.storeU32(12,0);r.storeU32(52,0)
+    var field=0
+    while (field < 9) { r.storeU32(16+field*4,p4FlashSpeedRead(p4FlashSpeedOffset(field))&p4FlashSpeedMask(field));field=field+1 }
+    return esp32p4FlashSpeedContinueOwned(r,polls,true)
+}
+trusted fun esp32p4FlashSpeedCloseOwned(r: NativeBuffer,polls: int,cpuClockRestored: bool,exclusive: bool): int {
+    if (!cpuClockRestored) return 2
+    val result=esp32p4FlashSpeedContinueOwned(r,polls,exclusive)
+    if (result != 1) return result
+    r.storeU32(4,14);return esp32p4FlashSpeedContinueOwned(r,polls,true)
+}

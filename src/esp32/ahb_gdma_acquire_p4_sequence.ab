@@ -1,0 +1,47 @@
+import "./sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+type Esp32P4AhbGdmaAcquireResult = int
+fun Esp32P4AhbGdmaAcquireResult.status(): int = this & 255
+fun Esp32P4AhbGdmaAcquireResult.cacheStatus(): int = (this >>> 8) & 255
+fun Esp32P4AhbGdmaAcquireResult.bytes(): int = (this >>> 16) & 4095
+fun Esp32P4AhbGdmaAcquireResult.events(): int = (this >>> 32) & 0xffffffff
+// Nonblocking owner poll; bounded polls apply to each cache operation only.
+// Exclusive channel/ring+global cache engine. Ring was successfully published;
+// NO CPU writes/accesses to this descriptor/payload since publication. Do not
+// reacquire a block after modifying it: invalidation would discard dirty data.
+// Descriptor-owner checking and TX writeback enabled. Does not ack/rearm/copy.
+// 1 acquired,2 invalid,3 DMA still owns,4 DMA events,5 descriptor cache failure,
+// 6 malformed/erroneous descriptor,7 payload cache failure. Retain on failure.
+trusted fun esp32p4AhbGdmaAcquireBlockOwned(channel: int,transmit: bool,
+    descriptors: int,count: int,buffers: int,stride: int,bytes: int,index: int,
+    circular: bool,polls: int,exclusive: bool): Esp32P4AhbGdmaAcquireResult {
+    if (!exclusive || channel < 0 || channel > 2 || index < 0 || index >= count ||
+        polls < 1 || polls > 1000000 || !esp32p4AhbGdmaRingLayoutValid(descriptors,count,buffers,stride,bytes)) return Esp32P4AhbGdmaAcquireResult(2)
+    val eventAddress=0x50085000+channel*16+(if (transmit) 48 else 0)
+    var events=p4AhbAcquireEvents(eventAddress)
+    val errors=if (transmit) 0xfffffff4 else 0xfffffffc
+    if ((events & errors) != 0) return Esp32P4AhbGdmaAcquireResult(4 | (events << 32))
+    val descriptor=descriptors+index*64
+    p4AhbAcquireFence()
+    val sync=p4AhbAcquireInvalidate(nativeBufferAt(descriptor,64),64,polls)
+    if (sync != 1) return Esp32P4AhbGdmaAcquireResult(5 | (sync << 8) | (events << 32))
+    p4AhbAcquireFence()
+    val flags=p4AhbAcquireLoad(descriptor)
+    if ((flags & 0x80000000) != 0) return Esp32P4AhbGdmaAcquireResult(3 | (events << 32))
+    val length=(flags >>> 12) & 4095
+    val payload=buffers+index*stride
+    val expectedNext=if (index+1 == count) (if (circular) descriptors else 0) else descriptor+64
+    if ((flags & 4095) != bytes || (flags & 0x3f000000) != 0 || length < 1 || length > bytes ||
+        (transmit && length != bytes) || p4AhbAcquireLoad(descriptor+4) != payload ||
+        p4AhbAcquireLoad(descriptor+8) != expectedNext) return Esp32P4AhbGdmaAcquireResult(6 | (events << 32))
+    // TX data was only read by DMA. RX data must be invalidated after seeing
+    // CPU descriptor ownership; descriptor and payload occupy disjoint lines.
+    if (!transmit) {
+        val dataSync=p4AhbAcquireInvalidate(nativeBufferAt(payload,stride),stride,polls)
+        if (dataSync != 1) return Esp32P4AhbGdmaAcquireResult(7 | (dataSync << 8) | (events << 32))
+        p4AhbAcquireFence()
+    }
+    events=events | p4AhbAcquireEvents(eventAddress)
+    if ((events & errors) != 0) return Esp32P4AhbGdmaAcquireResult(4 | (events << 32))
+    return Esp32P4AhbGdmaAcquireResult(1 | (length << 16) | (events << 32))
+}

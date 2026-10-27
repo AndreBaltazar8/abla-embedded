@@ -1,0 +1,64 @@
+import "../sdk/raw_buffer.ab"
+// Classic ESP32 pads0..9, including the shared GPIO32/33 crystal-pad mux.
+// Caller owns the idle touch controller, HP/RTC/analog pad users and clocks;
+// prevents sleep/global holds and serializes shared RTC register writers.
+// Does not release holds or stop an oscillator/peripheral on caller's behalf.
+fun esp32TouchPadMuxAddress(channel: int): int = if (channel < 8) 0x3FF48494+channel*4 else 0x3FF4848C
+fun esp32TouchPadMuxMask(channel: int): u32 = if (channel < 8) u32(0x180E2000) else if (channel == 8) u32(0x18058800) else u32(0x00C20620)
+fun esp32TouchPadMuxSelect(channel: int): u32 = if (channel < 8) u32(0x80000) else if (channel == 8) u32(0x40000) else u32(0x20000)
+fun esp32TouchPadOutputMask(channel: int): u32 = u32(1)<<u32(if (channel < 8) channel+24 else if (channel == 8) 22 else 23)
+fun esp32TouchPadChargeAddress(channel: int): int = 0x3FF48494+(if (channel == 8) 9 else if (channel == 9) 8 else channel)*4
+fun esp32TouchPadHoldMask(channel: int): u32 = u32(1)<<u32(if (channel < 8) 31 else if (channel == 9) 24 else 29)
+trusted fun esp32TouchPadField(address: int,mask: u32,value: u32): bool {
+    touchScanWrite(address,(touchScanRead(address)&(u32(0xFFFFFFFF)^mask))|(value&mask))
+    (touchScanRead(address)&mask) == (value&mask)
+}
+trusted fun esp32TouchPadRecordValid(record: NativeBuffer): bool = record.hasAddressRange(0,32) && (record.addressValue()&3) == 0
+// Fresh exclusive32-byte RAM record with zero magic. Returns1configured,
+// 2invalid/no writes,3held/crystal active,4partial setup (keep record/lease).
+// chargeSpeed0..7; initialVoltage0low/1high/2float. Defaults for Atom7/2.
+trusted fun esp32TouchPadOpenOwned(record: NativeBuffer,channel: int,chargeSpeed: int,initialVoltage: int,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !esp32TouchPadRecordValid(record) || channel < 0 || channel > 9 || chargeSpeed < 0 || chargeSpeed > 7 || initialVoltage < 0 || initialVoltage > 2) return 2
+    if (record.loadU32(0) != 0) return 2
+    val muxAddress=esp32TouchPadMuxAddress(channel)
+    val mux=touchScanRead(muxAddress)
+    val hold=esp32TouchPadHoldMask(channel)
+    val force=u32(1)<<u32(if (channel < 8) channel+8 else if (channel == 8) 17 else 16)
+    if ((mux&hold) != u32(0) || (touchScanRead(0x3FF480C8)&force) != u32(0) || (channel >= 8 && (mux&u32(0x80000)) != u32(0))) return 3
+    record.storeU32(4,channel); record.storeU32(8,int(mux))
+    record.storeU32(12,int(touchScanRead(0x3FF48494+channel*4)))
+    record.storeU32(16,int(touchScanRead(esp32TouchPadChargeAddress(channel))))
+    val output=esp32TouchPadOutputMask(channel)
+    record.storeU32(20,int(touchScanRead(0x3FF4840C)&output))
+    record.storeU32(24,4); record.storeU32(28,0)
+    record.storeU32(0,0x54504431)
+    touchScanWrite(0x3FF48414,output)
+    if ((touchScanRead(0x3FF4840C)&output) != u32(0)) return 4
+    if (!esp32TouchPadField(muxAddress,esp32TouchPadMuxMask(channel),esp32TouchPadMuxSelect(channel))) return 4
+    // Slope uses logical index; initial voltage uses hardware8/9 swap, as LL.
+    if (!esp32TouchPadField(0x3FF48494+channel*4,u32(0x3800000),u32(chargeSpeed)<<u32(23))) return 4
+    val mask=if (initialVoltage == 2) u32(0x100000) else u32(0x300000)
+    val value=if (initialVoltage == 2) u32(0) else u32(0x100000)|(u32(initialVoltage)<<u32(21))
+    if (!esp32TouchPadField(esp32TouchPadChargeAddress(channel),mask,value)) return 4
+    record.storeU32(24,1)
+    return 1
+}
+// Returns1restored,2invalid/notidle,4restore failure (retry with same record).
+// Call after scans finish. Restore only owned fields, not the neighboring
+// channel's fields in the shared crystal pad / swapped charge registers.
+trusted fun esp32TouchPadCloseOwned(record: NativeBuffer,exclusiveIdle: bool): int {
+    if (!exclusiveIdle || !esp32TouchPadRecordValid(record)) return 2
+    if (record.loadU32(0) != 0x54504431 || (record.loadU32(24) != 1 && record.loadU32(24) != 4)) return 2
+    val channel=record.loadU32(4)
+    if (channel < 0 || channel > 9) return 2
+    var okay=esp32TouchPadField(esp32TouchPadChargeAddress(channel),u32(0x300000),u32(record.loadU32(16)))
+    if (!esp32TouchPadField(0x3FF48494+channel*4,u32(0x3800000),u32(record.loadU32(12)))) okay=false
+    if (!esp32TouchPadField(esp32TouchPadMuxAddress(channel),esp32TouchPadMuxMask(channel),u32(record.loadU32(8)))) okay=false
+    val output=esp32TouchPadOutputMask(channel)
+    val saved=u32(record.loadU32(20))
+    touchScanWrite(if (saved != u32(0)) 0x3FF48410 else 0x3FF48414,output)
+    if ((touchScanRead(0x3FF4840C)&output) != saved) okay=false
+    if (!okay) { record.storeU32(24,4); return 4 }
+    record.storeU32(24,0); record.storeU32(0,0)
+    return 1
+}
