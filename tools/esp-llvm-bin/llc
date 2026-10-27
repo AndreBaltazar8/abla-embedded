@@ -1,18 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Code generation uses the same LLVM 23 that ablac optimizes with (built with
+# the Xtensa target, see ablac/nix/llvm.nix), so bitcode never crosses LLVM
+# versions. Espressif's toolchain is only used as an external Xtensa assembler
+# for boot/vector code whose inline assembly relies on GNU-as layout
+# directives (`.literal_position`, `.begin no-transform`).
 cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
-toolchain_root="${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}"
+assembler_root="${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}"
 cpu="${ABLA_ESP_CPU:-esp32}"
 script_root=$(cd -- "$(dirname -- "$0")" && pwd -P)
-runner=()
-if command -v steam-run >/dev/null 2>&1; then
-    runner=(steam-run)
+
+# Find the next llc on PATH after this wrapper.
+llc=""
+IFS=: read -r -a path_entries <<< "$PATH"
+for entry in "${path_entries[@]}"; do
+    [[ -n $entry && -x $entry/llc ]] || continue
+    [[ $(cd -- "$entry" && pwd -P) == "$script_root" ]] && continue
+    llc="$entry/llc"
+    break
+done
+if [[ -z $llc ]]; then
+    echo "esp-llvm-bin/llc: no LLVM llc found on PATH" >&2
+    exit 127
 fi
+tool_root=$(dirname -- "$llc")
+
+# LLVM 23.1 has no esp32s3 CPU yet (upstream main does). The S3 core is the
+# ESP32 core without the double-precision accelerator; Abla does not use the
+# S3-only vector extension.
+case "$cpu" in
+    esp32) target=(-mcpu=esp32) ;;
+    esp32s2) target=(-mcpu=esp32s2) ;;
+    esp32s3) target=(-mcpu=esp32 -mattr=-dfpaccel) ;;
+    esp32c2|esp32c3) target=(-mcpu=generic-rv32 -mattr=+m,+c,+zicsr,+zifencei) ;;
+    esp32c5|esp32c6|esp32c61|esp32h2)
+        target=(-mcpu=generic-rv32 -mattr=+m,+a,+c,+zicsr,+zifencei) ;;
+    esp32p4) target=(-mcpu=generic-rv32 -mattr=+m,+a,+c,+f,+zicsr,+zifencei) ;;
+    *) echo "esp-llvm-bin/llc: unknown ABLA_ESP_CPU '$cpu'" >&2; exit 2 ;;
+esac
+
 arguments=()
 output=""
 expect_output=false
 filetype=""
+inputs=()
 for argument in "$@"; do
     if $expect_output; then
         output="$argument"
@@ -25,29 +57,34 @@ for argument in "$@"; do
     if [[ "$argument" == -filetype=* ]]; then
         filetype="${argument#-filetype=}"
     fi
+    if [[ ($argument == *.bc || $argument == *.ll) && -f $argument ]]; then
+        inputs+=("$argument")
+    fi
     if [[ "$argument" != "--threads=1" && "$argument" != "-relocation-model=pic" ]]; then
         arguments+=("$argument")
     fi
 done
+common=("${target[@]}" -relocation-model=static --function-sections --data-sections)
 
-# Espressif LLVM's Xtensa code generator understands TLS and emits the right
-# target expressions, but its integrated assembler does not register Xtensa
-# relocation names for `.reloc` inside inline assembly.  Emit one assembly
-# stream for the whole optimized LLVM module and feed that stream to the
-# toolchain's Xtensa assembler.  The result remains one monolithic object; no
-# component boundary is introduced and LLVM has already optimized/pruned the
-# complete program before this final encoding step.
-if [[ $filetype == obj && -n $output ]]; then
+# Boot/vector code marks its assembly layout for the external assembler.
+needs_external_assembler=false
+if [[ $filetype == obj && -n $output && ${#inputs[@]} -gt 0 && $cpu == esp32* && $cpu != esp32c* && $cpu != esp32h* && $cpu != esp32p* ]]; then
+    for input in "${inputs[@]}"; do
+        if { if [[ $input == *.bc ]]; then "$tool_root/llvm-dis" "$input" -o -; else cat -- "$input"; fi; } |
+            grep -q 'ABLA_XTENSA_\|WindowVectors'; then
+            needs_external_assembler=true
+        fi
+    done
+fi
+
+if $needs_external_assembler; then
     if [[ ${ABLA_KEEP_XTENSA_INPUT:-0} == 1 ]]; then
-        for argument in "${arguments[@]}"; do
-            if [[ $argument == *.bc && -f $argument ]]; then
-                cp -- "$argument" "$output.abla-input.bc"
-            fi
-        done
+        for input in "${inputs[@]}"; do cp -- "$input" "$output.abla-input.${input##*.}"; done
     fi
+    runner=()
+    if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
     output_directory=$(cd -- "$(dirname -- "$output")" && pwd -P)
-    temporary_assembly=$(mktemp \
-        "$output_directory/.abla-xtensa.XXXXXX.s")
+    temporary_assembly=$(mktemp "$output_directory/.abla-xtensa.XXXXXX.s")
     if [[ ${ABLA_KEEP_XTENSA_ASSEMBLY:-0} != 1 ]]; then
         trap 'status=$?; if (( status == 0 )); then rm -f -- "$temporary_assembly"; fi; exit "$status"' EXIT
     fi
@@ -66,18 +103,12 @@ if [[ $filetype == obj && -n $output ]]; then
             assembly_arguments+=("$argument")
         fi
     done
-    "${runner[@]}" "$toolchain_root/bin/llc" -mcpu="$cpu" \
-        -relocation-model=static --mtext-section-literals \
-        --function-sections --data-sections \
-        "${assembly_arguments[@]}" -o "$temporary_assembly"
+    "$llc" "${common[@]}" "${assembly_arguments[@]}" -o "$temporary_assembly"
     "$script_root/prepare-xtensa-assembly" < "$temporary_assembly" | \
-    "${runner[@]}" "$toolchain_root/bin/xtensa-${cpu}-elf-clang-as" \
+    "${runner[@]}" "$assembler_root/bin/xtensa-${cpu}-elf-clang-as" \
         --text-section-literals -o "$output" -c -
 else
-    "${runner[@]}" "$toolchain_root/bin/llc" -mcpu="$cpu" \
-        -relocation-model=static --mtext-section-literals \
-        --function-sections --data-sections \
-        "${arguments[@]}"
+    "$llc" "${common[@]}" "${arguments[@]}"
 fi
 
 # Abla's MCU panic boundary traps and never unwinds, and Arduino/ESP-IDF MCU
@@ -87,7 +118,6 @@ fi
 if [[ $filetype == obj && -n "$output" && -f "$output" &&
       "${ABLA_ESP_KEEP_UNWIND:-0}" != "1" ]]; then
     temporary="$output.abla-no-eh"
-    "${runner[@]}" "$toolchain_root/bin/llvm-objcopy" \
-        --remove-section=.eh_frame "$output" "$temporary"
+    "$tool_root/llvm-objcopy" --remove-section=.eh_frame "$output" "$temporary"
     mv -f "$temporary" "$output"
 fi
