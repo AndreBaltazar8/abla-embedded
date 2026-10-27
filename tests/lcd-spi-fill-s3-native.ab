@@ -1,0 +1,105 @@
+import "../src/display/spi_fill_sequence_esp32s3.ab"
+import "../src/esp32/spi/buffer_sequence_esp32s3.ab"
+import "../src/spi/pins.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin = int
+var pinFail = -1
+trusted fun Pin.outputLevelOwned(high: bool): bool {
+    this.write(high);this.setOpenDrain(false);this.output();return pinFail != 0
+}
+trusted fun Pin.writeLevelOwned(high: bool): bool {
+    this.write(high)
+    return pinFail != (if (this == 35) 2 else if (high) 3 else 1)
+}
+trusted fun Pin.inputOwned(): bool { this.input();return pinFail != 4 }
+val storage = nativeStaticAllocate(512)
+var calls = 0
+var chunks = 0
+var failAt = -1
+var step = 0
+var bad = false
+var color = u32(0)
+fun esp32s3SpiCommandPinsValid(peripheral: int, pins: SpiPins, select: Pin, dc: Pin, shared: bool): bool =
+    peripheral == 2 && pins == spiPins(37,35,36) && select == 3 && dc == 35 && shared
+// This high-level fixture models completed/idle transfers, including failures.
+// Active-controller cleanup is covered by spi-command-cleanup-s3-native.
+trusted fun esp32s3SpiRead(address: int): int {
+    if (address != 0x60024000 && address != 0x60024030) bad=true
+    if (nativeAddressLoadU32(storage,0) != 41) bad=true
+    return 0
+}
+trusted fun esp32s3SpiWrite(address: int, value: int): void { bad = true; return }
+trusted fun checkBlitOwner(): void { if (nativeAddressLoadU32(storage, 0) != 41) bad = true; return }
+trusted fun nextBlitCall(): int { checkBlitOwner(); calls = calls + 1; if (calls - 1 == failAt) 263 else 257 }
+trusted fun esp32s3SpiCommandWordOwned(peripheral: int, select: Pin, dc: Pin,
+    command: int, value: u32, bytes: int, shared: bool): int {
+    if (step != 0 || bytes != 4 || command != (if (calls == 0) 42 else 43) ||
+        value != (if (calls == 0) u32(0x00050027) else u32(0x00070009))) bad = true
+    nextBlitCall()
+}
+trusted fun Pin.write(high: bool): void {
+    checkBlitOwner()
+    if (this == 35 && !high && step == 0) step = 1
+    else if (this == 3 && !high && step == 3) step = 4
+    else if (this == 35 && high && step == 5) step = 6
+    else if (this == 3 && high && (step == 3 || step == 4 || step == 5 || step == 6)) step = 7
+    else bad = true
+    return
+}
+trusted fun Pin.setOpenDrain(enabled: bool): void { checkBlitOwner(); if (step != 1 || enabled) bad = true; step = 2; return }
+trusted fun Pin.output(): void { checkBlitOwner(); if (step != 2) bad = true; step = 3; return }
+trusted fun Pin.input(): void { checkBlitOwner(); if (step != 7) bad = true; step = 8; return }
+trusted fun esp32s3SpiTransmitByteOwned(peripheral: int, value: int, polls: int): int {
+    if (step != 4 || value != 44 || polls != 100000) bad = true
+    step = 5; nextBlitCall()
+}
+trusted fun esp32s3SpiTransmitColorOwned(peripheral: int, value: u32, pixels: int): int {
+    if (step != 6 || value != color || pixels != (if (chunks < 3) 32 else 9)) bad = true
+    chunks = chunks + 1
+    nextBlitCall()
+}
+trusted fun resetFill(): void {
+    nativeAddressStoreU32(storage,0,0); calls = 0; chunks = 0; step = 0; bad = false; return
+}
+trusted fun runFill(x: int, width: int): SpiTransactionResult =
+    esp32s3LcdFillRect(peripheralGateAt(storage),u32(41),2,spiPins(37,35,36),Pin(3),Pin(35),
+        lcdViewValue(35,3,5,7,0),x,-1,width,4,Rgb565(int(color)),true)
+trusted fun lcdSpiFillTest(): int {
+    pinFail=0;failAt=-1
+    while (pinFail < 5) {
+        resetFill()
+        val result=runFill(-1,36)
+        val expected=if (pinFail == 0) 11 else if (pinFail == 1) 12 else if (pinFail == 2) 269 else 266|(1<<(if (pinFail == 3) 24 else 25))
+        if (result.status() != 6 || result.value() != u32(expected) || bad ||
+            step != (if (pinFail == 3) 7 else 8) ||
+            calls != (if (pinFail < 2) 2 else if (pinFail == 2) 3 else 7) ||
+            nativeAddressLoadU32(storage,0) != 0x80000000) return 7
+        pinFail=pinFail+1
+    }
+    pinFail=-1
+    var variant = 0
+    while (variant < 3) {
+        color = if (variant == 0) u32(0) else if (variant == 1) u32(0xffff) else u32(0xf800)
+        failAt = -1
+        while (failAt < 7) {
+            resetFill()
+            val result = runFill(-1,36)
+            if (result.status() != (if (failAt < 0) 1 else 6) || bad ||
+                calls != (if (failAt < 0) 7 else failAt+1) ||
+                step != (if (failAt == 0 || failAt == 1) 0 else 8) ||
+                nativeAddressLoadU32(storage,0) != (if (failAt < 0) 0 else 0x80000000)) return 1
+            if (failAt >= 0 && result.value() != u32(263)) return 2
+            failAt = failAt + 1
+        }
+        variant = variant + 1
+    }
+    failAt = -1; resetFill()
+    if (runFill(-1,-1).status() != 3 || calls != 0 || nativeAddressLoadU32(storage,0) != 0) return 3
+    if (!runFill(40,36).valid() || calls != 0 || step != 0) return 4
+    if (!runFill(-1,0).valid() || calls != 0 || step != 0) return 5
+    nativeAddressStoreU32(storage,0,42)
+    if (runFill(-1,36).status() != 2 || calls != 0 || nativeAddressLoadU32(storage,0) != 42) return 6
+    0
+}
+#exportFunction("lcdSpiFillTest", "abla_lcd_spi_fill_test")

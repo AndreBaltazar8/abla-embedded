@@ -1,0 +1,111 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/standard_session_c5_sequence.ab"
+var conf=u32(0)
+var frame=u32(0)
+var slotsReg=u32(0)
+var converter=u32(0)
+var tx=false
+var writes=0
+var drop=0
+var publications=0
+var delayed=false
+var enabled=true
+var bad=false
+trusted fun c5I2sClockRead(at: int): u32 = if (at == 0) u32(13) else if (enabled) u32(0x400000) else u32(0)
+trusted fun c5I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c5I2sRead(at: int): u32 {
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if (!delayed) conf=conf&~u32(256)
+        return conf
+    }
+    if (at == (if (tx) 0x2c else 0x28)) return frame
+    if (at == (if (tx) 0x54 else 0x50)) return slotsReg
+    if (at == 0x40 && tx) return converter
+    if (at == 0x6c) return u32(1)
+    if (at == 0x14 || at == (if (tx) 0x20 else 0x24)) return u32(0)
+    bad=true;return u32(0)
+}
+trusted fun c5I2sWrite(at: int,value: u32): void {
+    writes=writes+1
+    if (at == (if (tx) 0x24 else 0x20) && (value&u32(256)) != u32(0)) publications=publications+1
+    if (writes == drop) return
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if ((value&u32(7)) != u32(0)) bad=true
+        conf=value
+    } else if (at == (if (tx) 0x2c else 0x28)) frame=value
+    else if (at == (if (tx) 0x54 else 0x50)) slotsReg=value
+    else if (at == 0x40 && tx) converter=value
+    else bad=true
+    return
+}
+trusted fun resetModel(r: NativeBuffer): void {
+    var at=0
+    while (at < 44) { r.storeU32(at,0);at=at+4 }
+    conf=u32(0xe1ffcef8);frame=u32(0xabcdef01);slotsReg=u32(0xffffffff);converter=u32(0xffffffff)
+    writes=0;drop=0;publications=0;delayed=false;enabled=true;bad=false;return
+}
+trusted fun restored(): bool = conf == u32(0xe1ffcef8) && frame == u32(0xabcdef01) && slotsReg == u32(0xffffffff) && converter == u32(0xffffffff) && !bad
+@export("abla_i2s_standard_session_c5_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(44)
+    val r=nativeBufferAt(storage,44)
+    var direction=0
+    while (direction < 2) {
+        tx=direction == 1
+        var flags=0
+        while (flags < 64) {
+            var slots=1
+            while (slots <= 3) {
+                var bits=8
+                while (bits <= 32) {
+                    resetModel(r)
+                    if (c5I2sStandardOpenOwned(r,0,tx,bits,32,32,true,slots,flags,1,true) != 1 || publications != 1 || r.loadU32(4) != 1) return i32(1)
+                    val mask=u32(0x1eb0c8)|(if (tx) u32(32) else u32(512))
+                    val expected=u32(c5I2sStandardConfigWord(tx,slots,flags))|u32(12288)
+                    if (conf != ((u32(0xe1ffcef8)&~mask)|expected) || frame != ((u32(0xabcdef01)&u32(0x3e00))|u32(c5I2sFrameWidthWord(bits,32,32)))) return i32(2)
+                    if (c5I2sStandardCloseOwned(r,1,true) != 5 || publications != 2 || !restored()) return i32(3)
+                    val doneWrites=writes
+                    if (c5I2sStandardCloseOwned(r,1,true) != 5 || writes != doneWrites) return i32(4)
+                    bits=bits+8
+                }
+                slots=slots+1
+            }
+            flags=flags+1
+        }
+        // Every configuration write may fail; retained snapshots still restore.
+        var fault=1
+        while (fault <= 8) {
+            resetModel(r);drop=fault
+            val opened=c5I2sStandardOpenOwned(r,0,tx,16,32,32,true,3,0,1,true)
+            if (opened != 1 && opened != 3) return i32(5)
+            drop=0
+            if (c5I2sStandardCloseOwned(r,1,true) != 5 || !restored()) return i32(6)
+            // Dropped restore writes are retryable without losing originals.
+            resetModel(r)
+            if (c5I2sStandardOpenOwned(r,0,tx,16,32,32,true,3,0,1,true) != 1) return i32(7)
+            drop=writes+fault
+            val closed=c5I2sStandardCloseOwned(r,1,true)
+            if (closed != 3 && closed != 5) return i32(8)
+            drop=0
+            if (c5I2sStandardCloseOwned(r,1,true) != 5 || !restored()) return i32(9)
+            fault=fault+1
+        }
+        resetModel(r);delayed=true
+        if (c5I2sStandardOpenOwned(r,0,tx,16,32,32,true,3,0,1,true) != 4 || publications != 1) return i32(10)
+        val pendingWrites=writes
+        if (c5I2sStandardWaitOwned(r,1,true) != 4 || c5I2sStandardCloseOwned(r,1,true) != 4 || writes != pendingWrites) return i32(11)
+        enabled=false
+        if (c5I2sStandardCloseOwned(r,1,true) != 3 || writes != pendingWrites) return i32(12)
+        enabled=true;conf=conf&~u32(256)
+        if (c5I2sStandardCloseOwned(r,1,true) != 4 || publications != 2 || r.loadU32(40) != 3) return i32(13)
+        val restoringWrites=writes
+        if (c5I2sStandardCloseOwned(r,1,true) != 4 || writes != restoringWrites) return i32(14)
+        delayed=false
+        if (c5I2sStandardWaitOwned(r,1,true) != 5 || !restored() || writes != restoringWrites) return i32(15)
+        resetModel(r)
+        if (c5I2sStandardOpenOwned(r,1,tx,16,32,32,true,3,0,1,true) != 2 || c5I2sStandardOpenOwned(r,0,tx,16,32,32,true,3,0,1,false) != 2 || writes != 0 || r.loadU32(0) != 0) return i32(16)
+        direction=direction+1
+    }
+    return i32(0)
+}

@@ -1,0 +1,133 @@
+import "./cpll-p4-native.ab"
+import "./p4-clock-order-model.ab"
+import "../src/esp32/power/cpu_clock_p4_sequence.ab"
+val cpuClockRecord=nativeStaticAllocate(52)
+var cpuMem=0
+var cpuApb=0
+var cpuFrac=0
+var cpuClockWrites=0
+var cpuClockDrop=0
+var cpuUpdates=0
+var cpuStuckUpdate=0
+var cpuBad=false
+var cpuActiveDiv=0
+var cpuActiveMem=0
+var cpuActiveApb=0
+var cpuRootMHz=400
+var cpuOldRoot=0
+var cpuOldDiv=0
+var cpuOldMem=0
+var cpuOldApb=0
+fun p4CpuClockFence(): void { return }
+fun p4CpuClockRead(address: int): int {
+    if (address == 0x500e6008) return cpuMem
+    if (address == 0x500e600c) return cpuApb
+    if (address == 0x500e6010) return cpuFrac
+    return p4CpllRead(address)
+}
+fun cpuLatch(): void {
+    cpllDiv=cpllDiv&0xffffffef
+    cpuActiveDiv=cpllDiv;cpuActiveMem=cpuMem;cpuActiveApb=cpuApb;return
+}
+fun p4CpuClockWrite(address: int,value: int): void {
+    cpuClockWrites=cpuClockWrites+1
+    if (cpuClockWrites == cpuClockDrop) return
+    if (address == 0x50111040) { clockOrderCpu(cpllRoot&3,value&3);cpllRoot=value }
+    else if (address == 0x500e6004) {
+        cpllDiv=value
+        if ((value&16) != 0) {
+            cpuUpdates=cpuUpdates+1
+            if (cpuUpdates != cpuStuckUpdate) cpuLatch()
+        }
+    } else if (address == 0x500e6008) cpuMem=value
+    else if (address == 0x500e600c) cpuApb=value
+    else cpuBad=true
+    // Independent active (latched) divider model checks intermediate bus
+    // limits, not just the final shadow register values.
+    if ((cpllRoot&3) == 1) {
+        val cpu=cpuRootMHz/(((cpuActiveDiv>>>5)&255)+1)
+        val mem=cpu/((cpuActiveMem&255)+1)
+        val apb=mem/(((cpuActiveMem>>>24)&255)+1)/(((cpuActiveApb>>>16)&255)+1)
+        if (mem > 200 || apb > 100) cpuBad=true
+    }
+    return
+}
+fun seedCpuClock(mode: int): NativeBuffer {
+    seedCpll();cpllClockInspection=true
+    val source=if (mode < 6) 1 else if (mode < 11) 0 else 2
+    cpuRootMHz=if (mode < 3) 360 else if (mode < 6) 400 else if (mode < 11) 40 else 20
+    val div=if (mode < 6) (if (mode%3 == 0) 1 else if (mode%3 == 1) 2 else 4) else if (mode == 6 || mode == 11) 1 else if (mode == 7) 2 else if (mode == 8) 4 else if (mode == 9) 40 else 255
+    cpllHart=u32(mode&1);cpllRoot=0xa4000004|source;cpllDiv=0xa0000007|((div-1)<<5)
+    cpuMem=if (source == 1) (if (div == 1) 1 else 0) else if (source == 0) 1 else 0
+    cpuApb=if (source == 1) (if (div == 4) 0 else 65536) else if (source == 0) 65536 else 0
+    cpuFrac=0;cpuClockWrites=0;cpuClockDrop=0;cpuUpdates=0;cpuStuckUpdate=0;cpuBad=false
+    cpuActiveDiv=cpllDiv;cpuActiveMem=cpuMem;cpuActiveApb=cpuApb
+    cpuOldRoot=cpllRoot;cpuOldDiv=cpllDiv;cpuOldMem=cpuMem;cpuOldApb=cpuApb
+    val revision=if (mode%3 == 0) 0 else if (mode%3 == 1) 1 else 300
+    nativeBufferAt(cpllChip,256).store(2,0x50)
+    nativeBufferAt(cpllChip,256).store(3,if (revision == 0) (if (cpuRootMHz == 400) 6 else 5) else (if (cpuRootMHz == 400) 10 else 9))
+    val r=nativeBufferAt(cpuClockRecord,52)
+    var i=0
+    while (i < 48) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(48,0x1234abcd);return r
+}
+fun openCpuClock(r: NativeBuffer,mode: int): int = esp32p4CpuClockOpenOwned(r,cpuRootMHz,if (mode%3 == 0) 0 else if (mode%3 == 1) 1 else 300,3,true)
+@export("abla_cpu_clock_p4_test")
+trusted fun cpuClockTest(): i32 {
+    var mode=0
+    while (mode < 12) {
+        var fault=0
+        while (fault <= 15) {
+            // Fault injection applies to R/W fields, not to unobservable lost
+            // WT commands. Completion delays are tested separately below.
+            if (fault != 6 && fault != 8 && fault != 10 && fault != 12 && fault != 14) {
+                val r=seedCpuClock(mode);cpuClockDrop=fault
+                val opened=openCpuClock(r,mode)
+                if (opened != 1 && opened != 4) return i32(20)
+                if (opened == 4) cpuClockDrop=0
+                if (esp32p4CpuClockContinueOwned(r,3,true) != 1 || (cpllRoot&3) != 0 || (cpllDiv&0x1ffffff0) != 0 || cpuMem != 0 || cpuApb != 0) return i32(21)
+                val closed=esp32p4CpuClockCloseOwned(r,3,true)
+                if (closed != 6 && closed != 4) return i32(22)
+                cpuClockDrop=0
+                if (esp32p4CpuClockCloseOwned(r,3,true) != 6 || cpllRoot != cpuOldRoot || cpllDiv != cpuOldDiv || cpuMem != cpuOldMem || cpuApb != cpuOldApb ||
+                    cpuUpdates != 5 || cpuBad || cpllBad || r.loadU32(48) != 0x1234abcd) return i32(23)
+                val count=cpuClockWrites
+                if (esp32p4CpuClockCloseOwned(r,3,true) != 6 || cpuClockWrites != count) return i32(24)
+            }
+            fault=fault+1
+        }
+        mode=mode+1
+    }
+    var update=1
+    while (update <= 5) {
+        val r=seedCpuClock(3);cpuStuckUpdate=update
+        val opened=openCpuClock(r,3)
+        if (opened != (if (update == 1) 5 else 1)) return i32(25)
+        if (update != 1 && esp32p4CpuClockCloseOwned(r,3,true) != 5) return i32(26)
+        val count=cpuClockWrites
+        if (esp32p4CpuClockCloseOwned(r,3,true) != 5 || cpuClockWrites != count || cpuUpdates != update) return i32(27)
+        cpuLatch();cpuStuckUpdate=0
+        if (esp32p4CpuClockCloseOwned(r,3,true) != 6 || cpuUpdates != 5 || cpuBad) return i32(28)
+        update=update+1
+    }
+    // Missing PLL recovery must leave CPU undivided XTAL for the actual
+    // calibration routine; then restore the original divided CPU profile.
+    val recovered=seedCpuClock(4)
+    if (openCpuClock(recovered,4) != 1) return i32(29)
+    nativeBufferAt(cpllChip,256).store(3,9)
+    val count=cpuClockWrites
+    if (esp32p4CpuClockCloseOwned(recovered,3,true) != 3 || cpuClockWrites != count || recovered.loadU32(4) != 8 || (cpllDiv&0x1fffffe0) != 0) return i32(30)
+    if (esp32p4CpllBeginOwned(nativeBufferAt(cpllRecord,32),400,1,3,true) != 1 || esp32p4CpuClockCloseOwned(recovered,3,true) != 6 || cpuBad || cpllBad) return i32(31)
+    val wrong=seedCpuClock(0)
+    if (openCpuClock(wrong,0) != 1) return i32(32)
+    cpllHart=u32(1);val held=cpuClockWrites
+    if (esp32p4CpuClockCloseOwned(wrong,3,true) != 3 || cpuClockWrites != held) return i32(33)
+    var invalid=0
+    while (invalid < 4) {
+        val r=seedCpuClock(0)
+        if (invalid == 0) cpuMem=2 else if (invalid == 1) cpllDiv=cpllDiv|8192 else if (invalid == 2) cpuApb=0 else cpuFrac=1
+        if (openCpuClock(r,0) != 2 || r.loadU32(0) != 0 || cpuClockWrites != 0) return i32(34)
+        invalid=invalid+1
+    }
+    return i32(0)
+}

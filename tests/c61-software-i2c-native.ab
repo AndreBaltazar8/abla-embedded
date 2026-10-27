@@ -1,0 +1,92 @@
+import "../src/esp32/i2c/software_bus_c61_bindings.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c61GpioRead(address: int): u32 {
+    if (address == 0x600960c0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960c4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c61GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C61GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C61GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+fun open(): Esp32C61SoftwareI2cBus = esp32C61SoftwareI2cOpenOwned(sda,scl,5,8,true)
+@export("abla_c61_software_i2c_test")
+fun test(): int {
+    sda=0
+    while (sda < 30) {
+        scl=(sda+1)%30
+        seed()
+        var bus=open()
+        if (!bus.ready() || !bus.ownsSda() || !bus.ownsScl() || bad) return 1
+        val setupWrites=writes
+        // Actual shared transaction logic: absent slave produces address NACK,
+        // never success, and completes STOP with both open-drain latches high.
+        val tx=bus.transfer(42,NativeBuffer(0),0,NativeBuffer(0),0)
+        if (tx.status() != 5 || tx.stopStatus() != 1 || bad) return 2
+        fault=7
+        bus=bus.recoverOwned()
+        if (bus.status() != 10 || bus.ready()) return 3
+        fault=0;bus=bus.recoverOwned()
+        if (!bus.ready() || bus.closeOwned() != 0 || c61GpioRead(0x60091034) != u32(0)) return 4
+        var failed=1
+        while (failed <= setupWrites) {
+            seed();drop=failed;bus=open()
+            if (bus.status() != 1 && bus.status() != 4 && bus.status() != 5) return 5
+            drop=0
+            if (bus.closeOwned() != 0 || c61GpioRead(0x60091034) != u32(0) || bad) return 6
+            failed=failed+1
+        }
+        var conflict=1
+        while (conflict <= 6) {
+            seed();fault=conflict
+            if (conflict == 3) nativeAddressStoreU32(memory,256+52,1<<scl)
+            val denied=conflict <= 4 || (conflict == 5 && (sda < 7 || scl < 7)) ||
+                (conflict == 6 && (sda == 12 || sda == 13 || scl == 12 || scl == 13))
+            bus=open()
+            if (denied && (bus.status() != 3 || bus.ownsSda() || bus.ownsScl() || writes != 0)) return 7
+            if (!denied && !bus.ready()) return 8
+            if (bad) return 9
+            conflict=conflict+1
+        }
+        seed();fault=7;bus=open()
+        if (bus.status() != 6 || !bus.ownsSda() || !bus.ownsScl()) return 10
+        fault=0
+        if (!bus.recoverOwned().ready() || bus.closeOwned() != 0 || bad) return 11
+        sda=sda+1
+    }
+    seed()
+    if (esp32C61SoftwareI2cOpenOwned(30,1,5,8,true).status() != 2 ||
+        esp32C61SoftwareI2cOpenOwned(0,0,5,8,true).status() != 2 ||
+        esp32C61SoftwareI2cOpenOwned(0,1,5,8,false).status() != 3 || writes != 0) return 12
+    return 0
+}

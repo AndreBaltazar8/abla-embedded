@@ -1,0 +1,97 @@
+import "../src/esp32/rtc_retention_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var control=0
+var ir=0
+var dr=0
+var stage=0
+var fault=0
+var bad=false
+var writes=0
+var cancelling=false
+fun esp32S3RetentionRead(address: int): int { if (address != 0x60008140) bad=true; control }
+fun esp32S3TagRead(address: int): int { if (address == 0x600260BC) return ir; if (address != 0x600260C0) bad=true; dr }
+fun esp32S3TagBufferWrite(address: int,value: int): void { writes=writes+1; return }
+fun esp32S3CpuRetentionBufferInitOwned(cpu: NativeBuffer): bool { writes=writes+1; true }
+fun esp32S3CpuRetentionEnableOwned(cpu: NativeBuffer,d: bool,small: bool): bool {
+    if (stage != 0) bad=true
+    stage=1
+    if (fault == 1) return false
+    control=0x01004000; true
+}
+fun esp32S3TagRetentionEnableOwned(link: int,i: bool,a: int,b: int,c: int,d: bool,e: int,f: int,g: int): bool {
+    if (stage != 1) bad=true
+    stage=2
+    if (fault == 2) return false
+    control=control | 0x8000; ir=if (i) 0x80000000 else 0; dr=if (d) 0x80000000 else 0
+    true
+}
+fun esp32S3RetentionUpdate(address: int,mask: int,value: int): void {
+    if ((stage != 2 && !(cancelling && stage == 5)) || address != 0x60008140 || mask != 0x01000000 || value != 0) bad=true
+    stage=5; control=control & 0xFEFFFFFF; return
+}
+fun esp32S3CpuRetentionDisableOwned(i: bool,d: bool): bool {
+    if (cancelling) bad=true
+    if (stage != 2) bad=true
+    if (fault == 3) return false
+    stage=3; control=control & 0xFEFFFFFF; true
+}
+fun esp32S3TagRetentionDisableOwned(i: bool,d: bool): bool {
+    if (stage != (if (cancelling) 5 else 3)) bad=true
+    if (fault == 4) return false
+    stage=4; control=control & 0xFFFF7FFF; ir=0; dr=0; true
+}
+@export("abla_rtc_retention_test")
+trusted fun retentionTest(): i32 {
+    val cpu=nativeBufferAt(4096,8800)
+    val tags=nativeBufferAt(16384,16384)
+    var mask=0
+    while (mask < 4) {
+        val i=esp32S3TagPlan(false,32768,8,32,0,if ((mask & 1) != 0) 8192 else 0,false)
+        val d=esp32S3TagPlan(true,32768,4,32,0,if ((mask & 2) != 0) 8192 else 0,false)
+        fault=0
+        while (fault < 5) {
+            control=0; ir=0; dr=0; stage=0; bad=false
+            val arm=esp32S3RetentionArmOwned(cpu,tags,i,d,false)
+            if (fault == 1) { if (arm != 2 || stage != 1) return i32(1) }
+            else if (fault == 2) { if (arm != 3 || stage != 5 || (control & 0x01000000) != 0) return i32(2) }
+            else {
+                if (arm != 1 || stage != 2) return i32(3)
+                val end=esp32S3RetentionFinishOwned(i,d)
+                if (end != (if (fault == 3) 2 else if (fault == 4) 3 else 1)) return i32(4)
+                val saved=fault
+                if (fault == 3 || fault == 4) { fault=0; if (esp32S3RetentionFinishOwned(i,d) != 1) return i32(5); fault=saved }
+                if (stage != 4) return i32(6)
+            }
+            if (bad) return i32(7)
+            fault=fault+1
+        }
+        // Cancellation after rejection must disarm without the CPU/cache
+        // invalidation path; failed tag cleanup remains explicitly retryable.
+        cancelling=true
+        var retryCase=0
+        while (retryCase < 2) {
+            control=0; ir=0; dr=0; stage=0; fault=0; bad=false
+            if (esp32S3RetentionArmOwned(cpu,tags,i,d,false) != 1) return i32(12)
+            fault=if (retryCase == 0) 0 else 4
+            val cancelled=esp32S3RetentionCancelOwned(i,d)
+            if (cancelled != (retryCase == 0) || bad || (control & 0x01000000) != 0) return i32(13)
+            if (!cancelled) {
+                if (stage != 5 || (control & 0x8000) == 0) return i32(14)
+                fault=0
+                if (!esp32S3RetentionCancelOwned(i,d)) return i32(15)
+            }
+            if (stage != 4 || bad) return i32(16)
+            retryCase=retryCase+1
+        }
+        cancelling=false
+        control=0; ir=0; dr=0; stage=0; writes=0
+        if (esp32S3RetentionArmOwned(cpu,tags,i,d,true) != 0 || stage != 0) return i32(11)
+        if (esp32S3RetentionInitOwned(cpu,nativeBufferAt(8192,16384),i,d) || writes != 0) return i32(8)
+        if (!esp32S3RetentionInitOwned(cpu,tags,i,d) || writes < 3) return i32(9)
+        control=0x8000; writes=0
+        if (esp32S3RetentionInitOwned(cpu,tags,i,d) || writes != 0) return i32(10)
+        mask=mask+1
+    }
+    i32(0)
+}

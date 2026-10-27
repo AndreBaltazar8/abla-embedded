@@ -1,0 +1,141 @@
+import "../src/esp32/flash/speed_p4_sequence.ab"
+import "abla/build"
+import "./p4-clock-order-model.ab"
+val fsMemory=nativeStaticAllocate(8192)
+val fsOriginal=nativeStaticAllocate(8192)
+val fsRecord=nativeStaticAllocate(60)
+val fsLatched=nativeStaticAllocate(16)
+var fsWrites=0
+var fsDrop=0
+var fsUpdates=0
+var fsStuck=0
+var fsReady=true
+var fsBusy=false
+var fsBad=false
+var fsPllStatus=0x3cc
+fun fsOffset(i: int): int = if (i == 0) 60 else if (i == 1) 20 else if (i == 2) 4116 else if (i == 3) 8 else if (i == 4) 4104 else if (i == 5) 388 else if (i == 6) 392 else if (i == 7) 384 else 4480
+fun fsMask(i: int): int = if (i == 0) 0x80000001 else if (i <= 2) 0x80ffffff else if (i <= 4) 4 else if (i == 5) 0x07ffffff else if (i == 6) 0x3ffff else 30
+fun p4FlashSpeedFence(): void { return }
+fun p4FlashSpeedRccRead(offset: int): int {
+    if (offset == 188) return fsPllStatus
+    if (offset == 20) return if (fsReady) 0x40000000 else 0
+    if (offset == 48) return 0x3d
+    if (offset == 192) return 0
+    fsBad=true;return 0
+}
+fun p4FlashSpeedRead(offset: int): int {
+    if (offset == 376 && fsBusy) return 0
+    return nativeBufferAt(fsMemory,8192).loadU32(offset)
+}
+fun fsLatch(): void {
+    val mem=nativeBufferAt(fsMemory,8192);val latched=nativeBufferAt(fsLatched,16)
+    mem.storeU32(384,mem.loadU32(384)&0xffffffbf)
+    var i=0
+    while (i < 4) { latched.storeU32(i*4,mem.loadU32(fsOffset(i+5))&fsMask(i+5));i=i+1 }
+    return
+}
+fun p4FlashSpeedWrite(offset: int,value: int): void {
+    fsWrites=fsWrites+1
+    if (fsWrites == fsDrop) return
+    val mem=nativeBufferAt(fsMemory,8192)
+    if (offset != 60 && (mem.loadU32(60)&0x80000001) != 0x80000000) fsBad=true
+    if (offset == 4480 && (value&64) != 0) fsBad=true
+    mem.storeU32(offset,value)
+    if (offset == 384 && (value&64) != 0) {
+        fsUpdates=fsUpdates+1
+        if (fsUpdates != fsStuck) fsLatch()
+    }
+    if (offset == 60 && (value&0x80000001) != 0x80000000) {
+        clockOrderMemory(true,(mem.loadU32(20)&0x80ffffff) == 0x50205 && (mem.loadU32(4116)&0x80ffffff) == 0x50205)
+        var i=0
+        while (i < 4) {
+            if (nativeBufferAt(fsLatched,16).loadU32(i*4) != (mem.loadU32(fsOffset(i+5))&fsMask(i+5))) fsBad=true
+            i=i+1
+        }
+        if ((mem.loadU32(384)&64) != 0) fsBad=true
+    }
+    return
+}
+fun seedFlashSpeed(mode: int): NativeBuffer {
+    fsWrites=0;fsDrop=0;fsUpdates=0;fsStuck=0;fsReady=true;fsBusy=false;fsBad=false
+    val mem=nativeBufferAt(fsMemory,8192);val old=nativeBufferAt(fsOriginal,8192)
+    var i=0
+    while (i < 8192) { mem.storeU32(i,(0x98765000^(i*0x1021))&0xffffffff);i=i+4 }
+    mem.storeU32(0,0);mem.storeU32(4096,0);mem.storeU32(376,0xfc000000)
+    mem.storeU32(60,0x12345678|(mode&1)|((mode&2)<<30))
+    mem.storeU32(20,if ((mode&4) == 0) 0xd5000000 else 0x55010001)
+    mem.storeU32(4116,0x33030103);mem.storeU32(384,0xabc0001b);mem.storeU32(4480,0x1234001e)
+    mem.storeU32(388,0xa1249249);mem.storeU32(392,0xbb015555)
+    fsLatch()
+    i=0
+    while (i < 8192) { old.storeU32(i,mem.loadU32(i));i=i+4 }
+    val r=nativeBufferAt(fsRecord,60)
+    i=0
+    while (i < 56) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(56,0x1234abcd);return r
+}
+fun fsMemoryMatches(low: bool): bool {
+    val mem=nativeBufferAt(fsMemory,8192);val old=nativeBufferAt(fsOriginal,8192)
+    var offset=0
+    while (offset < 8192) {
+        var expected=old.loadU32(offset)
+        if (low) {
+            var field=1
+            while (field < 9) {
+                if (offset == fsOffset(field)) expected=(expected&(fsMask(field)^0xffffffff))|(if (field <= 2) 0x50205 else if (field <= 4) 4 else 0)
+                field=field+1
+            }
+        }
+        if (mem.loadU32(offset) != expected) return false
+        offset=offset+4
+    }
+    return true
+}
+@export("abla_flash_speed_p4_test")
+trusted fun flashSpeedTest(): i32 {
+    var mode=0
+    while (mode < 8) {
+        var fault=0
+        while (fault <= 22) {
+            // WT acceptance is a hardware boundary; delay it below rather
+            // than pretend an unobservably dropped command is detectable.
+            if (fault != 10 && fault != 17) {
+                val r=seedFlashSpeed(mode);fsDrop=fault
+                val opened=esp32p4FlashSpeedOpenOwned(r,2,true)
+                if (opened != 1 && opened != 5) return i32(1)
+                if (opened == 5) fsDrop=0
+                if (esp32p4FlashSpeedContinueOwned(r,2,true) != 1 || !fsMemoryMatches(true) || fsUpdates != 1) return i32(2)
+                val count=fsWrites
+                if (esp32p4FlashSpeedCloseOwned(r,2,false,true) != 2 || fsWrites != count) return i32(3)
+                val closed=esp32p4FlashSpeedCloseOwned(r,2,true,true)
+                if (closed != 7 && closed != 5) return i32(4)
+                fsDrop=0
+                if (esp32p4FlashSpeedCloseOwned(r,2,true,true) != 7 || !fsMemoryMatches(false) || fsBad || fsUpdates != 2 || r.loadU32(56) != 0x1234abcd) return i32(5)
+            }
+            fault=fault+1
+        }
+        mode=mode+1
+    }
+    var update=1
+    while (update <= 2) {
+        val r=seedFlashSpeed(1);fsStuck=update
+        if (esp32p4FlashSpeedOpenOwned(r,2,true) != (if (update == 1) 6 else 1)) return i32(6)
+        if (update == 2 && esp32p4FlashSpeedCloseOwned(r,2,true,true) != 6) return i32(7)
+        val count=fsWrites
+        if (esp32p4FlashSpeedContinueOwned(r,2,true) != 6 || fsWrites != count || (p4FlashSpeedRead(60)&0x80000001) != 0x80000000) return i32(8)
+        fsLatch();fsStuck=0
+        if (esp32p4FlashSpeedCloseOwned(r,2,true,true) != 7 || fsUpdates != 2 || !fsMemoryMatches(false) || fsBad) return i32(9)
+        update=update+1
+    }
+    val busy=seedFlashSpeed(1);fsBusy=true
+    if (esp32p4FlashSpeedOpenOwned(busy,2,true) != 4 || fsWrites != 0) return i32(10)
+    fsBusy=false
+    if (esp32p4FlashSpeedContinueOwned(busy,2,true) != 1) return i32(11)
+    fsReady=false;val count=fsWrites
+    if (esp32p4FlashSpeedCloseOwned(busy,2,true,true) != 3 || fsWrites != count) return i32(12)
+    fsReady=true
+    if (esp32p4FlashSpeedCloseOwned(busy,2,true,true) != 7 || fsBad) return i32(13)
+    val invalid=seedFlashSpeed(1);nativeBufferAt(fsMemory,8192).storeU32(20,0x20002)
+    if (esp32p4FlashSpeedOpenOwned(invalid,2,true) != 2 || invalid.loadU32(0) != 0 || fsWrites != 0) return i32(14)
+    return i32(0)
+}

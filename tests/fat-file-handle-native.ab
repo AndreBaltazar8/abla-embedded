@@ -1,0 +1,95 @@
+import "../src/storage/fat_file_handle.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val disk=nativeStaticAllocate(2048)
+var volume=FatVolume(0)
+var file=FatFile(0)
+var failRead=false
+var nested=false
+var bad=false
+var reads=0
+var writes=0
+var failWrite=0
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    reads=reads+1
+    if (nested) {
+        nested=false
+        val result=file.readAt(u32(8),0,1,8,nativeBufferAt(memory+4096,512),nativeBufferAt(memory+4608,2048))
+        if (result.status() != 12 || file.close(u32(8)) || volume.invalidate(u32(8))) bad=true
+    }
+    if (failRead) return false
+    val slot=if (lba == 0) 0 else if (lba == 81) 1 else if (lba == 82) 2 else if (lba == 113) 3 else -1
+    if (slot < 0) return false
+    val source=nativeBufferAt(disk+slot*512,512);var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,input: NativeBuffer): bool {
+    writes=writes+1
+    val slot=if (lba == 82) 2 else if (lba == 113) 3 else -1
+    if (slot < 0) { bad=true;return false }
+    val output=nativeBufferAt(disk+slot*512,512);var i=0
+    while (i < 512) { output.store(i,input.load(i));i=i+1 }
+    return writes != failWrite
+}
+@export("abla_fat_file_handle_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val storage=nativeBufferAt(memory+576,80);val work=nativeBufferAt(memory+704,2080)
+    val name=nativeBufferAt(memory+2816,16);val output=nativeBufferAt(memory+3072,512)
+    val bpb=nativeBufferAt(disk,512);val directory=nativeBufferAt(disk+512,1024)
+    var i=0;while (i < 2048) { nativeBufferAt(disk,2048).store(i,0);i=i+1 }
+    bpb.storeU16(11,512);bpb.store(13,1);bpb.storeU16(14,1);bpb.store(16,2)
+    bpb.storeU16(17,512);bpb.storeU16(22,40);bpb.storeU16(19,10113);bpb.storeU16(510,0xaa55)
+    // Root lookup crosses a sector before finding A.TXT at ordinal1,index2.
+    var entry=0;while (entry < 18) { directory.store(entry*32,229);entry=entry+1 }
+    val entryOffset=18*32
+    i=0;while (i < 11) { directory.store(entryOffset+i,32);i=i+1 }
+    directory.store(entryOffset,65);directory.store(entryOffset+8,84);directory.store(entryOffset+9,88);directory.store(entryOffset+10,84)
+    directory.storeU16(entryOffset+26,2);directory.storeU32(entryOffset+28,100)
+    i=0;while (i < 512) { nativeBufferAt(disk+1536,512).store(i,i&255);output.store(i,238);i=i+1 }
+    name.storeU16(0,97);name.storeU16(2,46);name.storeU16(4,116);name.storeU16(6,120);name.storeU16(8,116)
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,output)
+    if (volume == 0 || !fatFileInitializeFresh(storage,volume,u32(7))) return i32(2)
+    if (fatFileInitializeFresh(nativeBufferAt(boot.addressValue(),80),volume,u32(7)) || boot.loadU16(11) != 512) return i32(3)
+    file=fatFileOpen(storage,u32(7),0,name,5,8,work)
+    if (file.status() != 1 || storage.loadU32(28) != 1 || storage.loadU32(32) != 2) return i32(4)
+    if (fatFileOpen(storage,u32(7),0,name,5,8,work).status() != 12) return i32(5)
+    nested=true
+    val read=file.readAt(u32(7),90,32,8,output,work)
+    if (read.status() != 1 || read.bytesRead() != 10 || bad || output.load(0) != 90 || output.load(9) != 99) return i32(6)
+    output.store(0,238)
+    if (file.readAt(u32(7),100,1,8,output,work).status() != 2 || output.load(0) != 238) return i32(7)
+    directory.store(entryOffset+11,32)
+    val before=reads
+    if (file.readAt(u32(7),0,1,8,output,work).status() != 10 || reads != before+1 || output.load(0) != 238) return i32(8)
+    directory.store(entryOffset+11,0)
+    val old=file
+    if (!file.close(u32(7)) || file.close(u32(7)) || old.readAt(u32(7),0,1,8,output,work).status() != 13) return i32(9)
+    file=fatFileOpen(storage,u32(7),0,name,5,8,work)
+    if (file.status() != 1 || file == old || old.close(u32(7)) || old.readAt(u32(7),0,1,8,output,work).status() != 13) return i32(10)
+    val secondStorage=nativeBufferAt(memory+6720,80)
+    if (!fatFileInitializeFresh(secondStorage,volume,u32(7))) return i32(14)
+    val second=fatFileOpen(secondStorage,u32(7),0,name,5,8,work)
+    val modified=rtcCalendarDateTime(2026,9,9,12,34,56)
+    val written=file.overwriteAt(u32(7),0,1,8,output,modified,work)
+    if (second.status() != 1 || written.status() != 1 || written.dataBytesWritten() != 1 || writes != 2 ||
+        file.readAt(u32(7),0,1,8,output,work).bytesRead() != 1 || output.load(0) != 238 ||
+        second.readAt(u32(7),0,1,8,output,work).status() != 10) return i32(15)
+    failRead=true
+    if (file.readAt(u32(7),0,1,8,output,work).status() != 4 || state.loadU32(12) != 3 || output.load(0) != 238) return i32(11)
+    if (file.readAt(u32(7),0,1,8,output,work).status() != 14 || !volume.invalidate(u32(7))) return i32(12)
+    failRead=false
+    volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,output)
+    if (volume == 0 || file.readAt(u32(7),0,1,8,output,work).status() != 13) return i32(13)
+    val thirdStorage=nativeBufferAt(memory+6848,80)
+    if (!fatFileInitializeFresh(thirdStorage,volume,u32(7))) return i32(16)
+    val third=fatFileOpen(thirdStorage,u32(7),0,name,5,8,work)
+    writes=0;failWrite=2
+    val failed=third.overwriteAt(u32(7),1,1,8,output,rtcCalendarDateTime(2026,9,9,12,35,0),work)
+    if (failed.status() != 11 || failed.dataBytesWritten() != 1 || writes != 2 || state.loadU32(12) != 3 ||
+        thirdStorage.loadU32(62) == directory.loadU32(entryOffset+22)) return i32(17)
+    return i32(0)
+}

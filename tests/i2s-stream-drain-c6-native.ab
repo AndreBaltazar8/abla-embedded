@@ -1,0 +1,136 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/stream_drain_c6_sequence.ab"
+var descriptors=NativeBuffer(0)
+var drain=NativeBuffer(0)
+var channel=0
+var tail=0
+var conf=u32(0x8b004)
+var link=u32(0)
+var raw=u32(0)
+var idle=false
+var empty=true
+var dropLink=false
+var dropStop=false
+var dropAck=false
+var writes=0
+var ownerWrites=0
+var stops=0
+var acks=0
+var bad=false
+trusted fun c6I2sClockRead(at: int): u32 = if (at == 0) u32(1) else u32(0x400000)
+trusted fun c6I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6I2sRead(at: int): u32 = if (at == 0x24) conf else if (at == 0x6c) (if (idle) u32(1) else u32(0)) else u32(0)
+trusted fun c6I2sWrite(at: int,value: u32): void {
+    if (at != 0x24 || !idle || value != (conf&~u32(4))) bad=true
+    writes=writes+1;conf=value;return
+}
+trusted fun c6GdmaBusRead(): u32 = u32(1)
+trusted fun c6GdmaBusWrite(value: u32): void { bad=true;return }
+trusted fun c6GdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    if (at == 0x30+channel*16) return raw
+    if (at == 0xe0+channel*192) return link
+    if (at == 0xd8+channel*192) return if (empty) u32(2) else u32(0)
+    return u32(0)
+}
+trusted fun c6GdmaWrite(at: int,value: u32): void {
+    writes=writes+1
+    if (at == 0xe0+channel*192) {
+        stops=stops+1
+        if ((conf&u32(4)) != u32(0) || (value&u32(0x100000)) == u32(0)) bad=true
+        if (!dropStop) link=u32(0x800000)
+    } else if (at == 0x3c+channel*16) {
+        acks=acks+1
+        if (link != u32(0x800000) || (conf&u32(4)) != u32(0)) bad=true
+        if (!dropAck) raw=raw&~value
+    } else bad=true
+    return
+}
+trusted fun c6GdmaDescriptorFence(): void { return }
+trusted fun c6GdmaDescriptorRead(at: int): u32 = u32(descriptors.loadU32(at-0x40800000))
+trusted fun c6GdmaDescriptorWrite(at: int,value: u32): void {
+    writes=writes+1
+    if (at == 0x40800000+tail*12+8) {
+        if (drain.loadU32(4) != 1 || value != u32(0) || (descriptors.loadU32(tail*12)&0x80000000) != 0) bad=true
+        if (!dropLink) descriptors.storeU32(tail*12+8,0)
+    } else if (at == 0x40800000+tail*12) {
+        if (drain.loadU32(4) != 2 || descriptors.loadU32(tail*12+8) != 0 || value != u32(0xc0040040)) bad=true
+        ownerWrites=ownerWrites+1;descriptors.storeU32(tail*12,int(value))
+    } else bad=true
+    return
+}
+trusted fun clear(r: NativeBuffer): void { var at=0;while (at < r.capacity()) { r.storeU32(at,0);at=at+4 };return }
+@export("abla_i2s_stream_drain_c6_test")
+trusted fun test(): i32 {
+    val memory=nativeStaticAllocate(512)
+    val r=nativeBufferAt(memory,72);val q=nativeBufferAt(memory+72,32);drain=nativeBufferAt(memory+104,64);descriptors=nativeBufferAt(memory+168,96)
+    while (channel < 3) {
+        var count=2
+        while (count <= 8) {
+            tail=0
+            while (tail < count) {
+                var fault=0
+                while (fault < 5) {
+                    clear(r);clear(q);clear(drain);conf=u32(0x8b004);link=u32(0);raw=u32(0);idle=false;empty=true
+                    dropLink=false;dropStop=false;dropAck=false;writes=0;ownerWrites=0;stops=0;acks=0;bad=false
+                    r.storeU32(0,0x43364944);r.storeU32(4,1);r.storeU32(12,channel);r.storeU32(16,1);r.storeU32(20,0x40800000);r.storeU32(24,count);r.storeU32(28,0x40810000);r.storeU32(32,64);r.storeU32(36,64);r.storeU32(40,1);r.storeU32(52,3)
+                    var index=0
+                    while (index < count) {
+                        descriptors.storeU32(index*12,if (index == tail) 0x40040040 else 0xc0040040)
+                        descriptors.storeU32(index*12+4,0x40810000+index*64);descriptors.storeU32(index*12+8,0x40800000+((index+1)%count)*12);index=index+1
+                    }
+                    q.storeU32(0,0x43365354);q.storeU32(4,r.addressValue());q.storeU32(8,tail);q.storeU32(12,1)
+                    if (c6I2sStreamAcquireOwned(r,q,true) != 1 || c6I2sStreamDrainBeginOwned(r,q,drain,true,true) != 5 || c6I2sStreamWritableBuffer(r,q) != NativeBuffer(0) || c6I2sStreamPublishOwned(r,q,true,true) != 2) return i32(1)
+                    if (fault == 1) {
+                        dropLink=true
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 4 || ownerWrites != 0) return i32(2)
+                        dropLink=false
+                    }
+                    if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 5 || ownerWrites != 1 || stops != 0) return i32(3)
+                    if (fault == 2) {
+                        raw=u32(4)
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 3 || stops != 0 || acks != 0 || ownerWrites != 1 || bad) return i32(4)
+                    } else {
+                        // Hardware follows the live links: exactly the pending ring
+                        // remainder followed by the republished final block, then NULL.
+                        var address=0x40800000+((tail+1)%count)*12
+                        var consumed=0
+                        while (address != 0 && consumed < count+1) {
+                            index=(address-0x40800000)/12
+                            if ((descriptors.loadU32(index*12)&0x80000000) == 0) return i32(5)
+                            descriptors.storeU32(index*12,0x40040040)
+                            address=descriptors.loadU32(index*12+8);consumed=consumed+1
+                            if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 5 || stops != 0) return i32(6)
+                        }
+                        if (consumed != count || address != 0) return i32(7)
+                        raw=u32(11);empty=false
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 5 || stops != 0) return i32(8)
+                        empty=true
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 5 || stops != 0) return i32(9)
+                        idle=true;dropStop=fault == 3;dropAck=fault == 4
+                        val result=c6I2sStreamDrainPollOwned(r,q,drain,count,1,true)
+                        if (fault == 3) {
+                            if (result != 5 || stops != 1 || acks != 0) return i32(10)
+                            dropStop=false
+                            val stop=C6GdmaStop(drain.loadU32(40)).retryStopOwned(1,true)
+                            drain.storeU32(40,stop|0)
+                            if (stop.status() != 1) return i32(11)
+                        } else if (fault == 4) {
+                            if (result != 4 || acks != 1) return i32(12)
+                            dropAck=false
+                        } else if (result != 1) return i32(13)
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 1 || raw != u32(0) || ownerWrites != 1 || bad) return i32(14)
+                        val before=writes
+                        if (c6I2sStreamDrainPollOwned(r,q,drain,count,1,true) != 1 || writes != before) return i32(15)
+                    }
+                    fault=fault+1
+                }
+                tail=tail+1
+            }
+            count=count+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

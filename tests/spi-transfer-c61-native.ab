@@ -1,0 +1,107 @@
+import "../src/esp32/spi/transfer_c61_sequence.ab"
+import "abla/build"
+val ram=nativeStaticAllocate(192)
+val regs=nativeStaticAllocate(256)
+var command=u32(0)
+var events=u32(4096)
+var fault=0
+var started=0
+var writes=0
+var size=0
+var txAddress=0
+var bad=false
+fun c61SpiRead(address: int): u32 {
+    if (address == 0x60096094) return u32(5)
+    if (address == 0x60096098) return u32(0x401000)
+    if (address == 0x60081000) {
+        val old=command
+        if (old == u32(1<<23) && fault != 1) command=u32(0)
+        return old
+    }
+    if (address == 0x6008103c) return events
+    if (address < 0x60081000 || address >= 0x60081100) { bad=true;return u32(0) }
+    return u32(nativeAddressLoadU32(regs,address-0x60081000))
+}
+fun c61SpiWrite(address: int,value: u32): void {
+    writes=writes+1
+    if (address == 0x60081038) { if (value != u32(4096)) bad=true;if (fault != 5) events=events&~value;return }
+    if (address == 0x60081000) {
+        command=value
+        if (value == u32(1<<23)) return
+        if (value != u32(1<<24)) { bad=true;return }
+        started=started+1
+        if (events != u32(0) || nativeAddressLoadU32(regs,28) != size*8-1) bad=true
+        var offset=0
+        while (offset < size) {
+            var expected=u32(0)
+            var lane=0
+            while (lane < 4 && offset+lane < size) {
+                expected=expected|(u32(nativeBufferAt(txAddress,size).load(offset+lane))<<u32(lane*8));lane=lane+1
+            }
+            if (u32(nativeAddressLoadU32(regs,152+offset)) != expected) bad=true
+            nativeAddressStoreU32(regs,152+offset,int(~expected))
+            offset=offset+4
+        }
+        if (fault != 2 && fault != 3) command=u32(0)
+        if (fault != 2) events=u32(4096)
+        if (fault == 4) events=events|u32(1<<17)
+        return
+    }
+    if (fault == 6 && address == 0x60081010) return
+    if (fault == 7 && address == 0x60081098) return
+    if (address < 0x60081000 || address >= 0x60081100) { bad=true;return }
+    nativeAddressStoreU32(regs,address-0x60081000,int(value));return
+}
+fun seed(offset: int,count: int): void {
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(regs,at,0);at=at+4 }
+    at=0
+    while (at < 192) { nativeBufferAt(ram,192).store(at,90);at=at+1 }
+    txAddress=ram+offset;size=count
+    at=0
+    while (at < count) { nativeBufferAt(txAddress,count).store(at,(at*37+19)&255);at=at+1 }
+    command=u32(0);events=u32(4096);fault=0;started=0;writes=0;bad=false;return
+}
+@export("abla_spi_transfer_c61_test")
+trusted fun testTransfer(): i32 {
+    var bytes=1
+    while (bytes <= 64) {
+        var alignment=0
+        while (alignment < 4) {
+            var kind=0
+            while (kind < 3) {
+                seed(alignment,bytes)
+                val receive=kind != 0
+                val destination=if (kind == 2) nativeBufferAt(txAddress,bytes) else nativeBufferAt(ram+96+alignment,bytes)
+                val result=esp32C61SpiTransferOwned(nativeBufferAt(txAddress,bytes),destination,bytes,4,receive)
+                if (result != 257 || started != 1 || bad) return i32(1)
+                var at=0
+                while (at < bytes) {
+                    val expected=if (receive) ((at*37+19)&255)^255 else 90
+                    if (destination.load(at) != expected) return i32(2)
+                    at=at+1
+                }
+                if (nativeBufferAt(ram,192).load(96+alignment+bytes) != 90) return i32(3)
+                kind=kind+1
+            }
+            alignment=alignment+1
+        }
+        bytes=bytes+1
+    }
+    var error=1
+    while (error <= 7) {
+        seed(1,7);fault=error
+        val result=esp32C61SpiTransferOwned(nativeBufferAt(txAddress,7),nativeBufferAt(ram+96,7),7,4,true)
+        val expected=if (error == 1) 6 else if (error == 2 || error == 3) 7 else if (error == 4) 9 else 5
+        if ((result&255) != expected || started != (if (error >= 2 && error <= 4) 1 else 0) || bad) return i32(4)
+        var at=0
+        while (at < 7) { if (nativeBufferAt(ram+96,7).load(at) != 90) return i32(5);at=at+1 }
+        error=error+1
+    }
+    seed(0,8);events=u32(0x20000)
+    if ((esp32C61SpiTransferOwned(nativeBufferAt(ram,8),nativeBufferAt(ram+96,8),8,4,true)&255) != 10 || writes != 0) return i32(6)
+    seed(0,8)
+    if (esp32C61SpiTransferOwned(nativeBufferAt(0x60081098,8),nativeBufferAt(ram+96,8),8,4,true) != 2 ||
+        esp32C61SpiTransferOwned(nativeBufferAt(ram,65),nativeBufferAt(ram+96,65),65,4,true) != 2 || writes != 0) return i32(7)
+    return i32(0)
+}

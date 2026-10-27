@@ -1,0 +1,138 @@
+import "../src/esp32/boot_main_esp32s3.ab"
+import "../src/esp32/runtime_prepare_esp32s3.ab"
+import "../src/esp32/task_resolver_esp32s3.ab"
+import "../src/esp32/task_launch_esp32s3.ab"
+import "../src/esp32/scheduler_setup_esp32s3.ab"
+import "../src/esp32/scheduler_irq_esp32s3.ab"
+import "../src/esp32/scheduler_tick_esp32s3.ab"
+import "./s3-fpu-witness.ab"
+import "./s3-simd-witness.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// Link-only complete two-task CPU0 preemption scenario, NOT physical proof or
+// flashable firmware. First task arms timer0/line6 after launch. Shared state:
+// task0 turns0,task1 turns4,result8,startCycle12. Both>=8 => result0x50524531;
+// bounded cycle timeout =>0xBAD00001. Stops masked with CPU lines disabled.
+@inline
+@section(".iram1.abla.s3BootFixtureHalt")
+trusted fun bootFixtureHalt(): void {
+    esp32S3ContextExtraAssembly("rsil a0, 15\n1: j 1b","~{a0},~{memory}"); return
+}
+@section(".iram1.abla.s3BootFixtureIrqFault")
+trusted fun bootFixtureIrqFault(frame: u32,status: i32,context: u32): void { bootFixtureHalt(); return }
+@section(".iram1.abla.s3BootFixtureException")
+trusted fun bootFixtureException(frame: u32,cause: u32,core: u32,context: u32): void { bootFixtureHalt(); return }
+@section(".iram1.abla.s3BootFixtureTask")
+trusted fun bootFixtureTask(arg: u32): void {
+    val state=int(xtensaGuardRead("movi $0, __abla_preemption_state","=a,~{memory}"))
+    val tick=int(xtensaGuardRead("movi $0, __abla_scheduler_tick","=a,~{memory}"))
+    val id=int(arg)
+    val simd=int(xtensaGuardRead("movi $0, __abla_simd_witness","=a,~{memory}"))+id*416
+    // Force lazy CP0 acquisition in EACH task, then keep distinct raw F0..F15 bits
+    // live across every timer switch. These architecture primitives deliberately
+    // avoid a compiler spill to the stack, which would hide CP ownership bugs.
+    s3FpuWitnessSeed(0x3F800000+id*256)
+    if (bootFixtureUseSimd()) s3SimdWitnessSeed(simd,0x12340000+id*65536)
+    if (id == 0) {
+        mmioStoreU32(state+12,esp32S3SchedulerTickCount())
+        if (!esp32S3SchedulerTickOwned(nativeBufferAt(tick,16))) { mmioStoreU32(state+8,0xBAD00002); bootFixtureHalt(); return }
+        // All other CPU lines were disabled at boot. CCOMPARE0 is already
+        // armed, handler registered and both tasks fully published.
+        xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(64))
+    }
+    // Tasks only poll; progress requires real interrupt entry/restore, not a
+    // cooperative yield. Keep a scalar live to exercise saved register state.
+    var witness=0x13570000+id
+    while (true) {
+        val count=mmioLoadU32(state+id*4)
+        if (bootFixtureUseSimd() && !s3SimdWitnessValid(simd+208,0x12340000+id*65536+count)) {
+            xtensaGuardMaskLocal(); xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(0))
+            mmioStoreU32(state+8,0xBAD00005); bootFixtureHalt(); return
+        }
+        if (!s3FpuWitnessValid(0x3F800000+id*256+count)) {
+            xtensaGuardMaskLocal(); xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(0))
+            mmioStoreU32(state+8,0xBAD00004); bootFixtureHalt(); return
+        }
+        if (witness != 0x13570000+id+count) {
+            xtensaGuardMaskLocal(); xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(0))
+            mmioStoreU32(state+8,0xBAD00003); bootFixtureHalt(); return
+        }
+        witness=witness+1
+        s3FpuWitnessSeed(0x3F800000+id*256+count+1)
+        if (bootFixtureUseSimd()) s3SimdWitnessSeed(simd,0x12340000+id*65536+count+1)
+        mmioStoreU32(state+id*4,count+1)
+        if (mmioLoadU32(state) >= 8 && mmioLoadU32(state+4) >= 8) {
+            xtensaGuardMaskLocal(); xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(0))
+            mmioStoreU32(state+8,0x50524531); bootFixtureHalt(); return
+        }
+        // Poll with interrupts enabled, so a missing tick cannot strand WAITI
+        // indefinitely. A switched-out task resumes this same deadline loop.
+        val before=mmioLoadU32(state+(id ^ 1)*4)
+        while (mmioLoadU32(state+(id ^ 1)*4) == before) {
+            if (((esp32S3SchedulerTickCount()-mmioLoadU32(state+12)) & 0xFFFFFFFF) > 0x10000000) {
+                xtensaGuardMaskLocal(); xtensaGuardWrite("wsr.intenable $0\nrsync","a,~{memory}",u32(0))
+                mmioStoreU32(state+8,0xBAD00001); bootFixtureHalt(); return
+            }
+        }
+    }
+    return
+}
+@section(".iram1.abla.s3BootFixtureTaskReturned")
+trusted fun bootFixtureTaskReturned(arg: u32): void { bootFixtureHalt(); return }
+@section(".iram1.abla.s3BootFixtureApplication")
+trusted fun esp32S3BootApplication(): void {
+    val local=int(xtensaGuardRead("movi $0, __abla_runtime_local","=a,~{memory}"))
+    val shared=int(xtensaGuardRead("movi $0, __abla_runtime_shared","=a,~{memory}"))
+    val stack=int(xtensaGuardRead("movi $0, __abla_irq_stack_low","=a,~{memory}"))
+    val current=int(xtensaGuardRead("movi $0, __abla_current_tasks","=a,~{memory}"))
+    val binding=int(xtensaGuardRead("movi $0, __abla_task_binding","=a,~{memory}"))
+    val cp0=int(xtensaGuardRead("movi $0, __abla_task_cp0","=a,~{memory}"))
+    val cp3=int(xtensaGuardRead("movi $0, __abla_task_cp3","=a,~{memory}"))
+    val taskStack=int(xtensaGuardRead("movi $0, __abla_task_stack_low","=a,~{memory}"))
+    val result=esp32S3RuntimePrepareOwned(nativeBufferAt(stack,4096),nativeBufferAt(local,40),nativeBufferAt(shared,544),0,
+        nativeFunctionAddress(bootFixtureIrqFault),nativeFunctionAddress(bootFixtureException),esp32S3TaskResolverAddress(),current)
+    mmioStoreU32(local+40,result & 0xFFFFFFFF)
+    if (result != 1) return
+    if (!esp32S3CpRecordInitializeOwned(nativeBufferAt(cp0,256),0) || !esp32S3CpRecordInitializeOwned(nativeBufferAt(cp3,256),3)) {
+        mmioStoreU32(local+40,0xFFFFFFFB); return
+    }
+    val frame=esp32S3TaskFrameInitializeOwned(nativeBufferAt(taskStack,4096),nativeFunctionAddress(bootFixtureTask),0,nativeFunctionAddress(bootFixtureTaskReturned),0)
+    if (frame == 0) { mmioStoreU32(local+40,0xFFFFFFFA); return }
+    if (!esp32S3TaskPublishFirstOwned(nativeBufferAt(current,8),nativeBufferAt(binding,16),nativeBufferAt(cp0,256),nativeBufferAt(cp3,256),0)) {
+        mmioStoreU32(local+40,0xFFFFFFF9); return
+    }
+    val scheduler=int(xtensaGuardRead("movi $0, __abla_scheduler_context","=a,~{memory}"))
+    val adapter=int(xtensaGuardRead("movi $0, __abla_scheduler_adapter","=a,~{memory}"))
+    val queue=int(xtensaGuardRead("movi $0, __abla_scheduler_queue","=a,~{memory}"))
+    val records=int(xtensaGuardRead("movi $0, __abla_scheduler_tasks","=a,~{memory}"))
+    val running=int(xtensaGuardRead("movi $0, __abla_scheduler_running","=a,~{memory}"))
+    val secondBinding=int(xtensaGuardRead("movi $0, __abla_second_binding","=a,~{memory}"))
+    val secondCp0=int(xtensaGuardRead("movi $0, __abla_second_cp0","=a,~{memory}"))
+    val secondCp3=int(xtensaGuardRead("movi $0, __abla_second_cp3","=a,~{memory}"))
+    val secondStack=int(xtensaGuardRead("movi $0, __abla_second_stack_low","=a,~{memory}"))
+    if (!esp32S3CpRecordInitializeOwned(nativeBufferAt(secondCp0,256),0) || !esp32S3CpRecordInitializeOwned(nativeBufferAt(secondCp3,256),3)) { mmioStoreU32(local+40,0xFFFFFFF5); return }
+    val secondFrame=esp32S3TaskFrameInitializeOwned(nativeBufferAt(secondStack,4096),nativeFunctionAddress(bootFixtureTask),1,nativeFunctionAddress(bootFixtureTaskReturned),0)
+    if (secondFrame == 0) { mmioStoreU32(local+40,0xFFFFFFF4); return }
+    // Fresh boot-owned binding, not resident on either core; independent CP
+    // snapshots were initialized above. Publication is via ready FIFO below.
+    mmioStoreU32(secondBinding,secondCp0); mmioStoreU32(secondBinding+4,secondCp3)
+    mmioStoreU32(secondBinding+8,0); mmioStoreU32(secondBinding+12,0x54415331)
+    if (!readyQueueInitializeOwned(nativeBufferAt(queue,20))) { mmioStoreU32(local+40,0xFFFFFFF7); return }
+    mmioStoreU32(records,binding); mmioStoreU32(records+4,frame)
+    mmioStoreU32(records+8,2); mmioStoreU32(records+12,1); mmioStoreU32(running,1)
+    mmioStoreU32(records+16,secondBinding); mmioStoreU32(records+20,secondFrame)
+    mmioStoreU32(records+24,1); mmioStoreU32(records+28,1)
+    if (!readyQueuePushOwned(nativeBufferAt(queue,20),2)) { mmioStoreU32(local+40,0xFFFFFFF3); return }
+    if (!esp32S3SchedulerSetupOwned(nativeBufferAt(scheduler,44),nativeBufferAt(queue,20),nativeBufferAt(records,32),
+        nativeBufferAt(running,8),nativeBufferAt(current,8),nativeBufferAt(shared+16,16),nativeBufferAt(shared,4),0) ||
+        !esp32S3SchedulerIrqInstallOwned(nativeBufferAt(adapter,12),nativeBufferAt(local,16),0,esp32S3SchedulerRunAddress(),scheduler)) {
+        mmioStoreU32(local+40,0xFFFFFFF6); return
+    }
+    val tick=int(xtensaGuardRead("movi $0, __abla_scheduler_tick","=a,~{memory}"))
+    mmioStoreU32(tick,240000); mmioStoreU32(tick+4,scheduler); mmioStoreU32(tick+8,0); mmioStoreU32(tick+12,0)
+    // Private dispatcher table, CPU0 timer0 line6, no peripheral matrix route.
+    mmioStoreU32(shared+32+6*16+4,tick)
+    mmioStoreU32(shared+32+6*16,esp32S3SchedulerTickAddress())
+    if (!esp32S3TaskLaunchFirstOwned(nativeBufferAt(taskStack,4096),nativeBufferAt(frame,192),0)) mmioStoreU32(local+40,0xFFFFFFF8)
+    return
+}

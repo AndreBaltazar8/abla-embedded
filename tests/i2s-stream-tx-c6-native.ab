@@ -1,0 +1,92 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/stream_tx_c6_sequence.ab"
+var descriptors=NativeBuffer(0)
+var cursor=NativeBuffer(0)
+var channel=0
+var raw=u32(0)
+var late=false
+var eventReads=0
+var writes=0
+var fences=0
+var bad=false
+trusted fun c6I2sClockRead(at: int): u32 { bad=true;return u32(0) }
+trusted fun c6I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6I2sRead(at: int): u32 { bad=true;return u32(0) }
+trusted fun c6I2sWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6GdmaBusRead(): u32 = u32(1)
+trusted fun c6GdmaBusWrite(value: u32): void { bad=true;return }
+trusted fun c6GdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    if (at == 0x30+channel*16) { eventReads=eventReads+1;return raw|(if (late && eventReads >= 2) u32(4) else u32(0)) }
+    if (at == 0x38+channel*16) return u32(0)
+    bad=true;return u32(0)
+}
+trusted fun c6GdmaWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6GdmaDescriptorFence(): void { fences=fences+1;return }
+trusted fun c6GdmaDescriptorRead(at: int): u32 {
+    if (at < 0x40800000 || at >= 0x40800060 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(descriptors.loadU32(at-0x40800000))
+}
+trusted fun c6GdmaDescriptorWrite(at: int,value: u32): void {
+    if (at != 0x40800000+cursor.loadU32(8)*12 || cursor.loadU32(12) != 4 || fences < 3 || value != u32(0xc0040040)) { bad=true;return }
+    writes=writes+1;descriptors.storeU32(at-0x40800000,int(value));return
+}
+trusted fun initialize(r: NativeBuffer,count: int): void {
+    var at=0
+    while (at < 72) { r.storeU32(at,0);at=at+4 }
+    at=0
+    while (at < 32) { cursor.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43364944);r.storeU32(4,1);r.storeU32(12,channel);r.storeU32(16,1)
+    r.storeU32(20,0x40800000);r.storeU32(24,count);r.storeU32(28,0x40810000);r.storeU32(32,64);r.storeU32(36,64);r.storeU32(40,1)
+    at=0
+    while (at < count) {
+        descriptors.storeU32(at*12,0xc0040040);descriptors.storeU32(at*12+4,0x40810000+at*64)
+        descriptors.storeU32(at*12+8,if (at+1 == count) 0x40800000 else 0x40800000+(at+1)*12)
+        at=at+1
+    }
+    raw=u32(0);late=false;eventReads=0;writes=0;fences=0;bad=false;return
+}
+@export("abla_i2s_stream_tx_c6_test")
+trusted fun test(): i32 {
+    val memory=nativeStaticAllocate(256)
+    val r=nativeBufferAt(memory,72);cursor=nativeBufferAt(memory+72,32);descriptors=nativeBufferAt(memory+104,96)
+    while (channel < 3) {
+        var count=2
+        while (count <= 8) {
+            initialize(r,count)
+            var cycle=0
+            while (cycle < 64) {
+                val index=cycle%count
+                if (c6I2sStreamAcquireOwned(r,cursor,true) != 5 || c6I2sStreamWritableBuffer(r,cursor) != NativeBuffer(0) || c6I2sStreamPublishOwned(r,cursor,true,true) != 2) return i32(1)
+                descriptors.storeU32(index*12,0x40040040);raw=u32(3);eventReads=0
+                if (c6I2sStreamAcquireOwned(r,cursor,true) != 1 || cursor.loadU32(8) != index) return i32(2)
+                val view=c6I2sStreamWritableBuffer(r,cursor)
+                if (view.addressValue() != 0x40810000+index*64 || view.capacity() != 64) return i32(3)
+                val before=writes;val reads=eventReads
+                if (c6I2sStreamAcquireOwned(r,cursor,true) != 1 || eventReads != reads || c6I2sStreamPublishOwned(r,cursor,false,true) != 2 || writes != before) return i32(4)
+                if (c6I2sStreamPublishOwned(r,cursor,true,true) != 1 || writes != before+1 || cursor.loadU32(24) != cycle+1 || c6I2sStreamWritableBuffer(r,cursor) != NativeBuffer(0)) return i32(5)
+                if (c6I2sStreamPublishOwned(r,cursor,true,true) != 2 || writes != before+1 || bad) return i32(6)
+                cycle=cycle+1
+            }
+            // Error arrives after acquisition but before publication: no owner write.
+            val index=cursor.loadU32(8);descriptors.storeU32(index*12,0x40040040)
+            if (c6I2sStreamAcquireOwned(r,cursor,true) != 1) return i32(7)
+            raw=u32(4);val before=writes
+            if (c6I2sStreamPublishOwned(r,cursor,true,true) != 3 || writes != before || c6I2sStreamAcquireOwned(r,cursor,true) != 3 || (cursor.loadU32(16)&4) == 0) return i32(8)
+            initialize(r,count);descriptors.storeU32(0,0x40040040);late=true
+            if (c6I2sStreamAcquireOwned(r,cursor,true) != 3 || writes != 0 || c6I2sStreamWritableBuffer(r,cursor) != NativeBuffer(0)) return i32(9)
+            initialize(r,count);descriptors.storeU32(0,0x40040040);descriptors.storeU32(8,0)
+            if (c6I2sStreamAcquireOwned(r,cursor,true) != 3 || writes != 0) return i32(10)
+            initialize(r,count);descriptors.storeU32(0,0x40040040)
+            if (c6I2sStreamAcquireOwned(r,cursor,true) != 1) return i32(11)
+            r.storeU32(4,6)
+            if (c6I2sStreamAcquireOwned(r,cursor,true) != 2 || c6I2sStreamPublishOwned(r,cursor,true,true) != 2 || c6I2sStreamWritableBuffer(r,cursor) != NativeBuffer(0) || writes != 0) return i32(12)
+            count=count+1
+        }
+        channel=channel+1
+    }
+    channel=0;initialize(r,1)
+    if (c6I2sStreamAcquireOwned(r,cursor,true) != 2 || cursor.loadU32(0) != 0) return i32(13)
+    return i32(0)
+}

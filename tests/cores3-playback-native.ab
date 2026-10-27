@@ -1,0 +1,100 @@
+import "../src/m5stack/cores3_playback_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "../src/esp32/gdma_ring_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Aw88298 = int
+type Aw9523 = int
+fun Aw88298.valid(): bool = this != 0
+fun Aw9523.valid(): bool = this != 0
+type TestResult = int
+fun TestResult.status(): int = this & 255
+fun TestResult.valid(): bool = this.status() == 1
+fun TestResult.sampleRate(): int = 16000
+fun TestResult.dmaStatus(): int = cleanupDma
+fun TestResult.amplifierStatus(): int = cleanupAmplifier
+fun TestResult.transferredBytes(): int = 960
+fun TestResult.nextIndex(): int = (this >>> 8) & 255
+var prepared = false
+var started = false
+var leading = 0
+var completed = 0
+var stops = 0
+var delays = 0
+var staged = 0
+var busyRemaining = 0
+var failure = 0
+var stopStatus = 1
+var prepareStatus = 1
+var startStatus = 1
+var cleanupDma = 1
+var cleanupAmplifier = 257
+var bad = false
+trusted fun esp32s3GdmaWrite(address: int, value: int): void { bad = true; return }
+trusted fun esp32s3GdmaPublish(): void { bad = true; return }
+trusted fun coreS3PrepareAudioDma(tx: bool, rate: int, channel: int, descriptors: int, count: int, buffers: int, block: int, owner: u32): TestResult { if (!tx || rate != 16000 || count != 6 || block != 960) bad = true; prepared = true; TestResult(prepareStatus) }
+trusted fun coreS3LoadPlaybackBlock(destination: int, source: NativeBuffer, index: int, count: int): void {
+    if (!prepared) bad = true
+    if (!started) {
+        if (destination != 0x3fc90000 + leading * 960 || count != 0) bad = true
+        leading = leading + 1
+    } else {
+        if (destination != 0x3fcc0000 || index != completed || count != 8) bad = true
+        staged = staged + 1
+    }
+    return
+}
+trusted fun cores3StartSpeakerStream(amp: Aw88298, expander: Aw9523, rate: int, channel: int, descriptors: int, polls: int): TestResult { if (leading != 6 || rate != 16000) bad = true; started = true; TestResult(startStatus) }
+trusted fun cores3StopSpeakerStream(amp: Aw88298, expander: Aw9523, channel: int, polls: int): TestResult { stops = stops + 1; TestResult(stopStatus) }
+trusted fun peripheralDelayMicroseconds(us: int): void { if (us != 1000) bad = true; delays = delays + 1; return }
+trusted fun esp32s3GdmaPumpBlock(channel: int, tx: bool, descriptors: int, count: int, index: int, buffer: NativeBuffer, length: int, polls: int): TestResult {
+    if (!started || !tx || count != 6 || index != completed % 6 || length != 960 || polls != 1) bad = true
+    if (busyRemaining > 0) { busyRemaining = busyRemaining - 1; return TestResult(3) }
+    if (failure != 0 && completed == 7) return TestResult(failure)
+    completed = completed + 1
+    TestResult(1 | ((completed % 6) << 8))
+}
+trusted fun playbackTest(): int {
+    var variant = 0
+    while (variant < 5) {
+        prepared = false; started = false; leading = 0; completed = 0; stops = 0; delays = 0
+        staged = 0; busyRemaining = if (variant == 4) 2 else 0
+        failure = if (variant == 1) 3 else if (variant == 2) 4 else 0
+        stopStatus = if (variant == 3) 6 else 1
+        val result = cores3PlaybackBlocks(Aw88298(1), Aw9523(1), 2, 0x3fc88000, 0x3fc90000, nativeBufferAt(0x3fca0000, 7680), 8, nativeBufferAt(0x3fcc0000, 960), u32(7), 3)
+        if (result.status() != (if (variant == 0 || variant == 4) 1 else if (variant == 1) 67 else if (variant == 2) 68 else 96) || result.bytes() != (if (variant == 1 || variant == 2) 960 else 7680) || completed != (if (variant == 1 || variant == 2) 7 else 22) || delays != (if (variant == 1 || variant == 4) 2 else 0) || stops != 1 || bad) return 1
+        if (staged != (if (variant == 1 || variant == 2) 8 else 22)) return 5
+        variant = variant + 1
+    }
+    prepared = false
+    if (cores3PlaybackBlocks(Aw88298(1), Aw9523(1), 2, 0x3fc88000, 0x3fc90000, nativeBufferAt(0x3fca0000, 7680), 8, nativeBufferAt(0x3fca0004, 960), u32(7), 3).status() != 2 || prepared) return 2
+    // Preparation failures must not initialize payloads or start peripherals.
+    prepareStatus = 2
+    while (prepareStatus <= 14) {
+        prepared = false; started = false; leading = 0; completed = 0; stops = 0
+        val result = cores3PlaybackBlocks(Aw88298(1), Aw9523(1), 2, 0x3fc88000, 0x3fc90000, nativeBufferAt(0x3fca0000, 7680), 8, nativeBufferAt(0x3fcc0000, 960), u32(7), 3)
+        if (result.status() != 16 + prepareStatus || result.bytes() != 0 ||
+            result.dmaStatus() != 0 || result.amplifierStatus() != 0 ||
+            !prepared || started || leading != 0 || stops != 0 || completed != 0 || bad) return 3
+        prepareStatus = prepareStatus + 1
+    }
+    prepareStatus = 1
+    startStatus = 2
+    while (startStatus <= 6) {
+        var bit = 0
+        while (bit < 16) {
+            cleanupDma = 1 << bit
+            cleanupAmplifier = 1 << (bit % 11)
+            prepared = false; started = false; leading = 0; completed = 0; stops = 0
+            val result = cores3PlaybackBlocks(Aw88298(1), Aw9523(1), 2, 0x3fc88000, 0x3fc90000, nativeBufferAt(0x3fca0000, 7680), 8, nativeBufferAt(0x3fcc0000, 960), u32(7), 3)
+            // Start owns its failure cleanup; the caller must not repeat it.
+            if (result.status() != 32 + startStatus || result.bytes() != 0 ||
+                result.dmaStatus() != cleanupDma || result.amplifierStatus() != cleanupAmplifier ||
+                !started || leading != 6 || stops != 0 || completed != 0 || bad) return 4
+            bit = bit + 1
+        }
+        startStatus = startStatus + 1
+    }
+    0
+}
+#exportFunction("playbackTest", "abla_cores3_playback_test")

@@ -1,0 +1,84 @@
+import "../src/storage/fat_allocate.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+val image=nativeStaticAllocate(3072)
+var mode=0
+var writes=0
+var failAt=0
+var bad=false
+fun slot(lba: int): int = if (mode == 0)
+    (if (lba == 1) 0 else if (lba == 41) 1 else if (lba == 115) 2 else if (lba == 116) 3 else -1)
+    else (if (lba == 32) 0 else if (lba == 632) 1 else if (lba == 1234) 2 else if (lba == 1235) 3 else if (lba == 1) 4 else if (lba == 7) 5 else -1)
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    val selected=slot(lba)
+    if (selected < 0) { bad=true;return false }
+    val source=nativeBufferAt(image+selected*512,512);var index=0
+    while (index < 512) { output.store(index,source.load(index));index=index+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    val selected=slot(lba);writes=writes+1
+    val expected=if (mode == 0) writes-1 else if (writes <= 2) writes+3 else writes-3
+    if (selected < 0 || selected != expected) { bad=true;return false }
+    val output=nativeBufferAt(image+selected*512,512);var index=0
+    while (index < 512) { output.store(index,source.load(index));index=index+1 }
+    return writes != failAt
+}
+@export("abla_fat_allocate_test")
+trusted fun test(): i32 {
+    val reader=nativeBufferAt(memory,28);val boot=nativeBufferAt(memory+32,512)
+    val work=nativeBufferAt(memory+1024,2048)
+    while (mode < 2) {
+        var index=0
+        while (index < 512) { boot.store(index,0);index=index+1 }
+        boot.storeU16(11,512);boot.store(13,2);boot.store(16,2);boot.storeU16(510,0xaa55)
+        if (mode == 0) { boot.storeU16(14,1);boot.storeU16(17,512);boot.storeU16(22,40);boot.storeU16(19,20113) }
+        else { boot.storeU16(14,32);boot.storeU32(32,140000);boot.storeU32(36,600);boot.storeU32(44,2);boot.storeU16(48,1);boot.storeU16(50,6) }
+        val total=if (mode == 0) 20113 else 140000
+        val location=fatLinkLocate(boot,0,total,3)
+        val count=if (mode == 0) 4 else 6
+        var failure=0
+        while (failure <= count) {
+            writes=0;failAt=failure;bad=false;index=0
+            while (index < 3072) { nativeBufferAt(image,3072).store(index,255);index=index+1 }
+            var copy=0
+            while (copy < 2) {
+                if (!fatLinkPatch(location,0,nativeBufferAt(image+copy*512,512),NativeBuffer(0))) return i32(1)
+                val hints=nativeBufferAt(image+2048+copy*512,512)
+                hints.storeU32(0,0x41615252);hints.storeU32(484,0x61417272);hints.storeU32(508,0xaa550000)
+                hints.storeU32(488,123);hints.storeU32(492,9)
+                copy=copy+1
+            }
+            val result=fatAllocateClusterOwned(reader,boot,0,total,2,4,1,work)
+            val expected=if (failure == 0) 1 else if (mode == 1 && failure <= 2) 6 else if (failure <= count-2) 7 else 8
+            if (result.status() != expected || result.cluster() != 3 || writes != (if (failure == 0) count else failure) || bad) return i32(2)
+            if (failure == 0) {
+                index=0
+                while (index < 1024) { if (nativeBufferAt(image+1024,1024).load(index) != 0) return i32(3);index=index+1 }
+                copy=0
+                while (copy < 2) {
+                    if (fatLinkRaw(location,nativeBufferAt(image+copy*512,512),NativeBuffer(0)) !=
+                        (if (mode == 0) 65535 else 268435455)) return i32(4)
+                    if (mode == 1 && (nativeBufferAt(image+2048+copy*512,512).loadU32(488) != 0xffffffff ||
+                        nativeBufferAt(image+2048+copy*512,512).loadU32(492) != 0xffffffff)) return i32(5)
+                    copy=copy+1
+                }
+            }
+            failure=failure+1
+        }
+        if (mode == 1) {
+            if (!fatLinkPatch(location,0,nativeBufferAt(image,512),NativeBuffer(0)) ||
+                !fatLinkPatch(location,0,nativeBufferAt(image+512,512),NativeBuffer(0))) return i32(6)
+            writes=0;failAt=0
+            nativeBufferAt(image+2560,512).storeU32(484,0)
+            var rejected=fatAllocateClusterOwned(reader,boot,0,total,2,4,1,work)
+            if (rejected.status() != 6 || rejected.detail() != 4 || writes != 0) return i32(7)
+            boot.storeU16(50,1)
+            rejected=fatAllocateClusterOwned(reader,boot,0,total,2,4,1,work)
+            if (rejected.status() != 6 || rejected.detail() != 2 || writes != 0) return i32(8)
+        }
+        mode=mode+1
+    }
+    return i32(0)
+}

@@ -1,0 +1,112 @@
+import "../src/m5stack/es8311_channels_window_sequence.ab"
+import "abla/runtime/scalar"
+import "../src/runtime/memory32.ab"
+import "abla/build"
+#requiredInternalFunction("freestandingMemorySet32", "memset")
+val memory=nativeStaticAllocate(1024)
+var scenario=0
+var writes=0
+var sourceBlocks=0
+var silenceBlocks=0
+var delays=0
+var closes=0
+var bad=false
+var expectedTail=0
+var savedCursor=0
+var queuedMode=false
+val retryBytes=nativeStaticAllocate(16)
+type Esp32S3GdmaPumpResult=int
+fun Esp32S3GdmaPumpResult.status(): int = this&255
+fun m5Es8311PlaybackValid(r: NativeBuffer): bool = r.hasAddressRange(0,136) && r.loadU32(0) == 0x45545031
+fun esp32s3GdmaRingLayoutValid(desc: int,count: int,payload: int,bytes: int,stride: int): bool =
+    desc == 0x3fc88000 && count == 2 && payload == 0x3fc90000 && bytes == 16 && stride == 16
+trusted fun m5Es8311PlaybackWriteOwned(r: NativeBuffer,buffer: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    writes=writes+1
+    if (buffer.addressValue() != memory+512 || buffer.capacity() != 16 || polls != 1 || !exclusive) bad=true
+    val silence=buffer.loadU32(0) == 0
+    if (queuedMode && !silence && sourceBlocks == 0) {
+        val stereo=M5BoardId(r.loadU32(8)).speakerProfile().stereo()
+        val stride=if (stereo) 4 else 2
+        if (buffer.loadU16(0) != 10000 || buffer.loadU16(stride) != 10000 ||
+            buffer.loadU16(stride*2) != (if (stereo) 12544 else 17920)) bad=true
+    }
+    if (scenario == 0) {
+        val saved=nativeBufferAt(retryBytes,16);var offset=0
+        while (offset < 16) {
+            if ((writes&1) != 0) saved.store(offset,buffer.load(offset))
+            else if (saved.load(offset) != buffer.load(offset)) bad=true
+            offset=offset+1
+        }
+    }
+    if (scenario == 1 && !silence) return Esp32S3GdmaPumpResult(3)
+    if ((scenario == 2 && !silence) || (scenario == 4 && silence)) { r.storeU32(4,3);return Esp32S3GdmaPumpResult(4) }
+    if (scenario == 3 && silence) return Esp32S3GdmaPumpResult(3)
+    // Alternate busy/success for the normal case, including the silence tail.
+    if (scenario == 0 && (writes&1) != 0) return Esp32S3GdmaPumpResult(3)
+    if (silence) {
+        if (sourceBlocks != 3) bad=true
+        val cursor=nativeAddressLoadU32(memory+160,16)
+        if (silenceBlocks == 0) savedCursor=cursor else if (cursor != savedCursor) bad=true
+        var offset=0
+        while (offset < 16) { if (buffer.load(offset) != u8(0)) bad=true;offset=offset+1 }
+        silenceBlocks=silenceBlocks+1
+    } else sourceBlocks=sourceBlocks+1
+    r.storeU32(44,1-r.loadU32(44))
+    return Esp32S3GdmaPumpResult(1)
+}
+trusted fun m5Es8311PlaybackCloseOwned(r: NativeBuffer,polls: int,exclusive: bool): int {
+    closes=closes+1
+    if (polls != 1000 || !exclusive || ((scenario == 0 || scenario == 5) && silenceBlocks != expectedTail)) bad=true
+    r.storeU32(4,if (scenario == 5) 3 else 4)
+    return if (scenario == 5) 3 else 4
+}
+fun peripheralDelayMilliseconds(ms: int): void { if (ms != 1) bad=true;delays=delays+1;return }
+@export("abla_es8311_channels_window_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(memory,136);val acc=nativeBufferAt(memory+320,64)
+    val scratch=nativeBufferAt(memory+448,32);val staging=nativeBufferAt(memory+512,16)
+    val source=nativeBufferAt(memory+240,64)
+    var i=0
+    while (i < 32) { source.storeU16(i*2,10000);i=i+1 }
+    val wav=pcmRaw(source,nativeBufferAt(memory+208,20),16000,2,16)
+    var mode=0
+    while (mode < 6) {
+        queuedMode=mode >= 4
+        val stereo=(mode&1) == 0
+        expectedTail=if (stereo) 483 else 243
+        scenario=0
+        while (scenario <= 6) {
+            writes=0;sourceBlocks=0;silenceBlocks=0;delays=0;closes=0
+            val bank=pcmChannelsAt(nativeBufferAt(memory+160,32),1,16000)
+            if (bank.enqueue(wav,0) != 0) return i32(1)
+            r.storeU32(0,0x45545031);r.storeU32(4,2);r.storeU32(8,if (stereo) m5BoardStickS3|0 else m5BoardCardputerADV|0)
+            r.storeU32(28,0x3fc88000);r.storeU32(32,2);r.storeU32(36,0x3fc90000);r.storeU32(40,16);r.storeU32(44,0);r.storeU32(48,16000)
+            val tone=if (mode == 3 || mode >= 4) pcmToneWaveAt(nativeBufferAt(memory+600,40),nativeBufferAt(pcmToneWave,16),true,16000,440123,4294967295)
+                else if (mode == 2) pcmToneAt(nativeBufferAt(memory+600,32),16000,440123,4294967295) else PcmTone(0)
+            val queues=pcmSourceQueuesAt(nativeBufferAt(memory+704,32),1,16000)
+            if (mode >= 4) {
+                bank.stop()
+                val shortWav=pcmRaw(nativeBufferAt(source.addressValue(),8),nativeBufferAt(memory+752,20),16000,2,16)
+                if (bank.enqueue(shortWav,1) != 0 || queues.enqueue(pcmPlaybackChannel(bank.channel(0))) != 0 ||
+                    queues.enqueue(pcmPlaybackTone(tone),0) != 0) return i32(7)
+            }
+            val target=if (scenario == 6) nativeBufferAt(memory+512,1) else staging
+            val result=if (mode >= 4) m5Es8311PlaybackSourceQueuesWindowOwned(r,queues,3,acc,scratch,target,3,32768,true)
+                else m5Es8311PlaybackChannelsWindowOwned(r,bank,3,acc,scratch,target,3,32768,true,tone)
+            if (tone != 0) {
+                val rendered=if (scenario == 6) 0 else if (scenario == 1 || scenario == 2) 1 else 3
+                val frames=if (stereo) 4 else 8
+                val toneFrames=rendered*frames-(if (mode >= 4 && rendered != 0) 2 else 0)
+                if (tone.storage().loadU32(12) != (toneFrames*440123)%16000000) return i32(6)
+            }
+            val status=if (scenario == 0) 1 else if (scenario == 1 || scenario == 3) 3 else if (scenario == 5) 10 else if (scenario == 6) 2 else 4
+            if (result.status() != status || result.queuedBlocks() != sourceBlocks || bad || closes != (if (scenario == 6) 0 else 1)) return i32(2)
+            if (scenario == 6 && (writes != 0 || r.loadU32(4) != 2 || bank.channel(0).storage().loadU32(16) != 0)) return i32(3)
+            if ((scenario == 1 || scenario == 3) && delays != 2) return i32(4)
+            if (scenario == 0 && (sourceBlocks != 3 || silenceBlocks != expectedTail || delays != 3+expectedTail)) return i32(5)
+            scenario=scenario+1
+        }
+        mode=mode+1
+    }
+    return i32(0)
+}

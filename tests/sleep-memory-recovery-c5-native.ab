@@ -1,0 +1,82 @@
+import "../src/esp32/power/sleep_memory_recovery_c5.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(2048)
+var phase=0
+var bad=false
+var writes=0
+var failAt=0
+var failure=0
+trusted fun c5MspiRead(address: int): int {
+    if (address == 0x60096018) return 13
+    if (address == 0x6009601c) return nativeBufferAt(storage,2048).loadU32(1000)
+    if (address < 0x60002000 || address >= 0x60002200) { bad=true;return 0 }
+    nativeBufferAt(storage,2048).loadU32(1024+address-0x60002000)
+}
+trusted fun c5MspiWrite(address: int,value: int): void {
+    writes=writes+1
+    if (writes == failAt) return
+    if (address == 0x6009601c) { nativeBufferAt(storage,2048).storeU32(1000,value);return }
+    if (address < 0x60002000 || address >= 0x60002200) { bad=true;return }
+    nativeBufferAt(storage,2048).storeU32(1024+address-0x60002000,if (address == 0x60002180) value&~64 else value)
+    return
+}
+fun step(expected: int): bool {
+    if (phase != expected) bad=true
+    if (failure == expected+1) return false
+    phase=phase+1;return true
+}
+trusted fun c5SleepRecoveryProfile(record: NativeBuffer): int = if (step(0)) 4 else 3
+trusted fun c5SleepRecoveryClock(record: NativeBuffer,plan: C5CpuClock,pvt: bool,peripheralPll: bool): int {
+    if (!peripheralPll) bad=true
+    if (step(1)) 1 else 3
+}
+trusted fun c5SleepRecoveryAlarm(record: NativeBuffer): int = if (step(2)) 6 else 3
+trusted fun c5SleepRecoveryCache(token: int,result: int,down: bool,us: int): bool {
+    if (nativeBufferAt(storage+456,448).loadU32(4) != 4 || nativeBufferAt(storage,2048).loadU32(1000) != 0x603) bad=true
+    step(3)
+}
+trusted fun c5SleepRecoveryUarts(token: int): int = if (step(4)) 0 else 0x101
+trusted fun c5SleepRecoveryTime(record: NativeBuffer,outcome: int): int { bad=true;return 2 }
+trusted fun c5SleepRecoveryEntry(record: NativeBuffer): int { bad=true;return 2 }
+trusted fun c5CpuClockRead(offset: int): int { bad=true;return 0 }
+trusted fun c5CpuClockWrite(offset: int,value: int): void { bad=true;return }
+trusted fun c5CpuClockTicks(mhz: int): void { bad=true;return }
+@export("abla_sleep_memory_recovery_c5_test")
+trusted fun test(): i32 {
+    val record=nativeBufferAt(storage,128);val profile=nativeBufferAt(storage+128,304)
+    val memory=nativeBufferAt(storage+456,448);val request=nativeBufferAt(storage+904,48)
+    var fault=0
+    while (fault <= 40) {
+        var childFault=0
+        while (childFault <= 5) {
+            var offset=0
+            while (offset < 2048) { nativeBufferAt(storage,2048).storeU32(offset,0);offset=offset+4 }
+            nativeBufferAt(storage,2048).storeU32(1000,0x603)
+            request.storeU32(0,80);request.storeU32(4,40);request.storeU32(8,20);request.storeU32(44,40)
+            request.storeU32(16,19);request.storeU32(24,19);request.storeU32(28,71);request.storeU32(36,68);request.storeU32(40,67)
+            bad=false;writes=0;failAt=0
+            if (esp32C5MspiTransitionBeginOwned(memory,request,true) != 1 || bad) return i32(1)
+            phase=0;failure=childFault;failAt=writes+fault
+            val begin=esp32C5SleepRecoveryBeginOwned(record,profile,storage+432,C5CpuClock(40<<18),false,-3,false,0,0,0x301,true,0,0,storage+456)
+            if (begin != 3 || phase > 3 || bad) return i32(2)
+            failure=0
+            // Even an ordinary recovery retry must stop before the cache.
+            if (esp32C5SleepRecoveryContinueOwned(record,true) != 3 || phase != 3 || bad) return i32(3)
+            val before=writes
+            if (esp32C5SleepMemoryRecoveryContinueOwned(record,false) != 2 || writes != before) return i32(4)
+            val first=esp32C5SleepMemoryRecoveryContinueOwned(record,true)
+            if (first != 1 && first != 3 || bad) return i32(5)
+            failAt=0
+            if (esp32C5SleepMemoryRecoveryContinueOwned(record,true) != 1 || phase != 5 || bad || record.loadU32(60) != 0 ||
+                int(i32(record.loadU32(28))) != -3) return i32(6)
+            val done=writes
+            if (esp32C5SleepMemoryRecoveryContinueOwned(record,true) != 1 || writes != done || bad) return i32(7)
+            childFault=childFault+1
+        }
+        fault=fault+1
+    }
+    record.storeU32(0,0)
+    if (esp32C5SleepRecoveryBeginOwned(record,profile,0,C5CpuClock(40<<18),false,0,false,0,0,0,true,0,0,storage+128) != 2 || record.loadU32(0) != 0) return i32(8)
+    return i32(0)
+}

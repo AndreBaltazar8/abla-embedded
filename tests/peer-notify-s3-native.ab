@@ -1,0 +1,57 @@
+import "../src/esp32/peer_notify_s3_sequence.ab"
+import "../src/xtensa/peer_park_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var word=0
+var doorbell=false
+var channel=0
+var masked=false
+var bad=false
+var writes=0
+var polls=0
+var delay=0
+var onAck=0
+fun xtensaInterruptGuardEnter(): int { masked=true; return 7 }
+fun xtensaInterruptGuardLeave(guard: int): bool { if (guard != 7 || !masked) bad=true; masked=false; return true }
+fun xtensaPeerParkCas(address: int,expected: int,replacement: int): int {
+    if (address != 4096) bad=true
+    if (masked && (word & 7) == 2 && expected == 0) {
+        polls=polls+1
+        if (polls > delay) word=(word & ~7) | 3
+    }
+    if ((replacement & 7) == 4 && masked) bad=true
+    val old=word
+    if (old == expected) word=replacement
+    old
+}
+fun esp32S3IntercoreSignalOwned(port: int,asserted: bool): bool {
+    if (port != channel || masked || (asserted && (word & 7) != 1)) bad=true
+    doorbell=asserted; writes=writes+1
+    // Inject a new request after clear but before handler acquires mailbox.
+    if (!asserted && onAck != 0) { word=onAck | 1; doorbell=true; onAck=0 }
+    true
+}
+@export("abla_peer_notify_test")
+trusted fun notifyTest(): i32 {
+    while (channel < 4) {
+        delay=0
+        while (delay < 8) {
+            polls=0; writes=0; bad=false
+            val ticket=esp32S3PeerParkNotifyOwned(4096,channel)
+            if (ticket == 0 || !doorbell || writes != 1) return i32(1)
+            if (!esp32S3PeerParkServiceOwned(4096,channel) || masked || doorbell || bad || writes != 2 || polls != delay+1 || word != (ticket | 4)) return i32(2)
+            delay=delay+1
+        }
+        channel=channel+1
+    }
+    channel=0
+    val cancelled=esp32S3PeerParkNotifyOwned(4096,0)
+    if (!xtensaPeerParkCancelOwned(4096,cancelled) || esp32S3PeerParkServiceOwned(4096,0) || doorbell) return i32(3)
+    // Doorbell from old request is coalesced with new request during ack.
+    onAck=cancelled+8; polls=0; delay=0
+    if (!esp32S3PeerParkServiceOwned(4096,0) || word != ((cancelled+8) | 4) || !doorbell || bad) return i32(4)
+    if (esp32S3PeerParkServiceOwned(4096,0) || doorbell || masked) return i32(5)
+    writes=0
+    if (esp32S3PeerParkNotifyOwned(4096,4) != 0 || esp32S3PeerParkNotifyOwned(0,0) != 0 || esp32S3PeerParkServiceOwned(4097,0) || writes != 0) return i32(6)
+    i32(0)
+}

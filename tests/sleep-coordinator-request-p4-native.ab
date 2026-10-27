@@ -1,0 +1,82 @@
+import "./sleep-smp-p4-native.ab"
+import "../src/esp32/power/sleep_coordinator_request_p4_sequence.ab"
+// Real SMP and callback state machine; session/hardware boundary modeled here.
+// Actual session is checked separately through generated graph/MMIO models.
+val requestStorage=nativeStaticAllocate(1648)
+var requestCalls=0
+var requestEvent=1
+var requestBad=false
+var requestFault=false
+fun requestBase(): int = (requestStorage+15)&(~15)
+fun requestRecord(): NativeBuffer = nativeBufferAt(requestBase(),48)
+fun requestCpu(): NativeBuffer = nativeBufferAt(requestBase()+48,816)
+fun requestClocks(): NativeBuffer = nativeBufferAt(requestBase()+864,288)
+fun requestSession(): NativeBuffer = nativeBufferAt(requestBase()+1152,464)
+fun p4RequestRelax(): void { return }
+fun p4RequestSession(r: NativeBuffer,polls: int,eventPolls: int): int {
+    requestCalls=requestCalls+1
+    val state=esp32p4SleepSmpObserve(nativeBufferAt(smpStorage,4),smpGeneration)
+    if (state.stage() != 2 || state.phase(0) != 2 || state.phase(1) != 2 ||
+        requestCpu().loadU32(676) != 1 || requestRecord().loadU32(4) != 3) requestBad=true
+    if (requestFault) return 11
+    if (requestCalls == 1) return 7
+    return requestEvent
+}
+fun requestSeed(hart: int,event: int): void {
+    smpSeed();requestCalls=0;requestBad=false;requestFault=false;requestEvent=event
+    val all=nativeBufferAt(requestBase(),1620)
+    var i=0
+    while (i < 1620) { all.storeU32(i,0);i=i+4 }
+    all.storeU32(1616,0x1234abcd)
+    val cpu=requestCpu();cpu.storeU32(0,0x50345243);cpu.storeU32(4,4);cpu.storeU32(8,hart)
+    val clocks=requestClocks();clocks.storeU32(0,0x50344353);clocks.storeU32(4,4);clocks.storeU32(32,hart)
+    val session=requestSession();session.storeU32(0,0x50345332);session.storeU32(4,2)
+    session.storeU32(32,0x50345031);session.storeU32(36,2)
+    if (smpAct(hart,0).status() != 1 || smpAct(1-hart,1).status() != 1 || smpAct(1-hart,2).status() != 1) requestBad=true
+    smpHart=u32(hart);return
+}
+fun requestPrepare(): int = esp32p4SleepCoordinatorRequestPrepareOwned(requestRecord(),requestCpu(),requestClocks(),requestSession(),nativeBufferAt(smpStorage,4),smpGeneration,true)
+fun requestEnter(): void {
+    val cpu=requestCpu();cpu.storeU32(4,5);cpu.storeU32(672,0x50344358);cpu.storeU32(676,1);cpu.storeU32(680,int(smpHart));return
+}
+fun requestContinue(): int = esp32p4SleepCoordinatorRequestContinueOwned(requestRecord(),2,2,true)
+@export("abla_sleep_coordinator_request_p4_test")
+fun requestTest(): int {
+    var scenario=0
+    while (scenario < 16) {
+        val hart=scenario&1;val event=if ((scenario/2)%4 == 3) 10 else 1+(scenario/2)%4
+        requestSeed(hart,event)
+        if (requestPrepare() != 7 || requestBad || requestCalls != 0) return 1
+        // Neither a ready bank owner nor an incomplete integer frame grants authorization.
+        if (requestContinue() != 9 || ((smpWord>>>9)&u32(7)) != u32(1)) return 2
+        requestEnter()
+        if (scenario < 8) {
+            if (requestContinue() != 7 || requestRecord().loadU32(4) != 2 || requestCalls != 0) return 3
+            if (requestContinue() != 7 || requestRecord().loadU32(4) != 3 || requestCalls != 0) return 4
+            val authorized=smpCasCalls
+            if (requestContinue() != 7 || requestCalls != 1 || requestContinue() != event || smpCasCalls != authorized) return 5
+            if (requestContinue() != event || requestCalls != 2) return 6
+        } else if (esp32p4SleepCoordinatorRequest(u32(requestRecord().addressValue())) != u32(event)) return 7
+        if (requestBad || requestCalls != 2 || requestRecord().loadU32(8) != event ||
+            nativeBufferAt(requestBase(),1620).loadU32(1616) != 0x1234abcd) return 8
+        scenario=scenario+1
+    }
+    requestSeed(0,1)
+    requestSession().storeU32(176,0x50344331)
+    if (requestPrepare() != 4 || requestRecord().loadU32(0) != 0) return 9
+    requestSeed(0,1)
+    if (esp32p4SleepCoordinatorRequestPrepareOwned(requestRecord(),requestCpu(),requestClocks(),requestSession(),nativeBufferAt(requestBase()+8,4),smpGeneration,true) != 4) return 10
+    requestSeed(0,1)
+    if (requestPrepare() != 7) return 11
+    requestEnter();smpHart=u32(1)
+    if (requestContinue() != 4 || requestCalls != 0) return 12
+    smpHart=u32(0)
+    if (requestContinue() != 7 || requestContinue() != 7) return 13
+    requestFault=true
+    if (requestContinue() != 9 || requestRecord().loadU32(4) != 3 || requestRecord().loadU32(12) != 11) return 14
+    // A resumed ROM frame cannot re-enter the request callback.
+    requestCpu().storeU32(676,3)
+    val calls=requestCalls
+    if (requestContinue() != 9 || requestCalls != calls) return 15
+    return 0
+}

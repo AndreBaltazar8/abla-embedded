@@ -1,0 +1,134 @@
+import "../src/esp32/i2c/pins_p4_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val registers=nativeStaticAllocate(4608)
+val original=nativeStaticAllocate(4608)
+val storage=nativeStaticAllocate(40)
+var writes=0
+var drop=0
+var changed=0
+var held=false
+var busy=false
+var bad=false
+trusted fun p4GpioHoldRead(address: int): u32 = if (held) u32(0xffffffff) else u32(0)
+trusted fun p4GpioHoldWrite(address: int,value: u32): void { bad=true;return }
+trusted fun p4I2cRead(address: int): u32 {
+    if (address == 0x500e601c) return u32(0x3000)
+    if (address == 0x500e6040) return u32(0x8000002)
+    if (address == 0x500e60c4) return u32(0)
+    val offset=address-(if (address >= 0x500c5000) 0x500c5000 else 0x500c4000)
+    if (offset == 4) return u32(0x110)
+    if (offset == 8) return if (busy) u32(16) else u32(0)
+    if (offset == 24) return u32(0x4000)
+    bad=true;return u32(0)
+}
+trusted fun p4I2cWrite(address: int,value: u32): void { bad=true;return }
+fun mapped(offset: int): int = if (offset >= 0x4b008 && offset <= 0x4b044) 4400+offset-0x4b008 else offset
+trusted fun p4GpioRead(offset: int): u32 {
+    val at=mapped(offset)
+    if (at < 0 || at >= 4608 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(registers,4608).loadU32(at))
+}
+trusted fun p4GpioWrite(offset: int,value: u32): void {
+    writes=writes+1
+    val m=nativeBufferAt(registers,4608)
+    var at=mapped(offset)
+    var wanted=value
+    if (offset == 36 || offset == 48 || offset == 8 || offset == 20) {
+        at=offset-4;wanted=p4GpioRead(at)|value
+    } else if (offset == 40 || offset == 52 || offset == 12 || offset == 24) {
+        at=offset-8;wanted=p4GpioRead(at)&(u32(0xffffffff)^value)
+    }
+    if (at < 0 || at >= 4608 || (at&3) != 0) { bad=true;return }
+    if (u32(m.loadU32(at)) != wanted) {
+        changed=changed+1
+        if (changed == drop) return
+    }
+    m.storeU32(at,int(wanted));return
+}
+trusted fun p4PinSnapshotRead(address: int): int = int(p4GpioRead(address-0x500e0000))
+trusted fun p4PinSnapshotWrite(address: int,value: int): void { p4GpioWrite(address-0x500e0000,u32(value));return }
+trusted fun seed(): void {
+    val m=nativeBufferAt(registers,4608);val saved=nativeBufferAt(original,4608)
+    var i=0
+    while (i < 4608) { m.storeU32(i,(i*1337)^0xa55a1234);saved.storeU32(i,m.loadU32(i));i=i+4 }
+    i=0
+    while (i < 40) { nativeBufferAt(storage,40).storeU32(i,0);i=i+4 }
+    writes=0;drop=0;changed=0;held=false;busy=false;bad=false;return
+}
+trusted fun restored(): bool {
+    var i=0
+    while (i < 4608) {
+        if (nativeBufferAt(registers,4608).loadU32(i) != nativeBufferAt(original,4608).loadU32(i)) return false
+        i=i+4
+    }
+    return !bad
+}
+@export("abla_i2c_pins_p4_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(storage,40)
+    var layout=1
+    while (layout <= 3) {
+        var port=0
+        while (port < 2) {
+            var pin=0
+            while (pin <= 54) {
+                val other=(pin+29)%55
+                var pull=0
+                while (pull < 2) {
+                    seed()
+                    if (esp32p4I2cPinsOpenOwned(r,port,pin,other,pull != 0,layout,true) != 1 || bad) return i32(1)
+                    val count=changed
+                    var i=0
+                    while (i < 2) {
+                        val pad=if (i == 0) other else pin
+                        val signal=68+port*2+i
+                        if ((p4GpioRead(344+signal*4)&u32(255)) != u32(128|pad) ||
+                            (p4GpioRead(1368+pad*4)&u32(4095)) != u32(signal) ||
+                            (p4GpioRead(116+pad*4)&u32(4)) == u32(0) ||
+                            (p4GpioRead(4100+pad*4)&u32(29570)) != u32(4608+pull*256)) return i32(2)
+                        i=i+1
+                    }
+                    if (esp32p4I2cPinsOpenOwned(r,port,pin,other,false,layout,true) != 0) return i32(3)
+                    busy=true;val before=writes
+                    if (esp32p4I2cPinsCloseOwned(r,true) != 4 || writes != before) return i32(4)
+                    busy=false;changed=0
+                    if (esp32p4I2cPinsCloseOwned(r,true) != 2 || !restored()) return i32(5)
+                    val closeCount=changed
+                    val closedWrites=writes
+                    if (esp32p4I2cPinsCloseOwned(r,true) != 2 || writes != closedWrites) return i32(6)
+                    var fault=1
+                    while (fault <= count) {
+                        seed();drop=fault
+                        if (esp32p4I2cPinsOpenOwned(r,port,pin,other,pull != 0,layout,true) != 3 || changed != fault || bad) return i32(7)
+                        drop=0
+                        if (esp32p4I2cPinsCloseOwned(r,true) != 2 || !restored()) return i32(8)
+                        fault=fault+1
+                    }
+                    fault=1
+                    while (fault <= closeCount) {
+                        seed()
+                        if (esp32p4I2cPinsOpenOwned(r,port,pin,other,pull != 0,layout,true) != 1) return i32(9)
+                        changed=0;drop=fault
+                        if (esp32p4I2cPinsCloseOwned(r,true) != 3 || changed != fault || bad) return i32(10)
+                        drop=0
+                        if (esp32p4I2cPinsCloseOwned(r,true) != 2 || !restored()) return i32(11)
+                        fault=fault+1
+                    }
+                    pull=pull+1
+                }
+                pin=pin+1
+            }
+            port=port+1
+        }
+        layout=layout+2
+    }
+    seed();held=true
+    if (esp32p4I2cPinsOpenOwned(r,0,0,1,true,1,true) != 0 || writes != 0) return i32(12)
+    held=false;busy=true
+    if (esp32p4I2cPinsOpenOwned(r,0,0,1,true,1,true) != 4 || writes != 0) return i32(13)
+    busy=false
+    if (esp32p4I2cPinsOpenOwned(r,0,0,0,true,1,true) != 0 || writes != 0) return i32(14)
+    if (esp32p4I2cPinsOpenOwned(r,0,0,1,true,1,false) != 0 || writes != 0) return i32(15)
+    return i32(0)
+}

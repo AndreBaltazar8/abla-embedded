@@ -1,0 +1,173 @@
+import "../src/sd/selected_s3_sequence.ab"
+import "../src/sd/owned_s3_sequence.ab"
+import "../src/sd/session_s3_sequence.ab"
+import "../src/esp32/gpio/s3_logic.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin=int
+fun Pin.valid(): bool = espChipS3().gpioValid(this)
+fun Pin.outputCapable(): bool = espChipS3().gpioOutputValid(this)
+fun Pin.outputLevelOwned(high: bool): bool { bad=true;return false }
+fun Pin.routeOutputSignal(signal: int,inverted: bool = false): bool { bad=true;return false }
+fun Pin.routeInputSignal(signal: int,inverted: bool = false): bool { bad=true;return false }
+fun s3SdMuxAddress(number: int): int = esp32S3GpioMuxAddress(number)
+val memory=nativeStaticAllocate(528)
+val queue=nativeStaticAllocate(1024)
+val sent=nativeStaticAllocate(1024)
+val gateStorage=nativeStaticMutableU32s([0])
+val sessionMemory=nativeStaticAllocate(64)
+var peripheral=2
+var firstPin=10
+var starts=0
+var failAt=0
+var faults=0
+var faultAddress=0
+var faultMask=0
+var busy=false
+var stallAt=0
+var done=false
+var fifo=0
+var bad=false
+var csHigh=false
+var csCalls=0
+var csFailAt=0
+var fastClock=false
+val imageData=nativeStaticAllocate(2560)
+var imageEnabled=false
+var imageCorrupt=false
+var imageHeader=0
+var imageArgument=0
+var imageReply=-1
+var imageSlot=0
+var imageCrc=0
+var imageCommand=17
+var imageWritePhase=-1
+var imageStatusBytes=0
+trusted fun imageExchange(value: int): int {
+    if (nativeAddressLoadU32(gateStorage,0) != 7) bad=true
+    if (csHigh) { if (imageHeader != 0 || imageReply != -1) bad=true;return 255 }
+    if (imageStatusBytes > 0) { imageStatusBytes=imageStatusBytes-1;return 0 }
+    if (imageWritePhase >= 0) {
+        val phase=imageWritePhase;imageWritePhase=phase+1
+        if (phase == 0) return 0
+        if (phase == 1) { if (value != 254) bad=true;return 255 }
+        if (phase < 514) {
+            nativeBufferAt(imageData,2560).store(imageSlot*512+phase-2,value)
+            imageCrc=sdSpiCrc16Byte(imageCrc,value);return 255
+        }
+        if (phase == 514) { if (value != imageCrc>>>8) bad=true;return 255 }
+        if (phase == 515) { if (value != (imageCrc&255)) bad=true;return 255 }
+        if (phase == 516) return 5
+        imageWritePhase=-1;return 255
+    }
+    if (imageReply >= 0) {
+        if (value != 255) bad=true
+        val index=imageReply;imageReply=imageReply+1
+        if (index == 0) return 0
+        if (index == 1) return 254
+        if (index < 514) {
+            val byte=nativeBufferAt(imageData,2560).load(imageSlot*512+index-2)
+            imageCrc=sdSpiCrc16Byte(imageCrc,byte);return byte
+        }
+        if (index == 514) return imageCrc>>>8
+        imageReply=-1
+        return (imageCrc&255)^(if (imageCorrupt) 1 else 0)
+    }
+    if (imageHeader == 0) {
+        if (value == 255) return 255
+        if (value != 81 && value != 88 && value != 77) bad=true
+        imageCommand=value&63
+        imageHeader=1;imageArgument=0;return 255
+    }
+    if (imageHeader < 5) { imageArgument=(imageArgument<<8)|value;imageHeader=imageHeader+1;return 255 }
+    if (value != sdSpiCommandFrameCrc(imageCommand,imageArgument)) bad=true
+    if (imageCommand == 13) { imageHeader=0;imageStatusBytes=2;return 255 }
+    imageSlot=if (imageArgument == 0) 0 else if (imageArgument == 1) 1 else if (imageArgument == 81) 2
+        else if (imageArgument == 113) 3 else if (imageArgument == 114) 4 else -1
+    if (imageSlot < 0) { bad=true;imageSlot=0 }
+    imageHeader=0;imageCrc=0
+    if (imageCommand == 24) imageWritePhase=0 else imageReply=0
+    return 255
+}
+trusted fun prepareSessionCard(): void {
+    transferDivider=(3<<18)|(49<<12)|(24<<6)|49;transferRoot=7;clockWrites=0;ignoredClockWrite=0
+    imageEnabled=false;imageCorrupt=false;imageHeader=0;imageReply=-1
+    imageWritePhase=-1;imageStatusBytes=0;imageCommand=17
+    val q=nativeBufferAt(queue,1024)
+    var index=0
+    while (index < 1024) { q.store(index,255);index=index+1 }
+    q.store(16,1);q.store(23,1);q.store(24,0);q.store(25,0);q.store(26,1);q.store(27,170)
+    q.store(34,1);q.store(41,0);q.store(48,0);q.store(49,192);q.store(50,255);q.store(51,128);q.store(52,0)
+    q.store(61,0);q.store(62,254)
+    index=0
+    while (index < 16) { q.store(63+index,0);index=index+1 }
+    q.store(63,64);q.store(68,9);q.store(70,63);q.store(71,255);q.store(72,255)
+    var crc7=0;index=0
+    while (index < 15) { crc7=sdSpiCrc7Byte(crc7,q.load(63+index));index=index+1 }
+    q.store(78,(crc7<<1)|1)
+    var crc16=0;index=0
+    while (index < 16) { crc16=sdSpiCrc16Byte(crc16,q.load(63+index));index=index+1 }
+    q.store(79,crc16>>>8);q.store(80,crc16)
+    nativeAddressStoreU32(gateStorage,0,0);starts=0;csCalls=0;csHigh=true;done=false
+    failAt=0;stallAt=0;csFailAt=0;bad=false;return
+}
+fun s3SdSelectLevel(select: Pin,high: bool): bool {
+    csCalls=csCalls+1
+    if (select != firstPin+3) bad=true
+    if (csCalls == csFailAt) return false
+    csHigh=high;return true
+}
+fun sdSpiSelectedDelay(us: int): void { if (us != 1000) bad=true;return }
+trusted fun esp32s3SpiRead(address: int): int {
+    val base=esp32s3SpiBase(peripheral)
+    var result=0
+    if (address == base) result=if (busy) 0x01000000 else 0
+    else if (address == base+0x3c) result=if (starts == failAt && failAt != 0) 0x21000 else if (done) 4096 else 0
+    else if (address == base+0x98) result=fifo
+    else if (address == 0x600c0018) result=64|65536
+    else if (address == base+0xe8) result=transferRoot
+    else if (address == base+12) result=if (fastClock) 1<<31 else transferDivider
+    else if (address == 0x60004004+(if (firstPin >= 32) 12 else 0)) result=if (csHigh) 1<<((firstPin+3)&31) else 0
+    else if (address == 0x60004020 || address == 0x6000402c) {
+        val bank=if (firstPin >= 32) 0x6000402c else 0x60004020
+        if (address == bank) result=(1<<(firstPin&31))|(1<<((firstPin+2)&31))|(1<<((firstPin+3)&31))
+    } else {
+        val signal=if (peripheral == 2) 101 else 66
+        var index=0
+        while (index < 4) {
+            val number=firstPin+index
+            if (address == s3SdMuxAddress(number)) result=if (index == 1) 0x1200 else 0x1000
+            if (address == 0x60004554+number*4) result=if (index == 0) signal+2 else if (index == 2) signal else if (index == 3) 1280 else 1024|73
+            index=index+1
+        }
+        if (address == 0x60004154+(signal+1)*4) result=128|(firstPin+1)
+    }
+    return if (address == faultAddress) result^faultMask else result
+}
+var transferDivider=(3<<18)|(49<<12)|(24<<6)|49
+var transferRoot=7
+var clockWrites=0
+var ignoredClockWrite=0
+trusted fun esp32s3SpiWrite(address: int,value: int): void {
+    val base=esp32s3SpiBase(peripheral)
+    if (address == base+12 || address == base+0xe8) {
+        clockWrites=clockWrites+1
+        if (clockWrites != ignoredClockWrite) {
+            if (address == base+12) transferDivider=value else transferRoot=value
+        }
+    }
+    else if (address == base+0x98) fifo=value
+    else if (address == base+0x10) { if (value != 0x18000001) bad=true }
+    else if (address == base+0x1c) { if (value != 7) bad=true }
+    else if (address == base+0x38) { if (value != 0x61000 && value != 4096) bad=true;done=false }
+    else if (address == base) {
+        if (value == 0x01000000) {
+            if (imageEnabled) { fifo=imageExchange(fifo);starts=starts+1;done=true;return }
+            if (starts >= 1024) { bad=true;return }
+            nativeBufferAt(sent,1024).store(starts,fifo)
+            fifo=nativeBufferAt(queue,1024).load(starts);starts=starts+1;done=true
+            if (starts == stallAt) busy=true
+        } else if (value != 0x00800000) bad=true
+    } else bad=true
+    return
+}

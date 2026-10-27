@@ -1,0 +1,160 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/buzzer_stream_c6_sequence.ab"
+import "../src/esp32/i2s/buzzer_stream_end_c6_sequence.ab"
+var descriptors=NativeBuffer(0)
+var cursor=NativeBuffer(0)
+var channel=0
+var raw=u32(0)
+var late=false
+var eventReads=0
+var writes=0
+var fences=0
+var bad=false
+var expected=NativeBuffer(0)
+var producer=NativeBuffer(0)
+trusted fun c6I2sClockRead(at: int): u32 = if (at == 0) u32(1) else u32(0x400000)
+trusted fun c6I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6I2sRead(at: int): u32 = if (at == 0x24) u32(0x8b004) else if (at == 0x2c) u32(c6I2sStereoFrameWord(16,16,16,false)) else if (at == 0x54) u32(0x10003) else u32(0)
+trusted fun c6I2sWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6GdmaBusRead(): u32 = u32(1)
+trusted fun c6GdmaBusWrite(value: u32): void { bad=true;return }
+trusted fun c6GdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    if (at == 0x30+channel*16) { eventReads=eventReads+1;return raw|(if (late && eventReads >= 3) u32(4) else u32(0)) }
+    if (at == 0x38+channel*16) return u32(0)
+    bad=true;return u32(0)
+}
+trusted fun c6GdmaWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6GdmaDescriptorFence(): void { fences=fences+1;return }
+trusted fun c6GdmaDescriptorRead(at: int): u32 {
+    if (at < 0x40800000 || at >= 0x40800060 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(descriptors.loadU32(at-0x40800000))
+}
+trusted fun c6GdmaDescriptorWrite(at: int,value: u32): void {
+    if (at != 0x40800000+cursor.loadU32(8)*12 || cursor.loadU32(12) != 4 || fences < 3 || value != u32(0xc0040040)) { bad=true;return }
+    if (producer.loadU32(4) != 2) bad=true
+    val payload=nativeBufferAt(0x40810000+cursor.loadU32(8)*64,64)
+    var offset=0
+    while (offset < 64) { if (payload.loadU32(offset) != expected.loadU32(offset)) bad=true;offset=offset+4 }
+    writes=writes+1;descriptors.storeU32(at-0x40800000,int(value));return
+}
+trusted fun initialize(r: NativeBuffer,count: int): void {
+    var at=0
+    while (at < 72) { r.storeU32(at,0);at=at+4 }
+    at=0
+    while (at < 32) { cursor.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43364944);r.storeU32(4,1);r.storeU32(12,channel);r.storeU32(16,1)
+    r.storeU32(20,0x40800000);r.storeU32(24,count);r.storeU32(28,0x40810000);r.storeU32(32,64);r.storeU32(36,64);r.storeU32(40,1)
+    at=0
+    while (at < count) {
+        descriptors.storeU32(at*12,0xc0040040);descriptors.storeU32(at*12+4,0x40810000+at*64)
+        descriptors.storeU32(at*12+8,if (at+1 == count) 0x40800000 else 0x40800000+(at+1)*12)
+        at=at+1
+    }
+    raw=u32(0);late=false;eventReads=0;writes=0;fences=0;bad=false;return
+}
+trusted fun newBank(address: int): PcmSourceQueues {
+    val bank=pcmSourceQueuesAt(nativeBufferAt(address,64),2,8000)
+    val data=nativeBufferAt(address+180,8)
+    data.storeU16(0,30000);data.storeU16(2,-20000);data.storeU16(4,10000);data.storeU16(6,-5000)
+    val wav=pcmRaw(data,nativeBufferAt(address+160,20),8000,1,16)
+    val channel=pcmChannelAt(nativeBufferAt(address+64,32),8000)
+    val tone=pcmToneAt(nativeBufferAt(address+96,32),8000,500000,3)
+    val other=pcmToneAt(nativeBufferAt(address+128,32),8000,731000,4294967295,12000)
+    channel.enqueue(wav,2)
+    bank.enqueue(pcmPlaybackChannel(channel),0)
+    bank.enqueue(pcmPlaybackTone(tone),0)
+    bank.enqueue(pcmPlaybackTone(other),1)
+    return bank
+}
+
+@export("abla_buzzer_stream_c6_test")
+trusted fun test(): i32 {
+    val memory=nativeStaticAllocate(8192)
+    val r=nativeBufferAt(memory+512,72);cursor=nativeBufferAt(memory+584,32)
+    producer=nativeBufferAt(memory+616,24)
+    descriptors=nativeBufferAt(0x40800000,96)
+    val acc=nativeBufferAt(memory+1024,512);val scratch=nativeBufferAt(memory+1536,256)
+    val mono=nativeBufferAt(memory+1792,128);val staging=nativeBufferAt(memory+2048,256)
+    expected=nativeBufferAt(memory+2304,256)
+    val refMono=nativeBufferAt(memory+2560,128)
+    val volume=PcmVolume(177)
+    while (channel < 3) {
+        var count=2
+        while (count <= 4) {
+            val sources=newBank(memory);val reference=newBank(memory+256)
+            initialize(r,count);producer.storeU32(0,0)
+            if (!buzzerSourceBlockInitOwned(producer,0,true)) return i32(1)
+            var refState=BuzzerDeltaSigma(0)
+            // Prefill precedes modeled START; source/remainder continue from its tail.
+            var index=0
+            while (index < count) {
+                if (buzzerSourceBlockPrepareOwned(producer,sources,16,acc,scratch,mono,staging,volume,true) != 1 || !reference.renderOutput(16,acc,scratch,refMono,false,volume.gainQ15())) return i32(2)
+                refState=refState.encodePcm16Stereo16(refMono,expected,16)
+                val buffer=nativeBufferAt(0x40810000+index*64,64)
+                var at=0
+                while (at < 64) { buffer.storeU32(at,staging.loadU32(at));if (staging.loadU32(at) != expected.loadU32(at)) return i32(3);at=at+4 }
+                if (!buzzerSourceBlockReleaseOwned(producer,true,true)) return i32(4)
+                index=index+1
+            }
+            var cycle=0
+            while (cycle < 48) {
+                val phase=nativeBufferAt(memory+128,32).loadU32(12)
+                if (c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 5 || nativeBufferAt(memory+128,32).loadU32(12) != phase) return i32(5)
+                index=cycle%count;descriptors.storeU32(index*12,0x40040040);eventReads=0
+                if (!reference.renderOutput(16,acc,scratch,refMono,false,volume.gainQ15())) return i32(6)
+                refState=refState.encodePcm16Stereo16(refMono,expected,16)
+                if (c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 1 || writes != cycle+1 || producer.loadU32(4) != 1 || producer.loadU32(8) != (refState|0) || bad) return i32(7)
+                cycle=cycle+1
+            }
+            // Invalid rate/workspaces are rejected before rendering or publication.
+            index=cursor.loadU32(8);descriptors.storeU32(index*12,0x40040040)
+            val before=writes;val phase=nativeBufferAt(memory+128,32).loadU32(12)
+            if (c6BuzzerStreamRefillOwned(r,cursor,producer,sources,16000,acc,scratch,mono,staging,volume,true) != 2 ||
+                c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,nativeBufferAt(0x40810000,64),volume,true) != 2 || writes != before || nativeBufferAt(memory+128,32).loadU32(12) != phase) return i32(8)
+            // Error at publish after a successful render retains staging and cursor.
+            eventReads=0;late=true
+            if (c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 3 || writes != before || producer.loadU32(4) != 2 || cursor.loadU32(8) != index) return i32(9)
+            val renderedPhase=nativeBufferAt(memory+128,32).loadU32(12);val remainder=producer.loadU32(8);val first=staging.loadU32(0)
+            if (c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,staging,PcmVolume(0),true) != 3 || writes != before || nativeBufferAt(memory+128,32).loadU32(12) != renderedPhase || producer.loadU32(8) != remainder || staging.loadU32(0) != first) return i32(10)
+            count=count+1
+        }
+        channel=channel+1
+    }
+    // Final block uses the same source/encoder path but never circular-publishes.
+    channel=0
+    while (channel < 3) {
+        var count=2
+        while (count <= 4) {
+            val sources=newBank(memory);val reference=newBank(memory+256)
+            initialize(r,count);producer.storeU32(0,0)
+            val drain=nativeBufferAt(memory+700,64);drain.storeU32(0,0)
+            if (!buzzerSourceBlockInitOwned(producer,0,true)) return i32(11)
+            val phase=nativeBufferAt(memory+128,32).loadU32(12)
+            if (c6BuzzerStreamEndBeginOwned(r,cursor,drain,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 5 ||
+                drain.loadU32(0) != 0 || nativeBufferAt(memory+128,32).loadU32(12) != phase) return i32(12)
+            descriptors.storeU32(0,0x40040040)
+            // Drain initialization may not clobber any producer/workspace/source.
+            staging.storeU32(0,0)
+            if (c6BuzzerStreamEndBeginOwned(r,cursor,nativeBufferAt(staging.addressValue(),64),producer,sources,8000,acc,scratch,mono,staging,volume,true) != 2 ||
+                c6BuzzerStreamEndBeginOwned(r,cursor,nativeBufferAt(memory,64),producer,sources,8000,acc,scratch,mono,staging,volume,true) != 2 ||
+                writes != 0 || nativeBufferAt(memory+128,32).loadU32(12) != phase) return i32(13)
+            if (!reference.renderOutput(16,acc,scratch,refMono,false,volume.gainQ15())) return i32(14)
+            val refState=BuzzerDeltaSigma(0).encodePcm16Stereo16(refMono,expected,16)
+            if (c6BuzzerStreamEndBeginOwned(r,cursor,drain,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 5 ||
+                drain.loadU32(0) != 0x43364452 || drain.loadU32(4) != 1 || cursor.loadU32(12) != 5 || producer.loadU32(4) != 2 ||
+                producer.loadU32(8) != (refState|0) || descriptors.loadU32(0) != 0x40040040 || writes != 0 || bad) return i32(15)
+            val payload=nativeBufferAt(0x40810000,64)
+            var at=0
+            while (at < 64) { if (payload.loadU32(at) != expected.loadU32(at)) return i32(16);at=at+4 }
+            val renderedPhase=nativeBufferAt(memory+128,32).loadU32(12)
+            if (c6BuzzerStreamEndBeginOwned(r,cursor,drain,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 2 ||
+                c6BuzzerStreamRefillOwned(r,cursor,producer,sources,8000,acc,scratch,mono,staging,volume,true) != 2 ||
+                nativeBufferAt(memory+128,32).loadU32(12) != renderedPhase || writes != 0) return i32(17)
+            count=count+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

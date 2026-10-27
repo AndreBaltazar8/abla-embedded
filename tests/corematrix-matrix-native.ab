@@ -1,0 +1,207 @@
+import "../src/m5stack/corematrix_control_sequence.ab"
+import "../src/m5stack/expander_open.ab"
+import "../src/m5stack/pmic_open.ab"
+import "../src/m5stack/corematrix_startup_sequence.ab"
+import "../src/m5stack/corematrix_power.ab"
+import "../src/m5stack/pm1_presence.ab"
+import "abla/build"
+var apb=u32(0)
+var functional=u32(0)
+var gpio=u32(0)
+var gateWrites=0
+var dropGate=0
+var padWrites=0
+var dropPad=0
+var pads=0
+var bad=false
+var low=false
+var ticks=0
+fun c61DelayClockRead(address: int): int = if (address == 0x600960e8) 2<<16 else 1
+fun c61DelayClockSetRomTicks(value: int): void { ticks=value;return }
+fun c61GpioClockRead(address: int): u32 = if (address == 0x600960c0) apb else if (address == 0x600960c4) functional else gpio
+fun c61GpioClockWrite(address: int,value: u32): void {
+    gateWrites=gateWrites+1
+    if (pads != 0) bad=true
+    if (gateWrites == dropGate) return
+    if (address == 0x600960c0) apb=value else if (address == 0x600960c4) functional=value else gpio=value
+    return
+}
+fun c61SoftwareI2cReady(sda: int,scl: int): bool = apb == u32(1) && functional == u32(0x400000) && gpio == u32(1) && ticks == 80
+fun c61SoftwareI2cConfigure(pin: int,enabled: bool): bool {
+    padWrites=padWrites+1
+    if (padWrites == dropPad) return false
+    if (enabled) pads=pads|(1<<pin) else pads=pads&~(1<<pin)
+    return true
+}
+fun softwareI2cSample(pin: int): bool = if (pin == 1) clockHigh else masterHigh && slaveHigh
+fun softwareI2cDrive(pin: int,released: bool): void = wireDrive(pin,released)
+fun softwareI2cDelay(us: int): void { return }
+fun seed(borrow: int): void {
+    apb=u32(borrow&1);functional=if ((borrow&2) != 0) u32(0x400000) else u32(0)
+    gpio=u32((borrow>>>2)&1)
+    gateWrites=0;dropGate=0;padWrites=0;dropPad=0;pads=0;bad=false;low=false;ticks=0
+    return
+}
+fun open(): Esp32C61I2cSession = esp32C61I2cSessionOpenOwned(0,1,40000000,20000000,true,5,8)
+
+val registers=nativeStaticAllocate(512)
+val record=nativeStaticAllocate(64)
+val presenceStorage=nativeStaticAllocate(32)
+var irqCalls=0
+fun coreMatrixStartupAdmission(owner: int,presence: Pm1BatteryPresence): bool = M5CoreMatrixControl(owner).ready()
+fun coreMatrixStartupInputs(owner: int): int = M5CoreMatrixControl(owner).pmic().configureCoreMatrixPm1Inputs()|0
+// GPIO2 MMIO handoff has its own register fault matrix; model only that leaf.
+fun coreMatrixStartupIrq(): int { irqCalls=irqCalls+1;return 1 }
+fun coreMatrixStartupChargeSense(owner: int): bool = M5Ioe1(M5CoreMatrixControl(owner).expanders().device(0)|0).setDirection(7,false)
+fun coreMatrixStartupPresence(owner: int,presence: Pm1BatteryPresence,now: int): int {
+    val control=M5CoreMatrixControl(owner)
+    return presence.updateBoard(m5BoardCoreMatrix,control.pmic().pm1(),M5Ioe1(control.expanders().device(0)|0),now)
+}
+fun coreMatrixStartupSd(owner: int): int = M5CoreMatrixControl(owner).expanders().configureCoreMatrixSdPower()|0
+var masterHigh=true
+var slaveHigh=true
+var clockHigh=true
+var mode=0
+var bits=0
+var value=0
+var index=0
+var selected=-1
+var pointer=0
+var reading=false
+var ack=true
+var ackCount=0
+var nackAt=0
+var starts=0
+var stops=0
+fun wireByte(): void {
+    ackCount=ackCount+1
+    ack=ackCount != nackAt
+    if (index == 0) {
+        selected=if ((value>>>1) == 79) 0 else if ((value>>>1) == 110) 256 else if ((value>>>1) == 114) 512 else -1
+        reading=(value&1) != 0
+        if (selected < 0) ack=false
+        if (selected == 512) {
+            if (reading || matrixSettled != 1) bad=true
+            matrixTransactions=matrixTransactions+1
+        }
+    } else if (ack && selected >= 0) {
+        if (selected == 512) {
+            if (index > 33) bad=true
+            else nativeBufferAt(matrixWire,33).store(index-1,value)
+        }
+        else if (index == 1) pointer=value
+        else { nativeBufferAt(registers,512).store(selected+pointer,value);pointer=(pointer+1)&255 }
+    }
+    index=index+1
+    return
+}
+fun sendBit(): void {
+    val byte=nativeBufferAt(registers,512).load(selected+pointer)
+    slaveHigh=(byte&(128>>>bits)) != 0;return
+}
+fun wireDrive(pin: int,high: bool): void {
+    if (pin == 0) {
+        val old=masterHigh
+        masterHigh=high
+        if (clockHigh && slaveHigh && old != high) {
+            if (!high) { starts=starts+1;mode=1;bits=0;value=0;index=0;reading=false }
+            else { stops=stops+1;mode=0;slaveHigh=true }
+        }
+        return
+    }
+    if (pin != 1) { bad=true;return }
+    if (clockHigh == high) return
+    clockHigh=high
+    if (high) {
+        if (mode == 1) { value=(value<<1)|(if (masterHigh) 1 else 0);bits=bits+1 }
+        else if (mode == 3) bits=bits+1
+        else if (mode == 4) ack=!masterHigh
+    } else {
+        if (mode == 1 && bits == 8) { wireByte();mode=2;slaveHigh=!ack }
+        else if (mode == 2) {
+            slaveHigh=true;bits=0;value=0
+            if (!ack) mode=5
+            else if (reading) { mode=3;sendBit() }
+            else mode=1
+        } else if (mode == 3) {
+            if (bits == 8) { mode=4;slaveHigh=true } else sendBit()
+        } else if (mode == 4) {
+            bits=0
+            if (ack) { pointer=(pointer+1)&255;mode=3;sendBit() } else { mode=5;slaveHigh=true }
+        }
+    }
+    return
+}
+fun wireSeed(): void {
+    seed(0)
+    masterHigh=true;slaveHigh=true;clockHigh=true;mode=0;bits=0;value=0;index=0
+    selected=-1;pointer=0;reading=false;ack=true;ackCount=0;nackAt=0;starts=0;stops=0
+    var at=0
+    while (at < 512) { nativeBufferAt(registers,512).store(at,255);at=at+1 }
+    nativeBufferAt(registers,512).store(256,18)
+    nativeBufferAt(registers,512).store(257,52)
+    nativeBufferAt(registers,512).store(258,86)
+    nativeBufferAt(registers,512).store(259,120)
+    return
+}
+
+import "../src/m5stack/corematrix_matrix_sequence.ab"
+import "../src/m5stack/corematrix_matrix_draw.ab"
+val matrixMemory=nativeStaticAllocate(96)
+val matrixWire=nativeStaticAllocate(33)
+var matrixTransactions=0
+var matrixSettled=0
+fun coreMatrixMatrixDelay(us: int): void {
+    val r=nativeBufferAt(registers,512)
+    if (us != 20000 || (r.load(19)&8) != 0 || (r.load(3)&8) == 0 || (r.load(5)&8) == 0) bad=true
+    matrixSettled=matrixSettled+1;return
+}
+@export("abla_corematrix_matrix_test")
+trusted fun testMatrix(): i32 {
+    val control=m5CoreMatrixControlAt(nativeBufferAt(record,64))
+    val matrix=m5CoreMatrixMatrixAt(nativeBufferAt(matrixMemory,96))
+    val wire=nativeBufferAt(matrixWire,33)
+    wireSeed();matrixTransactions=0;matrixSettled=0
+    if (!control.initialize() || control.openOwned(40000000,20000000,true) != 1 || !matrix.initializeFresh()) return i32(1)
+    val r=nativeBufferAt(registers,512);r.store(5,85)
+    val before=ackCount
+    if (matrix.openOwned(control,true) != 1 || !matrix.ready() || matrixSettled != 1 || matrixTransactions != 2 || bad) return i32(2)
+    val total=ackCount-before
+    val second=m5CoreMatrixMatrixAt(nativeBufferAt(nativeStackAllocate(96),96))
+    val retainedAck=ackCount;val retainedGates=gateWrites;val retainedPads=padWrites
+    if (!second.initializeFresh() || second.openOwned(control,true) != 2 || !second.closeOwned(true) || !control.matrixRetained() ||
+        control.closeOwned(true) || !control.ready() || control.openFailure() != 0 || !matrix.ready() || ackCount != retainedAck || gateWrites != retainedGates || padWrites != retainedPads) return i32(16)
+    var at=0
+    while (at < 33) { if (wire.load(at) != 0) return i32(3);at=at+1 }
+    if (r.load(5) != 93 || r.load(19) != 247 || r.load(3) != 255) return i32(4)
+    if (!matrix.setPixel(7,7,true) || !matrix.display() || wire.load(0) != 0 || wire.load(15) != 8 || bad) return i32(5)
+    if (!matrix.setBrightness(127) || wire.load(0) != 183 || wire.load(1) != 131) return i32(6)
+    val bitmap=nativeBufferAt(nativeStackAllocate(1),1);bitmap.store(0,165)
+    val beforeDraw=ackCount
+    if (!matrix.fillRect(-1,-1,18,18,false) || !matrix.drawBitmap(-3,0,8,1,bitmap,1) || ackCount != beforeDraw) return i32(13)
+    if (!matrix.display() || wire.load(0) != 0 || wire.load(1) != 65) return i32(14)
+    at=2;while (at < 33) { if (wire.load(at) != 0) return i32(15);at=at+1 }
+    // Failed shutdown must retain the slot; retry after the one-shot NACK.
+    nackAt=ackCount+1
+    if (matrix.closeOwned(true) || matrix.status() != 6 || (matrix.device()|0) == 0) return i32(7)
+    val failedAck=ackCount
+    if (!control.matrixRetained() || control.closeOwned(true) || !control.ready() || ackCount != failedAck) return i32(17)
+    nackAt=0
+    if (!matrix.closeOwned(true) || control.matrixRetained() || (matrix.control()|0) != 0 || !matrix.closeOwned(true) || (matrix.device()|0) != 0 || wire.load(0) != 130 || wire.load(1) != 128 ||
+        !control.closeOwned(true) || pads != 0 || bad) return i32(8)
+    var failure=1
+    while (failure <= total) {
+        wireSeed();matrixTransactions=0;matrixSettled=0
+        if (!control.initialize() || control.openOwned(40000000,20000000,true) != 1 || !matrix.initializeFresh()) return i32(9)
+        r.store(5,85);nackAt=ackCount+failure
+        val status=matrix.openOwned(control,true)
+        if ((status != 3 && status != 5) || matrix.ready() || ackCount != nackAt || bad) return i32(10)
+        if (status == 3 && (matrixSettled != 0 || matrixTransactions != 0)) return i32(11)
+        val failedOpenAck=ackCount
+        if (!control.matrixRetained() || control.closeOwned(true) || !control.ready() || control.openFailure() != 0 || ackCount != failedOpenAck) return i32(18)
+        nackAt=0
+        if (!matrix.closeOwned(true) || !control.closeOwned(true) || pads != 0 || bad) return i32(12)
+        failure=failure+1
+    }
+    return i32(0)
+}

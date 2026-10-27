@@ -1,0 +1,101 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/dma_stream_c5_sequence.ab"
+var count=1
+var controls=nativeBufferAt(0,0)
+var writes=0
+var immediate=false
+var corrupt=false
+var channel=0
+var tx=false
+var reads=0
+var error=false
+var bad=false
+trusted fun c5I2sClockRead(at: int): u32 { bad=true;return u32(0) }
+trusted fun c5I2sClockWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c5I2sRead(at: int): u32 { bad=true;return u32(0) }
+trusted fun c5I2sWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c5AhbGdmaBusRead(): u32 = u32(1)
+trusted fun c5AhbGdmaBusWrite(v: u32): void { bad=true;return }
+trusted fun c5AhbGdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    if (at == channel*16+(if (tx) 48 else 0)) return u32(if (error) (if (tx) 64 else 128) else 2)
+    return u32(0)
+}
+trusted fun c5AhbGdmaWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c5AhbGdmaDescriptorFence(): void { return }
+trusted fun c5AhbGdmaDescriptorWrite(at: int,v: u32): void {
+    val index=(at-0x40800000)/12
+    if (index < 0 || index >= count || at != 0x40800000+index*12 || (v&u32(0x80000000)) == u32(0)) { bad=true;return }
+    writes=writes+1
+    controls.storeU32(index*4,int(if (immediate) v&~u32(0x80000000) else v))
+    return
+}
+trusted fun c5AhbGdmaDescriptorRead(at: int): u32 {
+    reads=reads+1
+    val offset=at-0x40800000;val index=offset/12;val word=offset%12
+    if (offset < 0 || index >= count || (at&3) != 0) { bad=true;return u32(0) }
+    if (word == 0) return u32(controls.loadU32(index*4))
+    if (word == 4) return u32(0x40810000+index*64)
+    return u32(if (corrupt) 0 else if (index+1 < count) at+4 else 0x40800000)
+}
+trusted fun initialize(r: NativeBuffer,q: NativeBuffer): void {
+    var at=0
+    while (at < 72) { r.storeU32(at,0);at=at+4 }
+    at=0
+    while (at < 28) { q.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43354944);r.storeU32(4,1);r.storeU32(12,channel);r.storeU32(16,if (tx) 1 else 0);r.storeU32(20,0x40800000);r.storeU32(24,count);r.storeU32(28,0x40810000);r.storeU32(32,64);r.storeU32(36,64);r.storeU32(40,1)
+    at=0
+    while (at < count) { controls.storeU32(at*4,0x80000040|(if (tx) 0x40040000 else 0));at=at+1 }
+    reads=0;writes=0;error=false;bad=false;immediate=false;corrupt=false;return
+}
+@export("abla_i2s_dma_stream_c5_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(228)
+    val r=nativeBufferAt(storage,72);val q=nativeBufferAt(storage+72,28)
+    controls=nativeBufferAt(storage+100,128)
+    while (channel < 3) {
+        var direction=0
+        while (direction < 2) {
+            tx=direction == 1;count=1
+            while (count <= 32) {
+                initialize(r,q)
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 5 || writes != 0) return i32(1)
+                var step=0
+                while (step < count*3) {
+                    val index=step%count
+                    val length=if (tx) 64 else step%65
+                    controls.storeU32(index*4,64|(length<<12)|0x40000000)
+                    if (c5I2sDmaStreamPollOwned(r,q,true) != 1 || q.loadU32(12) != index || q.loadU32(16) != length) return i32(2)
+                    val before=reads
+                    if (c5I2sDmaStreamPollOwned(r,q,true) != 1 || reads != before) return i32(3)
+                    if (c5I2sDmaStreamRearmOwned(r,q,false) != 2 || writes != step) return i32(4)
+                    immediate=(step&1) != 0
+                    if (c5I2sDmaStreamRearmOwned(r,q,true) != 1 || writes != step+1 || q.loadU32(12) != (step+1)%count || q.loadU32(4) != 5) return i32(5)
+                    if (c5I2sDmaStreamRearmOwned(r,q,true) != 2 || writes != step+1) return i32(6)
+                    step=step+1
+                }
+                if (bad || q.loadU32(20) != 2) return i32(7)
+                initialize(r,q);controls.storeU32(0,0x40040040)
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 1) return i32(8)
+                error=true
+                if (c5I2sDmaStreamRearmOwned(r,q,true) != 3 || writes != 0 || (q.loadU32(20)&(if (tx) 64 else 128)) == 0) return i32(9)
+                error=false
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 3 || c5I2sDmaStreamRearmOwned(r,q,true) != 3 || writes != 0) return i32(10)
+                initialize(r,q);controls.storeU32(0,0x40040040);corrupt=true
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 3 || q.loadU32(24) != 6 || writes != 0) return i32(11)
+                initialize(r,q);controls.storeU32(0,0x40040040)
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 1) return i32(12)
+                r.storeU32(4,6)
+                val beforeStop=reads
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 2 || c5I2sDmaStreamRearmOwned(r,q,true) != 2 || reads != beforeStop || writes != 0) return i32(13)
+                r.storeU32(4,1);q.storeU32(8,r.addressValue()+4)
+                if (c5I2sDmaStreamPollOwned(r,q,true) != 2 || c5I2sDmaStreamRearmOwned(r,q,true) != 2 || writes != 0 || bad) return i32(14)
+                count=count+1
+            }
+            direction=direction+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

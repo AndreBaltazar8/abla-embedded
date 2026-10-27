@@ -1,0 +1,110 @@
+import "../src/sd/mmc_transfer_clock_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val registers=nativeStaticAllocate(4096)
+val memory=nativeStaticAllocate(144)
+var writes=0
+var drop=-1
+var updates=0
+var statusCommands=0
+var earlySource=false
+var badR1=false
+trusted fun sdMmcS3Read(offset: int): int = nativeBufferAt(registers,4096).loadU32(offset)
+trusted fun reg(offset: int,value: int): void { nativeBufferAt(registers,4096).storeU32(offset,value); return }
+trusted fun sdMmcS3Write(offset: int,value: int): void {
+    writes=writes+1
+    if (offset == 2048 && ((sdMmcS3Read(16)&65535) != 0 || updates != 3)) earlySource=true
+    if (offset != drop) reg(offset,if (offset == 68) sdMmcS3Read(offset)&~value else value)
+    return
+}
+trusted fun reset(slot: int): void {
+    var index=0
+    while (index < 4096) { nativeBufferAt(registers,4096).store(index,0); index=index+1 }
+    index=0
+    while (index < 144) { nativeBufferAt(memory,144).store(index,0); index=index+1 }
+    val card=nativeBufferAt(memory+64,80)
+    card.storeU32(0,0x53444901); card.store(5,slot); card.storeU32(28,0x1234)
+    reg(16,1<<slot); reg(24,1<<slot); reg(8,0xaaaa); reg(12,4)
+    writes=0; drop=-1; updates=0; statusCommands=0; earlySource=false; badR1=false
+    return
+}
+trusted fun advance(): void {
+    val cmd=sdMmcS3Read(44)
+    if ((cmd&0x80000000) != 0) {
+        if ((cmd&(1<<21)) != 0) updates=updates+1
+        else {
+            statusCommands=statusCommands+1
+            reg(68,4); reg(48,if (badR1) 0x80000900 else 0x900)
+        }
+        reg(44,0)
+    }
+    return
+}
+@export("abla_sdmmc_transfer_clock_test")
+trusted fun test(): i32 {
+    val context=nativeBufferAt(memory,64)
+    val card=nativeBufferAt(memory+64,80)
+    var slot=0
+    while (slot < 2) {
+        var source=0
+        while (source < 2) {
+            reset(slot)
+            val plan=sdMmcFrequency(if (source == 0) 40000000 else 160000000,25000000)
+            if (sdMmcTransferClockBeginOwned(context,card,source == 1,25000000,600,u32(0),100,true) != 2) return i32(1)
+            var now=0
+            var result=2
+            while (result == 2 && now < 100) {
+                advance()
+                result=sdMmcTransferClockPollOwned(context,u32(now),u32(now*2))
+                now=now+1
+            }
+            if (result != 1 || updates != 6 || statusCommands != 1 || earlySource || sdMmcS3Read(24) != (1<<slot) || sdMmcS3Read(16) != (1<<slot)) return i32(2)
+            if (((sdMmcS3Read(8)>>(slot*8))&255) != plan.cardDivider() || sdMmcS3Read(20) != (((plan.actualHzCeiling()*600+999)/1000)<<8|255) || sdMmcS3Read(40) != 0x12340000) return i32(3)
+            source=source+1
+        }
+        slot=slot+1
+    }
+    // No live other-slot clock or active DMA may be taken over.
+    reset(0); reg(16,3)
+    if (sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,true) != 4 || writes != 0) return i32(4)
+    reset(0); reg(128,128)
+    if (sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,true) != 4 || writes != 0) return i32(5)
+    reset(0)
+    if (sdMmcTransferClockBeginOwned(context,card,true,25000001,100,u32(0),100,true) != 3 || sdMmcTransferClockBeginOwned(context,card,true,25000000,601,u32(0),100,true) != 3 || sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,false) != 3 || writes != 0) return i32(6)
+    // Each dropped clock/profile write is terminal, not forced success.
+    var fault=0
+    while (fault < 5) {
+        reset(0)
+        drop=if (fault == 0) 16 else if (fault == 1) 8 else if (fault == 2) 12 else if (fault == 3) 2048 else 20
+        if (fault == 2) reg(12,7)
+        var result=sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,true)
+        var now=0
+        while (result == 2 && now < 100) { advance(); result=sdMmcTransferClockPollOwned(context,u32(now),u32(now*10)); now=now+1 }
+        if (result != 5 || statusCommands != 0) return i32(7)
+        fault=fault+1
+    }
+    reset(0)
+    sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0xfffffff0),20,true)
+    if (sdMmcTransferClockPollOwned(context,u32(4),u32(0)) != 6 || context.load(4) != 1 || (sdMmcS3Read(44)&0x80000000) == 0) return i32(8)
+    reset(0)
+    sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,true)
+    reg(68,4096)
+    if (sdMmcTransferClockPollOwned(context,u32(1),u32(1)) != 5 || context.loadU32(56) != 4096) return i32(9)
+    reset(0); badR1=true
+    var result=sdMmcTransferClockBeginOwned(context,card,true,25000000,100,u32(0),100,true)
+    var now=0
+    while (result == 2 && now < 100) { advance(); result=sdMmcTransferClockPollOwned(context,u32(now),u32(now*10)); now=now+1 }
+    if (result != 7 || statusCommands != 1 || context.loadU32(56) != 0x80000900) return i32(10)
+    // Source propagation is a real 10us wait, including wrapping micros.
+    reset(0)
+    sdMmcTransferClockBeginOwned(context,card,false,25000000,100,u32(0),100,true)
+    now=0
+    while (context.load(4) != 3 && now < 10) {
+        advance(); sdMmcTransferClockPollOwned(context,u32(1),u32(0xfffffff8)); now=now+1
+    }
+    if (context.load(4) != 3) return i32(11)
+    val before=writes
+    if (sdMmcTransferClockPollOwned(context,u32(2),u32(1)) != 2 || writes != before || context.load(4) != 3) return i32(12)
+    if (sdMmcTransferClockPollOwned(context,u32(2),u32(2)) != 2 || context.load(4) != 4 || writes == before) return i32(13)
+    return i32(0)
+}

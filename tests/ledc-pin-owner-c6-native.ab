@@ -1,0 +1,100 @@
+import "../src/esp32/ledc_pin_owner_c6_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+var expectedUnit=0
+var txPin=0
+var rxPin=1
+fun addressOffset(address: int): int = if (address >= 0x60090000 && address < 0x60090080) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091630) 256+address-0x60091000 else -1
+fun c6GpioRead(address: int): u32 {
+    if (address == 0x600960e8) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960ec) return if (fault == 2) u32(0) else u32(0x700000)
+    if (address == 0x6009162c) return if (fault == 4) u32(0) else u32(1)
+    if (address == 0x600b102c) return if (fault == 3) u32(1)<<u32(txPin) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(1)<<u32(txPin) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    val at=addressOffset(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeAddressLoadU32(memory,at))
+}
+fun c6GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=addressOffset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091024) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    if (address == 0x6009100c || address == 0x60091028) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&~value }
+    if (at < 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+var channel=0
+var inverted=false
+var live=false
+fun c6LedcClockRead(offset: int): int = if (offset == 0) 1 else if (offset == 4) 0x600000 else 0
+fun c6LedcClockWrite(offset: int,value: int): void { bad=true;return }
+fun c6LedcRead(offset: int): int {
+    if (offset == channel*20) return (if (inverted) 8 else 0)|(if (live) 4 else 0)
+    if (offset == channel*20+12) return 0
+    bad=true;return 0
+}
+fun c6LedcWrite(offset: int,value: int): void { bad=true;return }
+val saved=nativeStaticAllocate(4096)
+val lease=nativeStaticAllocate(40)
+@export("abla_ledc_pin_owner_c6_test")
+trusted fun testOwner(): int {
+    val record=nativeBufferAt(lease,40)
+    var scenario=0
+    while (scenario < 4092) {
+        txPin=scenario%31;channel=(scenario/31)%6;inverted=(scenario/186)%2 != 0
+        writes=0;drop=0;fault=0;bad=false;live=false;record.storeU32(0,0)
+        var at=0
+        while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+        nativeAddressStoreU32(memory,addressOffset(0x60091554+txPin*4),0x84000280)
+        nativeAddressStoreU32(memory,addressOffset(0x60090004+txPin*4),0x85001380)
+        nativeAddressStoreU32(memory,addressOffset(0x60091074+txPin*4),0x82000004)
+        nativeAddressStoreU32(memory,addressOffset(0x60091004),scenario%2*0x7fffffff)
+        at=0
+        while (at < 4096) { nativeAddressStoreU32(saved,at,nativeAddressLoadU32(memory,at));at=at+4 }
+        drop=scenario/372
+        val opened=c6LedcPinOpenOwned(record,txPin,channel,inverted,true)
+        if ((opened != 1 && opened != 4) || bad) return 1
+        if (opened == 1 && ((c6GpioRead(0x60091554+txPin*4)&u32(2047)) != u32(512|channel|(if (inverted) 256 else 0)) ||
+            (c6GpioRead(0x60091020)&(u32(1)<<u32(txPin))) == u32(0))) return 2
+        val oldWrites=writes
+        if (c6LedcPinOpenOwned(record,txPin,channel,inverted,true) != 2 || writes != oldWrites) return 3
+        live=true
+        if (c6LedcPinCloseOwned(record,true) != 3 || writes != oldWrites) return 4
+        live=false;drop=writes+1+scenario%6
+        val closed=c6LedcPinCloseOwned(record,true)
+        if (closed != 5 && closed != 6) return 5
+        drop=0
+        if (c6LedcPinCloseOwned(record,true) != 6 || bad) return 6
+        at=0
+        while (at < 4096) {
+            if (nativeAddressLoadU32(memory,at) != nativeAddressLoadU32(saved,at)) return 7
+            at=at+4
+        }
+        val finalWrites=writes
+        if (c6LedcPinCloseOwned(record,true) != 6 || writes != finalWrites) return 8
+        scenario=scenario+1
+    }
+    scenario=0
+    while (scenario < 186) {
+        txPin=scenario%31;fault=1+scenario/31;channel=0;inverted=false
+        record.storeU32(0,0);writes=0;drop=0;bad=false
+        val refused=fault <= 4 || (fault == 5 && txPin < 8) || (fault == 6 && (txPin == 12 || txPin == 13))
+        if (c6LedcPinAdmission(txPin,0,false,true) == refused || writes != 0 || bad) return 9
+        scenario=scenario+1
+    }
+    fault=0;writes=0
+    if (c6LedcPinOpenOwned(record,31,0,false,true) != 2 ||
+        c6LedcPinOpenOwned(record,-1,0,false,true) != 2 ||
+        c6LedcPinOpenOwned(record,11,6,false,true) != 2 ||
+        c6LedcPinOpenOwned(record,11,0,false,false) != 3 || writes != 0) return 10
+    return 0
+}

@@ -1,0 +1,133 @@
+import "../src/esp32/i2s/pdm_dma_s3_sequence.ab"
+import "../src/esp32/i2s/pdm_session_s3_sequence.ab"
+import "../src/esp32/i2s/pdm_clock_s3.ab"
+import "../src/esp32/i2s/clock_choice_esp32s3.ab"
+import "../src/audio/pdm_pins.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var last=2
+var fail=0
+var bad=false
+var slots=3
+var pcm=true
+var ds=false
+var block=96
+val record=nativeBufferAt(nativeStaticAllocate(64),64)
+val cpu=nativeBufferAt(nativeStaticAllocate(256),256)
+type Esp32S3GdmaPumpResult=int
+fun Esp32S3GdmaPumpResult.status(): int = this&255
+fun Esp32S3GdmaPumpResult.transferredBytes(): int = (this>>>8)&4095
+fun Esp32S3GdmaPumpResult.nextIndex(): int = (this>>>20)&4095
+var startResult=1
+var stopResult=1
+var stops=0
+var pumpStatus=1
+var shortBlock=false
+var pumps=0
+fun esp32s3I2sStartStream(port: int,tx: bool,channel: int,desc: int,polls: int): int {
+    if (port != 0 || tx || channel != 2 || desc != 0x3fc90000 || record.loadU32(56) != 1 || record.loadU32(4) != 3) bad=true
+    return startResult
+}
+fun esp32s3I2sStopStream(port: int,tx: bool,channel: int,polls: int): int {
+    if (port != 0 || tx || channel != 2) bad=true
+    stops=stops+1;return stopResult
+}
+fun esp32s3GdmaPumpBlock(channel: int,tx: bool,desc: int,count: int,index: int,buffer: NativeBuffer,bytes: int,polls: int): Esp32S3GdmaPumpResult {
+    pumps=pumps+1
+    if (channel != 2 || tx || bytes != 0 || buffer.capacity() != block) bad=true
+    return Esp32S3GdmaPumpResult(pumpStatus|((if (shortBlock) block-4 else block)<<8)|
+        ((if (pumpStatus == 1) 1-index else index)<<20)|(0x155<<32))
+}
+fun beginSession(): int {
+    last=2
+    return esp32s3PdmSessionBeginOwned(record,pdmPins(10,11,12,13,14),slots,pcm,ds,true,
+        if (pcm) 16000 else 1024000,2,160000000,8,2,0x3fc90000,2,0x3fc91000,block,u32(41),true)
+}
+fun esp32s3GdmaRingLayoutValid(desc: int,count: int,payload: int,bytes: int,stride: int): bool =
+    desc == 0x3fc90000 && count == 2 && payload == 0x3fc91000 && bytes >= 4 && bytes <= 4092 && stride == bytes
+fun stage(value: int): bool { if (value != last+1) bad=true;last=value;return value != fail }
+fun esp32s3PdmPinsValid(port: int,pins: PdmPins,mask: int,slave: bool): bool = port == 0 && pins == pdmPins(10,11,12,13,14) && mask >= 1 && mask <= 255 && !slave
+fun esp32s3GdmaEnableClock(owner: u32): bool { if (owner != u32(41)) bad=true;return stage(3) }
+fun esp32s3I2sEnableClock(port: int,owner: u32): bool { if (port != 0 || owner != u32(41)) bad=true;return stage(4) }
+fun esp32s3GdmaParked(channel: int,tx: bool): bool { if (channel != 2 || tx) bad=true;return stage(5) }
+fun esp32s3I2sResetDirection(port: int,tx: bool): bool { if (port != 0 || tx) bad=true;return stage(6) }
+fun esp32s3I2sSelectClock(port: int,tx: bool,source: int,divisor: int): bool {
+    val expected=esp32s3PdmReceiveClock(160000000,if (pcm) 16000 else 1024000,slots,pcm,ds,8)
+    if (port != 0 || tx || source != 2 || divisor != expected.bitClockDivider()) bad=true
+    return stage(7)
+}
+fun esp32s3I2sSetDivider(port: int,tx: bool,n: int,b: int,a: int): bool { if (port != 0 || tx || n < 2 || a < 1 || b >= a) bad=true;return stage(8) }
+fun esp32s3I2sSetPdmReceiveMode(port: int,mask: int,convert: bool,down: bool,slave: bool): bool {
+    if (port != 0 || mask != slots || convert != pcm || down != ds || slave) bad=true
+    return stage(9)
+}
+fun esp32s3I2sSetReceiveBlockBytes(port: int,bytes: int): bool { if (port != 0 || bytes != block) bad=true;return stage(10) }
+fun esp32s3I2sActivateClock(port: int,tx: bool): bool { if (port != 0 || tx) bad=true;return stage(11) }
+fun esp32s3PdmRoutePinsOwned(port: int,pins: PdmPins,mask: int,slave: bool,inverted: bool): int {
+    if (!esp32s3PdmPinsValid(port,pins,mask,slave) || mask != slots || !inverted) bad=true
+    return if (stage(12)) 1 else 6
+}
+fun esp32s3GdmaInitializeRingOwned(desc: int,count: int,payload: int,bytes: int,stride: int,tx: bool): bool {
+    if (desc != 0x3fc90000 || count != 2 || payload != 0x3fc91000 || bytes != block || stride != block || tx) bad=true
+    return stage(13)
+}
+fun run(): Esp32S3PdmDmaPreparation = esp32s3PreparePdmReceiveDma(pdmPins(10,11,12,13,14),slots,pcm,ds,true,
+    if (pcm) 16000 else 1024000,2,160000000,8,2,0x3fc90000,2,0x3fc91000,block,u32(41))
+@export("abla_pdm_dma_s3_test")
+fun test(): i32 {
+    var variant=0
+    while (variant < 4) {
+        pcm=(variant&1) == 0;ds=(variant&2) != 0
+        slots=1
+        while (slots <= 255) {
+            var bits=slots;var channels=0
+            while (bits != 0) { channels=channels+(bits&1);bits=bits>>>1 }
+            block=channels*16
+            fail=2
+            while (fail <= 13) {
+                last=2;val result=run()
+                val expected=if (fail == 2) 1 else fail
+                if (result.status() != expected || last != (if (fail == 2) 13 else fail) || bad) return i32(1)
+                if (fail == 12 && (result|0) != (12|(6<<8))) return i32(2)
+                if (fail == 2 && result.sampleRate() != (if (pcm) 16000 else 1024000)) return i32(3)
+                fail=fail+1
+            }
+            slots=slots+1
+        }
+        variant=variant+1
+    }
+    slots=7;block=16;last=2
+    if (run().status() != 2 || last != 2) return i32(4)
+    slots=3;pcm=true;ds=false;block=32;fail=2
+    if (beginSession() != 1 || esp32s3PdmSessionRate(record) != 16000 || beginSession() != 0) return i32(5)
+    if (esp32s3PdmSessionStartOwned(record,4,true) != 2) return i32(6)
+    var read=0
+    while (read < 6) {
+        pumpStatus=3
+        val cursor=record.loadU32(28)
+        if (esp32s3PdmSessionReadOwned(record,cpu,4,true).status() != 3 || record.loadU32(28) != cursor || record.loadU32(4) != 2) return i32(7)
+        pumpStatus=1
+        if (esp32s3PdmSessionReadOwned(record,cpu,4,true).status() != 1 || record.loadU32(28) != 1-cursor || record.loadU32(52) != 0x155) return i32(8)
+        read=read+1
+    }
+    pumps=0
+    if (esp32s3PdmSessionReadOwned(record,record,4,true).status() != 2 ||
+        esp32s3PdmSessionReadOwned(record,nativeBufferAt(0x3fc91020,32),4,true).status() != 2 || pumps != 0) return i32(9)
+    shortBlock=true
+    if (esp32s3PdmSessionReadOwned(record,cpu,4,true).status() != 8 || record.loadU32(4) != 3 ||
+        esp32s3PdmSessionReadOwned(record,cpu,4,true).status() != 2 || pumps != 1) return i32(10)
+    stopResult=5
+    if (esp32s3PdmSessionCloseOwned(record,4,true) != 3 || record.loadU32(56) != 1 || record.loadU32(44) != 5 || beginSession() != 0) return i32(11)
+    stopResult=1
+    if (esp32s3PdmSessionCloseOwned(record,4,true) != 4 || record.loadU32(56) != 0) return i32(12)
+    val stopped=stops
+    if (esp32s3PdmSessionCloseOwned(record,4,true) != 4 || stops != stopped) return i32(13)
+    startResult=1288
+    if (beginSession() != 1 || esp32s3PdmSessionStartOwned(record,4,true) != 3 || record.loadU32(40) != 1288 || record.loadU32(56) != 1 ||
+        esp32s3PdmSessionCloseOwned(record,4,true) != 4) return i32(14)
+    fail=12
+    val before=stops
+    if (beginSession() != 3 || record.loadU32(36) != (12|(6<<8)) || esp32s3PdmSessionStartOwned(record,4,true) != 0 ||
+        esp32s3PdmSessionCloseOwned(record,4,true) != 4 || stops != before || bad) return i32(15)
+    return i32(0)
+}

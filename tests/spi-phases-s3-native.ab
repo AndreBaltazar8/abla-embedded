@@ -1,0 +1,256 @@
+import "../src/esp32/spi/phases_sequence_esp32s3.ab"
+import "../src/esp32/spi/quad_transfer_sequence_esp32s3.ab"
+import "../src/esp32/spi/phases_async_sequence_esp32s3.ab"
+import "../src/esp32/spi/phases_async_transaction_sequence_esp32s3.ab"
+import "../src/esp32/spi/queue_sequence_esp32s3.ab"
+import "../src/spi/pins.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(512)
+val queueMemory=nativeStaticAllocate(260)
+type Pin = int
+var selected=-1
+var csEdges=0
+var badCs=false
+var csFault=0
+trusted fun Pin.writeLevelOwned(high: bool): bool {
+    if (high && (csFault&2) != 0) {
+        if (selected != (this|0) || nativeBufferAt(queueMemory+256,4).loadU32(0) != 41) badCs=true
+        csEdges=csEdges+1;return false
+    }
+    this.write(high);return high || (csFault&1) == 0
+}
+fun esp32s3SpiMasterPinsValid(peripheral: int,pins: SpiPins,select: Pin): bool = peripheral == 2 && (select == 4 || select == 5)
+trusted fun Pin.write(high: bool): void {
+    if (nativeBufferAt(queueMemory+256,4).loadU32(0) != 41 || (if (high) selected != (this|0) else selected != -1)) badCs=true
+    selected=if (high) -1 else this|0
+    csEdges=csEdges+1; return
+}
+var base=0x60024000
+var drop=-1
+var starts=0
+var timeout=false
+var fifoError=false
+var writes=0
+trusted fun esp32s3SpiRead(address: int): int = nativeBufferAt(memory,256).loadU32(address-base)
+trusted fun esp32s3SpiWrite(address: int,value: int): void {
+    writes=writes+1
+    val offset=address-base
+    val regs=nativeBufferAt(memory,256)
+    if (offset == drop) return
+    if (offset == 0x38) { regs.storeU32(0x3c,regs.loadU32(0x3c)&~value); return }
+    if (offset == 0) {
+        if (value == 0x01000000) { starts=starts+1; regs.storeU32(0x3c,if (fifoError) 0x21000 else 4096) }
+        regs.storeU32(0,if (timeout) value else 0); return
+    }
+    regs.storeU32(offset,value); return
+}
+trusted fun reset(): void {
+    var i=0
+    while (i < 256) { nativeBufferAt(memory,256).store(i,0); i=i+1 }
+    drop=-1; starts=0; writes=0; timeout=false; fifoError=false; return
+}
+@export("abla_spi_phases_s3_test")
+trusted fun test(): i32 {
+    val data=nativeBufferAt(memory+256,64)
+    val regs=nativeBufferAt(memory,256)
+    var peripheral=2
+    while (peripheral <= 3) {
+        base=0x60024000+(peripheral-2)*4096
+        var bits=1
+        while (bits <= 16) {
+            var addressBits=1
+            while (addressBits <= 32) {
+                reset(); data.storeU32(0,0x12345678)
+                val cmd=(1<<bits)-1
+                val addr=(1<<addressBits)-1
+                if (esp32s3SpiPhasesOwned(peripheral,cmd,bits,addr,addressBits,8,1,data,4,2) != 257 || starts != 1 ||
+                    regs.loadU32(0x10) != 0xe8000000 || regs.loadU32(0x14) != (((addressBits-1)<<27)|7) ||
+                    regs.loadU32(4) != ((addr<<(32-addressBits))&0xffffffff) || regs.loadU32(0x98) != 0x12345678) return i32(1)
+                val wire=regs.loadU32(0x18)&65535
+                if ((((wire&255)<<8)|(wire>>8)) != (cmd<<(16-bits))) return i32(2)
+                addressBits=addressBits+1
+            }
+            bits=bits+1
+        }
+        reset(); regs.storeU32(0x98,0xabcdef12)
+        if (esp32s3SpiPhasesOwned(peripheral,0x9f,8,0,0,0,2,data,3,2) != 257 || (data.loadU32(0)&0xffffff) != 0xcdef12 || regs.loadU32(0x10) != 0x90000000) return i32(3)
+        reset()
+        if (esp32s3SpiPhasesOwned(peripheral,6,8,0,0,0,0,NativeBuffer(0),0,2) != 257 || regs.loadU32(0x10) != 0x80000000) return i32(4)
+        peripheral=peripheral+1
+    }
+    base=0x60024000
+    var bytes=1
+    while (bytes <= 64) {
+        reset();regs.storeU32(8,0x3dc7e0);regs.storeU32(0x10,0x7000)
+        var n=0
+        while (n < 64) { data.store(n,(n*37+17)&255);n=n+1 }
+        if (esp32s3SpiQuadTransmitOwned(2,0x32,8,0x2c00,24,0,data,bytes,2) != 257 || starts != 1 ||
+            regs.loadU32(8) != 0x3c0000 || regs.loadU32(0x10) != 0xc8002000 ||
+            regs.loadU32(0x18) != 0x70000032 || regs.loadU32(4) != 0x2c0000 || regs.loadU32(0x1c) != bytes*8-1) return i32(22)
+        n=0
+        while (n < bytes) { if (regs.load(0x98+n) != ((n*37+17)&255)) return i32(23);n=n+1 }
+        // Both byte-only and phased single-line APIs clear previous quad TX.
+        if (esp32s3SpiTransmitOwned(2,data,1,2) != 257 || regs.loadU32(0x10) != 0x08000000) return i32(28)
+        regs.storeU32(0x10,0x2000)
+        // Quad-to-single transition in the SAME controller state.
+        if (esp32s3SpiPhasesOwned(2,2,8,0x5100,24,0,1,data,1,2) != 257 ||
+            regs.loadU32(0x10) != 0xc8000000) return i32(24)
+        bytes=bytes+1
+    }
+    reset();fifoError=true
+    if (esp32s3SpiQuadTransmitOwned(2,0,0,0,0,0,data,64,2) != 0x20109) return i32(25)
+    reset();timeout=true
+    if (esp32s3SpiQuadTransmitOwned(2,0,0,0,0,0,data,64,2) != 6 || starts != 0) return i32(26)
+    reset()
+    if (esp32s3SpiQuadTransmitOwned(2,0,0,0,0,0,data,0,2) != 2 ||
+        esp32s3SpiQuadTransmitOwned(2,0,0,0,0,0,data,65,2) != 2 ||
+        esp32s3SpiQuadTransmitOwned(2,0,0,0,0,0,data,1,0) != 2 || writes != 0) return i32(27)
+    // Dirty lane-mode bits must be cleared even for existing single-line APIs.
+    reset(); regs.storeU32(8,0x3dc7e0);regs.storeU32(0x10,0x7000)
+    if (esp32s3SpiPhasesOwned(2,2,8,0x2c00,24,0,1,data,4,2) != 257 ||
+        regs.loadU32(8) != 0x3c0000 || regs.loadU32(0x10) != 0xc8000000) return i32(20)
+    reset();regs.storeU32(8,0x1c7e0);drop=8
+    if (esp32s3SpiPhasesOwned(2,2,8,0x2c00,24,0,1,data,4,2) != 10 || starts != 0) return i32(21)
+    var fault=0
+    while (fault < 5) {
+        reset(); drop=if (fault == 0) 0x10 else if (fault == 1) 0x14 else if (fault == 2) 0x18 else if (fault == 3) 4 else 0x1c
+        if (esp32s3SpiPhasesOwned(2,0x1234,16,0x123456,24,256,1,data,64,2) != 10 || starts != 0) return i32(5)
+        fault=fault+1
+    }
+    reset(); timeout=true; data.store(0,42)
+    if (esp32s3SpiPhasesOwned(2,1,1,0,0,0,2,data,1,2) != 6 || starts != 0 || data.load(0) != 42) return i32(6)
+    reset(); fifoError=true
+    if ((esp32s3SpiPhasesOwned(2,1,1,0,0,0,2,data,1,2)&255) != 9 || data.load(0) != 42) return i32(7)
+    reset(); regs.storeU32(8,1<<25)
+    if (esp32s3SpiPhasesOwned(2,1,1,0,0,0,2,data,1,2) != 4 || writes != 0) return i32(8)
+    reset()
+    if (esp32s3SpiPhasesOwned(0,1,1,0,0,0,2,data,1,2) != 2 || esp32s3SpiPhasesOwned(2,256,8,0,0,0,2,data,1,2) != 2 || esp32s3SpiPhasesOwned(2,1,1,0,0,257,2,data,1,2) != 2 || writes != 0) return i32(9)
+    val context=nativeBufferAt(memory+384,32)
+    reset(); timeout=true; data.storeU32(0,0x11223344)
+    if (esp32s3SpiPhasesBeginOwned(context,2,0x9f,8,0,0,0,2,data,4,u32(0xfffffff0),u32(100),true) != 2 || starts != 0) return i32(10)
+    val before=writes
+    if (esp32s3SpiPhasesPollOwned(context,u32(0xfffffff1)) != 2 || writes != before || data.loadU32(0) != 0x11223344) return i32(11)
+    // Stale completion before START cannot bypass the new transfer.
+    regs.storeU32(0,0); regs.storeU32(0x3c,4096)
+    if (esp32s3SpiPhasesPollOwned(context,u32(0)) != 2 || starts != 1 || context.load(4) != 2 || data.loadU32(0) != 0x11223344) return i32(12)
+    if (esp32s3SpiPhasesPollOwned(context,u32(1)) != 2) return i32(13)
+    regs.storeU32(0,0); regs.storeU32(0x98,0xabcdef12)
+    if (esp32s3SpiPhasesPollOwned(context,u32(2)) != 1 || data.loadU32(0) != 0xabcdef12) return i32(14)
+    val finished=writes
+    if (esp32s3SpiPhasesPollOwned(context,u32(200)) != 1 || writes != finished) return i32(15)
+    reset(); timeout=true; data.store(0,42)
+    esp32s3SpiPhasesBeginOwned(context,2,1,1,0,0,0,2,data,1,u32(0),u32(10),true)
+    if (esp32s3SpiPhasesPollOwned(context,u32(10)) != 5 || data.load(0) != 42 || regs.loadU32(0) != 0x00800000) return i32(16)
+    reset(); timeout=true
+    esp32s3SpiPhasesBeginOwned(context,2,1,1,0,0,0,2,data,1,u32(0),u32(10),true)
+    regs.storeU32(0,0)
+    esp32s3SpiPhasesPollOwned(context,u32(1))
+    if (esp32s3SpiPhasesPollOwned(context,u32(10)) != 6 || data.load(0) != 42 || regs.loadU32(0) != 0x01000000) return i32(17)
+    reset(); fifoError=true
+    esp32s3SpiPhasesBeginOwned(context,2,1,1,0,0,0,2,data,1,u32(0),u32(10),true)
+    esp32s3SpiPhasesPollOwned(context,u32(1))
+    if (esp32s3SpiPhasesPollOwned(context,u32(2)) != 7 || data.load(0) != 42 || context.loadU32(20) != 0x21000) return i32(18)
+    reset()
+    if (esp32s3SpiPhasesBeginOwned(context,2,1,1,0,0,0,2,context,1,u32(0),u32(10),true) != 3 || esp32s3SpiPhasesBeginOwned(context,2,1,1,0,0,0,2,data,1,u32(0),u32(10),false) != 3 || writes != 0) return i32(19)
+    // Entire production queue/atomic gate/CS/async/register path, not mocked
+    // transaction callbacks. Two chip selects share one physical controller.
+    val queue=nativeBufferAt(queueMemory,256)
+    val gate=peripheralGateAt(queueMemory+256)
+    nativeBufferAt(queueMemory+256,4).storeU32(0,0)
+    if (!esp32s3SpiQueueInitialize(queue,2,gate,u32(41),2,spiPins(37,35,36),true)) return i32(20)
+    val second=nativeBufferAt(memory+264,4)
+    if (esp32s3SpiQueueSubmit(queue,u32(1),Pin(4),0x9f,8,0,0,0,2,data,3,u32(100)) != 1 ||
+        esp32s3SpiQueueSubmit(queue,u32(2),Pin(5),0x9f,8,0,0,0,2,second,3,u32(100)) != 1) return i32(21)
+    var token=1
+    while (token <= 2) {
+        if (esp32s3SpiQueueService(queue,u32(token*10)) != 2 || selected != token+3 || nativeBufferAt(queueMemory+256,4).loadU32(0) != 41) return i32(22)
+        regs.storeU32(0x98,if (token == 1) 0x00abcdef else 0x00123456)
+        if (esp32s3SpiQueueService(queue,u32(token*10+1)) != 2 || esp32s3SpiQueueService(queue,u32(token*10+2)) != 1 || selected != -1 || nativeBufferAt(queueMemory+256,4).loadU32(0) != 0) return i32(23)
+        if (esp32s3SpiQueueTake(queue) != ((token<<32)|1)) return i32(24)
+        token=token+1
+    }
+    if ((data.loadU32(0)&0xffffff) != 0xabcdef || (second.loadU32(0)&0xffffff) != 0x123456 || starts != 2 || csEdges != 4 || badCs) return i32(25)
+    // Actual FIFO failure propagates through all layers and blocks next CS.
+    fifoError=true; data.store(0,42)
+    esp32s3SpiQueueSubmit(queue,u32(3),Pin(4),0x9f,8,0,0,0,2,data,3,u32(100))
+    esp32s3SpiQueueSubmit(queue,u32(4),Pin(5),0x9f,8,0,0,0,2,second,3,u32(100))
+    esp32s3SpiQueueService(queue,u32(30)); esp32s3SpiQueueService(queue,u32(31))
+    if (esp32s3SpiQueueService(queue,u32(32)) != 1 || esp32s3SpiQueueTake(queue) != ((3<<32)|7) || esp32s3SpiQueueService(queue,u32(33)) != 6 ||
+        nativeBufferAt(queueMemory+256,4).loadU32(0) != 0x80000000 || selected != -1 || data.load(0) != 42 || csEdges != 6 || starts != 3 || badCs) return i32(26)
+    // Explicit modeled recovery before timing tests. Setup delays START;
+    // successful hold retains CS/gate across clock wrap without busy waits.
+    reset(); csEdges=0
+    nativeBufferAt(queueMemory+256,4).storeU32(0,0)
+    esp32s3SpiQueueInitialize(queue,2,gate,u32(41),2,spiPins(37,35,36),true)
+    if (esp32s3SpiQueueSubmit(queue,u32(5),Pin(4),0x9f,8,0,0,0,2,data,3,u32(100),5,7) != 1) return i32(27)
+    if (esp32s3SpiQueueService(queue,u32(0xfffffff0)) != 2 || selected != 4 || starts != 0) return i32(28)
+    esp32s3SpiQueueService(queue,u32(0xfffffff1))
+    if (esp32s3SpiQueueService(queue,u32(0xfffffff5)) != 2 || starts != 0 || selected != 4) return i32(29)
+    if (esp32s3SpiQueueService(queue,u32(0xfffffff6)) != 2 || starts != 1) return i32(30)
+    if (esp32s3SpiQueueService(queue,u32(0xfffffff7)) != 2 || selected != 4 || esp32s3SpiQueueTake(queue) != 0) return i32(31)
+    esp32s3SpiQueueService(queue,u32(0xfffffffc))
+    if (esp32s3SpiQueueService(queue,u32(2)) != 2 || selected != 4 || nativeBufferAt(queueMemory+256,4).loadU32(0) != 41) return i32(32)
+    if (esp32s3SpiQueueService(queue,u32(3)) != 1 || selected != -1 || csEdges != 2 || esp32s3SpiQueueTake(queue) != ((5<<32)|1) || badCs) return i32(33)
+    if (esp32s3SpiQueueSubmit(queue,u32(6),Pin(4),0x9f,8,0,0,0,2,data,3,u32(5),5,0) != 3 || esp32s3SpiQueueSubmit(queue,u32(6),Pin(4),0x9f,8,0,0,0,2,data,3,u32(100),0,65536) != 3) return i32(34)
+    var armed=0
+    while (armed < 2) {
+        reset(); nativeBufferAt(queueMemory+256,4).storeU32(0,0)
+        esp32s3SpiQueueInitialize(queue,2,gate,u32(41),2,spiPins(37,35,36),true)
+        esp32s3SpiQueueSubmit(queue,u32(7),Pin(4),0x9f,8,0,0,0,2,data,3,u32(10),9,0)
+        esp32s3SpiQueueService(queue,u32(0))
+        if (armed == 1) esp32s3SpiQueueService(queue,u32(9))
+        if (esp32s3SpiQueueService(queue,u32(10)) != 1 || starts != 0 || selected != -1 || esp32s3SpiQueueTake(queue) != ((7<<32)|7) || queue.loadU32(48) != 5 || nativeBufferAt(queueMemory+256,4).loadU32(0) != 0x80000000 || badCs) return i32(35)
+        armed=armed+1
+    }
+    csFault=1
+    while (csFault < 4) {
+        // Explicit model-only recovery between independent fault scenarios.
+        reset();selected=-1;csEdges=0
+        nativeBufferAt(queueMemory+256,4).storeU32(0,0)
+        esp32s3SpiQueueInitialize(queue,2,gate,u32(41),2,spiPins(37,35,36),true)
+        esp32s3SpiQueueSubmit(queue,u32(8),Pin(4),0x9f,8,0,0,0,2,data,3,u32(100))
+        var service=esp32s3SpiQueueService(queue,u32(0))
+        if ((csFault&1) == 0) {
+            if (service != 2) return i32(36)
+            esp32s3SpiQueueService(queue,u32(1));service=esp32s3SpiQueueService(queue,u32(2))
+        }
+        val expected=(if ((csFault&1) != 0) 4|(1<<25) else 1)|(if ((csFault&2) != 0) 1<<24 else 0)
+        if (service != 1 || queue.loadU32(48) != expected || queue.loadU32(52) != (if ((csFault&2) != 0) 1 else 0) ||
+            selected != (if ((csFault&2) != 0) 4 else -1) || csEdges != 2 || starts != (if ((csFault&1) != 0) 0 else 1) || badCs) return i32(37)
+        if (esp32s3SpiQueueTake(queue) != ((8<<32)|7) || esp32s3SpiQueueService(queue,u32(3)) != 6 ||
+            queue.loadU32(48) != expected || queue.loadU32(52) != (if ((csFault&2) != 0) 1 else 0) ||
+            nativeBufferAt(queueMemory+256,4).loadU32(0) != 0x80000000 || csEdges != 2) return i32(38)
+        if (esp32s3SpiQueueSubmit(queue,u32(9),Pin(5),0x9f,8,0,0,0,2,data,3,u32(100)) != 4) return i32(39)
+        csFault=csFault+1
+    }
+    peripheral=2
+    while (peripheral <= 3) {
+        base=0x60024000+(peripheral-2)*4096
+        var count=1
+        while (count <= 64) {
+            var d=0
+            while (d < 4) {
+                val dummy=if (d == 0) 0 else if (d == 1) 1 else if (d == 2) 32 else 256
+                reset();var i=0
+                while (i < 64) { regs.store(0x98+i,(i*37+11)&255);data.store(i,0xcc);i=i+1 }
+                if (esp32s3SpiPhasesOwned(peripheral,4,8,0,0,dummy,2,data,count,3,true) != 257 || starts != 1 ||
+                    regs.loadU32(0x10) != (0x90020000|(if (dummy > 0) 0x20000000 else 0)) ||
+                    regs.loadU32(0x18) != 0x70000004 || regs.loadU32(0x1c) != count*8-1) return i32(40)
+                i=0;while (i < 64) { if (data.load(i) != (if (i < count) (i*37+11)&255 else 0xcc)) return i32(41);i=i+1 }
+                // Shared-data state must not leak into ordinary reads/TX.
+                if (esp32s3SpiPhasesPrepareOwned(peripheral,4,8,0,0,1,2,data,4) != 1 ||
+                    (regs.loadU32(0x10)&0x20001) != 0) return i32(42)
+                d=d+1
+            }
+            count=count+1
+        }
+        reset()
+        if (esp32s3SpiPhasesPrepareOwned(peripheral,4,8,0,0,1,1,data,4,1,true) != 2 || writes != 0 ||
+            esp32s3SpiPhasesPrepareOwned(peripheral,4,8,0,0,1,2,data,4,4,true) != 2 || writes != 0) return i32(43)
+        reset();drop=0x10
+        if (esp32s3SpiPhasesOwned(peripheral,4,8,0,0,1,2,data,4,3,true) != 10 || starts != 0) return i32(44)
+        peripheral=peripheral+1
+    }
+    return i32(0)
+}

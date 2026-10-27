@@ -1,0 +1,90 @@
+import "../src/esp32/interrupt_dispatch_s3_sequence.ab"
+import "../src/esp32/interrupt_capabilities_s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var core=0
+var pending=0
+var enabled=0xFFFFFFFF
+var selected=0
+var calls=0
+var reads=0
+var cleared=0
+var expected=0
+var phase=0
+var missing=false
+var mutate=false
+var bad=false
+fun esp32S3DispatchCore(): int = core
+fun esp32S3DispatchEnabled(): int { reads=reads+1; return enabled }
+fun esp32S3DispatchPending(): int = pending
+fun esp32S3DispatchRead(address: int): int {
+    if (phase == 0) {
+        selected=31
+        while (((expected>>>selected) & 1) == 0 && selected > 0) selected=selected-1
+        if (address != 4096+selected*16+core*8) bad=true
+        phase=1
+        if (missing) return 0
+        return 0x40378000+selected*4
+    }
+    if (phase != 1 || address != 4100+selected*16+core*8) bad=true
+    phase=2; return 0xABC00000+selected
+}
+fun esp32S3DispatchClear(mask: int): void {
+    if (phase != 2 || mask != 1<<selected) bad=true
+    cleared=cleared | mask
+    phase=3; return
+}
+fun esp32S3DispatchCall(handler: int,argument: int): void {
+    if (phase != 3 || handler != 0x40378000+selected*4 || argument != 0xABC00000+selected) bad=true
+    expected=expected & ~(1<<selected)
+    pending=pending & ~(1<<selected)
+    // During the first callback, disable another pending line and assert
+    // a fresh higher-priority one. Dispatcher must take a fresh snapshot.
+    if (mutate && calls == 0) {
+        enabled=enabled & ~1
+        pending=pending | 2
+        expected=(expected & ~1) | 2
+    }
+    calls=calls+1; phase=0; return
+}
+fun resetDispatch(): void {
+    pending=0; enabled=0xFFFFFFFF; selected=0; calls=0; reads=0
+    cleared=0; expected=0; phase=0; missing=false; mutate=false; bad=false
+    return
+}
+@export("abla_interrupt_dispatch_test")
+trusted fun dispatchTest(): i32 {
+    val table=nativeBufferAt(4096,512)
+    var c=0
+    while (c < 2) {
+        core=c
+        var level=1
+        while (level <= 3) {
+            resetDispatch()
+            var line=0
+            var count=0
+            while (line < 32) {
+                if (esp32S3InterruptLevel(line) == level) { expected=expected | (1<<line); count=count+1 }
+                line=line+1
+            }
+            pending=0xFFFFFFFF
+            val original=expected
+            if (esp32S3InterruptDispatchOwned(table,c,level) != 0 || bad || calls != count ||
+                expected != 0 || cleared != original || reads != count+1) return i32(1)
+            level=level+1
+        }
+        resetDispatch(); expected=1; pending=1; missing=true
+        if (esp32S3InterruptDispatchOwned(table,c,1) != -2 || bad || calls != 0 || cleared != 0) return i32(2)
+        resetDispatch(); expected=5; pending=5; mutate=true
+        if (esp32S3InterruptDispatchOwned(table,c,1) != 0 || bad || calls != 2 || cleared != 6 || pending != 1) return i32(3)
+        resetDispatch(); pending=1; enabled=0
+        if (esp32S3InterruptDispatchOwned(table,c,1) != 0 || calls != 0 || phase != 0) return i32(4)
+        resetDispatch()
+        if (esp32S3InterruptDispatchOwned(table,c ^ 1,1) != -1 || reads != 0) return i32(5)
+        if (esp32S3InterruptDispatchOwned(table,c,0) != -1 || esp32S3InterruptDispatchOwned(table,c,4) != -1 ||
+            esp32S3InterruptDispatchOwned(nativeBufferAt(4097,512),c,1) != -1 ||
+            esp32S3InterruptDispatchOwned(nativeBufferAt(4096,511),c,1) != -1 || reads != 0) return i32(6)
+        c=c+1
+    }
+    i32(0)
+}

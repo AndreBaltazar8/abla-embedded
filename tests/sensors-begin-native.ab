@@ -1,0 +1,97 @@
+import "../src/m5stack/sensors_begin_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(80)
+var mode=0
+var failures=0
+var available=0
+var rtcLive=0
+var imuLive=0
+var rtcCalls=0
+var imuCalls=0
+var syncCalls=0
+var irqCalls=0
+var stage=0
+var bad=false
+fun m5SensorsBusValid(bus: int): bool = (bus == 7 && (available&1) != 0) || (bus == 9 && (available&2) != 0)
+trusted fun m5SensorsRtcOpen(bus: int,board: M5BoardId): M5RtcOpenResult {
+    rtcCalls=rtcCalls+1
+    if (stage != 0 || rtcLive != 0 || board != (if (bus == 7) m5BoardToughC5 else m5BoardUnknown)) bad=true
+    if (mode == 2 || (bus == 7 && mode == 1)) return M5RtcOpenResult(3<<40)
+    rtcLive=bus
+    M5RtcOpenResult(((if (mode == 3 && bus == 7) 4 else 1)<<40)|bus)
+}
+trusted fun m5SensorsRtcSync(handle: int): bool {
+    if (stage != 0 || handle != rtcLive) bad=true
+    stage=1; syncCalls=syncCalls+1
+    (failures&4) == 0
+}
+trusted fun m5SensorsRtcDisableIrq(handle: int): bool {
+    if (stage > 1 || handle != rtcLive) bad=true
+    stage=2; irqCalls=irqCalls+1
+    (failures&4) == 0
+}
+trusted fun m5SensorsRtcClose(handle: int): bool {
+    if (handle != rtcLive || handle == 0) bad=true
+    if ((failures&1) != 0) return false
+    rtcLive=0
+    true
+}
+trusted fun m5SensorsImuOpen(owner: M5ImuOwner,bus: int): int {
+    if (imuLive != 0 || owner.status() != 0) bad=true
+    stage=3; imuCalls=imuCalls+1
+    if (mode == 2 || (bus == 7 && mode == 1)) { owner.buffer().storeU32(4,2); return 2 }
+    imuLive=bus
+    val status=if (mode == 3 && bus == 7) 4 else 1
+    owner.buffer().storeU32(4,status)
+    status
+}
+trusted fun m5SensorsImuClose(owner: M5ImuOwner): bool {
+    if (imuLive != 0 && (failures&2) != 0) return false
+    imuLive=0; owner.buffer().storeU32(4,0)
+    true
+}
+@export("abla_sensors_begin_test")
+trusted fun beginTest(): i32 {
+    val owner=m5SensorsAt(nativeBufferAt(storage+4,72))
+    var profile=0
+    while (profile < 8192) {
+        val options=profile%64
+        mode=profile/64%4; failures=profile/256%8; available=profile/2048%4
+        rtcLive=0; imuLive=0; rtcCalls=0; imuCalls=0; syncCalls=0; irqCalls=0; stage=0; bad=false
+        nativeAddressStoreU32(storage,0,0xA5A5A5A5); nativeAddressStoreU32(storage,76,0x5A5A5A5A)
+        if (!owner.initialize()) return i32(1)
+        val result=owner.beginOwned(7,9,m5BoardToughC5,options)
+        val internalRtc=(options&1) != 0 && (available&1) != 0
+        val externalRtc=(options&2) != 0 && (available&2) != 0 && (!internalRtc || mode == 1 || mode == 2)
+        val rtcReady=(internalRtc && mode == 0) || (externalRtc && mode != 2)
+        val rtcDirty=internalRtc && mode == 3
+        val internalImu=(options&4) != 0 && (available&1) != 0
+        val imuDirty=internalImu && mode == 3 && (failures&2) != 0
+        val externalImu=(options&8) != 0 && (available&2) != 0 && (!internalImu || mode != 0) && !imuDirty
+        val imuReady=(internalImu && mode == 0) || (externalImu && mode != 2)
+        val sync=rtcReady && (options&32) != 0
+        val irq=rtcReady && (options&16) != 0
+        val expected=1024|(if (rtcReady) 1 else 0)|(if (imuReady) 2 else 0)|
+            (if (externalRtc && rtcReady) 4 else 0)|(if (externalImu && imuReady) 8 else 0)|
+            (if (sync) (if ((failures&4) == 0) 16 else 256) else 0)|
+            (if (irq) (if ((failures&4) == 0) 32 else 512) else 0)|
+            (if (rtcDirty) 64 else 0)|(if (imuDirty) 128 else 0)
+        if (result != expected || bad || rtcCalls != (if (internalRtc) 1 else 0)+(if (externalRtc) 1 else 0) ||
+            imuCalls != (if (internalImu) 1 else 0)+(if (externalImu) 1 else 0) ||
+            syncCalls != (if (sync) 1 else 0) || irqCalls != (if (irq) 1 else 0)) return i32(2)
+        if (owner.imuBoard() != (if (imuReady && !externalImu) m5BoardToughC5 else m5BoardUnknown) ||
+            owner.beginOwned(7,9,m5BoardToughC5,options).valid()) return i32(3)
+        val closes=(rtcLive == 0 || (failures&1) == 0) && (imuLive == 0 || (failures&2) == 0)
+        if (owner.closeOwned() != closes || owner.result().valid() ||
+            (owner.rtcResult().handle() != 0) != (rtcLive != 0) || bad) return i32(4)
+        failures=0
+        if (!owner.closeOwned() || !owner.closeOwned() || rtcLive != 0 || imuLive != 0 || bad) return i32(5)
+        if (nativeAddressLoadU32(storage,0) != 0xA5A5A5A5 || nativeAddressLoadU32(storage,76) != 0x5A5A5A5A) return i32(6)
+        profile=profile+1
+    }
+    owner.initialize()
+    if (owner.beginOwned(7,9,m5BoardUnknown,64).valid() || owner.buffer().loadU32(4) != 0 ||
+        m5SensorsAt(nativeBufferAt(storage,71)).valid() || m5SensorsAt(nativeBufferAt(storage+1,72)).valid()) return i32(7)
+    i32(0)
+}

@@ -1,0 +1,113 @@
+import "../src/sd/mmc_startup_s3_sequence.ab"
+import "../src/sd/mmc_shutdown_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(128)
+val registers=nativeStaticAllocate(4096)
+var busClock=0
+var busReset=128
+var writes=0
+var drop=-1
+trusted fun sdMmcS3Read(offset: int): int = nativeBufferAt(registers,4096).loadU32(offset)
+trusted fun reg(offset: int,value: int): void { nativeBufferAt(registers,4096).storeU32(offset,value); return }
+trusted fun sdMmcS3Write(offset: int,value: int): void {
+    writes=writes+1
+    if (offset != drop) reg(offset,if (offset == 68) sdMmcS3Read(offset)&~value else value)
+    return
+}
+trusted fun sdMmcS3SystemRead(address: int): int = if (address == 0x600c001c) busClock else busReset
+trusted fun sdMmcS3SystemWrite(address: int,value: int): void {
+    writes=writes+1
+    if (address != drop) { if (address == 0x600c001c) busClock=value else busReset=value }
+    return
+}
+trusted fun reset(): void {
+    var n=0
+    while (n < 4096) { nativeBufferAt(registers,4096).store(n,0); n=n+1 }
+    writes=0; drop=-1; busClock=0; busReset=128
+    return
+}
+@export("abla_sdmmc_startup_test")
+trusted fun test(): i32 {
+    val ctx=nativeBufferAt(storage,128)
+    var mode=0
+    while (mode < 4) {
+        reset()
+        if ((mode&1) != 0) { busClock=128; busReset=0 }
+        if (sdMmcStartupBeginOwned(ctx,mode>>1,(mode&1) != 0,u32(0),2000,true) != 2 || writes != 0 || sdMmcStartupCard(ctx).capacity() != 0) return i32(1)
+        var n=0
+        var clockCommands=0
+        while (n < 90 && sdMmcStartupStatus(ctx) == 2) {
+            val phase=ctx.load(4)
+            if (phase == 3) {
+                val before=writes
+                if (sdMmcStartupPollOwned(ctx,u32(n),u32(ctx.loadU32(24)+9)) != 2 || ctx.load(4) != 3 || writes != before) return i32(2)
+            }
+            if (phase == 5) {
+                if (sdMmcStartupPollOwned(ctx,u32(n),u32(n*100)) != 2 || ctx.load(4) != 5) return i32(3)
+                reg(0,sdMmcS3Read(0)&~7)
+            }
+            if (phase == 11) {
+                if (sdMmcStartupPollOwned(ctx,u32(n),u32(n*100)) != 2 || ctx.load(4) != 11) return i32(11)
+                reg(128,0)
+            }
+            if (phase == 8 && (sdMmcS3Read(44)&0x80000000) != 0) {
+                if ((sdMmcS3Read(44)&0x200000) == 0) return i32(4)
+                clockCommands=clockCommands+1
+                reg(44,0)
+            }
+            if (phase == 10 && (sdMmcS3Read(44)&0x80000000) != 0) {
+                val index=sdMmcS3Read(44)&63
+                reg(44,0); reg(68,4)
+                reg(48,if (index == 8) 426 else if (index == 55) 32 else if (index == 41) 0xc0ff8000 else if (index == 3) 0x12340700 else if (index == 13) 0x900 else 0)
+                if (index == 9) { reg(52,0xffff0000); reg(56,0x9003f); reg(60,0x40000000) }
+            }
+            sdMmcStartupPollOwned(ctx,u32(n),u32(n*100))
+            n=n+1
+        }
+        if (sdMmcStartupStatus(ctx) != 1 || clockCommands != 3 || sdMmcCardBlockCount(sdMmcStartupCard(ctx)) != 4294967296 || busClock != 128 || busReset != 0 || sdMmcS3Read(16) != (1<<(mode>>1)) || sdMmcS3Read(20) != ((40000<<8)|255)) return i32(5)
+        if ((ctx.loadU32(28)&(if ((mode&1) == 0) 1024 else 2048)) == 0 || ctx.loadU32(40) != 400000) return i32(6)
+        reg(0,0x02000020)
+        val busyWrites=writes
+        if (sdMmcStartupCloseBeginOwned(ctx,true) != 4 || writes != busyWrites || sdMmcStartupStatus(ctx) != 1) return i32(12)
+        reg(0,0)
+        if (sdMmcStartupCloseBeginOwned(ctx,true) != 2 || sdMmcStartupCard(ctx).capacity() != 0 || sdMmcStartupClosePollOwned(ctx) != 2) return i32(13)
+        if (mode == 0) {
+            reg(68,4096)
+            if (sdMmcStartupClosePollOwned(ctx) != 5 || sdMmcStartupStatus(ctx) != 8 || busClock != 128 || busReset != 0 || (ctx.loadU32(32)&(1<<22)) == 0) return i32(20)
+            reg(44,0)
+            if (sdMmcStartupCloseBeginOwned(ctx,true) != 2) return i32(21)
+        }
+        var updates=0
+        while (ctx.loadU32(44) == 1 && updates < 4) {
+            reg(44,0)
+            if (sdMmcStartupClosePollOwned(ctx) != 2 || busClock != 128 || busReset != 0) return i32(14)
+            updates=updates+1
+        }
+        if (updates != 3 || sdMmcS3Read(16) != 0) return i32(15)
+        if ((mode&1) == 0) {
+            drop=0x600c0024
+            if (sdMmcStartupClosePollOwned(ctx) != 4 || sdMmcStartupStatus(ctx) != 6 || ctx.loadU32(28) == 0) return i32(16)
+            drop=-1
+        }
+        if (sdMmcStartupClosePollOwned(ctx) != 1 || sdMmcStartupStatus(ctx) != 7 || ctx.loadU32(28) != 0 || busClock != (if ((mode&1) == 0) 0 else 128) || busReset != (if ((mode&1) == 0) 128 else 0)) return i32(17)
+        val closedWrites=writes
+        if (sdMmcStartupCloseBeginOwned(ctx,true) != 1 || sdMmcStartupClosePollOwned(ctx) != 1 || writes != closedWrites) return i32(18)
+        mode=mode+1
+    }
+    reset(); sdMmcStartupBeginOwned(ctx,0,false,u32(0),100,true); drop=0x600c0024
+    if (sdMmcStartupPollOwned(ctx,u32(0),u32(0)) != 4 || ctx.load(4) != 1 || ctx.loadU32(28) == 0 || busClock != 128) return i32(7)
+    drop=-1
+    if (sdMmcStartupCloseBeginOwned(ctx,true) != 2 || sdMmcStartupClosePollOwned(ctx) != 1 || busClock != 0 || busReset != 128) return i32(19)
+    reset(); sdMmcStartupBeginOwned(ctx,0,false,u32(0),100,true)
+    sdMmcStartupPollOwned(ctx,u32(0),u32(0)); reg(16,1)
+    val before=writes
+    if (sdMmcStartupPollOwned(ctx,u32(1),u32(1)) != 4 || ctx.load(4) != 2 || writes != before || sdMmcS3Read(2048) != 0) return i32(8)
+    reset(); sdMmcStartupBeginOwned(ctx,0,false,u32(0xfffffff0),32,true)
+    sdMmcStartupPollOwned(ctx,u32(0xfffffff0),u32(0))
+    val timeoutWrites=writes
+    if (sdMmcStartupPollOwned(ctx,u32(16),u32(100)) != 5 || writes != timeoutWrites || busClock != 128 || ctx.loadU32(28) == 0) return i32(9)
+    reset()
+    if (sdMmcStartupBeginOwned(ctx,0,false,u32(0),100,false) != 3 || sdMmcStartupBeginOwned(nativeBufferAt(storage,127),0,false,u32(0),100,true) != 3 || writes != 0) return i32(10)
+    return i32(0)
+}

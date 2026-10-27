@@ -1,0 +1,120 @@
+import "../src/esp32/i2s/pdm_rx_esp32s3_sequence.ab"
+import "../src/esp32/i2s/pdm_pins_s3_sequence.ab"
+import "../src/esp32/gpio/s3_logic.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var config=0
+var width=0
+var slotsWord=0
+var writes=0
+var dropped=-1
+var bad=false
+type Pin=int
+fun Pin.number(): int = this|0
+fun Pin.valid(): bool = espChipS3().gpioValid(this)
+fun Pin.outputCapable(): bool = espChipS3().gpioOutputValid(this)
+var seen=0
+var routeFault=-1
+var routeSlave=false
+var routeInvert=false
+var routeSlots=0
+fun Pin.routeInputSignal(signal: int,inverted: bool): bool {
+    if (signal == 27) {
+        if (!routeSlave || this != 14 || inverted != routeInvert) bad=true
+        seen=seen|16;return routeFault != 4
+    }
+    val line=if (signal == 25) 0 else signal-50
+    if (line < 0 || line > 3 || inverted || this != 10+line || (seen&(16|(15<<line))) != 0 || (routeSlots&(3<<(line*2))) == 0) bad=true
+    seen=seen|(1<<line);return routeFault != line
+}
+fun Pin.routeOutputSignal(signal: int,inverted: bool): bool {
+    if (routeSlave || this != 14 || signal != 27 || inverted != routeInvert) bad=true
+    seen=seen|16;return routeFault != 4
+}
+fun esp32s3I2sClockRead(address: int): int {
+    if (address == 0x6000f020) return config
+    if (address == 0x6000f028) return width
+    if (address == 0x6000f050) return slotsWord
+    bad=true;return 0
+}
+fun esp32s3I2sClockField(address: int,mask: int,value: int): void {
+    val step=writes;writes=writes+1
+    if (step == dropped) return
+    if (address == 0x6000f020) config=(config&~mask)|value
+    else if (address == 0x6000f028) width=(width&~mask)|value
+    else if (address == 0x6000f050) slotsWord=(slotsWord&~mask)|value
+    else bad=true
+    return
+}
+@export("abla_i2s_s3_pdm_test")
+fun test(): i32 {
+    val pins=pdmPins(14,10,11,12,13)
+    routeSlots=1
+    while (routeSlots <= 255) {
+        var variant=0
+        while (variant < 4) {
+            routeSlave=(variant&1) != 0;routeInvert=(variant&2) != 0;routeFault=-1
+            while (routeFault <= 4) {
+                seen=0
+                var expectedSeen=0;var expectedStatus=1;var line=0
+                while (line < 4) {
+                    if ((routeSlots&(3<<(line*2))) != 0) {
+                        expectedSeen=expectedSeen|(1<<line)
+                        if (routeFault == line) { expectedStatus=3+line;break }
+                    }
+                    line=line+1
+                }
+                if (expectedStatus == 1) { expectedSeen=expectedSeen|16;if (routeFault == 4) expectedStatus=7 }
+                if (esp32s3PdmRoutePinsOwned(0,pins,routeSlots,routeSlave,routeInvert) != expectedStatus || seen != expectedSeen || bad) return i32(7)
+                routeFault=routeFault+1
+            }
+            variant=variant+1
+        }
+        routeSlots=routeSlots+1
+    }
+    seen=0
+    if (esp32s3PdmRoutePinsOwned(1,pins,3,false,false) != 2 || esp32s3PdmRoutePinsOwned(0,pdmPins(14,14),3,false,false) != 2 ||
+        esp32s3PdmRoutePinsOwned(0,pdmPins(14,10,10),15,false,false) != 2 || esp32s3PdmRoutePinsOwned(0,pdmPins(14,22),3,false,false) != 2 || seen != 0) return i32(8)
+    if (!esp32s3PdmPinsValid(0,pdmPins(14,10,10),3,false) || !pdmPins(254,0,1,253,254).valid() || pdmPins(254,0,1,253,254).dataPin(3) != 254 || pdmPins(255,0).valid()) return i32(9)
+    var slots=1
+    while (slots <= 255) {
+        var flags=0
+        while (flags < 8) {
+            val pcm=(flags&1) != 0;val ds=(flags&2) != 0;val slave=(flags&4) != 0
+            val desired=0x100000|(if (pcm) 0x200000 else 0)|(if (ds) 0x400000 else 0)|(if (slave) 8 else 0)
+            dropped=-1
+            while (dropped < 3) {
+                config=0x80000000|(0x780228^desired);width=0xc000007f;slotsWord=0xabc00000;writes=0
+                val result=esp32s3I2sSetPdmReceiveMode(0,slots,pcm,ds,slave)
+                if (result != (dropped == -1) || writes != (if (dropped == -1) 3 else dropped+1) || bad) return i32(1)
+                if (dropped == -1 && (config != (0x80000000|desired) || width != 0xcf3de07f || slotsWord != (0xabc00000|slots))) return i32(2)
+                dropped=dropped+1
+            }
+            flags=flags+1
+        }
+        var divider=1
+        while (divider <= 64) {
+            var bits=slots;var channels=0
+            while (bits != 0) { channels=channels+(bits&1);bits=bits>>>1 }
+            var ds=0
+            while (ds < 2) {
+                val factor=if (ds == 0) 64 else 128
+                val minimum=if (ds == 0) channels*2 else channels
+                var expected=if (divider < 8) 8 else divider
+                if (expected < minimum) expected=minimum
+                val clock=esp32s3PdmReceiveClock(240000000,8000,slots,true,ds == 1,divider)
+                if (!clock.valid() || clock.bitClockDivider() != expected || clock.masterClockHz() != 8000*factor*expected) return i32(3)
+                ds=ds+1
+            }
+            divider=divider+1
+        }
+        slots=slots+1
+    }
+    writes=0;config=4
+    if (esp32s3I2sSetPdmReceiveMode(0,1,true,false,false) || writes != 0) return i32(4)
+    config=256
+    if (esp32s3I2sSetPdmReceiveMode(0,1,true,false,false) || writes != 0 || esp32s3I2sSetPdmReceiveMode(1,1,true,false,false) || writes != 0) return i32(5)
+    val raw=esp32s3PdmReceiveClock(160000000,1024000,3,false,false,8)
+    if (!raw.valid() || raw.masterClockHz() != 16384000 || esp32s3PdmReceiveClock(160000000,1,1,true,false,8).valid() || esp32s3PdmReceiveClock(160000000,96000,255,true,true,64).valid()) return i32(6)
+    return i32(0)
+}

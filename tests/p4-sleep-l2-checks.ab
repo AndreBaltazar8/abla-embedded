@@ -1,0 +1,96 @@
+import "../src/esp32/power/sleep_l2_p4_sequence.ab"
+import "./p4-sleep-flash-rev3-checks.ab"
+val l2Record=nativeStaticAllocate(36)
+var l2Auto=u32(3)
+var l2Freeze=u32(0)
+var l2Flash=u32(1)
+var l2Writes=0
+var l2Drop=0
+var l2Changed=false
+var l2Stuck=0
+var l2Pulses=0
+var l2Thaws=0
+var l2Bad=false
+var l2FlashShared=false
+fun p4SleepL2Read(offset: int): u32 {
+    if (offset == 692) return if (l2Stuck == 2 && (l2Auto&u32(1)) == u32(0)) l2Auto&~u32(2) else l2Auto
+    if (offset == 680) return if (l2Stuck == 3) u32(0) else u32(2)
+    if (offset == 152) return if (l2Stuck == 4) u32(0) else u32(16)
+    if (offset == 136) return if (l2Stuck == 5) u32(0) else u32(4)
+    if (offset == 652) {
+        if (l2Stuck == 8 && l2Pulses != 0) return l2Freeze&~u32(1<<22)
+        if (l2Stuck == 10 && l2Thaws != 0) return l2Freeze|u32(1<<22)
+        return l2Freeze
+    }
+    l2Bad=true;return u32(0)
+}
+fun p4SleepL2Write(offset: int,value: u32): void {
+    l2Writes=l2Writes+1
+    val prior=if (offset == 692) l2Auto else l2Freeze
+    val mask=if (offset == 692) u32(1) else u32(0x300000)
+    if ((value&~(mask|u32(1<<22))) != (prior&~(mask|u32(1<<22)))) l2Bad=true
+    if (l2Writes == l2Drop) { l2Changed=(value&mask) != (prior&mask);return }
+    if (offset == 692) l2Auto=value
+    else if (offset == 652) {
+        val setting=(value&u32(1<<20)) != u32(0)
+        if (setting && (prior&u32(1<<20)) == u32(0)) { if ((value&u32(1<<21)) != u32(0)) l2Bad=true;l2Pulses=l2Pulses+1 }
+        if (!setting && (prior&u32(1<<20)) != u32(0)) l2Thaws=l2Thaws+1
+        l2Freeze=(value&~u32(1<<22))|(if (setting) u32(1<<22) else u32(0))
+    } else l2Bad=true
+    return
+}
+fun p4SleepL2FlashRead(): u32 = if (l2FlashShared) flashControl else l2Flash
+fun p4SleepL2FlashWrite(value: u32): void {
+    l2Writes=l2Writes+1
+    if ((value&u32(0x7fffffff)) != (p4SleepL2FlashRead()&u32(0x7fffffff))) l2Bad=true
+    if (l2Writes == l2Drop) { l2Changed=value != p4SleepL2FlashRead();return }
+    if ((value&u32(0x80000000)) != u32(0) && (l2Pulses == 0 || l2Thaws == 0 || (l2Freeze&u32(0x500000)) != u32(0))) l2Bad=true
+    l2Flash=value;if (l2FlashShared) flashControl=value;return
+}
+fun p4SleepL2Fence(): void { return }
+fun seedL2(flags: int): NativeBuffer {
+    l2FlashShared=false
+    l2Auto=u32(0xaa02|(flags&1));l2Freeze=u32(0x123|(if ((flags&2) != 0) 1<<21 else 0));l2Flash=u32(0x345|(if ((flags&4) != 0) 0x80000000 else 0))
+    l2Writes=0;l2Drop=0;l2Changed=false;l2Stuck=0;l2Pulses=0;l2Thaws=0;l2Bad=false
+    val r=nativeBufferAt(l2Record,36)
+    var i=0
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(32,0x1234abcd);return r
+}
+fun sleepL2Checks(): int {
+    var flags=0
+    while (flags < 8) {
+        var fault=0
+        while (fault <= 8) {
+            val r=seedL2(flags);val oldAuto=l2Auto;val oldFreeze=l2Freeze;val oldFlash=l2Flash
+            if (fault <= 6) l2Drop=fault
+            val opened=esp32p4SleepL2OpenOwned(r,2,true)
+            if (opened != (if (l2Changed) 4 else 1)) return 160
+            l2Drop=0
+            if (esp32p4SleepL2ContinueOwned(r,2,true) != 1 || l2Bad || l2Pulses != 1 || l2Thaws != 1 || (l2Auto&u32(1)) != u32(0) || (l2Flash&u32(0x80000000)) == u32(0)) return 161
+            l2Changed=false;if (fault > 6) l2Drop=l2Writes+fault-6
+            val closed=esp32p4SleepL2CloseOwned(r,2,true)
+            if (closed != (if (l2Changed) 4 else 6)) return 162
+            l2Drop=0
+            if (esp32p4SleepL2CloseOwned(r,2,true) != 6 || l2Auto != oldAuto || l2Freeze != oldFreeze || l2Flash != oldFlash || l2Bad || r.loadU32(32) != 0x1234abcd) return 163
+            val count=l2Writes
+            if (esp32p4SleepL2CloseOwned(r,2,true) != 6 || l2Writes != count) return 164
+            fault=fault+1
+        }
+        flags=flags+1
+    }
+    var stage=2
+    while (stage <= 10) {
+        if (stage <= 5 || stage == 8 || stage == 10) {
+            val r=seedL2(3);l2Stuck=stage
+            if (esp32p4SleepL2OpenOwned(r,2,true) != 5 || r.loadU32(20) != stage || (l2Flash&u32(0x80000000)) != u32(0)) return 165
+            if (esp32p4SleepL2CloseOwned(r,2,false) != 2 || esp32p4SleepL2CloseOwned(r,2,true) != 5) return 166
+            l2Stuck=0
+            if (esp32p4SleepL2CloseOwned(r,2,true) != 6 || l2Pulses != 1 || l2Thaws != 1 || l2Bad) return 167
+        }
+        stage=stage+1
+    }
+    val invalid=seedL2(0);l2Freeze=l2Freeze|u32(1<<20)
+    if (esp32p4SleepL2OpenOwned(invalid,2,true) != 3 || l2Writes != 0 || invalid.loadU32(0) != 0) return 168
+    return 0
+}

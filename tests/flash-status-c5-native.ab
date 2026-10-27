@@ -1,0 +1,76 @@
+import "../src/esp32/flash_status_c5_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(560)
+var response=0
+var pending=0
+var commands=0
+var writes=0
+var failAt=0
+var bad=false
+fun initial(offset: int): int = if (offset == 0 || offset == 0xd4) 0 else if (offset == 0x34) 2 else 0x5a5affff|offset
+trusted fun c5MspiRead(address: int): int {
+    if (address == 0x60096018) return 13
+    if (address == 0x6009601c) return 0x603
+    if (address == 0x60002000) return 0
+    if (address < 0x60003000 || address >= 0x60003200) { bad=true;return 0 }
+    if (address == 0x60003000) {
+        if (pending > 0) { pending=pending-1;return 0x40000 }
+        return 0
+    }
+    return nativeBufferAt(memory+48,512).loadU32(address-0x60003000)
+}
+trusted fun c5MspiWrite(address: int,value: int): void {
+    if (address < 0x60003000 || address >= 0x60003200 || pending != 0) { bad=true;return }
+    val regs=nativeBufferAt(memory+48,512)
+    if (address == 0x60003000) {
+        if (value != 0x40000 || (regs.loadU32(8)&0x2320) != 0 || (regs.loadU32(0x18)&0xf900f000) != 0x90000000 ||
+            (regs.loadU32(0x20)&0xf000ffff) != 0x70000005 || (regs.loadU32(0x28)&1023) != 7) bad=true
+        commands=commands+1;pending=if ((response&1) == 0) 0 else 3
+        regs.storeU32(0x58,response);return
+    }
+    writes=writes+1
+    if (writes == failAt) return
+    regs.storeU32(address-0x60003000,value);return
+}
+@export("abla_flash_status_c5_test")
+trusted fun test(): i32 {
+    val record=nativeBufferAt(memory,48);val regs=nativeBufferAt(memory+48,512)
+    response=0
+    while (response < 256) {
+        var failure=0
+        while (failure <= 10) {
+            var offset=0
+            while (offset < 512) { regs.storeU32(offset,initial(offset));offset=offset+4 }
+            record.storeU32(0,0);commands=0;writes=0;pending=0;bad=false;failAt=failure
+            var result=esp32C5FlashStatusReadOwned(record,1,true)
+            if (result != 1 && result != 3 || bad) return i32(1)
+            // Unowned fields survive setup and cleanup retries.
+            regs.storeU32(8,regs.loadU32(8)^0x80000000)
+            regs.storeU32(0x18,regs.loadU32(0x18)^256)
+            regs.storeU32(0x20,regs.loadU32(0x20)^0x100000)
+            regs.storeU32(0x28,regs.loadU32(0x28)^0x8000)
+            val before=writes;val issued=commands
+            if (esp32C5FlashStatusReadOwned(record,1,false) != 2 || writes != before || commands != issued) return i32(2)
+            failAt=0
+            var retries=0
+            while (result == 3 && retries < 8) { result=esp32C5FlashStatusReadOwned(record,1,true);retries=retries+1 }
+            if (result != 1 || bad || commands != 1 || record.loadU32(12) != response) return i32(3)
+            offset=0
+            while (offset < 512) {
+                val mutation=if (offset == 8) 0x80000000 else if (offset == 0x18) 256 else if (offset == 0x20) 0x100000 else if (offset == 0x28) 0x8000 else 0
+                if (regs.loadU32(offset) != (initial(offset)^mutation)) return i32(4)
+                offset=offset+4
+            }
+            val done=writes
+            if (esp32C5FlashStatusReadOwned(record,1,true) != 1 || commands != 1 || writes != done) return i32(5)
+            failure=failure+1
+        }
+        response=response+1
+    }
+    record.storeU32(0,0);commands=0;writes=0;regs.storeU32(0x34,0)
+    if (esp32C5FlashStatusReadOwned(record,1,true) != 2 || record.loadU32(0) != 0 || writes != 0 || commands != 0) return i32(6)
+    regs.storeU32(0x34,2);regs.storeU32(0xd4,1)
+    if (esp32C5FlashStatusReadOwned(record,1,true) != 2 || record.loadU32(0) != 0 || writes != 0 || commands != 0) return i32(7)
+    return i32(0)
+}

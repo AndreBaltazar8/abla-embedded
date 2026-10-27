@@ -1,0 +1,130 @@
+import "../src/esp32/psram/cold_p4_sequence.ab"
+import "../src/esp32/psram/cold_sweep_p4_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(512)
+var sweepResult=1
+var sweepCalls=0
+var step=0
+var fail=0
+var closeFail=0
+var closing=false
+var bad=false
+var config=0x00053000
+var profile=200
+var width=true
+var trace=0
+type P4MpllOwner = int
+type P4PsramClockOwner = int
+type P4PsramReset = int
+type P4PsramIdentity = int
+fun P4MpllOwner.ready(): bool = (this&255) == 1
+fun P4MpllOwner.status(): int = this&255
+fun P4PsramClockOwner.ready(): bool = (this&255) == 1
+fun P4PsramClockOwner.status(): int = this&255
+fun P4PsramReset.status(): int = this&255
+fun P4PsramIdentity.status(): int = this&255
+fun P4PsramIdentity.mode(index: int): int = if (index == 8 && width) 64 else 0
+fun P4PsramIdentity.physicalBytes(): int = 16777216
+fun P4PsramIdentity.matchesProfile(mhz: int,hex16: bool): bool = this.status() == 1 && mhz == profile && hex16 == width
+fun p4PsramCommandStorageSafe(address: int,length: int): bool = address >= memory && address+length <= memory+512
+fun p4PsramReadSweepOwned(mhz: int,hex16: bool,capacity: int,address: int,scratch: NativeBuffer,work: NativeBuffer,passes: NativeBuffer,polls: int): int {
+    sweepCalls=sweepCalls+1
+    if (mhz != profile || hex16 != width || capacity != 16777216 || address != 128 ||
+        scratch.addressValue() != memory+256 || work.addressValue() != memory+320 || passes.addressValue() != memory+456 ||
+        nativeBufferAt(memory,48).loadU32(4) != 10 || nativeBufferAt(memory+448,32).loadU32(28) != 0) bad=true
+    var i=0
+    while (i < 4) { passes.storeU32(i*4,1234+i); i=i+1 }
+    return sweepResult
+}
+fun p4PsramProfileValid(mhz: int): bool = mhz == 20 || mhz == 80 || mhz == 200 || mhz == 250
+fun p4PsramProfileMpllMHz(mhz: int): int = if (mhz == 80) 320 else if (mhz == 250) 500 else 400
+fun p4PsramProfileReadDummy(mhz: int): int = if (mhz == 250) 34 else if (mhz == 200) 26 else 18
+fun p4PsramProfileWriteDummy(mhz: int): int = if (mhz == 250) 16 else if (mhz == 200) 12 else 8
+fun event(expected: int): bool { step=step+1; if (step != expected) bad=true; return fail == expected }
+fun p4PsramClockRead(offset: int): int { if (offset != 48) bad=true; return config }
+fun p4MpllStartColdOwned(mhz: int,xtal: int,polls: int): P4MpllOwner {
+    if (mhz != p4PsramProfileMpllMHz(profile) || xtal != 40 || polls != 3) bad=true
+    return P4MpllOwner((1<<24)|(if (event(1)) 4 else 1))
+}
+fun p4PsramClockSelectOwned(expected: int,source: int,divider: int): int {
+    if (expected != ((config>>>12)&3)) bad=true
+    if (closing) { trace=trace*10+3; if (closeFail == 12) return 7 }
+    else if (event(2)) return 7
+    config=(source<<12)|((divider-1)<<16); return 1
+}
+fun p4PsramClockOpenOwned(source: int,divider: int): P4PsramClockOwner {
+    if (source != 1 || divider != 1) bad=true
+    return P4PsramClockOwner(1792|(if (event(3)) 5 else 1))
+}
+fun P4PsramClockOwner.resetControllerOwned(polls: int): P4PsramReset = P4PsramReset(if (event(4)) 256|5 else 1)
+fun P4PsramClockOwner.prepareApControllerOwned(a: int,b: int,drive: int,polls: int): int {
+    if (a != (if (profile == 80) 16 else if (profile == 250) 25 else 20) || b != a || drive != 2) bad=true
+    return if (event(5)) 517 else 1
+}
+fun p4PsramApplyProfileOwned(mhz: int,hex16: bool,dummy: int,scratch: NativeBuffer,work: NativeBuffer): P4PsramIdentity {
+    if (mhz != profile || hex16 != width || dummy != 8 || scratch.addressValue() != memory+50 || work.addressValue() != memory+64) bad=true
+    return P4PsramIdentity(0x1234567800000000|(if (event(6)) 7 else 1))
+}
+fun p4PsramMappedConfigureOwned(rd: int,wr: int,hex16: bool,polls: int): int {
+    if (rd != p4PsramProfileReadDummy(profile) || wr != p4PsramProfileWriteDummy(profile) || hex16 != width) bad=true
+    return if (event(7)) 773 else 1
+}
+fun P4PsramReset.releaseOwned(): P4PsramReset { trace=trace*10+1; return P4PsramReset(if (closeFail == 10) 256|5 else 1) }
+fun P4PsramClockOwner.resumeOwned(): P4PsramClockOwner = P4PsramClockOwner((this&1792)|1)
+fun P4PsramClockOwner.closeOwned(polls: int): P4PsramClockOwner { trace=trace*10+2; return P4PsramClockOwner(if (closeFail == 11) this|7 else 0) }
+fun P4MpllOwner.closeOwned(polls: int): P4MpllOwner { trace=trace*10+4; return P4MpllOwner(if (closeFail == 13) this|3 else 0) }
+@export("abla_p4_psram_cold_test")
+trusted fun coldTest(): i32 {
+    val record=nativeBufferAt(memory,48); val scratch=nativeBufferAt(memory+50,2); val work=nativeBufferAt(memory+64,100)
+    var p=0
+    while (p < 4) {
+        profile=if (p == 0) 20 else if (p == 1) 80 else if (p == 2) 200 else 250
+        fail=0
+        while (fail <= 7) {
+            step=0; bad=false; closing=false; trace=0; config=0x00053000
+            if (!p4PsramColdInitializeOwned(record)) return i32(1)
+            val result=p4PsramColdStartOwned(record,profile,true,8,scratch,work,3)
+            if (result != (if (fail == 0) 1 else 4) || step != (if (fail == 0) 7 else fail) || bad || record.loadU32(4) != (if (fail == 0) 8 else fail)) return i32(2)
+            if (fail == 0 && (record.loadU32(24) != 1 || record.loadU32(28) != 0x12345678)) return i32(3)
+            closing=true
+            if (p4PsramColdCloseOwned(record,3) != 1 || config != 0x00053000 || record.loadU32(44) != 0 || bad) return i32(4)
+            if (trace != (if (fail == 1) 4 else if (fail == 2) 34 else if (fail == 4) 1234 else 234)) return i32(5)
+            if (p4PsramColdStartOwned(record,profile,true,8,scratch,work,3) != 3) return i32(6)
+            fail=fail+1
+        }
+        p=p+1
+    }
+    closeFail=10
+    while (closeFail <= 13) {
+        step=0; fail=4; closing=false; config=0x00053000
+        p4PsramColdInitializeOwned(record)
+        if (p4PsramColdStartOwned(record,profile,true,8,scratch,work,3) != 4) return i32(7)
+        closing=true; trace=0
+        if (p4PsramColdCloseOwned(record,3) != 4 || record.loadU32(40) != closeFail) return i32(8)
+        val saved=closeFail; closeFail=0
+        if (p4PsramColdCloseOwned(record,3) != 1 || config != 0x00053000) return i32(9)
+        closeFail=saved+1
+    }
+    p4PsramColdInitializeOwned(record); step=0
+    if (p4PsramColdStartOwned(record,200,true,8,nativeBufferAt(memory+47,2),work,3) != 2 ||
+        p4PsramColdStartOwned(record,100,true,8,scratch,work,3) != 2 || step != 0) return i32(10)
+    val readScratch=nativeBufferAt(memory+256,64); val readWork=nativeBufferAt(memory+320,100); val report=nativeBufferAt(memory+448,32)
+    var trial=0
+    while (trial < 3) {
+        fail=0; closeFail=0; step=0; closing=false; config=0x00053000; bad=false; sweepCalls=0
+        p4PsramColdInitializeOwned(record)
+        if (p4PsramColdStartOwned(record,profile,width,8,scratch,work,3) != 1) return i32(11)
+        sweepResult=if (trial == 0) 1|(1<<8)|(13<<16) else if (trial == 1) 4 else 1|(1<<32)|(773<<40)
+        if (p4PsramColdReadSweepOwned(record,128,readScratch,readWork,report,3) != (if (trial == 0) 1 else 4) || sweepCalls != 1 || bad ||
+            record.loadU32(4) != (if (trial == 0) 8 else 10) || report.loadU32(0) != (sweepResult&4294967295) || report.loadU32(4) != (sweepResult>>>32) ||
+            report.loadU32(8) != 1234 || report.loadU32(20) != 1237 || report.loadU32(24) != 128 || report.loadU32(28) != 0x50345452) return i32(12)
+        if (trial != 0 && p4PsramColdReadSweepOwned(record,128,readScratch,readWork,report,3) != 3) return i32(13)
+        closing=true
+        if (p4PsramColdCloseOwned(record,3) != 1) return i32(14)
+        trial=trial+1
+    }
+    sweepCalls=0
+    if (p4PsramColdReadSweepOwned(record,128,readScratch,readWork,nativeBufferAt(memory+400,32),3) != 2 || sweepCalls != 0) return i32(15)
+    return i32(0)
+}

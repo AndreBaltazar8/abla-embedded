@@ -1,0 +1,114 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/dma_finite_c5_sequence.ab"
+var descriptors=NativeBuffer(0)
+var channel=0
+var tx=false
+var conf=u32(0)
+var head=u32(0)
+var delay=0
+var writes=0
+var drop=0
+var starts=0
+var updates=0
+var bad=false
+var raw=u32(0)
+var parked=true
+var acks=0
+trusted fun acceptWrite(): bool { writes=writes+1;return writes != drop }
+trusted fun c5I2sClockRead(at: int): u32 = if (at == 0) u32(13) else u32(0x400000)
+trusted fun c5I2sClockWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c5I2sRead(at: int): u32 {
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if ((conf&u32(256)) != u32(0)) { if (delay == 0) conf=conf&~u32(256) else delay=delay-1 }
+        return conf
+    }
+    if (at == 0x6c) return u32(1)
+    if (at == 0x64) return u32(64)
+    return u32(0)
+}
+trusted fun c5I2sWrite(at: int,v: u32): void {
+    if (at != (if (tx) 0x24 else 0x20)) bad=true
+    if ((v&u32(256)) != u32(0)) updates=updates+1
+    if ((v&u32(4)) != u32(0) && starts != 1) bad=true
+    if (acceptWrite()) conf=v
+    return
+}
+trusted fun c5AhbGdmaBusRead(): u32 = u32(1)
+trusted fun c5AhbGdmaBusWrite(v: u32): void { bad=true;return }
+trusted fun c5AhbGdmaRead(at: int): u32 {
+    val base=0x70+channel*192+(if (tx) 96 else 0)
+    if (at == 0x64) return u32(8)
+    if (at == base) return u32(if (tx) 12 else 0)
+    if (at == base+4) return u32(4096)
+    if (at == base+8) return u32(2)
+    if (at == base+16) return if (parked) u32(if (tx) 8 else 17) else u32(0)
+    if (at == channel*16+(if (tx) 48 else 0)) return raw
+    if (at == base+48) return u32(3)
+    if (at == 0x3c4) return u32(0x40800000)
+    if (at == 0x3c8) return u32(0x40860000)
+    if (at == 0x3ac+channel*4+(if (tx) 12 else 0)) return head
+    return u32(0)
+}
+trusted fun c5AhbGdmaWrite(at: int,v: u32): void {
+    if (at == 0x3ac+channel*4+(if (tx) 12 else 0)) { if (acceptWrite()) head=v }
+    else if (at == 0x80+channel*192+(if (tx) 96 else 0)) {
+        if (updates != 1 || (conf&u32(0x104)) != u32(0) || head != u32(0x40800000)) bad=true
+        starts=starts+1;parked=false;acceptWrite()
+    } else if (at == channel*16+(if (tx) 48 else 0)+12) {
+        if (!parked || (conf&u32(4)) != u32(0)) bad=true
+        acks=acks+1;raw=raw&~v
+    } else bad=true
+    return
+}
+trusted fun c5AhbGdmaDescriptorFence(): void { return }
+trusted fun c5AhbGdmaDescriptorRead(at: int): u32 = u32(descriptors.loadU32(at-0x40800000))
+trusted fun c5AhbGdmaDescriptorWrite(at: int,v: u32): void {
+    if (starts != 0) bad=true
+    if (acceptWrite()) descriptors.storeU32(at-0x40800000,int(v))
+    return
+}
+@export("abla_i2s_dma_finite_c5_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(164)
+    val r=nativeBufferAt(storage,140)
+    descriptors=nativeBufferAt(storage+140,24)
+    while (channel < 3) {
+        var direction=0
+        while (direction < 2) {
+            tx=direction == 1
+            var lag=0
+            while (lag < 16) {
+                var scenario=0
+                while (scenario < 2) {
+                    var at=0
+                    while (at < 140) { r.storeU32(at,0);at=at+4 }
+                    conf=u32(0x80000);head=u32(0);delay=lag;writes=0;drop=0;starts=0;updates=0;bad=false;raw=u32(0);parked=true;acks=0
+                    if (c5I2sDmaFiniteBeginOwned(r,channel,tx,0x40800000,2,0x40810000,64,64,1,true) != 5) return i32(1)
+                    if (c5I2sDmaFinitePollOwned(r,1,32,true) != 5 || starts != 1 || updates != 1 || acks != 0) return i32(2)
+                    // Hardware releases each descriptor only after moving payload.
+                    descriptors.storeU32(0,if (tx) 0x40040040 else 0x40020040)
+                    raw=u32(if (scenario == 1) (if (tx) 64 else 128) else 2)
+                    if (scenario == 1) {
+                        if (c5I2sDmaFinitePollOwned(r,2,32,true) != 4 || acks != 0 || r.loadU32(12) != int(raw) || r.loadU32(4) != 6) return i32(3)
+                        val oldWrites=writes
+                        if (c5I2sDmaFinitePollOwned(r,2,32,true) != 4 || writes != oldWrites) return i32(4)
+                    } else {
+                        if (c5I2sDmaFinitePollOwned(r,1,32,true) != 5 || r.loadU32(100) != 1 || acks != 0) return i32(5)
+                        descriptors.storeU32(12,if (tx) 0x40040040 else 0x40010040)
+                        raw=u32(if (tx) 11 else 3);parked=true
+                        if (c5I2sDmaFinitePollOwned(r,1,32,true) != 1 || (conf&u32(4)) != u32(0) || raw != u32(0) || acks != 1 || r.loadU32(104) != (if (tx) 128 else 48)) return i32(6)
+                        val oldWrites=writes
+                        if (c5I2sDmaFinitePollOwned(r,1,32,true) != 1 || writes != oldWrites || c5I2sDmaFiniteBeginOwned(r,channel,tx,0x40800000,2,0x40810000,64,64,1,true) != 2) return i32(7)
+                    }
+                    if (bad) return i32(8)
+                    scenario=scenario+1
+                }
+                lag=lag+1
+            }
+            direction=direction+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

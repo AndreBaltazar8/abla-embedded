@@ -1,0 +1,105 @@
+import "../src/esp32/mspi_transition_c5_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(1536)
+var core=0
+var ready=13
+var spi1=false
+var psram=false
+var writes=0
+var failAt=0
+var commits=0
+var bad=false
+var dividedMemory=false
+fun initial(offset: int,bank: int): int {
+    val value=0xa5000001|(bank<<20)|(offset<<4)|(if (offset == 0x190) 64 else 0)
+    if (dividedMemory && bank == 0 && offset == 0x50) return (value&~0x800000ff)|6
+    value
+}
+trusted fun hardware(address: int): int {
+    val bank=if (address >= 0x60003000) 1 else 0
+    val offset=address-0x60002000-bank*4096
+    if (offset < 0 || offset >= 512 || (offset&3) != 0 || bank == 1 && !spi1 ||
+        bank == 1 && (offset == 0x184 || offset == 0x188) ||
+        bank == 0 && !psram && (offset == 0x40 || offset == 0x50 || offset == 0x190 || offset == 0x194 || offset == 0x198)) { bad=true;return 0 }
+    512+bank*512+offset
+}
+trusted fun c5MspiRead(address: int): int {
+    if (address == 0x60096018) return ready
+    if (address == 0x6009601c) return core
+    val offset=hardware(address)
+    return nativeBufferAt(memory,1536).loadU32(offset)|(if (address == 0x60002180 || address == 0x60003180) 64 else 0)
+}
+trusted fun c5MspiWrite(address: int,value: int): void {
+    if (address == 0x60002180 && (value&64) != 0) commits=commits+1
+    else {
+        writes=writes+1
+        if (writes == failAt) return
+    }
+    if (address == 0x6009601c) { core=value;return }
+    if (address == 0x60003180 && (value&64) != 0) bad=true
+    nativeBufferAt(memory,1536).storeU32(hardware(address),if (address == 0x60002180 || address == 0x60003180) value&~64 else value)
+    return
+}
+@export("abla_mspi_transition_c5_test")
+trusted fun test(): i32 {
+    val record=nativeBufferAt(memory,448);val request=nativeBufferAt(memory+448,48)
+    var mode=0
+    while (mode < 32) {
+        dividedMemory=(mode&16) != 0
+        val mhz=if ((mode&1) == 0) 80 else 120;spi1=(mode&2) != 0;psram=(mode&4) != 0
+        var failure=0
+        while (failure <= 50) {
+            var bank=0
+            while (bank < 2) { var offset=0;while (offset < 512) { nativeBufferAt(memory,1536).storeU32(512+bank*512+offset,initial(offset,bank));offset=offset+4 };bank=bank+1 }
+            core=0x12340603;ready=13;writes=0;failAt=failure;commits=0;bad=false;record.storeU32(0,0)
+            request.storeU32(0,mhz);request.storeU32(4,40);request.storeU32(8,if (psram) 20 else 0);request.storeU32(12,if (spi1) 1 else 0)
+            request.storeU32(16,3|(2<<3)|(1<<5));request.storeU32(20,3|(2<<3)|(6<<5));request.storeU32(24,2|(1<<3)|(2<<5))
+            request.storeU32(28,7|64);request.storeU32(32,7|64);request.storeU32(36,4|64);request.storeU32(40,3|64);request.storeU32(44,10)
+            val first=esp32C5MspiTransitionBeginOwned(record,request,true)
+            if (first != 1 && first != 3 || bad) return i32(1)
+            request.storeU32(0,0) // copied plan must survive caller mutation
+            if ((mode&8) == 0) {
+                failAt=0
+                if (esp32C5MspiTransitionContinueOwned(record,true) != 1 || bad || (core&255) != (if (mhz == 80) 5 else 3)) return i32(2)
+                if ((c5MspiRead(0x60002184)&0x7ffffff) != 3*0x1249249 || (c5MspiRead(0x60002188)&0x3ffff) != 2*0x15555 ||
+                    commits != 1+(if (spi1) 1 else 0)+(if (psram) 1 else 0)) return i32(3)
+                if (spi1 && ((c5MspiRead(0x60003180)>>>2)&7) != 6 || psram && ((c5MspiRead(0x60002190)>>>2)&7) != 2) return i32(4)
+                failAt=writes+failure
+            }
+            // Mutate only unowned bits; nested shared flash and PSRAM fields
+            // must unwind without erasing another child's saved/current state.
+            core=core^0x10000
+            var offset=512
+            while (offset < 1536) { val all=nativeBufferAt(memory,1536);all.storeU32(offset,all.loadU32(offset)^0x10000000);offset=offset+4 }
+            // Original core is PLL480/4; PSRAM EQ_SYSCLK is set in the
+            // saved direct model, so restoring requires CPU >=15MHz,
+            // regardless of stale N. The divided model uses 120/7MHz:
+            // CPU2 is unsafe (rounding down the ratio would miss this).
+            // Denial must not begin any cleanup.
+            val safeCpu=if (dividedMemory) 3 else 15
+            val beforeDenied=writes;val beforeStage=record.loadU32(16);val beforeState=record.loadU32(4)
+            if (psram && record.loadU32(96) != 0) {
+                if (esp32C5MspiTransitionCloseAtCpuOwned(record,safeCpu-1,true) != 2 || writes != beforeDenied ||
+                    record.loadU32(16) != beforeStage || record.loadU32(4) != beforeState) return i32(11)
+            }
+            var closed=esp32C5MspiTransitionCloseAtCpuOwned(record,safeCpu,true)
+            if (closed != 3 && closed != 4) return i32(5)
+            failAt=0
+            if (esp32C5MspiTransitionCloseAtCpuOwned(record,safeCpu,true) != 4 || bad || core != (0x12340603^0x10000)) return i32(6)
+            bank=0
+            while (bank < 2) { offset=0;while (offset < 512) { if (nativeBufferAt(memory,1536).loadU32(512+bank*512+offset) != (initial(offset,bank)^0x10000000)) return i32(7);offset=offset+4 };bank=bank+1 }
+            val before=writes;val published=commits
+            if (esp32C5MspiTransitionCloseOwned(record,true) != 4 || esp32C5MspiTransitionContinueOwned(record,true) != 2 ||
+                writes != before || commits != published) return i32(8)
+            failure=failure+1
+        }
+        mode=mode+1
+    }
+    record.storeU32(0,0);writes=0;commits=0
+    request.storeU32(0,80);request.storeU32(8,80);request.storeU32(12,1);request.storeU32(44,9)
+    if (esp32C5MspiTransitionBeginOwned(record,request,true) != 2 || record.loadU32(0) != 0 || writes != 0) return i32(9)
+    request.storeU32(44,10);request.storeU32(20,4|(2<<3))
+    if (esp32C5MspiTransitionBeginOwned(record,request,true) != 2 || record.loadU32(0) != 0 || writes != 0) return i32(10)
+    return i32(0)
+}

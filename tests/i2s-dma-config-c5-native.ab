@@ -1,0 +1,117 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/dma_config_c5_sequence.ab"
+var conf=u32(0)
+var frame=u32(0)
+var slotsReg=u32(0)
+var converter=u32(0)
+var tx=false
+var writes=0
+var drop=0
+var publications=0
+var delayed=false
+var enabled=true
+var bad=false
+var channel=0
+var dmaConf=u32(0)
+var dmaOwner=u32(0)
+var dmaPeri=u32(0)
+var rxEof=u32(0)
+var dmaBusy=false
+trusted fun c5I2sClockRead(at: int): u32 = if (at == 0) u32(13) else if (enabled) u32(0x400000) else u32(0)
+trusted fun c5I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c5I2sRead(at: int): u32 {
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if (!delayed) conf=conf&~u32(256)
+        return conf
+    }
+    if (at == (if (tx) 0x2c else 0x28)) return frame
+    if (at == (if (tx) 0x54 else 0x50)) return slotsReg
+    if (at == 0x40 && tx) return converter
+    if (at == 0x64) return rxEof
+    if (at == 0x6c) return u32(1)
+    if (at == 0x14 || at == (if (tx) 0x20 else 0x24)) return u32(0)
+    bad=true;return u32(0)
+}
+trusted fun c5I2sWrite(at: int,value: u32): void {
+    writes=writes+1
+    if (at == (if (tx) 0x24 else 0x20) && (value&u32(256)) != u32(0)) publications=publications+1
+    if (writes == drop) return
+    if (at == 0x64) { rxEof=value;return }
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if ((value&u32(7)) != u32(0)) bad=true
+        conf=value
+    } else if (at == (if (tx) 0x2c else 0x28)) frame=value
+    else if (at == (if (tx) 0x54 else 0x50)) slotsReg=value
+    else if (at == 0x40 && tx) converter=value
+    else bad=true
+    return
+}
+trusted fun resetModel(r: NativeBuffer): void {
+    var at=0
+    while (at < 68) { r.storeU32(at,0);at=at+4 }
+    conf=u32(0xe1ffcef8);frame=u32(0xabcdef01);slotsReg=u32(0xffffffff);converter=u32(0xffffffff)
+    dmaConf=u32(0);dmaOwner=u32(0x80000000);dmaPeri=u32(0x8000003f);rxEof=u32(0xa5000040);dmaBusy=false
+    writes=0;drop=0;publications=0;delayed=false;enabled=true;bad=false;return
+}
+trusted fun restored(): bool = conf == u32(0xe1ffcef8) && frame == u32(0xabcdef01) && slotsReg == u32(0xffffffff) && converter == u32(0xffffffff) && dmaConf == u32(0) && dmaOwner == u32(0x80000000) && dmaPeri == u32(0x8000003f) && rxEof == u32(0xa5000040) && !bad
+
+trusted fun c5AhbGdmaBusRead(): u32 = u32(1)
+trusted fun c5AhbGdmaBusWrite(v: u32): void { bad=true;return }
+trusted fun c5AhbGdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    val base=0x70+channel*192+(if (tx) 96 else 0)
+    if (at == base) return dmaConf
+    if (at == base+4) return dmaOwner
+    if (at == base+48) return dmaPeri
+    if (at == base+8) return u32(2)
+    if (at == base+16) return if (dmaBusy) u32(0) else u32(if (tx) 8 else 16)
+    return u32(0)
+}
+trusted fun c5AhbGdmaWrite(at: int,v: u32): void {
+    writes=writes+1
+    if (writes == drop) return
+    val base=0x70+channel*192+(if (tx) 96 else 0)
+    if (at == base) dmaConf=v else if (at == base+4) dmaOwner=v else if (at == base+48) dmaPeri=v else bad=true
+    return
+}
+@export("abla_i2s_dma_config_c5_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(68)
+    val r=nativeBufferAt(storage,68)
+    while (channel < 3) {
+        var direction=0
+        while (direction < 2) {
+            tx=direction == 1
+            var flags=0
+            while (flags < 64) {
+                var fault=0
+                while (fault <= 30) {
+                    resetModel(r);drop=fault
+                    val result=c5I2sDmaConfigOpenOwned(r,channel,tx,16,32,32,true,3,flags,256,1,true)
+                    if (result != 1 && result != 4) return i32(1)
+                    if (result == 1 && (dmaConf != u32(if (tx) 12 else 0) || dmaOwner != u32(0x80001000) || dmaPeri != u32(0x80000003) || rxEof != u32(if (tx) 0xa5000040 else 0xa5000100))) return i32(2)
+                    val primary=r.loadU32(8)
+                    c5I2sDmaConfigCloseOwned(r,1,true)
+                    drop=0
+                    if (c5I2sDmaConfigCloseOwned(r,1,true) != 6 || !restored() || r.loadU32(8) != primary) return i32(3)
+                    fault=fault+1
+                }
+                flags=flags+1
+            }
+            resetModel(r);delayed=true
+            if (c5I2sDmaConfigOpenOwned(r,channel,tx,16,32,32,true,3,0,256,1,true) != 5) return i32(4)
+            val before=writes
+            if (c5I2sDmaConfigWaitOwned(r,1,true) != 5 || writes != before) return i32(5)
+            delayed=false
+            if (c5I2sDmaConfigWaitOwned(r,1,true) != 1) return i32(6)
+            dmaBusy=true
+            if (c5I2sDmaConfigCloseOwned(r,1,true) != 3 || writes != before || c5I2sDmaConfigWaitOwned(r,1,true) != 2) return i32(7)
+            dmaBusy=false
+            if (c5I2sDmaConfigCloseOwned(r,1,true) != 6 || !restored()) return i32(8)
+            direction=direction+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

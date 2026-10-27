@@ -1,0 +1,96 @@
+import "../src/display/i80_config_s3_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/build"
+val i80Memory=nativeStaticAllocate(128)
+var i80Clock=256
+var i80Reset=0
+var i80Writes=0
+var i80Drop=0
+var i80Bad=false
+var i80TransferModel=false
+var i80FifoStuck=false
+var i80StopStuck=false
+var i80DmaStarted=false
+var i80DelaySeen=false
+fun esp32S3I80Read(address: int): int {
+    if (address == 0x600C001C) return i80Clock
+    if (address == 0x600C0024) return i80Reset
+    if (address < 0x60041000 || address > 0x60041070 || (address&3) != 0) { i80Bad=true;return 0 }
+    return nativeAddressLoadU32(i80Memory,address-0x60041000)
+}
+fun esp32S3I80Write(address: int,value: int): void {
+    i80Writes=i80Writes+1
+    if (address != 0x60041000 && address != 0x60041010 && address != 0x60041014 && address != 0x60041018 &&
+        address != 0x6004101C && address != 0x60041028 && address != 0x60041064 && address != 0x60041070) { i80Bad=true;return }
+    if (i80Writes == i80Drop) return
+    if (i80TransferModel && address == 0x60041018 && (value&(1<<27)) != 0 && !i80FifoStuck) {
+        nativeAddressStoreU32(i80Memory,24,value&(~(1<<27)));return
+    }
+    if (i80TransferModel && address == 0x60041014) {
+        if ((value&(1<<27)) != 0 && (!i80DmaStarted || !i80DelaySeen)) i80Bad=true
+        nativeAddressStoreU32(i80Memory,20,if (i80StopStuck) value|(1<<20) else value&(~(1<<20)));return
+    }
+    if (address == 0x60041070) {
+        if (value != 2) i80Bad=true
+        nativeAddressStoreU32(i80Memory,104,nativeAddressLoadU32(i80Memory,104)&(~value))
+    } else nativeAddressStoreU32(i80Memory,address-0x60041000,value)
+    return
+}
+fun i80Seed(): void {
+    var i=0
+    while (i < 128) { nativeAddressStoreU32(i80Memory,i,0xA55AA55A);i=i+4 }
+    nativeAddressStoreU32(i80Memory,20,0x07080001)
+    nativeAddressStoreU32(i80Memory,24,0xF7FFFFC1)
+    nativeAddressStoreU32(i80Memory,104,6)
+    i80Clock=256;i80Reset=0;i80Writes=0;i80Bad=false;return
+}
+@export("abla_i80_config_s3_test")
+fun testI80Config(): int {
+    val r=nativeBufferAt(i80Memory,128)
+    var profile=0
+    while (profile < 512) {
+        i80Seed();i80Drop=0
+        val width=if ((profile&1) == 0) 8 else 16
+        val divider=1+(profile/2)%64;val idle=(profile&128) != 0;val edge=(profile&256) != 0
+        if (esp32S3LcdI80ConfigureOwned(width,2,divider,idle,edge,true) != 1 || i80Writes != 7 || i80Bad) return 1
+        val expected=0xE0000400|(if (divider == 1) 65 else divider-1)|(if (idle) 128 else 0)|(if (edge) 256 else 0)
+        if (r.loadU32(0) != expected || r.loadU32(20) != (8192|(if (width == 16) 1<<23 else 0)) || r.loadU32(24) != 0x04000001 || r.loadU32(104) != 4) return 2
+        if (r.loadU32(4) != 0xA55AA55A || r.loadU32(8) != 0xA55AA55A || r.loadU32(12) != 0xA55AA55A) return 3
+        profile=profile+1
+    }
+    var group=2
+    while (group <= 256) {
+        val word=esp32S3LcdI80ClockWord(group,5,false,false)
+        if (((word>>>9)&255) != group%256 || (word&127) != 4 || (word&0x1FFE0000) != 0) return 4
+        group=group+1
+    }
+    i80Drop=1
+    while (i80Drop <= 7) {
+        i80Seed()
+        if (esp32S3LcdI80ConfigureOwned(8,2,5,false,false,true) != 4 || i80Writes != i80Drop || i80Bad) return 5
+        i80Drop=i80Drop+1
+    }
+    i80Drop=0
+    profile=0
+    while (profile < 60) {
+        i80Seed();r.storeU32(28,0)
+        val cmd=profile%3;val dummy=(profile/3)%5;val data=if (profile < 15) 0 else if (profile < 30) 1 else 8192
+        val continuous=profile >= 30
+        val result=esp32S3LcdI80PhasesOwned(cmd,dummy,data,0x12345678,continuous,true)
+        if (cmd+dummy+data == 0) { if (result != 2 || i80Writes != 0) return 6 }
+        else {
+            val word=r.loadU32(20)
+            if (result != 1 || ((word>>>26)&1) != (if (cmd > 0) 1 else 0) || ((word>>>31)&1) != (if (cmd == 2) 1 else 0) ||
+                ((word>>>25)&1) != (if (dummy > 0) 1 else 0) || ((word>>>29)&3) != (if (dummy > 0) dummy-1 else 0) ||
+                ((word>>>24)&1) != (if (data > 0) 1 else 0) || (word&8191) != (if (data > 0) data-1 else 0) ||
+                ((word>>>13)&1) != (if (continuous) 1 else 0) || (word&0x80000) == 0) return 7
+        }
+        profile=profile+1
+    }
+    i80Seed();i80Clock=0
+    if (esp32S3LcdI80ConfigureOwned(8,2,5,false,false,true) != 3 || i80Writes != 0) return 8
+    i80Clock=256;r.storeU32(20,1<<27)
+    if (esp32S3LcdI80PhasesOwned(0,0,1,0,true,true) != 3 || i80Writes != 0) return 9
+    if (esp32S3LcdI80ClockWord(1,1,false,false) != -1 || esp32S3LcdI80ClockWord(2,65,false,false) != -1) return 10
+    return 0
+}

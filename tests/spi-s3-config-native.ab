@@ -1,0 +1,142 @@
+import "../src/esp32/spi/buffer_sequence_esp32s3.ab"
+import "../src/esp32/spi/config_sequence_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var base = 0
+var operation = 0
+var calls = 0
+var source = 0
+var pre = 1
+var cycles = 1
+var high = 1
+var mode = 0
+var order = 0
+var busy = 0
+var busClock = 0
+var busReset = 0
+var busMask = 0
+var bad = false
+var savedClock = 0
+var savedGate = 0
+var savedMisc = 0xffffffff
+var savedUser = 0xffffffff
+var savedControl = 0xffffffff
+var droppedModeWrite = 0
+trusted fun esp32s3SpiRead(address: int): int {
+    if (address == 0x600c0018) return busClock
+    if (address == 0x600c0020) return busReset
+    if (address == base) return if (busy == 1) 0x00800000 else if (busy == 2) 0x01000000 else 0
+    if (address == base + 0x30) return if (busy == 3) 0x18000000 else 0
+    if (address == base + 0xe0) return if (busy == 4) 0x04000000 else 0
+    if (operation == 0 && address == base + 0xe8 && calls > 0) return savedGate
+    if (operation == 0 && address == base + 12 && calls >= 2) return savedClock
+    if (operation == 1 && address == base + 32) return savedMisc
+    if (operation == 1 && address == base + 16) return savedUser
+    if (operation == 1 && address == base + 8) return savedControl
+    0xffffffff
+}
+trusted fun esp32s3SpiWrite(address: int, value: int): void {
+    calls = calls + 1
+    if (operation == 0) {
+        if (address == base + 0xe8) savedGate=value
+        if (address == base + 12) savedClock=value
+        if (calls == 1) { if (address != base + 0xe8 || value != 0xfffffff8) bad = true }
+        else if (calls == 2) {
+            if (address != base + 12 || (value & 0x7fc00000) != 0x7fc00000) bad = true
+            if (cycles == 1) { if ((value & 0x803fffff) != 0x80000000) bad = true }
+            else if ((value & 0x80000000) != 0 || ((value >>> 18) & 15) != pre - 1 ||
+                ((value >>> 12) & 63) != cycles - 1 || ((value >>> 6) & 63) != high - 1 ||
+                (value & 63) != cycles - 1) bad = true
+        } else if (calls == 3) { if (address != base + 0xe8 || value != (0xfffffffb | (source << 2))) bad = true }
+        else bad = true
+    } else if (operation == 1) {
+        if (calls != droppedModeWrite) {
+            if (address == base + 32) savedMisc=value
+            if (address == base + 16) savedUser=value
+            if (address == base + 8) savedControl=value
+        }
+        if (calls == 1) { if (address != base + 32 || value != (0xdfffffff | (if (mode >= 2) 0x20000000 else 0))) bad = true }
+        else if (calls == 2) { if (address != base + 16 || value != (0xfffffdff | (if (mode == 1 || mode == 2) 512 else 0))) bad = true }
+        else if (calls == 3) { if (address != base + 8 || value != (0xf87fffff | ((order & 1) << 25) | ((order & 2) << 22))) bad = true }
+        else bad = true
+    } else {
+        if (address == 0x600c0018) {
+            if (value != (busClock | busMask)) bad = true
+            busClock = value
+        } else if (address == 0x600c0020) {
+            if (value != (busReset & (0xffffffff ^ busMask))) bad = true
+            busReset = value
+        } else bad = true
+    }
+    return
+}
+trusted fun spiConfigTest(): int {
+    var peripheral = 2
+    while (peripheral <= 3) {
+        base = 0x60024000 + (peripheral - 2) * 4096
+        operation = 0; source = 0
+        while (source <= 1) {
+            pre = 1
+            while (pre <= 16) {
+                cycles = if (pre == 1) 1 else 2
+                while (cycles <= 64) {
+                    high = 1
+                    while (high <= cycles) {
+                        calls = 0
+                        if (!esp32s3SpiConfigureClockOwned(peripheral, source, pre, cycles, high) || calls != 3 || bad) return 1
+                        high = high + 1
+                    }
+                    cycles = cycles + 1
+                }
+                pre = pre + 1
+            }
+            source = source + 1
+        }
+        operation = 1; mode = 0
+        while (mode < 4) {
+            order = 0
+            while (order < 4) {
+                calls = 0
+                savedMisc=0xffffffff;savedUser=0xffffffff;savedControl=0xffffffff
+                if (!esp32s3SpiConfigureModeOwned(peripheral, mode, (order & 1) != 0, (order & 2) != 0) || calls != 3 || bad) return 2
+                order = order + 1
+            }
+            mode = mode + 1
+        }
+        // A failed field write must stop subsequent configuration and report
+        // failure, not silently claim a usable clock polarity/bit order.
+        mode=0;order=0;droppedModeWrite=1
+        while (droppedModeWrite <= 3) {
+            calls=0;savedMisc=0xffffffff;savedUser=0xffffffff;savedControl=0xffffffff
+            if (esp32s3SpiConfigureModeOwned(peripheral,0,false,false) || calls != droppedModeWrite || bad) return 8
+            droppedModeWrite=droppedModeWrite+1
+        }
+        droppedModeWrite=0
+        operation = 2
+        busMask = if (peripheral == 2) 64 else 65536
+        var initial = 0
+        while (initial < 4) {
+            busClock = 0x80000000 | (if ((initial & 1) != 0) busMask else 0)
+            busReset = 0x40000000 | (if ((initial & 2) != 0) busMask else 0)
+            calls = 0
+            if (!esp32s3SpiEnableBusClockLocked(peripheral) || busClock != (0x80000000 | busMask) ||
+                busReset != 0x40000000 || calls != (if ((initial & 1) == 0) 1 else 0) + (if ((initial & 2) != 0) 1 else 0) || bad) return 3
+            calls = 0
+            if (!esp32s3SpiEnableBusClockLocked(peripheral) || calls != 0) return 4
+            initial = initial + 1
+        }
+        peripheral = peripheral + 1
+    }
+    base = 0x60024000; calls = 0; busy = 1
+    while (busy <= 4) {
+        if (esp32s3SpiConfigureClockOwned(2, 1, 1, 2, 1) || esp32s3SpiConfigureModeOwned(2, 0, false, false) || calls != 0) return 5
+        busy = busy + 1
+    }
+    busy = 0
+    if (esp32s3SpiConfigureClockOwned(0, 1, 1, 2, 1) || esp32s3SpiConfigureClockOwned(2, 2, 1, 2, 1) ||
+        esp32s3SpiConfigureClockOwned(2, 1, 17, 2, 1) || esp32s3SpiConfigureClockOwned(2, 1, 2, 1, 1) ||
+        esp32s3SpiConfigureClockOwned(2, 1, 1, 65, 1) || esp32s3SpiConfigureClockOwned(2, 1, 1, 2, 3) ||
+        esp32s3SpiConfigureModeOwned(2, 4, false, false) || esp32s3SpiEnableBusClockLocked(1) || calls != 0) return 6
+    0
+}
+#exportFunction("spiConfigTest", "abla_spi_config_test")

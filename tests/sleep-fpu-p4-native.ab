@@ -1,0 +1,101 @@
+import "../src/esp32/power/sleep_fpu_p4_sequence.ab"
+import "abla/build"
+val fpuRecord=nativeStaticAllocate(164)
+val fpuBank=nativeStaticAllocate(128)
+var fpuHart=u32(0)
+var fpuStatus=u32(0)
+var fpuControl=u32(0)
+var fpuReads=0
+var fpuWrites=0
+var fpuControlReads=0
+var fpuControlWrites=0
+var fpuFences=0
+var fpuBad=false
+fun p4SleepFpuHart(): u32 = fpuHart
+fun p4SleepFpuStatus(): u32 = fpuStatus
+fun p4SleepFpuFence(): void { fpuFences=fpuFences+1;return }
+fun p4SleepFpuSetFs(fs: u32): void {
+    if ((fs&u32(0xffff9fff)) != u32(0) || fpuFences != 1) fpuBad=true
+    fpuStatus=(fpuStatus&u32(0xffff9fff))|fs
+    return
+}
+fun p4SleepFpuControlRead(): u32 {
+    if ((fpuStatus&u32(0x6000)) == u32(0) || fpuReads != 0) fpuBad=true
+    fpuControlReads=fpuControlReads+1
+    return fpuControl
+}
+fun p4SleepFpuControlWrite(value: u32): void {
+    if ((fpuStatus&u32(0x6000)) == u32(0) || fpuWrites != 32) fpuBad=true
+    fpuControlWrites=fpuControlWrites+1;fpuControl=value
+    fpuStatus=fpuStatus|u32(0x6000)
+    return
+}
+fun p4SleepFpuRead(slot: int): u32 {
+    if (slot != fpuReads || fpuControlReads != 1 || fpuFences != 0 ||
+        (fpuStatus&u32(0x6000)) == u32(0)) fpuBad=true
+    fpuReads=fpuReads+1
+    return u32(nativeBufferAt(fpuBank,128).loadU32(slot*4))
+}
+fun p4SleepFpuWrite(slot: int,value: u32): void {
+    if (slot != fpuWrites || fpuFences != 1 || (fpuStatus&u32(0x6000)) == u32(0) ||
+        nativeBufferAt(fpuRecord,164).loadU32(4) != 2) fpuBad=true
+    nativeBufferAt(fpuBank,128).storeU32(slot*4,int(value))
+    fpuWrites=fpuWrites+1;fpuStatus=fpuStatus|u32(0x6000)
+    return
+}
+fun fpuPattern(slot: int): int = 0xff800001|(slot<<15)|slot
+fun fpuSeed(): NativeBuffer {
+    val r=nativeBufferAt(fpuRecord,164)
+    var i=0
+    while (i < 164) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(160,0x1234abcd)
+    i=0
+    while (i < 32) { nativeBufferAt(fpuBank,128).storeU32(i*4,fpuPattern(i));i=i+1 }
+    fpuHart=u32(0);fpuStatus=u32(0);fpuControl=u32(0x9f)
+    fpuReads=0;fpuWrites=0;fpuControlReads=0;fpuControlWrites=0;fpuFences=0;fpuBad=false
+    return r
+}
+@export("abla_sleep_fpu_p4_test")
+fun test(): int {
+    var combination=0
+    while (combination < 32) {
+        val r=fpuSeed()
+        val saved=(combination&3)<<13
+        val awake=((combination>>>2)&3)<<13
+        val hart=(combination>>>4)&1
+        fpuHart=u32(hart);fpuStatus=u32(0x1880|saved)
+        if (esp32p4SleepFpuSaveOwned(r,true) != 1 || fpuStatus != u32(0x1880|saved)) return 1
+        if (fpuReads != (if (saved == 0) 0 else 32) || fpuControlReads != (if (saved == 0) 0 else 1)) return 2
+        var i=0
+        while (i < 32) {
+            if (r.loadU32(20+i*4) != (if (saved == 0) 0 else fpuPattern(i))) return 3
+            nativeBufferAt(fpuBank,128).storeU32(i*4,0x12345678);i=i+1
+        }
+        fpuStatus=u32(0x1800|awake);fpuControl=u32(0)
+        fpuHart=u32(1-hart)
+        if (esp32p4SleepFpuRestoreOwned(r,true) != 3 || fpuWrites != 0) return 4
+        fpuHart=u32(hart);fpuStatus=fpuStatus|u32(8)
+        if (esp32p4SleepFpuRestoreOwned(r,true) != 3 || fpuWrites != 0) return 5
+        fpuStatus=fpuStatus&u32(0xfffffff7)
+        if (esp32p4SleepFpuRestoreOwned(r,false) != 2 || fpuWrites != 0) return 6
+        if (esp32p4SleepFpuRestoreOwned(r,true) != 4 || fpuStatus != u32(0x1800|saved) ||
+            fpuFences != 2 || fpuBad) return 7
+        if (fpuWrites != (if (saved == 0) 0 else 32) || fpuControl != u32(if (saved == 0) 0 else 0x9f)) return 8
+        i=0
+        while (i < 32) {
+            if (nativeBufferAt(fpuBank,128).loadU32(i*4) != (if (saved == 0) 0x12345678 else fpuPattern(i))) return 9
+            i=i+1
+        }
+        if (esp32p4SleepFpuRestoreOwned(r,true) != 2 || r.loadU32(160) != 0x1234abcd) return 10
+        combination=combination+1
+    }
+    val r=fpuSeed()
+    if (esp32p4SleepFpuSaveOwned(r,false) != 2 ||
+        esp32p4SleepFpuSaveOwned(nativeBufferAt(fpuRecord,159),true) != 2 ||
+        esp32p4SleepFpuSaveOwned(nativeBufferAt(fpuRecord+1,160),true) != 2) return 11
+    fpuHart=u32(2)
+    if (esp32p4SleepFpuSaveOwned(r,true) != 3) return 12
+    fpuHart=u32(0);fpuStatus=u32(8)
+    if (esp32p4SleepFpuSaveOwned(r,true) != 3 || r.loadU32(0) != 0 || fpuReads != 0) return 13
+    return 0
+}

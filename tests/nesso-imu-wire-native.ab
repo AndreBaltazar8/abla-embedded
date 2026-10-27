@@ -1,0 +1,95 @@
+import "./nesso-power-wire-native.ab"
+import "../src/m5stack/nesso_imu_c6_bindings.ab"
+import "../src/m5stack/nesso_imu_temperature_c6_bindings.ab"
+val imuStorage=nativeStaticAllocate(64)
+var imuWaits=0
+fun imuDelay(ms: int): void { if (ms != 1) bad=true;imuWaits=imuWaits+1;return }
+@export("abla_nesso_imu_wire_test")
+trusted fun testNessoImu(): i32 {
+    wireSeed();chargeAddress=85;afterCommit=false;bad=false;dropClose=false;ticks=0;commands=0;delayTotal=0
+    val gpioRegs=nativeBufferAt(gpioMemory,4096);var at=0
+    while (at < 4096) { gpioRegs.storeU32(at,0);at=at+4 }
+    apb=u32(0);functional=u32(0x300000);gpioClock=u32(0)
+    var session=esp32C6I2cSessionOpenOwned(10,8,40000000,20000000,true,5,8)
+    val boardRegs=nativeBufferAt(registers,512)
+    at=0;while (at < 512) { boardRegs.store(at,255);at=at+1 }
+    boardRegs.store(1,1);boardRegs.store(266,73)
+    val power=nessoPowerAt(nativeBufferAt(powerStorage,40))
+    if (!session.ready() || !power.initialize() || power.openOwned(session.bus()|0,true) != 1) return i32(1)
+    val r=nativeBufferAt(pm1ImuRegisters,256)
+    at=0;while (at < 256) { r.store(at,0);at=at+1 }
+    r.store(0,36);pm1ImuPresent=true;bmiModel=true;bmiExpectedConfig=bmi270ConfigurationAddress
+    val before=ackCount
+    if (power.openImuOwned(session.bus()|0,false) != 0 || ackCount != before) return i32(2)
+    var imu=power.openImuOwned(session.bus()|0,true)
+    if (!imu.ready() || imu.kind() != m5ImuBmi270 || imu.address() != 104 || imu.capabilities() != 3 ||
+        bmiUploaded != 8192 || imuWaits != 3 || bad) return i32(3)
+    // Exhaustive conversion independent reference uses the datasheet ratio.
+    var code=0
+    while (code < 65536) {
+        val sample=imuSample(code);val converted=bmi270Temperature(sample)
+        val signed=if (code < 32768) code else code-65536
+        if (converted.valid() != (code != 32768) ||
+            (converted.valid() && converted.milliCelsius() != (signed*1000+23000*512)/512)) return i32(15)
+        code=code+1
+    }
+    if (bmi270Temperature(invalidImuSample()).valid()) return i32(16)
+    var temperatureCase=0
+    while (temperatureCase < 7) {
+        val raw=if (temperatureCase == 0) 0 else if (temperatureCase == 1) 512 else if (temperatureCase == 2) 65535 else
+            if (temperatureCase == 3) 32767 else if (temperatureCase == 4) 32768 else if (temperatureCase == 5) 32769 else 53760
+        r.storeU16(34,raw)
+        var cut=0
+        while (cut < 4) {
+            nackAt=if (cut == 0) 0 else ackCount+cut
+            val temperature=power.readImuTemperatureOwned(session.bus()|0,imu,true)
+            if (temperature.valid() != (cut == 0 && raw != 32768) ||
+                (temperature.valid() && temperature != bmi270Temperature(imuSample(raw))) || bad) return i32(17)
+            cut=cut+1
+        }
+        temperatureCase=temperatureCase+1
+    }
+    nackAt=0
+    val snapshot=imuSnapshotAt(nativeBufferAt(imuStorage,44));val scratch=nativeBufferAt(imuStorage+44,20)
+    if (!snapshot.initialize()) return i32(4)
+    r.store(29,192);r.storeU16(12,100);r.storeU16(14,65536-200);r.storeU16(16,300)
+    r.storeU16(18,400);r.storeU16(20,500);r.storeU16(22,65536-600)
+    if (power.readImuOwned(session.bus()|0,imu,snapshot,scratch,12345,true) != 3 ||
+        snapshot.axes(0).axis(1) != -200 || snapshot.axes(1).axis(2) != -600) return i32(5)
+    var fault=1
+    while (fault <= 6) {
+        nackAt=ackCount+fault
+        if (power.readImuOwned(session.bus()|0,imu,snapshot,scratch,20000,true) != -2 || snapshot.timestamp(0) != 12345 ||
+            snapshot.axes(0).axis(0) != 100 || bad) return i32(6)
+        fault=fault+1
+    }
+    nackAt=0
+    val admission=ackCount
+    if (power.readImuOwned(session.bus()|0,imu,snapshot,nativeBufferAt(imuStorage,20),20000,true) != -1 ||
+        power.readImuOwned(session.bus()|0,imu,snapshot,nativeBufferAt(powerStorage,20),20000,true) != -1 ||
+        power.readImuOwned(session.bus()|0,imu,snapshot,scratch,20000,false) != -1 || ackCount != admission) return i32(11)
+    val other=session.bus().device(68,100000)
+    val wrong=M5ImuProbeResult((imu&~0xffffffff)|(other|0))
+    if (power.readImuTemperatureOwned(session.bus()|0,wrong,true).valid() ||
+        power.readImuTemperatureOwned(session.bus()|0,imu,false).valid() || ackCount != admission) return i32(18)
+    if (power.readImuOwned(session.bus()|0,wrong,snapshot,scratch,20000,true) != -1 ||
+        nessoImuCloseOwned(wrong,true) != wrong || !other.close() || ackCount != admission) return i32(12)
+    // A genuine not-ready status is not a fresh zero-valued sensor reading.
+    r.store(29,0)
+    if (power.readImuOwned(session.bus()|0,imu,snapshot,scratch,20000,true) != 0 || snapshot.timestamp(0) != 12345) return i32(13)
+    r.store(29,128);r.storeU16(12,123)
+    if (power.readImuOwned(session.bus()|0,imu,snapshot,scratch,4294967297,true) != 1 ||
+        snapshot.timestamp(0) != 1 || snapshot.axes(0).axis(0) != 123 || snapshot.timestamp(1) != 12345) return i32(14)
+    val stale=imu
+    if (!softwareI2cProviderEnter()) return i32(7)
+    imu=nessoImuCloseOwned(imu,true)
+    if (!softwareI2cProviderLeave() || imu.status() != 4 || imu.handle() == 0) return i32(8)
+    imu=nessoImuCloseOwned(imu,true)
+    val closed=ackCount
+    if (power.readImuTemperatureOwned(session.bus()|0,stale,true).valid() || ackCount != closed) return i32(19)
+    if (imu != 0 || power.readImuOwned(session.bus()|0,stale,snapshot,scratch,20000,true) != -1 ||
+        ackCount != closed || !power.closeOwned(true)) return i32(9)
+    session=session.closeOwned(true)
+    if (session != 0 || bad) return i32(10)
+    return i32(0)
+}

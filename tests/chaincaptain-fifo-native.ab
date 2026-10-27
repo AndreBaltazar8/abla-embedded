@@ -1,0 +1,201 @@
+import "../src/m5stack/chaincaptain_panel_s3_sequence.ab"
+import "../src/display/spi_mipi_sequence_esp32s3.ab"
+import "../src/display/spi_program_sequence_esp32s3.ab"
+import "../src/display/spi_fill_sequence_esp32s3.ab"
+import "../src/display/spi_blit_sequence_esp32s3.ab"
+import "../src/display/spi_control_sequence_esp32s3.ab"
+import "../src/esp32/spi/pins_sequence_esp32s3.ab"
+import "../src/esp32/spi/command_sequence_esp32s3.ab"
+import "../src/esp32/spi/command_word_sequence_esp32s3.ab"
+import "../src/esp32/spi/buffer_sequence_esp32s3.ab"
+import "../src/esp32/spi/transfer_sequence_esp32s3.ab"
+import "../src/esp32/spi/transmit_value_sequence_esp32s3.ab"
+import "../src/esp32/soc/gpio_capabilities.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// Real command/program/fill/FIFO/transfer code. Model only GPIO latches and
+// SPI MMIO completion. Words are decoded at actual START, not mocked payloads.
+type Pin=int
+fun Pin.number(): int = this|0
+fun Pin.valid(): bool = espChipS3().gpioValid(this|0)
+fun Pin.outputCapable(): bool = espChipS3().gpioOutputValid(this|0)
+val gateStorage=nativeStaticAllocate(4)
+val fifo=nativeStaticAllocate(64)
+val wire=nativeStaticAllocate(262144)
+val pixels=nativeStaticAllocate(300)
+val staging=nativeStaticAllocate(64)
+var count=0
+var transfers=0
+var failAt=0
+var cs=true
+var dc=false
+var bad=false
+var user=0
+var length=0
+var events=0
+var waits=0
+trusted fun Pin.outputLevelOwned(high: bool): bool = this.writeLevelOwned(high)
+trusted fun Pin.writeLevelOwned(high: bool): bool {
+    if (nativeAddressLoadU32(gateStorage,0) != 37) bad=true
+    if (this == 45) cs=high else if (this == 46) dc=high else bad=true
+    return !bad
+}
+fun Pin.inputOwned(): bool { bad=true;return false }
+fun Pin.routeOutputSignal(signal: int,inverted: bool): bool { bad=true;return false }
+fun Pin.routeInputSignal(signal: int,inverted: bool): bool { bad=true;return false }
+fun peripheralDelayMilliseconds(ms: int): void {
+    if (!cs || ms != 130 || nativeAddressLoadU32(gateStorage,0) != 37) bad=true
+    waits=waits+1;return
+}
+fun peripheralDelayMicroseconds(us: int): void { bad=true;return }
+trusted fun esp32s3SpiRead(address: int): int {
+    if (address == 0x60024000 || address == 0x60024030 || address == 0x60024034 || address == 0x600240e0) return 0
+    if (address == 0x60024010) return user
+    if (address == 0x6002401c) return length
+    if (address == 0x6002403c) return events
+    bad=true;return 0
+}
+trusted fun esp32s3SpiWrite(address: int,value: int): void {
+    if (nativeAddressLoadU32(gateStorage,0) != 37) bad=true
+    if (address == 0x60024010) user=value
+    else if (address == 0x6002401c) length=value
+    else if (address == 0x60024038) events=events&~value
+    else if (address >= 0x60024098 && address < 0x600240d8 && (address&3) == 0) nativeAddressStoreU32(fifo,address-0x60024098,value)
+    else if (address == 0x60024000) {
+        if (value == 0x01000000) {
+            transfers=transfers+1
+            val bytes=((length&262143)+1)/8
+            if (cs || bytes < 1 || bytes > 64 || (length&7) != 7 || (user&0x18000001) != 0x08000000) bad=true
+            var n=0
+            while (n < bytes) {
+                if (count >= 131072) { bad=true;return }
+                val payloadByte=nativeBufferAt(fifo,64).load(n)
+                nativeBufferAt(wire,262144).storeU16(count*2,payloadByte|(if (dc) 256 else 0))
+                count=count+1;n=n+1
+            }
+            events=4096|(if (transfers == failAt) 0x20000 else 0)
+        } else if (value != 0x00800000) bad=true
+    } else bad=true
+    return
+}
+trusted fun seed(): void {
+    nativeAddressStoreU32(gateStorage,0,0)
+    count=0;transfers=0;failAt=0;cs=true;dc=false;bad=false;user=0;length=0;events=0;waits=0;return
+}
+trusted fun byte(index: int): int = nativeBufferAt(wire,262144).loadU16(index*2)
+trusted fun fill(rotation: int,x: int,y: int,width: int,height: int,color: int): SpiTransactionResult =
+    esp32s3LcdFillRect(peripheralGateAt(gateStorage),u32(37),2,spiPins(16,-1,15),Pin(45),Pin(46),
+        chainCaptainDisplayView(rotation),x,y,width,height,Rgb565(color),false)
+@export("abla_chaincaptain_fifo_test")
+trusted fun test(): i32 {
+    seed()
+    val begin=chainCaptainPanelBeginOwned(peripheralGateAt(gateStorage),u32(37),0)
+    if (!begin.valid()) return i32(20+begin.status())
+    if (bad) return i32(30)
+    if (!cs) return i32(31)
+    if (waits != 1) return i32(32)
+    if (byte(count-1) != 33 || byte(count-3) != 54) return i32(33)
+    seed()
+    if (!fill(0,0,0,240,240,0).valid() || count != 115211 || transfers != 1805 || bad || !cs) return i32(2)
+    var n=11
+    while (n < count) { if (byte(n) != 256) return i32(3);n=n+1 }
+    var rotation=0
+    while (rotation < 8) {
+        seed()
+        // Clip left/top to3x2 pixels. Exact11 header bytes and12 color bytes.
+        if (!fill(rotation,-1,-1,4,3,0xf800).valid() || count != 23 || transfers != 6 || bad || !cs) return i32(4)
+        val view=chainCaptainDisplayView(rotation)
+        val col=view.columnStart();val row=view.rowStart()
+        if (byte(0) != 42 || byte(1) != (256|(col>>>8)) || byte(2) != (256|(col&255)) ||
+            byte(3) != (256|((col+2)>>>8)) || byte(4) != (256|((col+2)&255)) ||
+            byte(5) != 43 || byte(6) != (256|(row>>>8)) || byte(7) != (256|(row&255)) ||
+            byte(8) != (256|((row+1)>>>8)) || byte(9) != (256|((row+1)&255)) || byte(10) != 44) return i32(5)
+        n=11
+        while (n < 23) {
+            if (byte(n) != (if ((n&1) == 1) 504 else 256)) return i32(6)
+            n=n+1
+        }
+        var failure=1
+        while (failure <= 6) {
+            seed();failAt=failure
+            val result=fill(rotation,-1,-1,4,3,0xf800)
+            if (result.status() != 6 || result.value() != u32(0x20109) || transfers != failure || bad || !cs ||
+                nativeAddressLoadU32(gateStorage,0) != 2147483648) return i32(7)
+            failure=failure+1
+        }
+        rotation=rotation+1
+    }
+    seed();failAt=1805
+    if (fill(0,0,0,240,240,0).status() != 6 || transfers != 1805 || bad || !cs) return i32(8)
+    // Padded 35x4 image, clipped top/left to34x3: each row crosses the64B FIFO.
+    // Both memory byte orders must emit identical panel bytes; never mutate source.
+    var endian=0
+    while (endian < 2) {
+        n=0
+        while (n < 300) { nativeBufferAt(pixels,300).store(n,0xa5);n=n+1 }
+        var row=0
+        while (row < 4) {
+            var col=0
+            while (col < 35) {
+                val offset=row*74+col*2
+                nativeBufferAt(pixels,300).store(offset+endian,row+1)
+                nativeBufferAt(pixels,300).store(offset+1-endian,col+17)
+                col=col+1
+            }
+            row=row+1
+        }
+        rotation=0
+        while (rotation < 8) {
+            var failure=0
+            while (failure <= 11) {
+                seed();failAt=failure
+                val result=esp32s3LcdBlitRgb565(peripheralGateAt(gateStorage),u32(37),2,
+                    spiPins(16,-1,15),Pin(45),Pin(46),chainCaptainDisplayView(rotation),-1,-1,
+                    nativeBufferAt(pixels,300),35,4,74,endian == 1,nativeBufferAt(staging,64),false)
+                if (bad || !cs) return i32(40)
+                if (failure == 0) {
+                    if (!result.valid() || count != 215 || transfers != 11 || nativeAddressLoadU32(gateStorage,0) != 0) return i32(41)
+                    n=11;row=1
+                    while (row < 4) {
+                        var col=1
+                        while (col < 35) {
+                            if (byte(n) != (256|row+1) || byte(n+1) != (256|col+17)) return i32(42)
+                            n=n+2;col=col+1
+                        }
+                        row=row+1
+                    }
+                } else if (result.status() != 6 || result.value() != u32(0x20109) || transfers != failure ||
+                    nativeAddressLoadU32(gateStorage,0) != 2147483648) return i32(43)
+                failure=failure+1
+            }
+            rotation=rotation+1
+        }
+        n=0
+        while (n < 300) {
+            val rowIndex=n/74;val columnByte=n%74
+            var expected=0xa5
+            if (rowIndex < 4 && columnByte < 70)
+                expected=if ((columnByte&1) == endian) rowIndex+1 else columnByte/2+17
+            if (nativeBufferAt(pixels,300).load(n) != expected) return i32(44)
+            n=n+1
+        }
+        endian=endian+1
+    }
+    // Actual SLPIN/SLPOUT FIFO commands: settled while gated, no delay after
+    // failed transfer, fault latched and CS released on both error paths.
+    var sleeping=0
+    while (sleeping < 2) {
+        var failure=0
+        while (failure < 2) {
+            seed();failAt=failure
+            val result=esp32s3LcdSetSleep(peripheralGateAt(gateStorage),u32(37),2,
+                spiPins(16,-1,15),Pin(45),Pin(46),sleeping == 1,130,false)
+            if (bad || !cs || count != 1 || transfers != 1 || byte(0) != (if (sleeping == 1) 16 else 17) ||
+                waits != (if (failure == 0) 1 else 0) || result.status() != (if (failure == 0) 1 else 6) ||
+                nativeAddressLoadU32(gateStorage,0) != (if (failure == 0) 0 else 2147483648)) return i32(45)
+            failure=failure+1
+        }
+        sleeping=sleeping+1
+    }
+    return i32(0)
+}

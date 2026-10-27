@@ -1,0 +1,145 @@
+import "../src/esp32/i2c/timing_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(288)
+val original=nativeStaticAllocate(288)
+var writes=0
+var updates=0
+var reads=0
+var drop=0
+var bad=false
+fun mapping(address: int): int =
+    if (address >= 0x500c4000 && address < 0x500c4080) address-0x500c4000
+    else if (address >= 0x500c5000 && address < 0x500c5080) address-0x500c5000+128
+    else if (address == 0x500e601c) 256 else if (address == 0x500e6040) 260
+    else if (address == 0x500e6044) 264 else if (address == 0x500e60c4) 268 else -1
+trusted fun p4I2cRead(address: int): u32 {
+    reads=reads+1
+    val at=mapping(address)
+    if (at < 0) { bad=true;return u32(0) }
+    if (at < 256 && (nativeBufferAt(memory,288).loadU32(256)&(1<<(12+at/128))) == 0) bad=true
+    return u32(nativeBufferAt(memory,288).loadU32(at))
+}
+trusted fun p4I2cWrite(address: int,value: u32): void {
+    writes=writes+1
+    val at=mapping(address)
+    if (at < 0) { bad=true;return }
+    if (writes == drop) return
+    if (at == 4 || at == 132) {
+        if ((value&u32(2048)) != u32(0)) updates=updates+1
+        nativeBufferAt(memory,288).storeU32(at,int(value&u32(0xfffff7ff)))
+    } else nativeBufferAt(memory,288).storeU32(at,int(value))
+    return
+}
+trusted fun seed(port: int,flags: int): void {
+    val m=nativeBufferAt(memory,288)
+    var at=0
+    while (at < 288) { m.storeU32(at,0xffffffff);at=at+4 }
+    m.storeU32(port*128+4,0xfffff7df);m.storeU32(port*128+8,0)
+    m.storeU32(256,(0xffffffff^(1<<(12+port)))|((flags&1)<<(12+port)))
+    m.storeU32(260,(0xffffffff^(3<<(port*26)))|(((flags>>1)&3)<<(port*26)))
+    m.storeU32(268,0xffffffff^(1<<(22-port)))
+    at=0
+    while (at < 288) { nativeBufferAt(original,288).storeU32(at,m.loadU32(at));at=at+4 }
+    writes=0;updates=0;reads=0;drop=0;bad=false;return
+}
+trusted fun same(): bool {
+    var at=0
+    while (at < 288) {
+        if (nativeBufferAt(original,288).loadU32(at) != nativeBufferAt(memory,288).loadU32(at)) return false
+        at=at+4
+    }
+    return !bad
+}
+@export("abla_i2c_clock_timing_p4_test")
+trusted fun test(): i32 {
+    var port=0
+    while (port < 2) {
+        var flags=0
+        while (flags < 8) {
+            var source=0
+            while (source < 2) {
+                seed(port,flags)
+                val lease=esp32p4I2cClockOpenOwned(port,source,true)
+                if (lease.status() != 1 || !esp32p4I2cClockReady(port) ||
+                    ((nativeBufferAt(memory,288).loadU32(260)>>(port*26))&3) != source+2) return i32(1)
+                val count=writes
+                if (lease.closeOwned(false) != lease || writes != count) return i32(2)
+                if (lease.closeOwned(true).status() != 6 || !same()) return i32(3)
+                val closing=writes-count
+                var fault=1
+                while (fault <= count) {
+                    seed(port,flags);drop=fault
+                    val failed=esp32p4I2cClockOpenOwned(port,source,true)
+                    if (failed.status() != 5 || !failed.hasSnapshot() || writes != fault) return i32(4)
+                    drop=0
+                    if (failed.closeOwned(true).status() != 6 || !same()) return i32(5)
+                    fault=fault+1
+                }
+                fault=1
+                while (fault <= closing) {
+                    seed(port,flags)
+                    val opened=esp32p4I2cClockOpenOwned(port,source,true)
+                    writes=0;drop=fault
+                    val failed=opened.closeOwned(true)
+                    if (failed.status() != 5 || writes != fault || !failed.hasSnapshot()) return i32(6)
+                    drop=0
+                    if (failed.closeOwned(true).status() != 6 || !same()) return i32(7)
+                    fault=fault+1
+                }
+                source=source+1
+            }
+            flags=flags+1
+        }
+        var hz=1000
+        while (hz <= 1000000) {
+            seed(port,7)
+            val divider=40000000/(hz*1024)+1
+            val half=40000000/divider/hz/2
+            val wait=if (hz >= 80000) half/2-2 else half/4
+            val valid=divider <= 256 && half >= 4 && half <= 511 && wait <= 127 && wait < half/2 && half/2 < half-wait
+            val timing=esp32p4I2cTiming(u32(40000000),u32(hz))
+            val result=esp32p4I2cConfigureTimingOwned(port,timing,true)
+            if (timing.valid() != valid || result != (if (valid) 1 else 2) || bad) return i32(8)
+            if (valid) {
+                val m=nativeBufferAt(memory,288)
+                val b=port*128
+                val divShift=if (port == 0) 2 else 0
+                if ((m.loadU32(260+port*4)&(0xffffff<<divShift)) != ((divider-1)<<divShift) ||
+                    (m.loadU32(b)&511) != half-1 || (m.loadU32(b+56)&65535) != ((half-wait)|(wait<<9)) ||
+                    (m.loadU32(b+48)&511) != half/4-1 || (m.loadU32(b+52)&511) != half/2-1 ||
+                    updates != 1 || writes != 11) return i32(9)
+                var at=0
+                while (at < 288) {
+                    var mask=0
+                    if (at == 260+port*4) mask=0xffffff<<divShift
+                    else if (at == b || at == b+48 || at == b+52 || at == b+64 || at == b+68 || at == b+72 || at == b+76) mask=511
+                    else if (at == b+56) mask=65535
+                    else if (at == b+12) mask=63
+                    if ((m.loadU32(at)&(0xffffffff^mask)) != (nativeBufferAt(original,288).loadU32(at)&(0xffffffff^mask))) return i32(10)
+                    at=at+4
+                }
+            } else if (reads != 0 || writes != 0) return i32(11)
+            hz=hz+1000
+        }
+        var fault=1
+        while (fault <= 10) {
+            seed(port,7);drop=fault
+            val t=esp32p4I2cTiming(u32(40000000),u32(100000))
+            if (esp32p4I2cConfigureTimingOwned(port,t,true) != 5 || writes != fault || updates != 0) return i32(12)
+            drop=0
+            if (esp32p4I2cConfigureTimingOwned(port,t,true) != 1 || updates != 1 || bad) return i32(13)
+            fault=fault+1
+        }
+        seed(port,7);nativeBufferAt(memory,288).storeU32(port*128+8,16)
+        if (esp32p4I2cClockOpenOwned(port,0,true).status() != 4 ||
+            esp32p4I2cConfigureTimingOwned(port,esp32p4I2cTiming(u32(40000000),u32(100000)),true) != 4 || writes != 0) return i32(14)
+        port=port+1
+    }
+    seed(0,7)
+    if (esp32p4I2cClockOpenOwned(2,0,true).status() != 2 || esp32p4I2cClockOpenOwned(0,2,true).status() != 2 ||
+        esp32p4I2cClockOpenOwned(0,0,false).status() != 2 ||
+        esp32p4I2cConfigureTimingOwned(0,P4I2cTiming(u32(0xffffffff)),true) != 2 || reads != 0 || writes != 0) return i32(15)
+    return i32(0)
+}

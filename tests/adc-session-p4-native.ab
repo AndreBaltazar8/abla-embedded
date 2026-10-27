@@ -1,0 +1,169 @@
+import "../src/esp32/adc_session_p4_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(136)
+var live=0
+var calls=0
+var failOpen=-1
+var claimOnFailure=true
+var failClose=-1
+var expectedOpen=0
+var expectedClose=5
+var starts=0
+var finishes=0
+var releases=0
+var startResult=257
+var finishResult=(1234<<8)|1
+var releaseResult=1
+var conversion=false
+var matches=true
+var analogIdle=true
+var bad=false
+trusted fun p4AdcSessionResourceOpen(stage: int,r: NativeBuffer,c: P4AdcCalibration,layout: int,polls: int): int {
+    calls=calls+1
+    if (stage != expectedOpen || !c.valid() || (layout != 1 && layout != 3) || polls < 1) bad=true
+    expectedOpen=expectedOpen+1
+    val owned=stage != failOpen || claimOnFailure
+    if (owned) live=live|(1<<stage)
+    if (stage == 0 && owned) r.storeU32(0,0x41325334)
+    return (if (owned) 1<<48 else 0)|(stage<<40)|(if (stage == failOpen) 5 else 1)
+}
+trusted fun p4AdcSessionResourceClose(stage: int,r: NativeBuffer,token: int,polls: int): int {
+    calls=calls+1
+    if (conversion || !analogIdle || stage != expectedClose || polls < 1) bad=true
+    if (stage != 0 && ((token>>>40)&255) != stage) bad=true
+    if (stage == failClose) return (1<<48)|(stage<<40)|5
+    expectedClose=expectedClose-1
+    live=live&(63^(1<<stage))
+    return (1<<48)|(stage<<40)|6
+}
+fun p4AdcSessionResourceStatus(stage: int,token: int): int = token&255
+fun p4AdcSessionResourceReady(stage: int,token: int,closing: bool): bool = (token&255) == (if (closing) 6 else 1)
+trusted fun p4AdcSessionMatches(c: P4AdcCalibration): bool = matches
+trusted fun p4AdcSessionAnalogIdle(polls: int): bool = analogIdle
+trusted fun p4AdcSessionStart(c: P4AdcCalibration): int {
+    starts=starts+1
+    if (live != 63 || conversion) bad=true
+    if ((startResult&256) != 0) conversion=true
+    return startResult
+}
+trusted fun p4AdcSessionFinish(c: P4AdcCalibration,polls: int): int {
+    finishes=finishes+1
+    if (!conversion || live != 63) bad=true
+    return finishResult
+}
+trusted fun p4AdcSessionRelease(c: P4AdcCalibration,polls: int): int {
+    releases=releases+1
+    if (!conversion || live != 63) bad=true
+    if (releaseResult == 1) conversion=false
+    return releaseResult
+}
+trusted fun seed(): NativeBuffer {
+    val r=nativeBufferAt(memory+4,128)
+    var at=0
+    while (at < 136) { nativeBufferAt(memory,136).storeU32(at,0);at=at+4 }
+    nativeBufferAt(memory,136).storeU32(0,0x11223344)
+    nativeBufferAt(memory,136).storeU32(132,0x55667788)
+    live=0;calls=0;failOpen=-1;claimOnFailure=true;failClose=-1;expectedOpen=0;expectedClose=5
+    starts=0;finishes=0;releases=0;startResult=257;finishResult=(1234<<8)|1;releaseResult=1
+    conversion=false;matches=true;analogIdle=true;bad=false;return r
+}
+trusted fun clean(): bool = !bad && live == 0 && !conversion &&
+    nativeBufferAt(memory,136).loadU32(0) == 0x11223344 && nativeBufferAt(memory,136).loadU32(132) == 0x55667788
+@export("abla_adc_session_p4_test")
+trusted fun test(): i32 {
+    var unit=1
+    while (unit <= 2) {
+        var channel=0
+        while (channel < (if (unit == 1) 8 else 6)) {
+            var attenuation=0
+            while (attenuation < 4) {
+                val c=esp32p4AdcCalibrationFromFields(unit,channel,attenuation,1,123,511,15)
+                val r=seed()
+                if (esp32p4AdcSessionOpenOwned(r,c,1,2,true) != 1 || calls != 6 || live != 63 || starts != 0 ||
+                    p4AdcSessionLoad(r,48) != (c|0) || esp32p4AdcSessionRaw(r) != -1) return i32(1)
+                var sample=0
+                while (sample < 4) {
+                    if (esp32p4AdcSessionStartAfterSettlingOwned(r,true) != 1 ||
+                        esp32p4AdcSessionStartAfterSettlingOwned(r,true) != 2 || esp32p4AdcSessionRaw(r) != -1) return i32(2)
+                    finishResult=6
+                    if (esp32p4AdcSessionPollOwned(r,2,true) != 5 || releases != sample*2 || live != 63) return i32(3)
+                    val raw=sample*1024+1
+                    finishResult=(raw<<8)|1
+                    releaseResult=6
+                    if (esp32p4AdcSessionPollOwned(r,2,true) != 7 || r.loadU32(44) != 2 || esp32p4AdcSessionRaw(r) != -1) return i32(4)
+                    val count=finishes
+                    releaseResult=1
+                    if (esp32p4AdcSessionPollOwned(r,2,true) != 1 || finishes != count ||
+                        esp32p4AdcSessionRaw(r) != raw || esp32p4AdcSessionMillivolts(r) != c.millivolts(raw)) return i32(5)
+                    sample=sample+1
+                }
+                if (esp32p4AdcSessionCloseOwned(r,2,true) != 9 || !clean() || r.loadU32(96) != 0) return i32(6)
+                val count=calls
+                if (esp32p4AdcSessionCloseOwned(r,2,true) != 9 || calls != count ||
+                    esp32p4AdcSessionStartAfterSettlingOwned(r,true) != 2 || esp32p4AdcSessionOpenOwned(r,c,1,2,true) != 2) return i32(7)
+                attenuation=attenuation+1
+            }
+            channel=channel+1
+        }
+        unit=unit+1
+    }
+    val c=esp32p4AdcCalibrationFromFields(2,5,3,1,123,1023,7)
+    var stage=0
+    while (stage < 6) {
+        var claim=0
+        while (claim < 2) {
+            val r=seed();failOpen=stage;claimOnFailure=claim == 1
+            if (esp32p4AdcSessionOpenOwned(r,c,3,2,true) != 3 || calls != stage+1 ||
+                r.loadU32(40) != ((stage<<16)|5)) return i32(8)
+            val primary=r.loadU32(40)
+            expectedClose=stage
+            if (stage == 5) {
+                analogIdle=false
+                val count=calls
+                if (esp32p4AdcSessionCloseOwned(r,2,true) != 8 || calls != count || r.loadU32(40) != primary) return i32(9)
+                analogIdle=true
+            }
+            failClose=stage
+            if (esp32p4AdcSessionCloseOwned(r,2,true) != 8 || r.loadU32(40) != primary) return i32(10)
+            failClose=-1
+            if (esp32p4AdcSessionCloseOwned(r,2,true) != 9 || !clean() || r.loadU32(40) != primary) return i32(11)
+            claim=claim+1
+        }
+        // Fault each reverse-close stage after successful complete setup.
+        val r=seed()
+        if (esp32p4AdcSessionOpenOwned(r,c,3,2,true) != 1) return i32(12)
+        failClose=stage
+        if (esp32p4AdcSessionCloseOwned(r,2,true) != 8 || r.loadU32(96) != (1<<(stage+1))-1) return i32(13)
+        failClose=-1
+        if (esp32p4AdcSessionCloseOwned(r,2,true) != 9 || !clean()) return i32(14)
+        stage=stage+1
+    }
+    var failure=0
+    while (failure < 4) {
+        val r=seed()
+        if (esp32p4AdcSessionOpenOwned(r,c,3,2,true) != 1) return i32(15)
+        startResult=if (failure == 0) 3 else if (failure == 1) 261 else 257
+        val start=esp32p4AdcSessionStartAfterSettlingOwned(r,true)
+        if (start != (if (failure < 2) 4 else 1)) return i32(16)
+        if (failure >= 2) {
+            finishResult=if (failure == 2) 3 else 7
+            if (esp32p4AdcSessionPollOwned(r,2,true) != 6) return i32(17)
+        }
+        val primary=r.loadU32(40)
+        if (conversion) {
+            releaseResult=6
+            val count=calls
+            if (esp32p4AdcSessionCloseOwned(r,2,true) != 7 || calls != count || r.loadU32(40) != primary) return i32(18)
+            releaseResult=1
+        }
+        if (esp32p4AdcSessionCloseOwned(r,2,true) != 9 || !clean() || r.loadU32(40) != primary) return i32(19)
+        failure=failure+1
+    }
+    val r=seed()
+    if (esp32p4AdcSessionOpenOwned(nativeBufferAt(memory+4,127),c,1,2,true) != 2 ||
+        esp32p4AdcSessionOpenOwned(r,c,2,2,true) != 2 || esp32p4AdcSessionOpenOwned(r,c,1,0,true) != 2 ||
+        esp32p4AdcSessionOpenOwned(r,P4AdcCalibration(3),1,2,true) != 2 ||
+        esp32p4AdcSessionOpenOwned(r,c,1,2,false) != 2 || calls != 0 || !clean()) return i32(20)
+    return i32(0)
+}

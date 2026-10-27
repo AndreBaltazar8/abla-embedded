@@ -1,0 +1,116 @@
+import "../src/esp32/i2c/lp_fifo_c5_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0])
+var port = 0
+var size = 0
+var ready = 0
+var receiving = false
+var transferred = 0
+var statusReads = 0
+var bad = false
+var control=0
+var commandValue=0
+var config=0
+fun pattern(index: int): int = (index*73+199) & 255
+trusted fun esp32C5LpI2cFifoRegisterRead(address: int): int {
+    if (control == 2) {
+        if (address != 0x600B1818 || statusReads != 0 || transferred != 0) bad=true
+        statusReads=statusReads+1
+        return config
+    }
+    val base = esp32C5LpI2cControllerAddress(port)
+    if (address == base+8) {
+        statusReads = statusReads+1
+        return if (receiving) ready << 8 else ready << 18
+    }
+    if (address != base+0x1c || !receiving || transferred >= size) bad = true
+    val value = pattern(transferred)
+    transferred = transferred+1
+    value | 0xffffff00
+}
+trusted fun esp32C5LpI2cFifoRegisterWrite(address: int, value: int): void {
+    if (control != 0) {
+        val expectedAddress=if (control == 1) 0x600B1858 else 0x600B1818
+        val expectedValue=if (control == 1) commandValue else if (transferred == 0) config|12288 else config&~12288
+        if (address != expectedAddress || value != expectedValue || (control == 2 && statusReads != 1)) bad=true
+        transferred=transferred+1
+        return
+    }
+    if (address != esp32C5LpI2cControllerAddress(port)+0x1c || receiving ||
+        transferred >= size || value != pattern(transferred)) bad = true
+    transferred = transferred+1
+    return
+}
+@export("abla_c5_lp_i2c_fifo_test")
+trusted fun fifoNativeTest(): i32 {
+    while (port < 1) {
+        var direction = 0
+        while (direction < 2) {
+            receiving = direction == 1
+            size = 0
+            while (size <= 16) {
+                ready = 0
+                while (ready <= 63) {
+                    var index = 0
+                    while (index < 40) {
+                        ablaUnsafeStoreU8(nativePointerFromAddress(storage+index),
+                            if (!receiving && index >= 3 && index < 3+size) pattern(index-3) else 90)
+                        index = index+1
+                    }
+                    transferred = 0; statusReads = 0
+                    val buffer = nativeBufferAt(storage+3,size)
+                    val result = if (receiving) esp32C5LpI2cReadFifo(port,buffer,size)
+                        else esp32C5LpI2cWriteFifo(port,buffer,size)
+                    val expected = size == 0 || ((ready&31) <= 16 &&
+                        (if (receiving) (ready&31) >= size else size <= 16-(ready&31)))
+                    if (result != expected || transferred != (if (expected) size else 0) ||
+                        statusReads != (if (size == 0) 0 else 1) || bad) return i32(1)
+                    index = 0
+                    while (index < 40) {
+                        val payload = index >= 3 && index < 3+size
+                        val byte = if (payload && (!receiving || expected)) pattern(index-3) else 90
+                        if (ablaUnsafeLoadU8(nativePointerFromAddress(storage+index)) != byte) return i32(2)
+                        index = index+1
+                    }
+                    ready = ready+1
+                }
+                size = size+1
+            }
+            direction = direction+1
+        }
+        port = port+1
+    }
+    transferred = 0; statusReads = 0
+    if (esp32C5LpI2cReadFifo(0,nativeBufferAt(storage,1),2) ||
+        esp32C5LpI2cWriteFifo(0,nativeBufferAt(storage,16),17) ||
+        esp32C5LpI2cWriteFifo(0,nativeBufferAt(storage,16),-1) ||
+        esp32C5LpI2cReadFifo(1,nativeBufferAt(storage,16),1) ||
+        transferred != 0 || statusReads != 0) return i32(3)
+    control=1
+    commandValue=0
+    while (commandValue < 65536) {
+        val op=(commandValue>>>11)&7
+        val count=commandValue&255
+        val checks=(commandValue&768) != 0
+        val nack=(commandValue&1024) != 0
+        val valid=commandValue < 16384 && ((op == 1 || op == 3) && count > 0 || (op == 2 || op == 4 || op == 6) && count == 0) &&
+            (!checks || op == 1) && (!nack || op == 3)
+        transferred=0; statusReads=0; bad=false
+        if (esp32C5LpI2cWriteCommand(0,0,u32(commandValue)) != valid || transferred != (if (valid) 1 else 0) || statusReads != 0 || bad) return i32(4)
+        commandValue=commandValue+1
+    }
+    control=2
+    var patternIndex=0
+    while (patternIndex < 256) {
+        config=patternIndex*0x01010101
+        transferred=0; statusReads=0; bad=false
+        if (!esp32C5LpI2cResetFifos(0) || transferred != 2 || statusReads != 1 || bad) return i32(5)
+        patternIndex=patternIndex+1
+    }
+    transferred=0; statusReads=0
+    if (esp32C5LpI2cResetFifos(1) || esp32C5LpI2cWriteCommand(0,8,u32(12288)) ||
+        esp32C5LpI2cWriteCommand(0,-1,u32(12288)) || esp32C5LpI2cWriteCommand(1,0,u32(12288)) ||
+        transferred != 0 || statusReads != 0) return i32(6)
+    i32(0)
+}

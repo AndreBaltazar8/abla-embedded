@@ -1,0 +1,90 @@
+import "../src/esp32/power/sleep_memory_p4_sequence.ab"
+import "./p4-sleep-light-checks.ab"
+import "./p4-shared-hold-model.ab"
+val sleepMemoryRecord=nativeStaticAllocate(36)
+var sleepMemoryHolds=0xa400003f
+var sleepMemoryBad=false
+var sleepMemoryDrained=false
+fun p4PsramClockRead(offset: int): int {
+    if (offset == 48) return p4MpllRead(0x500e6030)
+    if (offset == 20) return 0x80000000
+    if (offset == 192) return 0
+    sleepMemoryBad=true;return 0
+}
+fun p4PsramClockWrite(offset: int,value: int): void {
+    if (offset != 48 || !sleepMemoryDrained) sleepMemoryBad=true
+    if ((value&0x3000) == 0x1000 && ((p4MpllRead(0x5011515c)&0x01000000) == 0 || (p4MpllRead(0x500e60bc)&512) == 0)) sleepMemoryBad=true
+    p4MpllWrite(0x500e6030,value);return
+}
+fun p4PsramMappedRead(offset: int): int {
+    if (offset == 0 || offset == 4096) return 0
+    if (offset == 376) { sleepMemoryDrained=true;return 0xfc000000 }
+    sleepMemoryBad=true;return 0
+}
+fun p4PsramMappedWrite(offset: int,value: int): void { sleepMemoryBad=true;return }
+fun p4SleepPsramHoldRead(): int = if (p4HoldModelShared) p4HoldModelValue else sleepMemoryHolds
+fun p4SleepPsramHoldWrite(value: int): void {
+    if ((value&0xfc00003f) != (p4SleepPsramHoldRead()&0xfc00003f)) sleepMemoryBad=true
+    if ((value&0x03ffffc0) == 0 && ((p4MpllRead(0x500e6030)&0xf000) != 0xd000 || (p4MpllRead(0x5011515c)&0x01000000) == 0)) sleepMemoryBad=true
+    mpllWrites=mpllWrites+1
+    if (mpllWrites != mpllDrop) { sleepMemoryHolds=value;if (p4HoldModelShared) p4HoldModelValue=value }
+    return
+}
+fun resetSleepMemory(mhz: int): NativeBuffer {
+    p4HoldModelShared=false
+    resetSleepMpll(mhz);sleepMemoryHolds=0xa400003f;sleepMemoryBad=false;sleepMemoryDrained=false
+    nativeBufferAt(mpllMemory,32).storeU32(16,0xffffdfff)
+    val r=nativeBufferAt(sleepMemoryRecord,36)
+    var i=0
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(32,0xabcdef12);return r
+}
+fun sleepMemoryOriginal(): bool = p4MpllRead(0x500e6030) == 0xffffdfff && p4MpllRead(0x5011515c) == 0xffffffff && p4SleepPsramHoldRead() == (if (p4HoldModelShared) p4HoldModelOriginal else 0xa400003f) && !sleepMemoryBad
+fun sleepMemoryChecks(): int {
+    var mode=0
+    while (mode < 12) {
+        val mhz=if (mode%3 == 0) 320 else if (mode%3 == 1) 400 else 500
+        val r=resetSleepMemory(mhz)
+        if (esp32p4SleepMemoryOpenOwned(r,if ((mode&1) == 0) 100 else 300,(mode&2) != 0,mhz,40,2,true) != 1) return 60
+        val count=mpllWrites
+        if (esp32p4SleepMemoryOpenOwned(r,300,false,mhz,40,2,true) != 2 ||
+            esp32p4SleepMemoryCloseOwned(r,2,false,true) != 2 || mpllWrites != count) return 61
+        if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 8 || !sleepMemoryOriginal() || r.loadU32(32) != 0xabcdef12) return 62
+        val doneWrites=mpllWrites
+        if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 8 || mpllWrites != doneWrites) return 63
+        mode=mode+1
+    }
+    var fault=1
+    while (fault <= 4) {
+        val r=resetSleepMemory(400);mpllDrop=fault
+        val expected=if (fault == 4) 4 else 3
+        if (esp32p4SleepMemoryOpenOwned(r,300,false,400,40,2,true) != expected || r.loadU32(8) != expected) return 64
+        mpllDrop=0
+        if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 8 || !sleepMemoryOriginal() || r.loadU32(8) != expected) return 65
+        fault=fault+1
+    }
+    fault=1
+    while (fault <= 7) {
+        val r=resetSleepMemory(400)
+        if (esp32p4SleepMemoryOpenOwned(r,300,false,400,40,2,true) != 1) return 66
+        // Force root restoration to be a real change, including write-drop2.
+        nativeBufferAt(mpllMemory,32).storeU32(4,0xefffffff)
+        mpllDrop=mpllWrites+fault
+        if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 5 || r.loadU32(12) != (if (fault <= 4) 4 else 3) || sleepMemoryBad) return 67
+        // A failed PLL stage must leave PSRAM parked and held.
+        if (fault <= 4 && ((p4MpllRead(0x500e6030)&0xf000) != 0 || sleepMemoryHolds != 0xa7ffffff)) return 68
+        mpllDrop=0
+        if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 8 || !sleepMemoryOriginal() || r.loadU32(12) != 0 || r.loadU32(8) != 0) return 69
+        fault=fault+1
+    }
+    val r=resetSleepMemory(400)
+    if (esp32p4SleepMemoryOpenOwned(r,300,false,400,40,2,true) != 1) return 70
+    mpllDone=false
+    if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 5 || r.loadU32(12) != 4 || sleepMemoryHolds != 0xa7ffffff || sleepMemoryBad) return 71
+    mpllDone=true
+    if (esp32p4SleepMemoryCloseOwned(r,2,true,true) != 8 || !sleepMemoryOriginal()) return 72
+    val invalid=resetSleepMemory(400)
+    if (esp32p4SleepMemoryOpenOwned(invalid,400,false,400,40,2,true) != 2 ||
+        esp32p4SleepMemoryOpenOwned(nativeBufferAt(sleepMemoryRecord,31),300,false,400,40,2,true) != 2 || mpllWrites != 0 || writes != 0 || invalid.loadU32(0) != 0) return 73
+    return sleepLightChecks()
+}

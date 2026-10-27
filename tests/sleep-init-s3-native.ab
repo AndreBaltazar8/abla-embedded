@@ -1,0 +1,97 @@
+import "../src/esp32/power/sleep_timing_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var step=0
+var bad=false
+var flags=0
+var policy=Esp32S3SleepPolicy(0)
+var withTiming=false
+fun esp32S3RtcWakeRead(address: int): int { bad=true; return 0 }
+fun esp32S3RtcWakeWrite(address: int,value: int): void { bad=true; return }
+fun esp32S3SleepBiasWriteOwned(register: int,value: int): void {
+    if (step == 4) { if (register != 5 || value != 23) bad=true }
+    else if (step == 5) { if (register != 7 || value != policy.digitalBias()) bad=true }
+    else bad=true
+    step=step+1
+    return
+}
+fun esp32S3RtcWakeUpdate(address: int,mask: int,value: int): void {
+    val deep=(flags & 1) != 0
+    var a=0
+    var m=0
+    var v=0
+    if (step < 4) {
+        a=if (step == 3) 0x60008088 else 0x60008090
+        m=if (step == 3) 1<<20 else 1<<(30-step)
+    } else if (step == 6) {
+        a=0x60008080; m=(15<<22) | (15<<18) | (1<<17) | (1<<16) | (1<<15) | (1<<14)
+        v=(policy.attenuation()<<18) | (if (policy.monitorBiasSleep()) 1<<17 else 0) |
+            (if (policy.biasSleep()) 1<<16 else 0) | (if (policy.monitorCurrentDown()) 1<<15 else 0) |
+            (if (policy.sleepCurrentDown()) 1<<14 else 0)
+    } else if (step == 7) {
+        a=if (deep) 0x60008090 else 0x6000808C
+        m=if (deep) 1<<31 else 255<<12
+        v=if (deep) 1<<31 else 15<<12
+    } else if (step == 8) {
+        a=if (deep) 0x60008034 else 0x60008090
+        m=if (deep) (1<<31) | (1<<30) | (1<<28) | (1<<27) else 1<<31
+    } else if (deep && step == 9) { a=0x60008000; m=128 }
+    else {
+        val tail=step-(if (deep) 10 else 9)
+        if (tail == 0) { a=0x60008090; m=16; v=m }
+        else if (tail == 1) { a=0x60008088; m=256; v=m }
+        else if (tail == 2) { a=0x60008088; m=2048; v=m }
+        else if (tail == 3) { a=0x60008084; m=1<<31; v=if (policy.regulatorForced()) m else 0 }
+        else if (tail == 4) { a=0x60008074; m=1<<26; v=if ((flags & 1024) == 0) m else 0 }
+        else if (tail == 5) { a=0x6000807C; m=1<<22 }
+        else if (tail == 6) { a=0x6000807C; m=1<<21; v=if ((flags & 32) != 0) m else 0 }
+        else if (tail == 7) { a=0x60008068; m=3<<30; v=m }
+        else if (tail == 8) { a=0x60008020; m=511<<15; v=255<<15 }
+        else if (tail == 9) { a=0x60008000; m=8192; v=if ((flags & 2048) == 0) m else 0 }
+        else if (tail == 10) { a=0x60008074; m=1<<28; v=if ((flags & 2048) == 0) m else 0 }
+        else if (tail == 11 && withTiming) { a=0x6000801C; m=0xFFFFFFC0; v=if (deep) (20<<24) | (100<<14) | (20<<6) else (1<<24) | (131<<14) | (4<<6) }
+        else bad=true
+    }
+    if (address != a || mask != m || value != v || (value & ~mask) != 0) bad=true
+    step=step+1
+    return
+}
+@export("abla_sleep_init_s3_test")
+trusted fun sleepInitTest(): i32 {
+    var period=1
+    while (period <= 10000000) {
+        val xtal=131072000/period
+        val expected=if (xtal > 1023) -1 else (1<<24) | (xtal<<14) | (4<<6)
+        if (esp32S3SleepTimingBits(period,false) != expected ||
+            esp32S3SleepTimingBits(period,true) != ((20<<24) | (100<<14) | (20<<6))) return i32(2)
+        period=period+7919
+    }
+    if (esp32S3SleepTimingBits(128000,false) != -1 ||
+        esp32S3SleepTimingBits(128001,false) != ((1<<24) | (1023<<14) | (4<<6)) ||
+        esp32S3SleepTimingBits(0,false) != -1 || esp32S3SleepTimingBits(0x100000000,false) != -1) return i32(3)
+    var pattern=0
+    while (pattern < 128) {
+        flags=(pattern & 1) | ((pattern & 2)<<4) | ((pattern & 12)<<8) | ((pattern & 112)<<12)
+        policy=esp32S3SleepPolicy(flags)
+        step=0; bad=false
+        val result=esp32S3SleepInitOwned(policy)
+        val expected=if (!policy.valid()) 0 else if ((flags & 1) != 0) 21 else 20
+        if (result != policy.valid() || bad || step != expected) return i32(1)
+        step=0; bad=false; withTiming=true
+        val prepared=esp32S3SleepRegistersPrepareOwned(flags,1000000)
+        if (prepared != policy.valid() || bad || step != (if (policy.valid()) expected+1 else 0)) return i32(4)
+        withTiming=false
+        pattern=pattern+1
+    }
+    step=0; bad=false
+    if (esp32S3SleepRegistersPrepareOwned(0,128000) || esp32S3SleepRegistersPrepareOwned(0,0) ||
+        esp32S3SleepRegistersPrepareOwned(1,1000000) || step != 0 || bad) return i32(5)
+    val canonical=esp32S3SleepPolicy(3072)
+    var bit=20
+    while (bit < 64) {
+        step=0; bad=false
+        if (esp32S3SleepInitOwned(Esp32S3SleepPolicy(canonical ^ (1<<bit))) || step != 0 || bad) return i32(6)
+        bit=bit+1
+    }
+    i32(0)
+}

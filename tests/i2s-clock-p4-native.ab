@@ -1,0 +1,126 @@
+import "../src/esp32/i2s/clock_control_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/build"
+val addresses=nativeStaticU32s([0x500e6044,0x500e604c,0x500e6050,0x500e6054,0x500e605c,0x500e6060])
+val enables=nativeStaticU32s([0x1000000,0x400,0x100000,0x10000000,0x800,0x80000])
+val masters=nativeStaticU32s([0x500e6050,0x500e605c,0x500e6064])
+val selects=nativeStaticU32s([0x80000,0x400,0x10000000])
+val regs=nativeStaticAllocate(160)
+val steps=nativeStaticAllocate(60)
+var port=0
+var transmit=false
+var writes=0
+var reads=0
+var fail=0
+var bad=false
+trusted fun at(address: int): int {
+    if (address == 0x50111040) return 128
+    val base=0x500c6000+port*4096
+    if (address == base+32) return 132
+    if (address == base+36) return 136
+    val n=address-0x500e6000
+    if (n < 0 || n > 100 || (n & 3) != 0) { bad=true;return 0 }
+    return n
+}
+trusted fun p4I2sControlRead(address: int): int {
+    reads=reads+1;return nativeAddressLoadU32(regs,at(address))
+}
+trusted fun p4I2sControlWrite(address: int,value: int): void {
+    if (writes >= 5) { bad=true;return }
+    val a=nativeAddressLoadU32(steps,writes*12)
+    val mask=nativeAddressLoadU32(steps,writes*12+4)
+    val bits=nativeAddressLoadU32(steps,writes*12+8)
+    val old=nativeAddressLoadU32(regs,at(a))
+    if (address != a || value != ((old & (0xffffffff ^ mask)) | bits)) bad=true
+    writes=writes+1
+    nativeAddressStoreU32(regs,at(address),if (writes == fail) value ^ mask else value)
+    return
+}
+trusted fun step(i: int,address: int,mask: int,bits: int): void {
+    nativeAddressStoreU32(steps,i*12,address)
+    nativeAddressStoreU32(steps,i*12+4,mask)
+    nativeAddressStoreU32(steps,i*12+8,bits)
+    return
+}
+trusted fun reset(): void {
+    var i=0
+    while (i < 160) { nativeAddressStoreU32(regs,i,0xa5a55a5a);i=i+4 }
+    nativeAddressStoreU32(regs,28,0x1c000)
+    nativeAddressStoreU32(regs,132,0x40000200)
+    nativeAddressStoreU32(regs,136,0x40000200)
+    writes=0;reads=0;bad=false
+    return
+}
+trusted fun prepare(source: int,divider: int): void {
+    reset()
+    val route=port*2+(if (transmit) 1 else 0)
+    val address=nativeAddressLoadU32(addresses,route*4)
+    val enable=nativeAddressLoadU32(enables,route*4)
+    step(0,address,enable,0)
+    step(1,address,enable*6,source*enable*2)
+    step(2,0x500c6020+port*4096+(if (transmit) 4 else 0),0x07e00000,(divider-1)*2097152)
+    val select=nativeAddressLoadU32(selects,port*4)
+    step(3,nativeAddressLoadU32(masters,port*4),select,if (transmit) select else 0)
+    step(4,address,enable,enable)
+    return
+}
+@export("abla_i2s_clock_p4_test")
+trusted fun test(): i32 {
+    while (port < 3) {
+        var tx=0
+        while (tx < 2) {
+            transmit=tx==1
+            var source=0
+            while (source < 4) {
+                var divider=1
+                while (divider <= 64) {
+                    prepare(source,divider)
+                    if (esp32p4I2sConfigureClockOwned(port,transmit,source,300,divider,true) != 1 || bad || writes != 5) return i32(1)
+                    divider=divider+1
+                }
+                source=source+1
+            }
+            fail=1
+            while (fail <= 5) {
+                prepare(1,8)
+                if (esp32p4I2sConfigureClockOwned(port,transmit,1,100,8,true) != fail+4 || writes != fail || bad) return i32(2)
+                fail=fail+1
+            }
+            fail=0;prepare(0,8)
+            nativeAddressStoreU32(regs,28,0)
+            if (esp32p4I2sConfigureClockOwned(port,transmit,0,0,8,true) != 3 || writes != 0 || reads != 1) return i32(3)
+            var direction=0
+            while (direction < 2) {
+                var bit=1
+                while (bit <= 256) {
+                    if ((bit & 263) != 0) {
+                        prepare(0,8);nativeAddressStoreU32(regs,132+direction*4,bit)
+                        if (esp32p4I2sConfigureClockOwned(port,transmit,0,0,8,true) != 4 || writes != 0) return i32(4)
+                    }
+                    bit=bit*2
+                }
+                direction=direction+1
+            }
+            tx=tx+1
+        }
+        fail=0
+        while (fail <= 2) {
+            reset()
+            val bus=1 << (14+port);val pad=1 << (12-port)
+            step(0,0x500e601c,bus,bus);step(1,0x50111040,pad,pad)
+            if (esp32p4I2sEnableBusOwned(port,true) != (if (fail == 0) 1 else fail+2) || bad || writes != (if (fail == 0) 2 else fail)) return i32(5)
+            fail=fail+1
+        }
+        fail=0;port=port+1
+    }
+    reads=0;writes=0
+    if (esp32p4I2sConfigureClockOwned(0,false,3,299,8,true) != 2 ||
+        esp32p4I2sConfigureClockOwned(0,false,0,300,8,false) != 2 ||
+        esp32p4I2sConfigureClockOwned(3,false,0,300,8,true) != 2 ||
+        esp32p4I2sConfigureClockOwned(0,false,4,300,8,true) != 2 ||
+        esp32p4I2sConfigureClockOwned(0,false,0,-1,8,true) != 2 ||
+        esp32p4I2sConfigureClockOwned(0,false,0,300,0,true) != 2 ||
+        esp32p4I2sConfigureClockOwned(0,false,0,300,65,true) != 2 ||
+        esp32p4I2sEnableBusOwned(3,true) != 2 || esp32p4I2sEnableBusOwned(0,false) != 2 || reads != 0 || writes != 0) return i32(6)
+    return i32(0)
+}

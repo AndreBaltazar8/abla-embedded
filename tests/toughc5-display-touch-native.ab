@@ -1,0 +1,348 @@
+import "../src/m5stack/tough_display_startup_admission_c5_sequence.ab"
+import "../src/i2c/results.ab"
+import "../src/m5stack/tough_touch_display_c5_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c5GpioRead(address: int): u32 {
+    if (address == 0x600960f0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960f4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c5GpioWrite(address: int,value: u32): void {
+    if (active && (address == 0x60091008 || address == 0x6009100c)) bad=true
+    writes=writes+1
+    if ((address == 0x60091008 || address == 0x6009100c) && value == u32(1<<26)) {
+        dcWrites=dcWrites+1
+        if (dcWrites == dcDrop) return
+    }
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C5GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C5GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+
+
+
+val spi=nativeStaticAllocate(256)
+var bus=u32(4)
+var functional=u32(0x100000)
+var spiWrites=0
+var spiDrop=0
+var pending=0
+var stall=false
+var active=false
+fun c5SpiRead(address: int): u32 {
+    if (address == 0x600960c4) return bus
+    if (address == 0x600960c8) return functional
+    if (address == 0x60081000) {
+        if (active) return u32(1<<24)
+        if (pending > 0) { if (!stall) pending=pending-1;return u32(1<<23) }
+        return u32(0)
+    }
+    return u32(nativeAddressLoadU32(spi,address-0x60081000))
+}
+fun c5SpiWrite(address: int,value: u32): void {
+    spiWrites=spiWrites+1
+    if (address == 0x600960c4) { bus=value;return }
+    if (address == 0x600960c8) { functional=value;return }
+    if (address == 0x60081000) {
+        if (value == u32(1<<23)) { pending=1;return }
+        if (value != u32(1<<24)) { bad=true;return }
+        starts=starts+1
+        if ((c5GpioRead(0x60091004)&u32(1<<25)) != u32(0) ||
+            peripheralGateAt(gateStorage).tryBegin(u32(9)) != 1) bad=true
+        val data=(c5GpioRead(0x60091004)&u32(1<<26)) != u32(0)
+        val count=nativeAddressLoadU32(spi,28)/8+1
+        val startupStage=nativeBufferAt(recordMemory,32).loadU32(8)
+        if (!data) {
+            phase=nativeAddressLoadU32(spi,152)&255
+            if (count != 1) bad=true
+            if (startupStage == 4) {
+                val table=ili9342InitProgram()
+                if (phase != table.load(programOffset)) bad=true
+                argumentOffset=programOffset+2
+                argumentCount=table.load(programOffset+1)&127
+                programOffset=argumentOffset+argumentCount+(if ((table.load(programOffset+1)&128) != 0) 1 else 0)
+            } else if (startupStage == 5) {
+                if (phase != (if (configurationCommands == 0) 58 else if (configurationCommands == 1) 54 else 33)) bad=true
+                configurationCommands=configurationCommands+1
+            } else if (startupStage == 6) {
+                if (phase != (if (drawingCommands == 0) 42 else if (drawingCommands == 1) 43 else 44)) bad=true
+                drawingCommands=drawingCommands+1
+            } else bad=true
+        } else if (startupStage == 4) {
+            if (count != argumentCount) bad=true
+            var at=0
+            while (at < count) {
+                val word=nativeAddressLoadU32(spi,152+(at/4)*4)
+                if (((word>>>((at%4)*8))&255) != ili9342InitProgram().load(argumentOffset+at)) bad=true
+                at=at+1
+            }
+        } else if (startupStage == 5) {
+            val expectedByte=if (phase == 58) 85 else toughDisplayView(rotationWanted).madctl()
+            if (count != 1 || nativeAddressLoadU32(spi,152) != expectedByte) bad=true
+        } else if (phase == 42 || phase == 43) {
+            val dimension=if (phase == 42) toughDisplayView(rotationWanted).width() else toughDisplayView(rotationWanted).height()
+            val last=dimension-1
+            if (count != 4 || nativeAddressLoadU32(spi,152) != (((last>>>8)<<16)|((last&255)<<24))) bad=true
+        } else {
+            if (phase != 44 || count%2 != 0) bad=true
+            var at=0
+            while (at < count) {
+                if (nativeAddressLoadU32(spi,152+(at/4)*4) != 0) bad=true
+                at=at+4
+            }
+            if (starts != timeoutAt) observed=observed+count/2
+        }
+        if (starts == timeoutAt) { active=true;return }
+        nativeAddressStoreU32(spi,60,4096);return
+    }
+    if (address == 0x60081038) { nativeAddressStoreU32(spi,60,nativeAddressLoadU32(spi,60)&~int(value));return }
+    nativeAddressStoreU32(spi,address-0x60081000,int(value));return
+}
+fun initialize(): void {
+    seed()
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(spi,at,0);at=at+4 }
+    bus=u32(4);functional=u32(0x100000);spiWrites=0;spiDrop=0;pending=0;stall=false;active=false;return
+}
+fun openMaster(mode: int): Esp32C5SpiMaster =
+    esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,160000000,2,1,8,mode,4,true)
+
+val buffers=nativeStaticAllocate(131080)
+val gateStorage=nativeStaticAllocate(4)
+var timeout=false
+var starts=0
+
+var timeoutAt=0
+
+var dcWrites=0
+var dcDrop=0
+var wantedCommand=0
+var observed=0
+
+var phase=0
+var expectedX=0
+var expectedY=0
+var expectedW=0
+var expectedH=0
+fun c5LcdProgramAdmission(value: int,dc: int): bool {
+    val master=Esp32C5SpiMaster(value)
+    return master.ready() && dc == 26 && c5SpiMasterDataReady(master,false) && c5SpiManualSelectReady(dc)
+}
+trusted fun c5LcdProgramCommand(master: int,dc: int,command: int,data: NativeBuffer,bytes: int,polls: int): SpiBufferResult =
+    c5SpiCommandDataOwned(Esp32C5SpiMaster(master),dc,command,data,bytes,polls)
+fun peripheralDelayMilliseconds(ms: int): void {
+    val stage=nativeBufferAt(recordMemory,32).loadU32(8)
+    if (stage == 2) {
+        if (ms != (if (powerDelays == 1 || powerDelays == 3) 2 else 10)) bad=true
+        powerDelays=powerDelays+1
+    } else if (stage == 4) { if (ms != 120 || programOffset != 70) bad=true;panelDelays=panelDelays+1 }
+    else bad=true
+    return
+}
+
+type I2cBus=int
+type I2cDevice=int
+val parentMemory=nativeStaticAllocate(96)
+val sessionMemory=nativeStaticAllocate(72)
+val recordMemory=sessionMemory+40
+val deviceMemory=nativeStaticAllocate(256)
+var ioWrites=0
+var ioFailure=0
+var powerDelays=0
+var panelDelays=0
+var programOffset=0
+var argumentOffset=0
+var argumentCount=0
+var configurationCommands=0
+var drawingCommands=0
+var rotationWanted=0
+fun toughDisplayStartupDeviceMatches(bus: int,device: int,address: int): bool =
+    bus == 13 && (device == 7 && address == 110 || device == 8 && address == 79)
+fun I2cBus.valid(): bool { bad=true;return false }
+fun I2cBus.device(address: int,hz: int): I2cDevice { bad=true;return I2cDevice(0) }
+fun I2cDevice.close(): bool { bad=true;return false }
+fun I2cDevice.readRegister(register: int,data: NativeBuffer,bytes: int): bool { bad=true;return false }
+fun I2cDevice.readRegister8Checked(register: int): I2cByteResult { bad=true;return I2cByteResult(0) }
+fun I2cDevice.readRegister16LittleEndianChecked(register: int): I2cWordResult { bad=true;return I2cWordResult(0) }
+fun I2cDevice.readRegister32BigEndianChecked(register: int): I2cDwordResult { bad=true;return I2cDwordResult(0) }
+fun I2cDevice.writeRegister16LittleEndian(register: int,value: int): bool { bad=true;return false }
+trusted fun I2cDevice.updateRegister8(register: int,mask: int,value: int): bool {
+    ioWrites=ioWrites+1
+    if ((this != 7 && this != 8) || register < 0 || register >= 128) { bad=true;return false }
+    if (ioWrites == ioFailure) return false
+    val address=register+(if (this == 7) 128 else 0)
+    val bytes=nativeBufferAt(deviceMemory,256)
+    bytes.store(address,(bytes.load(address)&~mask)|value);return true
+}
+trusted fun I2cDevice.writeRegister8(register: int,value: int): bool = this.updateRegister8(register,255,value)
+trusted fun I2cDevice.writeRegister(register: int,data: NativeBuffer,bytes: int): bool {
+    ioWrites=ioWrites+1
+    if (this != 8 || bytes != 2 || (register != 33 && register != 37)) { bad=true;return false }
+    if (register == 33 && (data.load(0) != 0 || data.load(1) != 128) && observed != 76800) bad=true
+    if (ioWrites == ioFailure) return false
+    nativeBufferAt(deviceMemory,256).store(register,data.load(0))
+    nativeBufferAt(deviceMemory,256).store(register+1,data.load(1));return true
+}
+val touchMemory=nativeStaticAllocate(24)
+var captures=0
+var captureResult=1
+fun toughTouchBusOwnsPmic(bus: int,pmic: int): bool = bus == 13 && pmic == 7
+fun toughTouchBusOwnsController(bus: int,touch: int): bool = bus == 13 && touch == 9
+fun touchControllerAllocate(bus: int,kind: int,address: int,frequency: int): int { bad=true;return 0 }
+fun touchControllerBegin(kind: int,handle: int): bool { bad=true;return false }
+fun touchControllerRelease(kind: int,handle: int): bool { bad=true;return false }
+trusted fun chsc6540Capture(handle: int,snapshot: NativeBuffer): int {
+    if (handle != 9) bad=true
+    captures=captures+1
+    snapshot.store(0,captureResult);snapshot.store(1,1);snapshot.store(2,63)
+    snapshot.store(3,0);snapshot.store(4,239)
+    return captureResult
+}
+@export("abla_toughc5_display_touch_test")
+trusted fun testStartup(): int {
+    val record=nativeBufferAt(recordMemory,32);val gate=peripheralGateAt(gateStorage)
+    val session=nativeBufferAt(sessionMemory,72)
+    val parentBuffer=nativeBufferAt(parentMemory,96)
+    val parent=m5ToughPowerOwnerAt(parentBuffer)
+    var scenario=0
+    var successfulStarts=0
+    while (scenario < 60) {
+        initialize();nativeAddressStoreU32(gateStorage,0,0);record.storeU32(0,0);session.storeU32(0,0)
+        var clearAt=0
+        while (clearAt < 256) { nativeAddressStoreU32(deviceMemory,clearAt,0);clearAt=clearAt+4 }
+        val master=esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,160000000,2,1,2,0,4,true)
+        if (!master.ready()) return 1
+        ioWrites=0;ioFailure=if (scenario < 8 || scenario >= 26) 0 else scenario-7
+        rotationWanted=scenario%8;powerDelays=0;panelDelays=0;programOffset=0
+        configurationCommands=0;drawingCommands=0;observed=0;starts=0;dcDrop=0;timeoutAt=0
+        if (scenario >= 26) timeoutAt=if (scenario < 58) scenario-25 else successfulStarts-(59-scenario)
+        var parentAt=0
+        while (parentAt < 96) { parentBuffer.storeU32(parentAt,0);parentAt=parentAt+4 }
+        parentBuffer.storeU32(0,0x54435057);parentBuffer.storeU32(4,1)
+        parentBuffer.storeU32(8,7);parentBuffer.storeU32(12,261)
+        parentBuffer.storeU32(16,1|(5<<8))
+        parentBuffer.storeU32(32,0x494f4532);parentBuffer.storeU32(36,1)
+        parentBuffer.storeU32(40,m5BoardToughC5|0)
+        parentBuffer.storeU32(48,8);parentBuffer.storeU32(52,258)
+        if (parent.beginDisplayOwned(session,master,13,gate,u32(7),rotationWanted,255,true,false) != 2 ||
+            parent.beginDisplayOwned(nativeBufferAt(parentMemory+24,72),master,13,gate,u32(7),rotationWanted,255,true,true) != 2 ||
+            parent.beginDisplayOwned(session,master,13,peripheralGateAt(parentMemory+80),u32(7),rotationWanted,255,true,true) != 2) return 20
+        var guard=0
+        while (guard < 10) {
+            val position=if (guard < 5) guard*4 else if (guard < 8) 32+(guard-5)*4 else 48+(guard-8)*4
+            val original=parentBuffer.loadU32(position)
+            parentBuffer.storeU32(position,0)
+            if (parent.beginDisplayOwned(session,master,13,gate,u32(7),rotationWanted,255,true,true) != 2) return 21
+            parentBuffer.storeU32(position,original);guard=guard+1
+        }
+        if (ioWrites != 0 || starts != 0 || session.loadU32(0) != 0) return 22
+        val result=parent.beginDisplayOwned(session,master,13,gate,u32(7),rotationWanted,255,true,true)
+        if (!parent.displaySessionMatches(session)) return 23
+        parentBuffer.storeU32(48,9)
+        val savedIo=ioWrites;val savedSpi=spiWrites
+        if (parent.sleepDisplayOwned(session,true,255,true).valid() || ioWrites != savedIo || spiWrites != savedSpi) return 24
+        parentBuffer.storeU32(48,8)
+        if (bad || result != (if (ioFailure == 0 && timeoutAt == 0) 1 else 3)) return 2
+        if (timeoutAt != 0) {
+            if (!active || starts != timeoutAt || ioWrites != 17 || record.loadU32(24) != 0 ||
+                record.loadU32(28) != 0 || record.loadU32(8) < 4 || record.loadU32(8) > 6 ||
+                (c5GpioRead(0x60091004)&u32(1<<25)) != u32(0) ||
+                nativeBufferAt(deviceMemory,256).load(33) != 0) return 6
+            val oldWrites=spiWrites;val oldIo=ioWrites
+            if (toughDisplayStartupOwned(record,master|0,13,7,8,gate,u32(7),rotationWanted,255,true) != 2 ||
+                spiWrites != oldWrites || ioWrites != oldIo) return 7
+        } else if (ioFailure == 0) {
+            successfulStarts=starts
+            if (observed != 76800 || ioWrites != 18 || powerDelays != 5 || panelDelays != 1 ||
+                configurationCommands != 3 || drawingCommands != 3 || record.loadU32(8) != 8) return 3
+            if (nativeBufferAt(deviceMemory,256).load(33) != 255 ||
+                nativeBufferAt(deviceMemory,256).load(34) != 143) return 4
+        } else {
+            if (ioWrites != ioFailure || record.loadU32(8) != (if (ioFailure <= 5) 1 else if (ioFailure <= 17) 2 else 7) ||
+                (ioFailure <= 17 && starts != 0) || record.loadU32(24) != 0 || record.loadU32(28) != 0) return 5
+        }
+        val snapshot=nativeBufferAt(touchMemory,11);val previous=nativeBufferAt(touchMemory+12,11)
+        val touch=TouchControllerOpen(9|(3<<32)|(1<<40))
+        captures=0;captureResult=1
+        if (scenario < 8) {
+            if (parent.readDisplayTouchOwned(session,touch,snapshot,previous,true) != 1 || captures != 2) return 25
+            if (!toughDisplayTouchSnapshotPoint(session,snapshot,1,0).valid()) return 26
+            captureResult=-1
+            if (parent.readDisplayTouchOwned(session,touch,snapshot,previous,true) != -1) return 27
+            captureResult=3
+            if (parent.readDisplayTouchOwned(session,touch,snapshot,previous,true) != -3) return 28
+            captureResult=0
+            if (parent.readDisplayTouchOwned(session,touch,snapshot,previous,true) != 0) return 29
+            val oldCaptures=captures
+            if (parent.readDisplayTouchOwned(session,touch,nativeBufferAt(sessionMemory+4,11),previous,true) != -1 ||
+                parent.readDisplayTouchOwned(session,touch,nativeBufferAt(parentMemory,11),previous,true) != -1 ||
+                parent.readDisplayTouchOwned(session,touch,nativeBufferAt(gateStorage,11),previous,true) != -1 ||
+                parent.readDisplayTouchOwned(session,touch,nativeBufferAt(0x60000000,11),previous,true) != -1 ||
+                parent.readDisplayTouchOwned(session,touch,snapshot,snapshot,true) != -1 ||
+                captures != oldCaptures) return 30
+        } else if (parent.readDisplayTouchOwned(session,touch,snapshot,previous,true) != -1 || captures != 0) return 31
+        val evidenceLow=record.loadU32(16);val evidenceHigh=record.loadU32(20)
+        val beforeIo=ioWrites;val beforeSpi=spiWrites;val beforeState=session.loadU32(4)
+        if (toughDisplaySessionQuiesceOwned(session,false) != 2) return 13
+        session.storeU32(16,14)
+        if (toughDisplaySessionQuiesceOwned(session,true) != 2) return 14
+        session.storeU32(16,13)
+        session.storeU32(32,sessionMemory+40)
+        if (toughDisplaySessionQuiesceOwned(session,true) != 2) return 15
+        session.storeU32(32,gateStorage)
+        if (ioWrites != beforeIo || spiWrites != beforeSpi || session.loadU32(4) != beforeState) return 16
+        ioFailure=ioWrites+1
+        if (toughDisplaySessionQuiesceOwned(session,true) != 4 || session.loadU32(4) != 4) return 8
+        if (toughDisplaySessionView(session).width() != 0) return 9
+        ioFailure=0
+        if (active) {
+            if (toughDisplaySessionQuiesceOwned(session,true) != 4 || !active ||
+                (c5GpioRead(0x60091004)&u32(1<<25)) != u32(0)) return 10
+            active=false
+        }
+        if (scenario%2 == 1) {
+            nativeAddressStoreU32(spi,60,0x60003)
+            if (toughDisplaySessionQuiesceOwned(session,true) != 4 || nativeAddressLoadU32(spi,60) != 0x60003) return 17
+            if (toughDisplaySessionQuiesceOwned(session,true) != 4 || nativeAddressLoadU32(spi,60) != 0x60003) return 18
+            if (toughDisplaySessionQuiesceOwned(session,true,true) != 5 || nativeAddressLoadU32(spi,60) != 0) return 19
+        }
+        if (toughDisplaySessionQuiesceOwned(session,true) != 5 || bad ||
+            nativeBufferAt(deviceMemory,256).load(33) != 0 ||
+            (c5GpioRead(0x60091004)&u32(1<<25)) == u32(0) ||
+            record.loadU32(16) != evidenceLow || record.loadU32(20) != evidenceHigh) return 11
+        val finalWrites=ioWrites;val finalSpi=spiWrites
+        if (toughDisplaySessionQuiesceOwned(session,true) != 5 || ioWrites != finalWrites || spiWrites != finalSpi ||
+            toughDisplaySessionBeginOwned(session,master|0,13,7,8,gate,u32(7),rotationWanted,255,true) != 2) return 12
+        scenario=scenario+1
+    }
+    return 0
+}

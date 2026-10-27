@@ -1,0 +1,127 @@
+import "../src/esp32/power/wake_session_p4_sequence.ab"
+import "../src/esp32/power/ext1_session_p4_sequence.ab"
+import "abla/unsafe/native"
+var clockOn=false
+var parked=false
+var extRestored=false
+var pads=0
+var calls=0
+var fail=0
+var bad=false
+var triggers=u32(0)
+var outer=false
+trusted fun step(): bool {
+    if (outer && (triggers&u32(0x7fffffff)) != u32(0)) bad=true
+    calls=calls+1;return calls != fail
+}
+trusted fun p4WakeTriggerRead(): u32 = triggers
+trusted fun p4WakeTriggerWrite(value: u32): void {
+    calls=calls+1
+    if (calls == fail) return
+    if ((value&u32(0x7fffffff)) == u32(4096) && (!clockOn || parked || pads != 65535)) bad=true
+    if ((value&u32(0x7fffffff)) == u32(0xa000) && (clockOn || pads != 0)) bad=true
+    triggers=value;return
+}
+trusted fun p4WakeSessionClockOpen(layout: int): int {
+    clockOn=true;return if (step()) 1 else 3
+}
+trusted fun p4WakeSessionClockClose(token: int): int {
+    if (pads != 0 || (parked && !extRestored)) bad=true
+    if (!step()) return 3
+    clockOn=false;return 6
+}
+trusted fun p4WakeSessionExtOpen(): int {
+    if (!clockOn) bad=true
+    val ok=step();parked=ok
+    return (1<<41)|(if (ok) 6 else 4)
+}
+trusted fun p4WakeSessionExtPark(token: int): int {
+    if (!clockOn || extRestored) bad=true
+    val ok=step();parked=ok
+    return (1<<41)|(if (ok) 6 else 4)
+}
+trusted fun p4WakeSessionExtConfigure(token: int,selection: u32,highLevels: u32,filter: bool): int {
+    if (!clockOn || !parked || pads != int(selection)) bad=true
+    parked=false
+    return (1<<41)|(if (step()) 1 else 4)
+}
+trusted fun p4WakeSessionExtClose(token: int): int {
+    if (!clockOn || !parked || pads != 0) bad=true
+    if (!step()) return (1<<41)|4
+    extRestored=true;parked=false;return (1<<41)|5
+}
+trusted fun p4WakeSessionPadOpen(pin: int,pull: int,layout: int): int {
+    if (!clockOn || !parked) bad=true
+    pads=pads|(1<<pin)
+    return (1<<34)|(pin<<29)|(if (step()) 1 else 5)
+}
+trusted fun p4WakeSessionPadClose(token: int): int {
+    if (!clockOn || !parked) bad=true
+    if (!step()) return (token&(~255))|5
+    pads=pads&(~(1<<((token>>>29)&15)))
+    return (token&(~255))|6
+}
+trusted fun seed(r: NativeBuffer): void {
+    var i=0
+    while (i < 164) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(160,0x12345678)
+    clockOn=false;parked=false;extRestored=false;pads=0;calls=0;fail=0;bad=false;return
+}
+@export("abla_wake_session_p4_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(nativeStaticAllocate(164),164)
+    var fault=0
+    // Clock, park, all sixteen pads, configure: fail every acquisition stage.
+    while (fault <= 19) {
+        seed(r);fail=fault
+        val opened=esp32p4WakeSessionOpenOwned(r,u32(65535),u32(0xaaaa),1,true,3,true)
+        if ((fault == 0 && opened != 1) || (fault != 0 && opened == 1) || bad) return i32(1)
+        val primary=r.loadU32(8)
+        fail=0
+        if (esp32p4WakeSessionCloseOwned(r,true) != 8 || clockOn || pads != 0 || bad ||
+            r.loadU32(8) != primary || r.loadU32(160) != 0x12345678) return i32(2)
+        fault=fault+1
+    }
+    fault=1
+    // Park, sixteen pad restores, EXT1 restore, clock close: retry each failure.
+    while (fault <= 19) {
+        seed(r)
+        if (esp32p4WakeSessionOpenOwned(r,u32(65535),u32(0),0,false,1,true) != 1) return i32(3)
+        calls=0;fail=fault
+        if (esp32p4WakeSessionCloseOwned(r,true) != 9 || !clockOn || bad) return i32(4)
+        fail=0
+        if (esp32p4WakeSessionCloseOwned(r,true) != 8 || clockOn || pads != 0 || bad || r.loadU32(12) != 0) return i32(5)
+        val before=calls
+        if (esp32p4WakeSessionCloseOwned(r,true) != 8 || calls != before ||
+            esp32p4WakeSessionOpenOwned(r,u32(1),u32(0),0,false,1,true) != 2) return i32(6)
+        fault=fault+1
+    }
+    seed(r)
+    if (esp32p4WakeSessionOpenOwned(r,u32(0),u32(0),0,false,1,true) != 2 || calls != 0) return i32(7)
+    val full=nativeBufferAt(nativeStaticAllocate(188),188)
+    outer=true
+    var phase=0
+    while (phase < 2) {
+        fault=0
+        while (fault <= 21) {
+            seed(r);triggers=u32(0x8000a000)
+            var i=0
+            while (i < 184) { full.storeU32(i,0);i=i+4 }
+            full.storeU32(184,0x12345678)
+            if (phase == 0) fail=fault
+            val opened=esp32p4Ext1SessionOpenOwned(full,u32(65535),u32(0),0,false,3,true)
+            if ((phase == 1 || fault == 0) && (opened != 1 || triggers != u32(0x80001000))) return i32(8)
+            if (phase == 0 && fault != 0 && opened == 1) return i32(9)
+            val primary=full.loadU32(8)
+            calls=0;fail=if (phase == 1) fault else 0
+            val closed=esp32p4Ext1SessionCloseOwned(full,true)
+            if (phase == 1 && fault != 0 && closed != 9) return i32(10)
+            fail=0
+            if (esp32p4Ext1SessionCloseOwned(full,true) != 8 || triggers != u32(0x8000a000) ||
+                clockOn || pads != 0 || bad || full.loadU32(8) != primary || full.loadU32(184) != 0x12345678) return i32(11)
+            fault=fault+1
+        }
+        phase=phase+1
+    }
+    return i32(0)
+}

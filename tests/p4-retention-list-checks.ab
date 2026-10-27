@@ -1,0 +1,119 @@
+import "../src/esp32/power/retention_list_p4.ab"
+import "../src/esp32/power/retention_system_p4.ab"
+import "../src/esp32/power/retention_cache_p4.ab"
+import "../src/esp32/power/retention_iomux_p4.ab"
+import "../src/esp32/power/retention_mspi_p4.ab"
+import "../src/esp32/power/retention_systimer_p4.ab"
+val listConfigs=nativeStaticAllocate(64*56)
+val listOutput=nativeStaticAllocate(64*36+4)
+val listScratch=nativeStaticAllocate(36)
+val listStorage=nativeStaticAllocate(8192)
+// This concatenation exercises every builder/layout, not the final PMU domain
+// priority graph. Hardware execution requires the separate domain ordering.
+trusted fun seedRetentionList(): bool {
+    var node=0
+    var used=0
+    while (node < 64) {
+        val c=nativeBufferAt(listConfigs+node*56,56)
+        var ok=false
+        if (node < 5) ok=esp32p4RetentionSystemConfig(c,node,listStorage+used,0)
+        else if (node < 17) ok=esp32p4RetentionCacheConfig(c,node-5,if (esp32p4RetentionCacheWords(node-5) == 0) 0 else listStorage+used,0)
+        else if (node < 23) ok=esp32p4RetentionIomuxConfig(c,node-17,listStorage+used,0)
+        else if (node < 31) ok=esp32p4RetentionMspiConfig(c,false,node-23,if (esp32p4RetentionMspiWords(false,node-23) == 0) 0 else listStorage+used,0)
+        else if (node < 45) ok=esp32p4RetentionMspiConfig(c,true,node-31,if (esp32p4RetentionMspiWords(true,node-31) == 0) 0 else listStorage+used,0)
+        else ok=esp32p4RetentionSystimerConfig(c,node-45,if (esp32p4RetentionSystimerWords(node-45) == 0) 0 else listStorage+used,0)
+        if (!ok) return false
+        used=used+(c.loadU32(0)&1023)*4
+        node=node+1
+    }
+    var i=0
+    while (i < 64*36+4) { nativeBufferAt(listOutput,64*36+4).storeU32(i,0x12345678);i=i+4 }
+    return used <= 8192
+}
+trusted fun retentionListChecks(): int {
+    val configs=nativeBufferAt(listConfigs,64*56)
+    val out=nativeBufferAt(listOutput,64*36+4)
+    val scratch=nativeBufferAt(listScratch,36)
+    if (!seedRetentionList()) return 50
+    val bytes=esp32p4RetentionListEncode(out,configs,scratch,64)
+    //64 original nodes, four bitmaps, three WAIT workaround pairs.
+    if (bytes != 64*20+4*16+3*40 || out.loadU32(bytes) != 0x12345678) return 51
+    var offset=0
+    var node=0
+    while (node < 64) {
+        val c=nativeBufferAt(listConfigs+node*56,56)
+        val head=c.loadU32(0);val size=if (((head>>>16)&15) == 1) 36 else 20
+        if (out.loadU32(offset) != (if (node == 63) head else head&0x7fffffff) ||
+            out.loadU32(offset+4) != (if (node == 63) 0 else listOutput+offset+size) || c.loadU32(4) != 0 || (head&0x80000000) == 0) return 52
+        var word=8
+        if (!esp32p4RetentionDescriptorEncode(scratch,c)) return 53
+        while (word < size) { if (out.loadU32(offset+word) != scratch.loadU32(word)) return 54;word=word+4 }
+        offset=offset+size
+        if (((head>>>16)&15) == 3) {
+            var extra=0
+            while (extra < 2) {
+                if (out.loadU32(offset) != ((head&0x60000000)|((2+extra)<<16)) ||
+                    out.loadU32(offset+4) != listOutput+offset+20 ||
+                    out.loadU32(offset+8) != 0x501153fc ||
+                    out.loadU32(offset+12) != (c.loadU32(48)^0xffffffff) ||
+                    out.loadU32(offset+16) != c.loadU32(52)) return 61
+                offset=offset+20;extra=extra+1
+            }
+        }
+        node=node+1
+    }
+    if (offset != bytes) return 55
+    var fault=0
+    while (fault < 5) {
+        if (!seedRetentionList()) return 56
+        if (fault == 0) configs.storeU32(63*56,0x80000401)
+        if (fault == 1) configs.storeU32(63*56+28,listOutput)
+        if (fault == 2) configs.storeU32(63*56+28,listStorage)
+        if (fault == 3) configs.storeU32(63*56+4,listOutput)
+        if (fault == 4) configs.storeU32(63*56,0x90000001)
+        if (esp32p4RetentionListEncode(out,configs,scratch,64) != 0) return 57
+        var i=0
+        while (i < 64*36+4) { if (out.loadU32(i) != 0x12345678) return 58;i=i+4 }
+        fault=fault+1
+    }
+    if (!seedRetentionList()) return 59
+    if (esp32p4RetentionListEncode(nativeBufferAt(listOutput,bytes-1),configs,scratch,64) != 0 ||
+        esp32p4RetentionListEncode(out,configs,nativeBufferAt(listConfigs,36),64) != 0 ||
+        esp32p4RetentionListEncode(out,configs,scratch,0) != 0) return 60
+    // Single terminal WAIT: all skip combinations, masks and complemented
+    // values. Reject CLK_EN masks before output mutation; inactive waits
+    // remain single descriptors. Synthetic WAITs must not expand recursively.
+    var flags=0
+    while (flags < 4) {
+        var variant=0
+        while (variant < 4) {
+            if (!seedRetentionList()) return 62
+            var word=0
+            while (word < 56) { configs.storeU32(word,0);word=word+4 }
+            val head=0x80030000|(flags<<29)
+            val mask=if (variant == 0) 0 else if (variant == 1) 0x7fffffff else if (variant == 2) 0x80000000 else 16
+            configs.storeU32(0,head);configs.storeU32(20,0x500e6004)
+            configs.storeU32(48,0x12345678);configs.storeU32(52,mask)
+            val result=esp32p4RetentionListEncode(out,configs,scratch,1)
+            if (flags != 3 && variant == 2) {
+                if (result != 0) return 63
+                word=0
+                while (word < 64*36+4) { if (out.loadU32(word) != 0x12345678) return 64;word=word+4 }
+            } else if (flags == 3 || variant == 0) {
+                if (result != 20 || out.loadU32(0) != head || out.loadU32(4) != 0 || out.loadU32(20) != 0x12345678) return 65
+            } else {
+                if (result != 60 || out.loadU32(0) != (head&0x7fffffff) || out.loadU32(4) != listOutput+20 ||
+                    out.loadU32(20) != ((flags<<29)|0x20000) || out.loadU32(24) != listOutput+40 ||
+                    out.loadU32(40) != head || out.loadU32(44) != 0 || out.loadU32(60) != 0x12345678) return 66
+                word=28
+                while (word < 60) {
+                    if (out.loadU32(word) != 0x501153fc || out.loadU32(word+4) != 0xedcba987 || out.loadU32(word+8) != mask) return 67
+                    word=word+20
+                }
+            }
+            variant=variant+1
+        }
+        flags=flags+1
+    }
+    return 0
+}

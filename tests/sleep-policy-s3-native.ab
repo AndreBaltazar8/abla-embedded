@@ -1,0 +1,94 @@
+import "../src/esp32/power/sleep_domains_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var isolation=0
+var digital=0
+var rtc=0
+var calls=0
+var bad=false
+fun esp32S3RtcWakeUpdate(address: int, mask: int, value: int): void {
+    calls=calls+1
+    if ((value & ~mask) != 0) bad=true
+    if (address == 0x60008094) isolation=(isolation & ~mask) | value
+    else if (address == 0x60008090) {
+        // PD must never be enabled before both overrides have been cleared.
+        if ((value & (1<<30)) != 0 && ((isolation & (1<<29)) != 0 || (digital & (1<<18)) != 0)) bad=true
+        if ((value & (1<<29)) != 0 && ((isolation & (3<<26)) != 0 || (digital & (1<<22)) != 0)) bad=true
+        if ((value & (1<<28)) != 0 && ((isolation & (3<<24)) != 0 || (digital & (1<<14)) != 0)) bad=true
+        digital=(digital & ~mask) | value
+    } else if (address == 0x60008088) {
+        if ((value & (1<<20)) != 0 && (rtc & ((1<<19) | 48)) != 0) bad=true
+        rtc=(rtc & ~mask) | value
+    } else bad=true
+    return
+}
+@export("abla_sleep_policy_s3_test")
+trusted fun sleepPolicyTest(): i32 {
+    var flags=0
+    while (flags <= 0xFFFFF) {
+        val policy=esp32S3SleepPolicy(flags)
+        val valid=(flags & ~0xF0F7F) == 0 && !((flags & 1) != 0 && (flags & 2048) == 0)
+        if (policy.valid() != valid) return i32(1)
+        if (valid) {
+            val deep=(flags & 1) != 0
+            val xtal=(flags & 2048) == 0
+            val rc=(flags & 1024) == 0
+            val adc=(flags & 0x20000) != 0
+            val noDrop=if (deep) adc || rc else (flags & 0x10000) != 0 || xtal || rc
+            val expectedAtten=if (noDrop) 0 else if (!deep) 5 else if ((flags & 0x40000) != 0) 14 else 15
+            val expectedDig=if (deep) 0 else if ((flags & 0x10000) != 0 || xtal) 23 else if (rc) 0 else 5
+            if (policy.flags() != flags || policy.rtcBias() != 23 || policy.digitalBias() != expectedDig ||
+                policy.attenuation() != expectedAtten || policy.regulatorForced() != (expectedAtten != 15) ||
+                policy.monitorBiasSleep() != !xtal || policy.biasSleep() != !xtal ||
+                policy.monitorCurrentDown() != (!xtal && !adc) || policy.sleepCurrentDown() != !xtal) return i32(2)
+        }
+        flags=flags+1
+    }
+    // Every non-flag bit is fixed by the constructor. Mutating a bias, control,
+    // tag or reserved bit must fail before any domain register is touched.
+    var choice=0
+    while (choice < 4) {
+        val base=esp32S3SleepPolicy(if (choice == 0) 0 else if (choice == 1) 3072 else if (choice == 2) 3073 else 0x40c01)
+        if (!base.valid()) return i32(7)
+        var bit=20
+        while (bit < 64) {
+            calls=0
+            val corrupt=Esp32S3SleepPolicy(base ^ (1<<bit))
+            if (corrupt.valid() || esp32S3SleepDomainsPrepareOwned(corrupt) || calls != 0) return i32(8)
+            bit=bit+1
+        }
+        choice=choice+1
+    }
+    calls=0
+    if (Esp32S3SleepPolicy(1<<39).valid() ||
+        esp32S3SleepDomainsPrepareOwned(Esp32S3SleepPolicy(1<<39)) || calls != 0) return i32(9)
+    var pattern=0
+    while (pattern < 16) {
+        flags=(if ((pattern & 1) != 0) 64 else 0) | (if ((pattern & 2) != 0) 256 else 0) |
+            (if ((pattern & 4) != 0) 512 else 0) | (if ((pattern & 8) != 0) 2 else 0)
+        var seed=0
+        while (seed < 33) {
+            val initial=if (seed == 32) 0xFFFFFFFF else 1<<seed
+            isolation=initial; digital=initial; rtc=initial; calls=0; bad=false
+            if (!esp32S3SleepDomainsPrepareOwned(esp32S3SleepPolicy(flags))) return i32(3)
+            var isoClear=0
+            var digClear=0x70000000
+            var digSet=0
+            var rtcClear=1<<20
+            var rtcSet=0
+            var expectedCalls=4
+            if ((pattern & 1) != 0) { isoClear=isoClear | (1<<29); digClear=digClear | (1<<18); digSet=digSet | (1<<30); expectedCalls=expectedCalls+2 }
+            if ((pattern & 2) != 0) { isoClear=isoClear | (3<<26); digClear=digClear | (1<<22); digSet=digSet | (1<<29); expectedCalls=expectedCalls+2 }
+            if ((pattern & 4) != 0) { isoClear=isoClear | (3<<24); digClear=digClear | (1<<14); digSet=digSet | (1<<28); expectedCalls=expectedCalls+2 }
+            if ((pattern & 8) != 0) { rtcClear=rtcClear | (1<<19) | 48; rtcSet=1<<20; expectedCalls=expectedCalls+1 }
+            if (bad || calls != expectedCalls || isolation != (initial & ~isoClear) ||
+                digital != ((initial & ~digClear) | digSet) || rtc != ((initial & ~rtcClear) | rtcSet)) return i32(4)
+            seed=seed+1
+        }
+        pattern=pattern+1
+    }
+    calls=0
+    if (esp32S3SleepDomainsPrepareOwned(esp32S3SleepPolicy(1)) || calls != 0 ||
+        esp32S3SleepPolicy(-1).valid() || esp32S3SleepPolicy(1<<40).valid()) return i32(5)
+    i32(0)
+}

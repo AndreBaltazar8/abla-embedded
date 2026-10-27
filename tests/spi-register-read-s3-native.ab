@@ -1,0 +1,103 @@
+import "../src/esp32/spi/register_read_sequence_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin=int
+fun Pin.outputCapable(): bool = this >= 1 && this <= 4
+val memory=nativeStaticAllocate(256)
+val gateMemory=nativeStaticMutableU32s([0])
+var base=0x60024000
+var selected=false
+var dc=true
+var gpioCalls=0
+var starts=0
+var updates=0
+var failPhase=0
+var failKind=0
+var failGpio=0
+var partial=false
+var bad=false
+fun Pin.routeOutputSignal(signal: int,inverted: bool): bool { bad=true;return false }
+fun Pin.routeBidirectionalSignal(input: int,output: int): bool { bad=true;return false }
+fun Pin.outputLevelOwned(high: bool): bool { bad=true;return false }
+trusted fun Pin.writeLevelOwned(high: bool): bool {
+    val r=nativeBufferAt(memory,256)
+    if (nativeAddressLoadU32(gateMemory,0) != 7 || (r.loadU32(0)&0x01800000) != 0) bad=true
+    gpioCalls=gpioCalls+1
+    if (gpioCalls != failGpio || partial) {
+        if (this == 3) selected=!high
+        else if (this == 4) dc=high
+        else bad=true
+    }
+    return gpioCalls != failGpio
+}
+trusted fun esp32s3SpiRead(address: int): int {
+    if (nativeAddressLoadU32(gateMemory,0) != 7) bad=true
+    return nativeBufferAt(memory,256).loadU32(address-base)
+}
+trusted fun esp32s3SpiWrite(address: int,value: int): void {
+    if (nativeAddressLoadU32(gateMemory,0) != 7) bad=true
+    val at=address-base;val r=nativeBufferAt(memory,256)
+    if (at == 0x38) { r.storeU32(0x3c,r.loadU32(0x3c)&~value);return }
+    if (at == 0 && value == 0x00800000) {
+        updates=updates+1
+        r.storeU32(0,if (failKind == 1 && updates == failPhase) value else 0);return
+    }
+    if (at == 0 && value == 0x01000000) {
+        starts=starts+1
+        if (starts == 1 && (selected || dc || r.loadU32(0x10) != 0x80000000 || r.loadU32(0x18) != 0x70000000)) bad=true
+        if (starts == 2 && (!selected || dc || r.loadU32(0x10) != 0x80000000 || r.loadU32(0x18) != 0x70000004)) bad=true
+        if (starts == 3 && (!selected || !dc || r.loadU32(0x10) != 0x30020000 || r.loadU32(0x14) != 0 || r.loadU32(0x1c) != 31)) bad=true
+        r.storeU32(0,if (failKind == 2 && updates == failPhase) value else 0)
+        r.storeU32(0x3c,if (failKind == 3 && updates == failPhase) 0x21000 else 4096)
+        if (starts == 3) r.storeU32(0x98,0x079100)
+        return
+    }
+    r.storeU32(at,value);return
+}
+trusted fun seed(): void {
+    var i=0;while (i < 256) { nativeBufferAt(memory,256).store(i,0);i=i+1 }
+    nativeAddressStoreU32(gateMemory,0,0)
+    selected=false;dc=true;gpioCalls=0;starts=0;updates=0;bad=false;return
+}
+@export("abla_spi_register_read_s3_test")
+trusted fun test(): i32 {
+    val gate=peripheralGateAt(gateMemory)
+    var port=2
+    while (port <= 3) {
+        base=0x60024000+(port-2)*4096
+        seed();failKind=0;failGpio=0
+        val success=esp32s3SpiReadRegister32Shared(gate,u32(7),port,Pin(1),Pin(2),Pin(3),Pin(4),4,1,3)
+        if (!success.valid() || success.value() != u32(0x079100) || starts != 3 || gpioCalls != 6 || selected || !dc || bad) return i32(1)
+        failKind=1
+        while (failKind <= 3) {
+            failPhase=1
+            while (failPhase <= 3) {
+                seed()
+                val result=esp32s3SpiReadRegister32Shared(gate,u32(7),port,Pin(1),Pin(2),Pin(3),Pin(4),4,1,3)
+                if (result.status() != 6 || ((result.value()>>u32(24))&u32(15)) != u32(failPhase) || bad ||
+                    starts != failPhase-(if (failKind == 1) 1 else 0) || nativeAddressLoadU32(gateMemory,0) != 0x80000000) return i32(2)
+                if (failKind < 3 && (result.value()&u32(0x800000)) == u32(0)) return i32(3)
+                if (failKind == 3 && (selected || !dc || (result.value()&u32(0x800000)) != u32(0))) return i32(4)
+                val previous=gpioCalls
+                if (esp32s3SpiReadRegister32Shared(gate,u32(7),port,Pin(1),Pin(2),Pin(3),Pin(4),4,1,3).status() != 4 || gpioCalls != previous) return i32(5)
+                failPhase=failPhase+1
+            }
+            failKind=failKind+1
+        }
+        failKind=0;failGpio=1
+        while (failGpio <= 6) {
+            var commit=0
+            while (commit < 2) {
+                seed();partial=commit != 0
+                val result=esp32s3SpiReadRegister32Shared(gate,u32(7),port,Pin(1),Pin(2),Pin(3),Pin(4),4,1,3)
+                if (result.status() != 6 || nativeAddressLoadU32(gateMemory,0) != 0x80000000 || bad) return i32(6)
+                commit=commit+1
+            }
+            failGpio=failGpio+1
+        }
+        seed();failGpio=0
+        if (esp32s3SpiReadRegister32Shared(gate,u32(7),port,Pin(1),Pin(2),Pin(2),Pin(4),4,1,3).status() != 3 || gpioCalls != 0 || starts != 0) return i32(7)
+        port=port+1
+    }
+    return i32(0)
+}

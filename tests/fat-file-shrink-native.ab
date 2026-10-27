@@ -1,0 +1,104 @@
+import "../src/storage/fat_volume_shrink.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+val image=nativeStaticAllocate(1536)
+var writes=0
+var failAt=0
+var target=0
+var bad=false
+fun slot(lba: int): int = if (lba == 1) 0 else if (lba == 41) 1 else if (lba == 81) 2 else -1
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    val selected=slot(lba)
+    if (selected < 0 && lba != 0) return false
+    val source=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(image+selected*512,512)
+    var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    writes=writes+1;val selected=slot(lba)
+    if (selected < 0) return false
+    val directory=nativeBufferAt(image+1024,512)
+    if (writes == 1 && lba != 81) bad=true
+    if (lba != 81 && directory.loadU32(28) != target) bad=true
+    if (lba != 81 && target > 0) {
+        val keep=if (target <= 512) 1 else if (target <= 1024) 2 else 3
+        var cluster=2+keep
+        while (cluster <= 4) {
+            if (source.loadU16(cluster*2) == 0) {
+                // Both mirrors must detach the kept tail before freeing.
+                if (nativeBufferAt(image,512).loadU16((keep+1)*2) != 65535 ||
+                    nativeBufferAt(image+512,512).loadU16((keep+1)*2) != 65535) bad=true
+            }
+            cluster=cluster+1
+        }
+    }
+    val output=nativeBufferAt(image+selected*512,512);var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return writes != failAt
+}
+@export("abla_fat_file_shrink_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val expected=nativeBufferAt(memory+576,32);val work=nativeBufferAt(memory+640,2560)
+    val scratch=nativeBufferAt(memory+3200,512);val plan=nativeBufferAt(memory+3712,24)
+    val directory=nativeBufferAt(image+1024,512);var i=0
+    while (i < 512) { boot.store(i,0);i=i+1 }
+    boot.storeU16(11,512);boot.store(13,1);boot.storeU16(14,1);boot.store(16,2)
+    boot.storeU16(17,512);boot.storeU16(22,40);boot.storeU16(19,10113);boot.storeU16(510,0xaa55)
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    val modified=rtcCalendarDateTime(2026,9,9,12,0,0)
+    var mode=0
+    while (mode < 4) {
+        target=if (mode == 0) 0 else if (mode == 1) 100 else if (mode == 2) 1024 else 1100
+        val keep=if (mode == 0) 0 else mode
+        val maximum=if (mode <= 1) 7 else if (mode == 2) 5 else 1
+        var failure=0
+        while (failure <= maximum) {
+            writes=0;failAt=failure;bad=false;i=0
+            while (i < 1536) { nativeBufferAt(image,1536).store(i,77);i=i+1 }
+            var copy=0
+            while (copy < 2) {
+                val fat=nativeBufferAt(image+copy*512,512);fat.storeU16(4,3);fat.storeU16(6,4);fat.storeU16(8,65535);copy=copy+1
+            }
+            i=0
+            while (i < 32) { directory.store(i,0);i=i+1 }
+            directory.store(0,65);directory.storeU16(26,2);directory.storeU32(28,1200)
+            i=0
+            while (i < 32) { expected.store(i,directory.load(i));i=i+1 }
+            val volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+            val result=volume.shrink(u32(7),0,0,0,expected,target,16,modified,plan,work)
+            if (bad || writes != (if (failure == 0) maximum else failure) ||
+                (failure == 0 && (result.status() != 1 || result.freedClusters() != 3-keep)) ||
+                (failure != 0 && (result.status() == 1 || state.loadU32(12) != 3))) return i32(2)
+            if (failure == 0) {
+                if (directory.loadU32(28) != target || directory.loadU16(26) != (if (keep == 0) 0 else 2)) return i32(3)
+                copy=0
+                while (copy < 2) {
+                    var cluster=2
+                    while (cluster <= 4) {
+                        val wanted=if (cluster >= 2+keep) 0 else if (cluster == 1+keep) 65535 else cluster+1
+                        if (nativeBufferAt(image+copy*512,512).loadU16(cluster*2) != wanted) return i32(4)
+                        cluster=cluster+1
+                    }
+                    copy=copy+1
+                }
+            }
+            if (!volume.invalidate(u32(7))) return i32(5)
+            failure=failure+1
+        }
+        mode=mode+1
+    }
+    writes=0;failAt=0;target=100
+    i=0
+    while (i < 32) { expected.store(i,directory.load(i));i=i+1 }
+    var volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+    if (volume.shrink(u32(7),0,0,0,expected,100,16,modified,nativeBufferAt(plan.addressValue(),16),work).status() != 6 ||
+        writes != 0 || !volume.invalidate(u32(7))) return i32(6)
+    nativeBufferAt(image,512).storeU16(6,2)
+    volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+    if (volume.shrink(u32(7),0,0,0,expected,100,16,modified,plan,work).status() != 5 || writes != 0 ||
+        !volume.invalidate(u32(7))) return i32(7)
+    return i32(0)
+}

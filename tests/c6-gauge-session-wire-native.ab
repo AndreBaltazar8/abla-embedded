@@ -1,0 +1,210 @@
+import "../src/esp32/i2c/software_session_c6_sequence.ab"
+import "../src/esp32/i2c/software_bus_c6_bindings.ab"
+import "../src/m5stack/c6_gauge.ab"
+import "abla/build"
+// Actual C6 session, clocks, GPIO configuration/latches, provider, bit engine
+// and gauge. Only MMIO/ROM timing and the external slave are simulated.
+// Nesso SDA10/SCL8; no physical validation or automatic board power setup.
+val registers=nativeStaticAllocate(512)
+val gpioMemory=nativeStaticAllocate(4096)
+var bad=false
+var ticks=0
+var apb=u32(0)
+var functional=u32(0x300000)
+var gpioClock=u32(0)
+var dropClose=false
+var gpioWrites=0
+fun c6DelayClockRead(address: int): int {
+    if (address == 0x60096110) return 65536|512
+    if (address == 0x60096118) return 256
+    bad=true;return 0
+}
+fun c6DelayClockSetRomTicks(value: int): void { ticks=value;return }
+fun c6GpioClockRead(address: int): u32 = c6GpioRead(address)
+fun c6GpioClockWrite(address: int,value: u32): void {
+    if (nativeBufferAt(gpioMemory,4096).loadU32(256+32) != 0) bad=true
+    if (address == 0x600960e8) apb=value
+    else if (address == 0x600960ec) functional=value
+    else if (address == 0x6009162c) gpioClock=value
+    else bad=true
+    return
+}
+fun mapped(address: int): int {
+    if (address >= 0x60090004 && address < 0x60090080) return address-0x60090000
+    if (address >= 0x60091000 && address < 0x6009162c) return 256+address-0x60091000
+    return -1
+}
+fun c6GpioRead(address: int): u32 {
+    if (address == 0x600960e8) return apb
+    if (address == 0x600960ec) return functional
+    if (address == 0x6009162c) return gpioClock
+    if (address == 0x600b102c || address == 0x600b1028 || address == 0x6000f018) return u32(0)
+    if (address == 0x6009103c) return u32((if (masterHigh && slaveHigh) 1024 else 0)|(if (clockHigh) 256 else 0))
+    val at=mapped(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(gpioMemory,4096).loadU32(at))
+}
+fun c6GpioWrite(address: int,value: u32): void {
+    gpioWrites=gpioWrites+1
+    if (apb != u32(1) || functional != u32(0x700000) || gpioClock != u32(1) || ticks != 80) bad=true
+    val r=nativeBufferAt(gpioMemory,4096)
+    val at=mapped(address)
+    if (at < 0) { bad=true;return }
+    if (address == 0x60091028 && dropClose) return
+    if (address == 0x60091008 || address == 0x60091024) r.storeU32(at-4,r.loadU32(at-4)|int(value))
+    else if (address == 0x6009100c || address == 0x60091028) r.storeU32(at-8,r.loadU32(at-8)&(0xffffffff^int(value)))
+    else r.storeU32(at,int(value))
+    val enabled=r.loadU32(256+32);val output=r.loadU32(256+4)
+    wireDrive(0,(enabled&1024) == 0 || (output&1024) != 0)
+    wireDrive(1,(enabled&256) == 0 || (output&256) != 0)
+    return
+}
+fun softwareI2cSample(pin: int): bool = esp32C6GpioReadOwned(pin) == 1
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C6GpioWriteOwned(pin,released);return }
+fun softwareI2cDelay(us: int): void { if (ticks != 80 || us <= 0) bad=true;return }
+fun peripheralDelayMilliseconds(ms: int): void { bad=true;return }
+var masterHigh=true
+var slaveHigh=true
+var clockHigh=true
+var mode=0
+var bits=0
+var value=0
+var index=0
+var selected=-1
+var pointer=0
+var reading=false
+var ack=true
+var ackCount=0
+var nackAt=0
+var starts=0
+var stops=0
+// Optional RX8130 slave for retained-child integration; disabled by default.
+val rtcRegisters=nativeStaticAllocate(256)
+var rtcPresent=false
+var rtcNackAfterCommit=false
+// Optional MPU6886 at0x68. Off by default; existing PM1/RTC tests unchanged.
+val pm1ImuRegisters=nativeStaticAllocate(256)
+var pm1ImuPresent=false
+var pm1ImuNackAfterCommit=false
+// Optional configurable charger-register slave, default off.
+val chargeRegisters=nativeStaticAllocate(256)
+var chargeAddress=85
+var chargeNackAfterCommit=false
+fun wireByte(): void {
+    ackCount=ackCount+1
+    ack=ackCount != nackAt
+    if (index == 0) {
+        selected=if ((value>>>1) == 79) 0 else if ((value>>>1) == 110) 256 else if (rtcPresent && (value>>>1) == 50) 512 else if (pm1ImuPresent && (value>>>1) == 104) 768 else if (chargeAddress != 0 && (value>>>1) == chargeAddress) 1024 else -1
+        reading=(value&1) != 0
+        if (selected < 0) ack=false
+    } else if ((ack || (index > 1 && ((selected == 512 && rtcNackAfterCommit) || (selected == 768 && pm1ImuNackAfterCommit) || (selected == 1024 && chargeNackAfterCommit)))) && selected >= 0) {
+        if (index == 1) pointer=value
+        else {
+            if (selected == 512) nativeBufferAt(rtcRegisters,256).store(pointer,value)
+            else if (selected == 768) nativeBufferAt(pm1ImuRegisters,256).store(pointer,value)
+            else if (selected == 1024) nativeBufferAt(chargeRegisters,256).store(pointer,value)
+            else nativeBufferAt(registers,512).store(selected+pointer,value)
+            pointer=(pointer+1)&255
+        }
+    }
+    index=index+1
+    return
+}
+fun sendBit(): void {
+    val byte=if (selected == 512) nativeBufferAt(rtcRegisters,256).load(pointer) else if (selected == 768) nativeBufferAt(pm1ImuRegisters,256).load(pointer) else if (selected == 1024) nativeBufferAt(chargeRegisters,256).load(pointer) else nativeBufferAt(registers,512).load(selected+pointer)
+    slaveHigh=(byte&(128>>>bits)) != 0;return
+}
+fun wireDrive(pin: int,high: bool): void {
+    if (pin == 0) {
+        val old=masterHigh
+        masterHigh=high
+        if (clockHigh && slaveHigh && old != high) {
+            if (!high) { starts=starts+1;mode=1;bits=0;value=0;index=0;reading=false }
+            else { stops=stops+1;mode=0;slaveHigh=true }
+        }
+        return
+    }
+    if (pin != 1) { bad=true;return }
+    if (clockHigh == high) return
+    clockHigh=high
+    if (high) {
+        if (mode == 1) { value=(value<<1)|(if (masterHigh) 1 else 0);bits=bits+1 }
+        else if (mode == 3) bits=bits+1
+        else if (mode == 4) ack=!masterHigh
+    } else {
+        if (mode == 1 && bits == 8) { wireByte();mode=2;slaveHigh=!ack }
+        else if (mode == 2) {
+            slaveHigh=true;bits=0;value=0
+            if (!ack) mode=5
+            else if (reading) { mode=3;sendBit() }
+            else mode=1
+        } else if (mode == 3) {
+            if (bits == 8) { mode=4;slaveHigh=true } else sendBit()
+        } else if (mode == 4) {
+            bits=0
+            if (ack) { pointer=(pointer+1)&255;mode=3;sendBit() } else { mode=5;slaveHigh=true }
+        }
+    }
+    return
+}
+fun wireSeed(): void {
+    rtcPresent=false;rtcNackAfterCommit=false
+    pm1ImuPresent=false;pm1ImuNackAfterCommit=false
+    chargeAddress=0;chargeNackAfterCommit=false
+    masterHigh=true;slaveHigh=true;clockHigh=true;mode=0;bits=0;value=0;index=0
+    selected=-1;pointer=0;reading=false;ack=true;ackCount=0;nackAt=0;starts=0;stops=0
+    var at=0
+    while (at < 512) { nativeBufferAt(registers,512).store(at,255);at=at+1 }
+    nativeBufferAt(registers,512).store(256,18)
+    nativeBufferAt(registers,512).store(257,52)
+    nativeBufferAt(registers,512).store(258,86)
+    nativeBufferAt(registers,512).store(259,120)
+    return
+}
+
+@export("abla_c6_gauge_session_wire_test")
+trusted fun testSessionGauge(): i32 {
+    var borrowed=0
+    while (borrowed < 8) {
+        var fault=0
+        while (fault <= 9) {
+            wireSeed();chargeAddress=85;bad=false;dropClose=false;ticks=0;gpioWrites=0
+            val regs=nativeBufferAt(gpioMemory,4096)
+            var at=0;while (at < 4096) { regs.storeU32(at,0);at=at+4 }
+            apb=u32(borrowed&1);functional=u32(0x300000|((borrowed&2)<<21));gpioClock=u32((borrowed>>>2)&1)
+            var session=esp32C6I2cSessionOpenOwned(10,8,40000000,20000000,true,5,8)
+            if (!session.ready() || bad || ticks != 80 || regs.loadU32(288) != 1280) return i32(1)
+            val device=session.bus().device(85,100000);val gauge=Bq27220(device|0)
+            if (!device.valid()) return i32(2)
+            val r=nativeBufferAt(chargeRegisters,256)
+            r.storeU16(8,3700);r.storeU16(20,65413)
+            nackAt=fault
+            val voltage=m5BoardArduinoNessoN1.readBatteryMillivoltsOwned(gauge,true)
+            val level=m5BoardArduinoNessoN1.readBatteryLevelOwned(gauge,true)
+            val current=gauge.currentMilliampsChecked()
+            // A failed transaction stops at its NACK; subsequent transactions
+            // must still use the released bus. Select faults by cumulative byte.
+            val voltageFailed=fault >= 1 && fault <= 3
+            val levelFailed=fault >= 4 && fault <= 6
+            val currentFailed=fault >= 7 && fault <= 9
+            if (voltage.valid() == voltageFailed || level.valid() == levelFailed || current.valid() == currentFailed ||
+                voltage.status() != (if (voltageFailed) 4 else 1) || level.status() != (if (levelFailed) 4 else 1)) return i32(3)
+            if ((voltage.valid() && voltage.millivolts() != 3700) || (level.valid() && level.percent() != 50) ||
+                (current.valid() && current.value() != -123)) return i32(4)
+            if (bad || mode != 0 || !masterHigh || !slaveHigh || !clockHigh ||
+                r.loadU16(8) != 3700 || r.loadU16(20) != 65413) return i32(5)
+            val before=ackCount
+            dropClose=true
+            session=session.closeOwned(true)
+            if (session.status() != 6 || apb != u32(1) || functional != u32(0x700000) ||
+                gpioClock != u32(1) || gauge.currentMilliampsChecked().valid() || ackCount != before) return i32(6)
+            dropClose=false
+            session=session.closeOwned(true)
+            if (session != 0 || regs.loadU32(288) != 0 || apb != u32(borrowed&1) ||
+                functional != u32(0x300000|((borrowed&2)<<21)) || gpioClock != u32((borrowed>>>2)&1) || bad) return i32(7)
+            fault=fault+1
+        }
+        borrowed=borrowed+1
+    }
+    return i32(0)
+}

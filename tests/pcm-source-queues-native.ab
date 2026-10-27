@@ -1,0 +1,70 @@
+import "../src/audio/pcm_source_queues.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+@export("abla_pcm_source_queues_test")
+trusted fun test(): i32 {
+    val bank=pcmSourceQueuesAt(nativeBufferAt(memory,256),8,8000)
+    val samples=nativeBufferAt(memory+256,2);samples.storeU16(0,30000)
+    val wav=pcmRaw(samples,nativeBufferAt(memory+260,20),8000,1,16)
+    val acc=nativeBufferAt(memory+1024,512)
+    val scratch=nativeBufferAt(memory+1536,256)
+    val output=nativeBufferAt(memory+1792,256)
+    var index=0
+    while (index < 8) {
+        val channel=pcmChannelAt(nativeBufferAt(memory+320+index*32,32),8000)
+        if (!channel.enqueue(wav,0) || bank.enqueue(pcmPlaybackChannel(channel)) != 7-index) return i32(1)
+        index=index+1
+    }
+    val first=PcmChannel(memory+320)
+    if (bank.enqueue(pcmPlaybackChannel(first),0,true) != -1 ||
+        !bank.renderOutput(16,acc,scratch,output,true,4096)) return i32(2)
+    index=0
+    while (index < 16) {
+        if (output.loadU16(index*4) != 30000 || output.loadU16(index*4+2) != 30000 ||
+            acc.loadU32(index*8) != 240000) return i32(3)
+        index=index+1
+    }
+    if (!bank.stop()) return i32(4)
+    // Every lane transitions PCM->tone inside one shared mixing block.
+    index=0
+    while (index < 8) {
+        val channel=PcmChannel(memory+320+index*32);channel.stop()
+        val tone=pcmToneAt(nativeBufferAt(memory+640+index*40,40),8000,500000,1)
+        if (!channel.enqueue(wav,2) || bank.enqueue(pcmPlaybackChannel(channel),index) != index ||
+            bank.enqueue(pcmPlaybackTone(tone),index) != index) return i32(5)
+        index=index+1
+    }
+    // Corrupt the final pending tone: earlier channels/buffers stay untouched.
+    val last=nativeBufferAt(memory+640+7*40,40)
+    acc.storeU32(0,123);scratch.storeU32(0,456);output.storeU32(0,789)
+    last.storeU32(0,0)
+    if (bank.renderOutput(16,acc,scratch,output) || first.storage().loadU32(16) != 0 ||
+        acc.loadU32(0) != 123 || scratch.loadU32(0) != 456 || output.loadU32(0) != 789) return i32(6)
+    last.storeU32(0,0x544f4e31)
+    if (bank.renderOutput(1,acc,scratch,bank.storage()) || bank.renderOutput(1,acc,scratch,last) ||
+        bank.renderOutput(1,acc,acc,output) || bank.renderOutput(1,acc,scratch,output,true,32769) ||
+        acc.loadU32(0) != 123 || first.storage().loadU32(16) != 0) return i32(7)
+    if (!bank.renderOutput(16,acc,scratch,output,false,4096)) return i32(8)
+    index=0
+    while (index < 16) {
+        val expected=if (index < 2) 30000 else if (index < 10)
+            (nativeBufferAt(pcmToneWave,16).load(index-2)-128)*256 else 0
+        if (output.loadU16(index*2) != (expected&65535)) return i32(9)
+        index=index+1
+    }
+    // Direct queue mutation cannot evade whole-bank ownership checks.
+    first.stop();if (!first.enqueue(wav,0)) return i32(10)
+    if (!bank.queue(0).enqueue(pcmPlaybackChannel(first)) ||
+        !bank.queue(1).enqueue(pcmPlaybackChannel(first)) || bank.valid() ||
+        bank.renderOutput(1,acc,scratch,output)) return i32(11)
+    bank.queue(1).stop()
+    if (!bank.valid() || !bank.stop()) return i32(12)
+    // Reject borrowing a waveform that is another lane's mutable state.
+    val badWave=pcmRaw(nativeBufferAt(memory+320,32),nativeBufferAt(memory+284,20),8000,1,16)
+    val other=pcmChannelAt(nativeBufferAt(memory+352,32),8000)
+    if (!other.enqueue(badWave) || bank.enqueue(pcmPlaybackChannel(first),0) != 0 ||
+        bank.enqueue(pcmPlaybackChannel(other),1) != -1 || !bank.valid()) return i32(13)
+    if (pcmSourceQueuesAt(nativeBufferAt(memory+1,256),8,8000) != 0) return i32(14)
+    return i32(0)
+}

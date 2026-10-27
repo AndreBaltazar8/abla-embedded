@@ -1,0 +1,157 @@
+import "../src/esp32/psram/identity_p4_sequence.ab"
+import "abla/unsafe/native"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(128)
+var phase=0
+var failAt=0
+var failure=3
+var bad=false
+val fixture=(0xe8<<8)|(0xed<<16)|(0xd7<<24)|(0xba<<32)|(0x20<<40)|(0xdb<<48)
+var applying=false
+var chip=0
+var targetMHz=200
+var dropAt=0
+var readDummy=12
+fun p4PsramCommandStorageSafe(address: int,length: int): bool = address >= memory && address+length <= memory+128
+fun p4PsramCommandOwned(command: int,address: int,dummy: int,payload: NativeBuffer,length: int,work: NativeBuffer): int {
+    phase=phase+1
+    if (applying) {
+        val writing=phase >= 5 && phase <= 7
+        val step=if (phase > 7) phase-7 else phase
+        val expected=if (writing) (if (phase == 5) 8 else if (phase == 6) 4 else 0) else if (step == 1) 0 else if (step == 2) 2 else if (step == 3) 4 else 8
+        if (phase > 11 || command != (if (writing) 0xc0c0 else 0x4040) || address != expected ||
+            dummy != (if (writing) 0 else readDummy) || length != (if (writing || step < 3) 2 else 1) || work.addressValue() != memory) bad=true
+        if (phase == failAt) return failure
+        if (writing) {
+            val value=payload.load(0)
+            if (payload.load(1) != value) bad=true
+            if (phase != dropAt) {
+                if (address == 8) chip=(chip&(~(255<<48)))|(value<<48)
+                if (address == 4) chip=(chip&(~(255<<40)))|(value<<40)
+                if (address == 0) { chip=(chip&(~(255<<8)))|(value<<8); readDummy=p4PsramProfileRegisterDummy(targetMHz) }
+            }
+        } else {
+            payload.store(0,P4PsramIdentity(chip).mode(address))
+            if (length == 2) payload.store(1,P4PsramIdentity(chip).mode(address+1))
+        }
+        return 1
+    }
+    val expected=if (phase == 1) 0 else if (phase == 2) 2 else if (phase == 3) 4 else 8
+    if (phase > 4 || command != 0x4040 || address != expected || dummy != 12 || length != (if (phase < 3) 2 else 1) || work.addressValue() != memory) bad=true
+    if (phase == failAt) return failure
+    payload.store(0,P4PsramIdentity(fixture).mode(expected))
+    if (length == 2) payload.store(1,P4PsramIdentity(fixture).mode(expected+1))
+    return 1
+}
+@export("abla_p4_psram_identity_test")
+trusted fun identityTest(): i32 {
+    val work=nativeBufferAt(memory,100)
+    val scratch=nativeBufferAt(memory+101,2)
+    val result=p4PsramIdentifyOwned(12,scratch,work)
+    if (!result.recognized() || result != (fixture|1) || result.physicalBytes() != 33554432 || phase != 4 || bad) return i32(1)
+    failAt=1
+    while (failAt <= 4) {
+        failure=2
+        while (failure <= 4) {
+            phase=0
+            val partial=p4PsramIdentifyOwned(12,scratch,work)
+            val retained=if (failAt == 1) 0 else if (failAt == 2) fixture&0xffffff else if (failAt == 3) fixture&0xffffffffff else fixture&0xffffffffffff
+            if (partial.status() != 3 || partial.failedStage() != failAt || partial.transportStatus() != failure ||
+                ((partial|0)&0x00ffffffffffff00) != retained || phase != failAt || bad) return i32(2)
+            failure=failure+1
+        }
+        failAt=failAt+1
+    }
+    var vendor=0
+    while (vendor < 32) {
+        var density=0
+        while (density < 8) {
+            var kgd=0
+            while (kgd < 8) {
+                val raw=(vendor<<16)|((density|(kgd<<5))<<24)
+                val decoded=p4PsramClassifyIdentity(raw)
+                val validDensity=density == 1 || density == 3 || density == 5 || density == 6 || density == 7
+                val expected=if (vendor != 13 && vendor != 26) 4 else if (!validDensity) 5 else if (kgd != 6) 6 else 1
+                if (decoded.status() != expected || ((decoded|0)&(-256)) != raw) return i32(3)
+                kgd=kgd+1
+            }
+            density=density+1
+        }
+        vendor=vendor+1
+    }
+    var profile=0
+    while (profile < 4) {
+        val mhz=if (profile == 0) 20 else if (profile == 1) 80 else if (profile == 2) 200 else 250
+        val rd=if (profile < 2) 18 else if (profile == 2) 26 else 34
+        val wr=if (profile < 2) 8 else if (profile == 2) 12 else 16
+        if (p4PsramProfileReadDummy(mhz) != rd || p4PsramProfileRegisterDummy(mhz) != wr || p4PsramProfileWriteDummy(mhz) != wr ||
+            p4PsramProfileMpllMHz(mhz) != (if (profile == 1) 320 else if (profile == 3) 500 else 400)) return i32(4)
+        var old=0
+        while (old < 256) {
+            val mr0=p4PsramProfileMode0(mhz,old)
+            val mr4=p4PsramProfileMode4(mhz,old)
+            if (mr0 != (32|((if (profile < 2) 2 else if (profile == 2) 4 else 6)<<2)) ||
+                mr4 != ((old&31)|((if (profile < 2) 2 else if (profile == 2) 1 else 3)<<5)) ||
+                p4PsramProfileMode8(true,old,mhz) != ((old&48)|(if (profile == 3) 67 else 75)) ||
+                p4PsramProfileMode8(false,old,mhz) != ((old&48)|(if (profile == 3) 3 else 11))) return i32(5)
+            old=old+1
+        }
+        var width=0
+        while (width < 2) {
+            val raw=(p4PsramProfileMode0(mhz,192)<<8)|(13<<16)|(0xc6<<24)|(p4PsramProfileMode4(mhz,24)<<40)|(p4PsramProfileMode8(width != 0,176,mhz)<<48)
+            val identity=p4PsramClassifyIdentity(raw)
+            if (!identity.matchesProfile(mhz,width != 0) || identity.physicalBytes() != 67108864 || identity.matchesProfile(mhz,width == 0)) return i32(6)
+            if (P4PsramIdentity((identity|0)|(1<<40)).matchesProfile(mhz,width != 0)) return i32(7)
+            if (P4PsramIdentity((identity|0)|(64<<8)).matchesProfile(mhz,width != 0) ||
+                P4PsramIdentity((identity|0)|(128<<48)).matchesProfile(mhz,width != 0) ||
+                (mhz == 250 && P4PsramIdentity((identity|0)|(8<<48)).matchesProfile(mhz,width != 0))) return i32(10)
+            width=width+1
+        }
+        profile=profile+1
+    }
+    if (p4PsramProfileMode0(100,0) != -1 || p4PsramProfileMode4(80,256) != -1 || p4PsramProfileMode8(true,-1) != -1) return i32(8)
+    phase=0; failAt=0
+    if (p4PsramIdentifyOwned(65,scratch,work).status() != 2 || p4PsramIdentifyOwned(12,nativeBufferAt(memory+99,2),work).status() != 2 ||
+        p4PsramIdentifyOwned(12,scratch,nativeBufferAt(memory+1,100)).status() != 2 || p4PsramIdentifyOwned(12,nativeBufferAt(memory+127,2),work).status() != 2 || phase != 0) return i32(9)
+    applying=true
+    profile=0
+    while (profile < 4) {
+        targetMHz=if (profile == 0) 20 else if (profile == 1) 80 else if (profile == 2) 200 else 250
+        var width=0
+        while (width < 2) {
+            phase=0; chip=fixture|(7<<40); readDummy=12; bad=false
+            val applied=p4PsramApplyProfileOwned(targetMHz,width != 0,12,scratch,work)
+            if (!applied.matchesProfile(targetMHz,width != 0) || applied != (chip|1) || phase != 11 || bad || (applied.mode(4)&7) != 0) return i32(11)
+            width=width+1
+        }
+        profile=profile+1
+    }
+    // All initial reads, individual writes and post-write reads stop on error.
+    targetMHz=200; failAt=1
+    while (failAt <= 11) {
+        failure=2
+        while (failure <= 4) {
+            phase=0; chip=fixture; readDummy=12; bad=false
+            val stopped=p4PsramApplyProfileOwned(200,false,12,scratch,work)
+            if (stopped.status() != 3 || stopped.failedStage() != (if (failAt > 7) failAt-7 else failAt) ||
+                stopped.transportStatus() != failure || phase != failAt || bad) return i32(12)
+            if (failAt >= 5 && failAt <= 7 && ((stopped|0)&0x00ffffffffffff00) != fixture) return i32(13)
+            failure=failure+1
+        }
+        failAt=failAt+1
+    }
+    failAt=0; dropAt=5
+    while (dropAt <= 7) {
+        phase=0; chip=fixture|(7<<40); readDummy=12; bad=false
+        val mismatch=p4PsramApplyProfileOwned(200,false,12,scratch,work)
+        if (mismatch.status() != 7 || phase != 11 || bad) return i32(14)
+        dropAt=dropAt+1
+    }
+    dropAt=0; phase=0; chip=(fixture&(~(31<<16)))|(26<<16); readDummy=12; bad=false
+    if (p4PsramApplyProfileOwned(200,false,12,scratch,work).status() != 8 || phase != 4 || bad) return i32(15)
+    phase=0
+    if (p4PsramApplyProfileOwned(100,false,12,scratch,work).status() != 2 ||
+        p4PsramApplyProfileOwned(200,false,12,nativeBufferAt(memory+99,2),work).status() != 2 || phase != 0) return i32(16)
+    return i32(0)
+}

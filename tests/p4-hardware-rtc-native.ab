@@ -1,0 +1,79 @@
+import "../src/esp32/i2c/hardware_provider_p4.ab"
+import "../src/m5stack/rtc_open.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(72)
+val chip=nativeStaticAllocate(256)
+var transfers=0
+var failedTransfer=0
+var bad=false
+trusted fun p4I2cSessionClockOpen(port: int,source: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionInitialize(port: int,filter: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionPinsOpen(r: NativeBuffer,port: int,sda: int,scl: int,pullup: bool,layout: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionClockClose(token: int): int = 4102
+trusted fun p4I2cSessionPinsClose(r: NativeBuffer): int = 2
+trusted fun p4I2cSessionTiming(port: int,t: P4I2cTiming): int {
+    if (port != 0 || t != esp32p4I2cTiming(u32(40000000),u32(400000))) bad=true
+    return 1
+}
+trusted fun p4I2cSessionTransfer(port: int,address: int,output: NativeBuffer,written: int,input: NativeBuffer,read: int,budget: u32,prefix: int): int {
+    transfers=transfers+1
+    if (p4HardwareLoad(0) != 1 || port != 0 || address != 50 || prefix < 0 ||
+        prefix+written > 256 || prefix+read > 256 || budget != u32(400000000)) { bad=true;return 7 }
+    if (transfers == failedTransfer) return 3
+    val regs=nativeBufferAt(chip,256)
+    var i=0
+    while (i < written) { regs.store(prefix+i,output.load(i));i=i+1 }
+    i=0
+    while (i < read) { input.store(i,regs.load(prefix+i));i=i+1 }
+    return 1
+}
+trusted fun seed(): void {
+    val r=nativeBufferAt(storage,72);val regs=nativeBufferAt(chip,256)
+    var i=0
+    while (i < 72) { r.storeU32(i,0);i=i+4 }
+    i=0
+    while (i < 256) { regs.store(i,0);i=i+1 }
+    r.storeU32(0,0x49324234);r.storeU32(4,1);r.storeU32(16,4097);r.storeU32(24,1)
+    regs.store(31,0x85)
+    transfers=0;failedTransfer=0;bad=false;return
+}
+@export("abla_p4_hardware_rtc_test")
+trusted fun test(): i32 {
+    var boardIndex=0
+    while (boardIndex < 3) {
+        val board=if (boardIndex == 0) m5BoardCoreP4X else if (boardIndex == 1) m5BoardTab5 else m5BoardTab5X
+        seed()
+        val bus=i2cHardwareBindOwned(nativeBufferAt(storage,72),u32(40000000),u32(400000000))
+        val opened=m5RtcOpen(bus,board)
+        if (opened.status() != 1 || bad) return i32(1)
+        val rtc=opened.rtc();val regs=nativeBufferAt(chip,256)
+        if (rtc.kind() != m5RtcRx8130 || transfers != 4 || regs.load(31) != 0xb5 || regs.load(48) != 0 || regs.load(30) != 0) return i32(2)
+        // Leap-day BCD round trip using actual stack-buffer driver calls.
+        val value=rtcDateTime(2024,2,29,4,23,58,59)
+        if (!rtc.setDateTime(value)) return i32(3)
+        val back=rtc.dateTime()
+        if (!back.calendarValid() || back.year() != 2024 || back.month() != 2 || back.day() != 29 ||
+            back.weekday() != 4 || back.hour() != 23 || back.minute() != 58 || back.second() != 59 || bad) return i32(4)
+        val before=transfers
+        if (rtc.setDateTime(rtcDateTime(2023,2,29,3,12,0,0)) || transfers != before) return i32(5)
+        regs.store(16,0x7a)
+        if (rtc.dateTime().calendarValid()) return i32(6)
+        failedTransfer=transfers+1
+        if (rtc.dateTime().calendarValid() || nativeBufferAt(storage,72).loadU32(4) != 3) return i32(7)
+        val failed=transfers
+        if (rtc.dateTime().calendarValid() || transfers != failed || !rtc.close() || !bus.close() || bad) return i32(8)
+        // Every begin transaction failure releases the driver slot without
+        // masking the fault-latched provider/session underneath it.
+        var failure=1
+        while (failure <= 4) {
+            seed();failedTransfer=failure
+            val failedBus=i2cHardwareBindOwned(nativeBufferAt(storage,72),u32(40000000),u32(400000000))
+            val result=m5RtcOpen(failedBus,board)
+            if (result.status() != 3 || transfers != failure || result.handle() != 0 || !failedBus.close() || bad) return i32(9)
+            failure=failure+1
+        }
+        boardIndex=boardIndex+1
+    }
+    return i32(0)
+}

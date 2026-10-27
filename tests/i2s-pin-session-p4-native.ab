@@ -1,0 +1,128 @@
+import "../src/esp32/i2s/pin_session_p4_sequence.ab"
+import "../src/esp32/gpio_p4_sequence.ab"
+import "abla/build"
+val registers=nativeStaticAllocate(4608)
+val record=nativeStaticAllocate(64)
+var writes=0
+var drop=0
+var held=false
+trusted fun mapped(offset: int): int = if (offset >= 0x4b008 && offset <= 0x4b044) 4352+offset-0x4b008 else offset
+trusted fun p4GpioRead(offset: int): u32 = u32(nativeBufferAt(registers,4608).loadU32(mapped(offset)))
+trusted fun p4GpioWrite(offset: int,value: u32): void {
+    writes=writes+1
+    if (writes == drop) return
+    val r=nativeBufferAt(registers,4608)
+    if (offset == 8 || offset == 20 || offset == 36 || offset == 48) r.storeU32(offset-4,int(p4GpioRead(offset-4)|value))
+    else if (offset == 12 || offset == 24 || offset == 40 || offset == 52) r.storeU32(offset-8,int(p4GpioRead(offset-8)&(u32(0xffffffff)^value)))
+    else r.storeU32(mapped(offset),int(value))
+    return
+}
+trusted fun p4GpioHoldRead(address: int): u32 = if (held) u32(0xffffffff) else u32(0)
+trusted fun p4GpioHoldWrite(address: int,value: u32): void { return }
+trusted fun p4PinSnapshotRead(address: int): int = int(p4GpioRead(address-0x500e0000))
+trusted fun p4PinSnapshotWrite(address: int,value: int): void { p4GpioWrite(address-0x500e0000,u32(value));return }
+trusted fun p4I2sPinRead(offset: int): u32 = p4GpioRead(offset)
+trusted fun p4I2sPinWrite(offset: int,value: u32): void { p4GpioWrite(offset,value);return }
+trusted fun p4I2sPinField(offset: int,mask: u32,value: u32): bool = p4GpioField(offset,mask,value)
+trusted fun p4I2sPinConfigure(pin: int,input: bool): int = esp32P4GpioConfigureOwned(pin,false,false,false,input,0)
+trusted fun clear(): void {
+    var offset=0
+    while (offset < 4608) { nativeBufferAt(registers,4608).storeU32(offset,0xffffffff);offset=offset+4 }
+    nativeBufferAt(record,64).storeU32(0,0)
+    writes=0;drop=0;held=false;return
+}
+@export("abla_i2s_pin_session_p4_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(record,64)
+    var layout=1
+    while (layout <= 3) {
+        var port=0
+        while (port < 3) {
+            var profile=0
+            while (profile < 64) {
+                var first=0
+                while (first < 55) {
+                    clear()
+                    val tx=profile < 32
+                    val flags=profile&31
+                    val data=first;val ws=(first+1)%55;val bclk=(first+2)%55
+                    val mclk=if ((flags&2) == 0 && (first&1) == 0) -1 else (first+3)%55
+                    if (esp32p4I2sPinsOpenOwned(r,port,tx,mclk,bclk,ws,data,flags,layout,true) != 1) return i32(1)
+                    val before=writes
+                    if (esp32p4I2sPinsOpenOwned(r,port,tx,mclk,bclk,ws,data,flags,layout,true) != 0 ||
+                        esp32p4I2sPinsCloseOwned(r,false) != 0 || writes != before) return i32(2)
+                    if (esp32p4I2sPinsCloseOwned(r,true) != 2) return i32(3)
+                    var index=0
+                    while (index < r.loadU32(8)) {
+                        val pin=if (index == 0) data else if (index == 1) ws else if (index == 2) bclk else mclk
+                        val now=esp32p4GpioSnapshotOwned(pin,layout,true)
+                        if (now != p4I2sSavedPad(r,index)) return i32(4)
+                        val signal=esp32p4I2sPinSignal(port,tx,index)
+                        if (p4I2sPinRead(344+signal*4) != u32(0xffffffff)) return i32(5)
+                        index=index+1
+                    }
+                    val after=writes
+                    if (esp32p4I2sPinsCloseOwned(r,true) != 2 || writes != after) return i32(6)
+                    first=first+1
+                }
+                profile=profile+1
+            }
+            port=port+1
+        }
+        layout=layout+2
+    }
+    // Every setup write fault: regardless of whether an unchanged write can
+    // be dropped harmlessly, close must restore the complete captured state.
+    clear()
+    if (esp32p4I2sPinsOpenOwned(r,0,false,2,6,4,3,3,3,true) != 1) return i32(7)
+    val total=writes
+    var fault=1
+    while (fault <= total) {
+        clear();drop=fault
+        val opened=esp32p4I2sPinsOpenOwned(r,0,false,2,6,4,3,3,3,true)
+        if (opened != 1 && opened != 3) return i32(8)
+        drop=0
+        if (esp32p4I2sPinsCloseOwned(r,true) != 2) return i32(9)
+        var index=0
+        while (index < 4) {
+            val saved=p4I2sSavedPad(r,index)
+            if (esp32p4GpioSnapshotOwned(saved.pin(),3,true) != saved) return i32(10)
+            index=index+1
+        }
+        fault=fault+1
+    }
+    clear()
+    if (esp32p4I2sPinsOpenOwned(r,0,false,2,6,4,3,3,1,true) != 1) return i32(16)
+    val closeStart=writes
+    if (esp32p4I2sPinsCloseOwned(r,true) != 2) return i32(17)
+    val closeWrites=writes-closeStart
+    fault=1
+    while (fault <= closeWrites) {
+        clear()
+        if (esp32p4I2sPinsOpenOwned(r,0,false,2,6,4,3,3,1,true) != 1) return i32(18)
+        drop=writes+fault
+        val closed=esp32p4I2sPinsCloseOwned(r,true)
+        if (closed != 2 && closed != 3) return i32(19)
+        drop=0
+        if (esp32p4I2sPinsCloseOwned(r,true) != 2) return i32(20)
+        var index=0
+        while (index < 4) {
+            val saved=p4I2sSavedPad(r,index)
+            if (esp32p4GpioSnapshotOwned(saved.pin(),1,true) != saved ||
+                p4I2sPinRead(344+esp32p4I2sPinSignal(0,false,index)*4) != u32(0xffffffff)) return i32(21)
+            index=index+1
+        }
+        fault=fault+1
+    }
+    clear()
+    if (esp32p4I2sPinsOpenOwned(r,0,false,2,6,4,3,3,1,true) != 1) return i32(11)
+    drop=writes+1
+    if (esp32p4I2sPinsCloseOwned(r,true) != 3 || r.loadU32(12) != 16 || r.loadU32(4) != 3) return i32(12)
+    drop=0;held=true
+    if (esp32p4I2sPinsCloseOwned(r,true) != 3 || r.loadU32(12) != 32) return i32(13)
+    held=false
+    if (esp32p4I2sPinsCloseOwned(r,true) != 2) return i32(14)
+    clear();held=true
+    if (esp32p4I2sPinsOpenOwned(r,0,true,2,6,4,3,0,1,true) != 0 || writes != 0 || r.loadU32(0) != 0) return i32(15)
+    return i32(0)
+}

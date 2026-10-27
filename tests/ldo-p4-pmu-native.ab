@@ -1,0 +1,102 @@
+import "../src/esp32/ldo_pmu_p4_sequence.ab"
+import "../src/esp32/ldo_owner_p4_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var control=u32(0)
+var analog=u32(0)
+var regulator=u32(0)
+var offset=440
+var reads=0
+var writes=0
+var efuseReads=0
+var drop=-1
+var bad=false
+fun p4LdoEfuseRead(address: int): u32 { efuseReads=efuseReads+1; if (address != 76) bad=true; return u32(0) }
+fun p4LdoPmuRead(address: int): u32 {
+    reads=reads+1
+    if (address == offset) return control
+    if (address == offset+4) return analog
+    if (address == 40) return regulator
+    bad=true
+    u32(0)
+}
+fun p4LdoPmuWrite(address: int,value: u32): void {
+    if (address == offset && (value&u32(64)) != u32(0)) bad=true
+    val discard=writes == drop
+    writes=writes+1
+    if (!discard) {
+        if (address == offset) control=value
+        else if (address == offset+4) analog=value
+        else if (address == 40) regulator=value
+        else bad=true
+    }
+    return
+}
+@export("abla_ldo_p4_pmu_test")
+trusted fun testPmu(): i32 {
+    var channel=1
+    while (channel <= 4) {
+        offset=if (channel == 1) 440 else if (channel == 2) 464 else if (channel == 3) 448 else 472
+        if (esp32P4LdoControlOffset(channel) != offset) return i32(1)
+        var revIndex=0
+        while (revIndex < 4) {
+            val revision=if (revIndex == 0) 0 else if (revIndex == 1) 99 else if (revIndex == 2) 100 else 300
+            var profile=0
+            while (profile < 10) {
+                val pattern=if (profile%2 == 0) u32(0) else u32(4294967295)
+                val mv=if (profile/2 == 0) 500 else if (profile/2 == 1) 1800 else if (profile/2 == 2) 2500 else if (profile/2 == 3) 2700 else 3300
+                control=pattern&u32(4294967039); analog=pattern; regulator=pattern&u32(4290772991)
+                writes=0; efuseReads=0
+                val plan=esp32P4LdoSelectVoltage(channel,mv,false,0,0,0,0,0)
+                val result=esp32P4LdoStartOwned(channel,mv,revision)
+                val special=channel == 1 && revision >= 100
+                val expectedControl=(pattern&u32(4294947007))|u32(384)|(if (mv == 3300) u32(16384) else u32(0))
+                val expectedAnalog=(pattern&u32(142606335))|(u32(plan.dref())<<u32(28))|(u32(plan.multiplier())<<u32(23))|u32(67108864)
+                if (result != 1 || control != expectedControl || analog != expectedAnalog ||
+                    writes != (if (special) 4 else 3) || efuseReads != 1 || bad) return i32(2)
+                if (special && regulator != ((pattern&u32(4287102975))|u32(4194304))) return i32(3)
+                writes=0; efuseReads=0
+                if (esp32P4LdoStartOwned(channel,mv,revision) != 3 || writes != 0 || efuseReads != 0) return i32(4)
+                if (esp32P4LdoStopOwned(channel,revision) != 1 || (control&u32(320)) != u32(0) ||
+                    (special && (regulator&u32(7864320)) != u32(0)) || bad) return i32(5)
+                profile=profile+1
+            }
+            revIndex=revIndex+1
+        }
+        channel=channel+1
+    }
+    offset=440; control=u32(0); regulator=u32(4194304); writes=0; efuseReads=0
+    if (esp32P4LdoStartOwned(1,1800,100) != 3 || writes != 0 || efuseReads != 0) return i32(6)
+    // Drop analog, VO1 extra-enable, or final-enable writes: caller retains
+    // ownership and receives failure, never a fabricated successful startup.
+    drop=1
+    while (drop <= 3) {
+        control=u32(0); analog=u32(0); regulator=u32(0); writes=0
+        if (esp32P4LdoStartOwned(1,1800,100) != 4) return i32(7)
+        drop=drop+1
+    }
+    drop=0; control=u32(256); writes=0
+    if (esp32P4LdoStopOwned(1,0) != 4) return i32(8)
+    reads=0; writes=0; efuseReads=0
+    if (esp32P4LdoStartOwned(5,2500,100) != 2 || esp32P4LdoStartOwned(3,2701,100) != 2 ||
+        esp32P4LdoStopOwned(1,-1) != 2 || reads != 0 || writes != 0 || efuseReads != 0 || bad) return i32(9)
+    offset=448; control=u32(0); analog=u32(0); regulator=u32(0); writes=0; drop=-1
+    val rail=esp32P4LdoOpenOwned(3,2500,300)
+    if (!rail.ready() || rail.channel() != 3 || rail.revision() != 300) return i32(10)
+    val refused=esp32P4LdoOpenOwned(3,2500,300)
+    val count=writes
+    if (refused.status() != 3 || refused.ownsRail() || refused.closeOwned() != refused || writes != count) return i32(11)
+    drop=writes
+    val partial=rail.closeOwned()
+    if (partial.status() != 4 || !partial.ownsRail()) return i32(12)
+    drop=-1
+    val closed=partial.closeOwned()
+    val after=writes
+    if (closed != 0 || closed.closeOwned() != 0 || writes != after || (control&u32(256)) != u32(0)) return i32(13)
+    control=u32(0); analog=u32(0); writes=0; drop=1
+    val failed=esp32P4LdoOpenOwned(3,2500,300)
+    if (failed.status() != 4 || !failed.ownsRail()) return i32(14)
+    drop=-1
+    if (failed.closeOwned() != 0 || bad) return i32(15)
+    i32(0)
+}

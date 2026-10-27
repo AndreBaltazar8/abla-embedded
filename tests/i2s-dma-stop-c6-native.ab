@@ -1,0 +1,101 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/dma_stop_c6_sequence.ab"
+var channel=0
+var tx=false
+var conf=u32(0)
+var link=u32(0)
+var delay=0
+var updateDelay=0
+var stops=0
+var writes=0
+var drop=false
+var fifoEmpty=true
+var enabled=true
+var bad=false
+trusted fun c6GdmaDescriptorRead(at: int): u32 { bad=true;return u32(0) }
+trusted fun c6GdmaDescriptorWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c6GdmaDescriptorFence(): void { bad=true;return }
+trusted fun c6I2sClockRead(at: int): u32 = if (at == 0) u32(1) else u32(0x400000)
+trusted fun c6I2sClockWrite(at: int,v: u32): void { bad=true;return }
+trusted fun c6I2sRead(at: int): u32 {
+    if (at == (if (tx) 0x24 else 0x20)) {
+        if ((conf&u32(256)) != u32(0)) { if (updateDelay == 0) conf=conf&~u32(256) else updateDelay=updateDelay-1 }
+        return conf
+    }
+    if (at == 0x6c) return u32(1)
+    return u32(0)
+}
+trusted fun c6I2sWrite(at: int,v: u32): void {
+    writes=writes+1
+    if (at != (if (tx) 0x24 else 0x20) || v != (conf&~u32(4))) bad=true
+    if (!drop) conf=v
+    return
+}
+trusted fun c6GdmaBusRead(): u32 = if (enabled) u32(1) else u32(0)
+trusted fun c6GdmaBusWrite(v: u32): void { bad=true;return }
+trusted fun c6GdmaRead(at: int): u32 {
+    if (at == 0x64) return u32(8)
+    val base=0x70+channel*192+(if (tx) 96 else 0)
+    if (at == base+16) {
+        if ((link&u32(if (tx) 0x100000 else 0x200000)) != u32(0)) { if (delay == 0) link=u32(if (tx) 0x800000 else 0x1000000) else delay=delay-1 }
+        return link
+    }
+    if (at == base+8) return if (fifoEmpty) u32(2) else u32(0)
+    return u32(0)
+}
+trusted fun c6GdmaWrite(at: int,v: u32): void {
+    writes=writes+1;stops=stops+1
+    if (at != 0x80+channel*192+(if (tx) 96 else 0) || (conf&u32(0x104)) != u32(0) || v != u32(if (tx) 0x100000 else 0x200000)) bad=true
+    link=v;return
+}
+trusted fun initialize(r: NativeBuffer,q: NativeBuffer,pending: bool): void {
+    var at=0
+    while (at < 72) { r.storeU32(at,0);at=at+4 }
+    at=0
+    while (at < 24) { q.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0x43364944);r.storeU32(4,if (pending) 5 else 1);r.storeU32(8,123);r.storeU32(12,channel);r.storeU32(16,if (tx) 1 else 0)
+    r.storeU32(20,0x40800000);r.storeU32(24,1);r.storeU32(28,0x40810000);r.storeU32(32,64);r.storeU32(36,64)
+    r.storeU32(52,if (pending) 1 else 3)
+    if (pending) {
+        val update=(0x80000<<16)|512|(if (tx) 256 else 0)|5
+        r.storeU32(44,update|0);r.storeU32(48,update>>>32)
+    }
+    conf=u32(if (pending) 0x80100 else 0x80004);link=u32(if (pending) (if (tx) 0x800000 else 0x1000000) else 0)
+    stops=0;writes=0;bad=false;enabled=true;drop=false;fifoEmpty=true;return
+}
+@export("abla_i2s_dma_stop_c6_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(96)
+    val r=nativeBufferAt(storage,72);val q=nativeBufferAt(storage+72,24)
+    while (channel < 3) {
+        var direction=0
+        while (direction < 2) {
+            tx=direction == 0
+            var lag=0
+            while (lag < 32) {
+                initialize(r,q,false);delay=lag
+                val result=c6I2sDmaStopOwned(r,q,1,true)
+                if (result != (if (lag == 0) 1 else 5) || stops != 1 || r.loadU32(8) != 123) return i32(1)
+                enabled=false
+                if (c6I2sDmaStopOwned(r,q,1,true) != 4 || stops != 1) return i32(2)
+                enabled=true;fifoEmpty=false
+                if (c6I2sDmaStopOwned(r,q,33,true) != 8 || stops != 1) return i32(3)
+                fifoEmpty=true
+                if (c6I2sDmaStopOwned(r,q,1,true) != 1 || stops != 1 || r.loadU32(8) != 123 || bad) return i32(4)
+                initialize(r,q,true);updateDelay=lag
+                val pending=c6I2sDmaStopOwned(r,q,1,true)
+                if (pending != (if (lag == 0) 1 else 5) || stops != 0) return i32(5)
+                if (c6I2sDmaStopOwned(r,q,33,true) != 1 || writes != 0 || r.loadU32(4) != 7 || bad) return i32(6)
+                lag=lag+1
+            }
+            initialize(r,q,false);drop=true
+            if (c6I2sDmaStopOwned(r,q,1,true) != 4 || stops != 0) return i32(7)
+            drop=false;delay=0
+            if (c6I2sDmaStopOwned(r,q,1,true) != 1 || stops != 1 || bad) return i32(8)
+            direction=direction+1
+        }
+        channel=channel+1
+    }
+    return i32(0)
+}

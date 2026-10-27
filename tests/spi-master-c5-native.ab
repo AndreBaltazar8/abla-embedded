@@ -1,0 +1,140 @@
+import "../src/esp32/spi/master_c5_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c5GpioRead(address: int): u32 {
+    if (address == 0x600960f0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960f4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c5GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C5GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C5GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+
+
+
+val spi=nativeStaticAllocate(256)
+var bus=u32(4)
+var functional=u32(0x100000)
+var spiWrites=0
+var spiDrop=0
+var pending=0
+var stall=false
+var active=false
+fun c5SpiRead(address: int): u32 {
+    if (address == 0x600960c4) return bus
+    if (address == 0x600960c8) return functional
+    if (address == 0x60081000) {
+        if (active) return u32(1<<24)
+        if (pending > 0) { if (!stall) pending=pending-1;return u32(1<<23) }
+        return u32(0)
+    }
+    return u32(nativeAddressLoadU32(spi,address-0x60081000))
+}
+fun c5SpiWrite(address: int,value: u32): void {
+    spiWrites=spiWrites+1
+    if (spiWrites == spiDrop) return
+    if (address == 0x600960c4) { bus=value;return }
+    if (address == 0x600960c8) { functional=value;return }
+    if (address == 0x60081000) {
+        if (value != u32(1<<23)) bad=true
+        pending=1;return
+    }
+    nativeAddressStoreU32(spi,address-0x60081000,int(value));return
+}
+fun initialize(): void {
+    seed()
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(spi,at,0);at=at+4 }
+    bus=u32(4);functional=u32(0x100000);spiWrites=0;spiDrop=0;pending=0;stall=false;active=false;return
+}
+fun openMaster(mode: int): Esp32C5SpiMaster =
+    esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,160000000,2,1,8,mode,4,true)
+@export("abla_spi_master_c5_test")
+trusted fun testMaster(): i32 {
+    var mode=0
+    while (mode < 4) {
+        initialize()
+        var owner=openMaster(mode)
+        if (!owner.ready() || bad || c5GpioRead(0x60091034) != u32((1<<9)|(1<<7)|(1<<25))) return i32(1)
+        if (nativeAddressLoadU32(spi,32) != (63|(if (mode >= 2) 1<<29 else 0)) ||
+            nativeAddressLoadU32(spi,16) != (if (mode == 1 || mode == 2) 512 else 0)) return i32(2)
+        val total=spiWrites
+        active=true
+        val gp=writes;val sp=spiWrites
+        if (owner.closeOwned(true).status() != 9 || writes != gp || spiWrites != sp) return i32(3)
+        active=false
+        if (owner.closeOwned(true) != 0 || c5GpioRead(0x60091034) != u32(0) ||
+            (bus&u32(1)) != u32(0) || (functional&u32(1<<22)) != u32(0) || bad) return i32(4)
+        var failed=1
+        while (failed <= total) {
+            initialize();spiDrop=failed;owner=openMaster(mode)
+            spiDrop=0
+            if (owner.closeOwned(true) != 0 || c5GpioRead(0x60091034) != u32(0) ||
+                (bus&u32(1)) != u32(0) || (functional&u32(1<<22)) != u32(0) || bad) return i32(5)
+            failed=failed+1
+        }
+        initialize();drop=2;owner=openMaster(mode)
+        if (owner.status() != 8) return i32(6)
+        drop=0
+        if (owner.closeOwned(true) != 0 || c5GpioRead(0x60091034) != u32(0) || bad) return i32(7)
+        mode=mode+1
+    }
+    initialize();stall=true
+    var owner=openMaster(0)
+    if (owner.status() != 7 || writes != 0 || owner.closeOwned(true).status() != 10) return i32(8)
+    stall=false;pending=0
+    if (owner.closeOwned(true) != 0 || bad) return i32(9)
+    initialize()
+    nativeAddressStoreU32(spi,60,0x20000)
+    owner=openMaster(0)
+    if (owner.status() != 4 || writes != 0 || nativeAddressLoadU32(spi,60) != 0x20000 ||
+        owner.closeOwned(true) != 0) return i32(10)
+    var borrowed=0
+    while (borrowed < 4) {
+        initialize();bus=bus|u32(borrowed&1)
+        functional=u32(0x300000)|(if ((borrowed&2) != 0) u32(1<<22) else u32(0))
+        owner=esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,120000000,2,1,2,0,4,true)
+        if (!owner.ready() || owner.closeOwned(false) != owner) return i32(11)
+        if (owner.closeOwned(true) != 0 || (bus&u32(1)) != u32(borrowed&1) ||
+            ((functional>>u32(22))&u32(1)) != u32((borrowed>>1)&1) ||
+            ((functional>>u32(20))&u32(3)) != u32(3) || bad) return i32(12)
+        borrowed=borrowed+1
+    }
+    initialize()
+    if (esp32C5SpiMasterOpenOwned(spiPins(7,8,9),29,160000000,2,1,2,0,4,true).status() != 2 ||
+        esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,160000000,2,1,2,0,4,false).status() != 2 ||
+        writes != 0 || spiWrites != 0) return i32(13)
+    return i32(0)
+}
+

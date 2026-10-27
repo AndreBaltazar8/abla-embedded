@@ -1,0 +1,162 @@
+import "../src/esp32/power/cpll_p4_sequence.ab"
+import "abla/build"
+val cpllRecord=nativeStaticAllocate(36)
+val cpllBus=nativeStaticAllocate(64)
+val cpllChip=nativeStaticAllocate(256)
+var cpllRoot=0x04000004
+var cpllDiv=0
+var cpllControl=0x200008
+var cpllDone=true
+var cpllClock=true
+var cpllHart=u32(0)
+var cpllTicks=u32(0xffffff80)
+var cpllTickStep=u32(200)
+var cpllWrites=0
+var cpllDrop=0
+var cpllAnalogWrites=0
+var cpllAnalogDrop=0
+var cpllStarts=0
+var cpllStops=0
+var cpllBad=false
+var cpllClockInspection=false
+var cpllPower=true
+var cpllGlobalGate=true
+var cpllPowerCommands=0
+var cpllGateWrites=0
+var cpllGateDrop=0
+var cpllPowerFences=0
+fun p4CpllFence(): void { cpllPowerFences=cpllPowerFences+1;return }
+fun p4CpllHart(): u32 = cpllHart
+fun p4CpllCycle(): u32 { cpllTicks=cpllTicks+cpllTickStep;return cpllTicks }
+fun p4AnalogClockReady(): bool = cpllClock
+fun p4AnalogRead(offset: int): int = nativeBufferAt(cpllBus,64).loadU32(offset)
+fun p4AnalogWrite(offset: int,value: int): void {
+    cpllAnalogWrites=cpllAnalogWrites+1
+    if (cpllAnalogWrites == cpllAnalogDrop) return
+    val bus=nativeBufferAt(cpllBus,64)
+    if (offset == 0) {
+        if (!cpllPower) { bus.storeU32(0,1<<25);return }
+        if ((value&255) != 0x67 || ((cpllControl&8) != 0 && (!cpllClockInspection || (value&(1<<24)) != 0)) || bus.loadU32(28) != 0xaa000000 || bus.loadU32(32) != 0xbb000800) cpllBad=true
+        val index=(value>>>8)&255
+        if (index != 2 && index != 3 && index != 6) cpllBad=true
+        if ((value&(1<<24)) != 0) nativeBufferAt(cpllChip,256).store(index,(value>>>16)&255)
+        bus.storeU32(0,nativeBufferAt(cpllChip,256).load(index)<<16)
+    } else bus.storeU32(offset,value)
+    return
+}
+fun p4CpllRead(address: int): int {
+    if (address == 0x50111040) return cpllRoot
+    if (address == 0x500e6004) return cpllDiv
+    if (address == 0x500e60bc) return cpllControl|(if (cpllDone && cpllPower && cpllGlobalGate) 4 else 0)
+    cpllBad=true;return 0
+}
+fun p4CpllWrite(address: int,value: int): void {
+    if (address == 0x501150cc) {
+        if (value != (if (cpllPowerCommands == 0) 0x08800000 else 0x00020000) || cpllPowerCommands >= 2) cpllBad=true
+        if (value == 0x08800000) cpllPower=true else if (value == 0x00020000) {
+            if (!cpllPower) cpllBad=true
+            cpllGlobalGate=true
+        } else cpllBad=true
+        cpllPowerCommands=cpllPowerCommands+1;return
+    }
+    if (address == 0x50111040) {
+        cpllGateWrites=cpllGateWrites+1
+        if ((value&0xfbffffff) != (cpllRoot&0xfbffffff) || (value&0x04000000) == 0 || cpllPowerCommands != 2) cpllBad=true
+        if (cpllGateWrites != cpllGateDrop) cpllRoot=value
+        return
+    }
+    cpllWrites=cpllWrites+1
+    if (address != 0x500e60bc || (value&0xfffffff3) != 0x200000) cpllBad=true
+    if (cpllWrites == cpllDrop) return
+    if ((value&8) == 0) cpllStarts=cpllStarts+1
+    else cpllStops=cpllStops+1
+    cpllControl=value&0xfffffffb;return
+}
+fun seedCpll(): NativeBuffer {
+    cpllClockInspection=false
+    cpllPower=true;cpllGlobalGate=true;cpllPowerCommands=0;cpllGateWrites=0;cpllGateDrop=0;cpllPowerFences=0
+    cpllRoot=0x04000004;cpllDiv=0;cpllControl=0x200008;cpllDone=true;cpllClock=true;cpllHart=u32(0)
+    cpllTicks=u32(0xffffff80);cpllTickStep=u32(200);cpllWrites=0;cpllDrop=0;cpllAnalogWrites=0;cpllAnalogDrop=0;cpllStarts=0;cpllStops=0;cpllBad=false
+    val r=nativeBufferAt(cpllRecord,36)
+    var i=0
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(32,0x1234abcd)
+    val bus=nativeBufferAt(cpllBus,64)
+    bus.storeU32(0,0);bus.storeU32(4,0);bus.storeU32(28,0xaaffffff);bus.storeU32(32,0xbbffffff);bus.storeU32(52,1)
+    i=0
+    while (i < 256) { nativeBufferAt(cpllChip,256).store(i,0xa5);i=i+1 }
+    return r
+}
+@export("abla_cpll_p4_test")
+trusted fun cpllTest(): i32 {
+    var mode=0
+    while (mode < 16) {
+        val revision=if ((mode>>>2) == 0) 0 else if ((mode>>>2) == 1) 1 else if ((mode>>>2) == 2) 100 else 300
+        val mhz=if ((mode&1) == 0) 360 else 400
+        var fault=0
+        while (fault <= 26) {
+            val r=seedCpll();cpllHart=u32((mode>>>1)&1)
+            if (fault <= 24) cpllAnalogDrop=fault else cpllDrop=fault-24
+            val result=esp32p4CpllBeginOwned(r,mhz,revision,3,true)
+            if (result != 1 && result != 4 && result != 5) return i32(1)
+            cpllDrop=0;cpllAnalogDrop=0
+            if (esp32p4CpllContinueOwned(r,3,true) != 1 || cpllBad || cpllStarts != 1 || cpllStops != 1 || r.loadU32(32) != 0x1234abcd) return i32(2)
+            var index=0
+            while (index < 256) {
+                val expected=if (index == 2) 0x50 else if (index == 3) (if (revision == 0) (if (mhz == 400) 6 else 5) else (if (mhz == 400) 10 else 9)) else if (index == 6) 0x73 else 0xa5
+                if (nativeBufferAt(cpllChip,256).load(index) != expected) return i32(3)
+                index=index+1
+            }
+            val count=cpllWrites+cpllAnalogWrites
+            if (esp32p4CpllContinueOwned(r,3,true) != 1 || count != cpllWrites+cpllAnalogWrites) return i32(4)
+            fault=fault+1
+        }
+        mode=mode+1
+    }
+    val pending=seedCpll();cpllDone=false
+    if (esp32p4CpllBeginOwned(pending,400,300,3,true) != 6 || pending.loadU32(4) != 5 || cpllStarts != 1 || cpllStops != 0) return i32(5)
+    val count=cpllWrites+cpllAnalogWrites
+    if (esp32p4CpllContinueOwned(pending,3,true) != 6 || count != cpllWrites+cpllAnalogWrites) return i32(6)
+    cpllHart=u32(1)
+    if (esp32p4CpllContinueOwned(pending,3,true) != 3 || count != cpllWrites+cpllAnalogWrites) return i32(7)
+    cpllHart=u32(0);cpllDone=true;cpllTickStep=u32(0)
+    if (esp32p4CpllContinueOwned(pending,3,true) != 6 || pending.loadU32(4) != 6 || cpllStops != 0) return i32(8)
+    cpllTicks=cpllTicks+u32(399)
+    if (esp32p4CpllContinueOwned(pending,3,true) != 6 || cpllStops != 0) return i32(9)
+    cpllTicks=cpllTicks+u32(1)
+    if (esp32p4CpllContinueOwned(pending,3,true) != 1 || cpllStarts != 1 || cpllStops != 1) return i32(10)
+    var invalid=0
+    while (invalid < 6) {
+        val r=seedCpll()
+        if (invalid == 0) cpllRoot=0x04000005 else if (invalid == 1) cpllDiv=32 else if (invalid == 2) cpllRoot=4 else if (invalid == 3) cpllClock=false else if (invalid == 4) nativeBufferAt(cpllBus,64).storeU32(52,0) else nativeBufferAt(cpllBus,64).storeU32(4,1<<25)
+        if (esp32p4CpllBeginOwned(r,400,300,3,true) != 3 || r.loadU32(0) != 0 || cpllWrites != 0 || cpllAnalogWrites != 0) return i32(11)
+        invalid=invalid+1
+    }
+    val r=seedCpll()
+    if (esp32p4CpllBeginOwned(r,401,300,3,true) != 2 || esp32p4CpllBeginOwned(r,400,400,3,true) != 2 || esp32p4CpllBeginOwned(r,400,300,3,false) != 2 || cpllWrites != 0 || cpllAnalogWrites != 0) return i32(12)
+    return i32(cpllWakeChecks())
+}
+fun cpllWakeChecks(): int {
+    var mode=0
+    while (mode < 16) {
+        val r=seedCpll();cpllHart=u32(mode&1)
+        cpllPower=false;cpllGlobalGate=false;cpllRoot=cpllRoot&0xfbffffff
+        val mhz=if ((mode&2) == 0) 360 else 400
+        val revision=if ((mode&4) == 0) 0 else 300
+        cpllGateDrop=if ((mode&8) == 0) 0 else 1
+        val opened=esp32p4CpllWakeBeginOwned(r,mhz,revision,3,true)
+        if (opened != (if (cpllGateDrop == 0) 1 else 4) || cpllPowerCommands != 2 || cpllPowerFences != 2 || !cpllPower || !cpllGlobalGate) return 13
+        cpllGateDrop=0
+        if (esp32p4CpllContinueOwned(r,3,true) != 1 || cpllPowerCommands != 2 || cpllStarts != 1 || cpllStops != 1 || cpllBad) return 14
+        mode=mode+1
+    }
+    val wait=seedCpll();cpllDone=false;cpllPower=false;cpllGlobalGate=false
+    if (esp32p4CpllWakeBeginOwned(wait,400,300,3,true) != 6 || cpllPowerCommands != 2 || cpllStarts != 1) return 15
+    val count=cpllPowerCommands+cpllWrites+cpllAnalogWrites+cpllGateWrites
+    if (esp32p4CpllContinueOwned(wait,3,true) != 6 || count != cpllPowerCommands+cpllWrites+cpllAnalogWrites+cpllGateWrites) return 16
+    cpllDone=true
+    if (esp32p4CpllContinueOwned(wait,3,true) != 1 || cpllPowerCommands != 2 || cpllBad) return 17
+    val invalid=seedCpll();cpllRoot=cpllRoot|1
+    if (esp32p4CpllWakeBeginOwned(invalid,400,300,3,true) != 3 || invalid.loadU32(0) != 0 || cpllPowerCommands != 0 || cpllWrites != 0) return 18
+    return 0
+}

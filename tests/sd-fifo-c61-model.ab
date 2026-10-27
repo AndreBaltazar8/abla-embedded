@@ -1,0 +1,219 @@
+import "../src/sd/block_c61_sequence.ab"
+import "../src/sd/selected_command_c61_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c61GpioRead(address: int): u32 {
+    if (address == 0x600960c0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960c4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c61GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C61GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C61GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+
+
+
+val spi=nativeStaticAllocate(256)
+var bus=u32(4)
+var functional=u32(0x100000)
+var spiWrites=0
+var spiDrop=0
+var pending=0
+var stall=false
+var active=false
+fun c61SpiRead(address: int): u32 {
+    if (address == 0x60096094) return bus
+    if (address == 0x60096098) return functional
+    if (address == 0x60081000) {
+        if (active) return u32(1<<24)
+        if (pending > 0) { if (!stall) pending=pending-1;return u32(1<<23) }
+        return u32(0)
+    }
+    return u32(nativeAddressLoadU32(spi,address-0x60081000))
+}
+fun c61SpiWrite(address: int,value: u32): void {
+    spiWrites=spiWrites+1
+    if (spiWrites == spiDrop) return
+    if (address == 0x60096094) { bus=value;return }
+    if (address == 0x60096098) { functional=value;return }
+    if (address == 0x60081000) {
+        if (value == u32(1<<23)) { pending=1;return }
+        if (value != u32(1<<24)) { bad=true;return }
+        starts=starts+1
+        if (nativeAddressLoadU32(spi,28) != 7 || nativeAddressLoadU32(spi,152) > 255) bad=true
+        if (starts == failAt && failureKind == 1) { active=true;return }
+        val received=cardExchange(nativeAddressLoadU32(spi,152))
+        nativeAddressStoreU32(spi,152,received)
+        nativeAddressStoreU32(spi,60,if (starts == failAt && failureKind == 2) 4096|(1<<17) else 4096);return
+    }
+    if (address == 0x60081038) { nativeAddressStoreU32(spi,60,nativeAddressLoadU32(spi,60)&~int(value));return }
+    nativeAddressStoreU32(spi,address-0x60081000,int(value));return
+}
+fun initialize(): void {
+    seed()
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(spi,at,0);at=at+4 }
+    bus=u32(4);functional=u32(0x100000);spiWrites=0;spiDrop=0;pending=0;stall=false;active=false;return
+}
+
+val gateStorage=nativeStaticAllocate(4)
+val buffers=nativeStaticAllocate(1040)
+val sector=nativeStaticAllocate(512)
+val staged=nativeStaticAllocate(512)
+val header=nativeStaticAllocate(6)
+val queue=nativeStaticAllocate(8)
+val cardRegisters=nativeStaticAllocate(32)
+var readPayloadBytes=512
+var registerOffset=0
+var starts=0
+var failAt=0
+var failureKind=0
+var cardMode=0
+var modelBlock=3
+var imageEnabled=false
+val imageData=nativeStaticAllocate(2560)
+var headerSize=0
+var queued=0
+var queueIndex=0
+var stream=0
+var dataIndex=0
+var dataCrc=0
+var wireCrc=0
+var cardReady=false
+var appPrefix=false
+var startupClocks=0
+var corruptRead=false
+var readCommands=0
+var writeCommands=0
+fun sdSpiSelectedDelay(us: int): void { if (us != 1000) bad=true;return }
+fun enqueue(value: int): void { nativeBufferAt(queue,8).store(queued,value);queued=queued+1;return }
+fun receiveCommand(): void {
+    val h=nativeBufferAt(header,6)
+    val command=h.load(0)&63
+    val argument=(h.load(1)<<24)|(h.load(2)<<16)|(h.load(3)<<8)|h.load(4)
+    if (h.load(0) != (64|command) || h.load(5) != sdSpiCommandFrameCrc(command,argument)) bad=true
+    queued=0;queueIndex=0
+    if (command == 0) {
+        if (startupClocks < 10 || argument != 0) bad=true
+        cardReady=false;appPrefix=false;enqueue(1)
+    } else if (command == 8) {
+        if (argument != 426) bad=true
+        if (cardMode == 2) enqueue(5)
+        else { enqueue(1);enqueue(0);enqueue(0);enqueue(1);enqueue(170) }
+    } else if (command == 55) { appPrefix=true;enqueue(if (cardReady) 0 else 1) }
+    else if (command == 41) {
+        if (!appPrefix || argument != (if (cardMode == 2) 0 else 1073741824)) bad=true
+        appPrefix=false;cardReady=true;enqueue(0)
+    } else if (command == 58) {
+        if (!cardReady) bad=true
+        enqueue(0);enqueue(if (cardMode == 0) 192 else 128);enqueue(255);enqueue(0);enqueue(0)
+    } else if (command == 16) { if (cardMode == 0 || argument != 512) bad=true;enqueue(0) }
+    else if (command == 9 || command == 10) {
+        if (!cardReady || argument != 0) bad=true
+        enqueue(0);stream=1;dataIndex=0;dataCrc=0;readPayloadBytes=16;registerOffset=if (command == 9) 0 else 16
+    }
+    else if (command == 17 || command == 24) {
+        if (!cardReady || (!(imageEnabled && command == 17) && argument != (if (cardMode == 0) modelBlock else modelBlock*512))) bad=true
+        if (imageEnabled && command == 17) {
+            val slot=if (argument == 0) 0 else if (argument == 1) 1 else if (argument == 81) 2
+                else if (argument == 113) 3 else if (argument == 114) 4 else -1
+            if (slot < 0) bad=true
+            else {
+                var at=0
+                while (at < 512) { nativeBufferAt(sector,512).store(at,nativeBufferAt(imageData,2560).load(slot*512+at));at=at+1 }
+            }
+        }
+        enqueue(0);dataIndex=0;dataCrc=0;wireCrc=0
+        if (command == 17) { stream=1;readPayloadBytes=512;readCommands=readCommands+1 }
+        else { stream=2;writeCommands=writeCommands+1 }
+    } else if (command == 13) { enqueue(0);enqueue(0) }
+    else { bad=true;enqueue(4) }
+    headerSize=0;return
+}
+fun cardExchange(value: int): int {
+    if (peripheralGateAt(gateStorage).tryBegin(u32(99)) != 1) bad=true
+    if ((c61GpioRead(0x60091004)&u32(1<<28)) != u32(0)) {
+        if (value != 255) bad=true
+        startupClocks=startupClocks+1;headerSize=0;queued=0;queueIndex=0;stream=0
+        return 255
+    }
+    if (queueIndex < queued) {
+        if (value != 255) bad=true
+        val result=nativeBufferAt(queue,8).load(queueIndex);queueIndex=queueIndex+1;return result
+    }
+    if (stream == 1) {
+        if (value != 255) bad=true
+        var result=254
+        if (dataIndex >= 1 && dataIndex <= readPayloadBytes) {
+            result=if (readPayloadBytes == 512) nativeBufferAt(sector,512).load(dataIndex-1)
+                else nativeBufferAt(cardRegisters,32).load(registerOffset+dataIndex-1)
+            dataCrc=sdSpiCrc16Byte(dataCrc,result)
+        } else if (dataIndex == readPayloadBytes+1) result=(dataCrc>>>8)&255
+        else if (dataIndex == readPayloadBytes+2) { result=(dataCrc&255)^(if (corruptRead) 1 else 0);stream=0 }
+        dataIndex=dataIndex+1;return result
+    }
+    if (stream == 2) {
+        if (dataIndex == 0) { if (value != 254) bad=true }
+        else if (dataIndex <= 512) {
+            nativeBufferAt(staged,512).store(dataIndex-1,value);dataCrc=sdSpiCrc16Byte(dataCrc,value)
+        } else if (dataIndex == 513) wireCrc=value<<8
+        else if (dataIndex == 514) {
+            wireCrc=wireCrc|value
+            if (wireCrc != dataCrc) bad=true
+            var at=0
+            while (at < 512) { nativeBufferAt(sector,512).store(at,nativeBufferAt(staged,512).load(at));at=at+1 }
+            queued=0;queueIndex=0;enqueue(5);enqueue(0);enqueue(255);stream=0
+        }
+        dataIndex=dataIndex+1;return 255
+    }
+    if (headerSize == 0 && value == 255) return 255
+    nativeBufferAt(header,6).store(headerSize,value);headerSize=headerSize+1
+    if (headerSize == 6) receiveCommand()
+    return 255
+}
+fun resetCard(): void {
+    initialize();nativeAddressStoreU32(gateStorage,0,0)
+    starts=0;failAt=0;failureKind=0;headerSize=0;queued=0;queueIndex=0;stream=0;dataIndex=0;dataCrc=0;wireCrc=0;modelBlock=3;imageEnabled=false
+    cardReady=false;appPrefix=false;startupClocks=0;corruptRead=false;readCommands=0;writeCommands=0
+    val r=nativeBufferAt(cardRegisters,32)
+    var at=0
+    while (at < 32) { r.store(at,0);at=at+1 }
+    r.store(0,if (cardMode == 0) 64 else 0);r.store(5,9)
+    var crc=0;at=0
+    while (at < 15) { crc=sdSpiCrc7Byte(crc,r.load(at));at=at+1 }
+    r.store(15,(crc<<1)|1);r.store(31,1)
+    return
+}
+fun openCardMaster(): Esp32C61SpiMaster =
+    esp32C61SpiMasterOpenOwned(spiPins(27,26,25),28,160000000,2,10,20,0,4,true)

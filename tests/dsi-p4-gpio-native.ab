@@ -1,0 +1,158 @@
+import "../src/esp32/gpio_p4_sequence.ab"
+import "../src/esp32/gpio_hold_p4_sequence.ab"
+import "../src/esp32/gpio_clock_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(4608)
+var writes=0
+var drop=0
+var holdAddress=0
+var holdValue=u32(0)
+var holdBad=false
+var apb=u32(0)
+var functional=u32(0)
+var reset=u32(0)
+trusted fun p4IomuxClockRead(offset: int): u32 {
+    if (offset == 32) return apb
+    if (offset == 172) return functional
+    if (offset == 196) return reset
+    holdBad=true; return u32(0)
+}
+trusted fun p4IomuxClockWrite(offset: int,value: u32): void {
+    writes=writes+1
+    if (writes == drop) return
+    if (offset == 32) apb=value else if (offset == 172) functional=value else holdBad=true
+    return
+}
+trusted fun p4GpioHoldRead(address: int): u32 { if (address != holdAddress) holdBad=true; return holdValue }
+trusted fun p4GpioHoldWrite(address: int,value: u32): void {
+    if (address != holdAddress) holdBad=true
+    writes=writes+1
+    if (drop != writes) holdValue=value
+    return
+}
+trusted fun gpioModelOffset(offset: int): int =
+    if (offset >= 0x4b008 && offset <= 0x4b044) 4352+offset-0x4b008 else offset
+trusted fun p4GpioRead(offset: int): u32 = u32(nativeBufferAt(storage,4608).loadU32(gpioModelOffset(offset)))
+trusted fun p4GpioWrite(offset: int,value: u32): void {
+    writes=writes+1
+    if (writes == drop) return
+    val memory=nativeBufferAt(storage,4608)
+    if (offset == 8 || offset == 20 || offset == 36 || offset == 48) memory.storeU32(offset-4,int(p4GpioRead(offset-4)|value))
+    else if (offset == 12 || offset == 24 || offset == 40 || offset == 52) memory.storeU32(offset-8,int(p4GpioRead(offset-8)&(u32(4294967295)^value)))
+    else memory.storeU32(gpioModelOffset(offset),int(value))
+    return
+}
+trusted fun resetGpio(): void {
+    var offset=0
+    while (offset < 4608) { nativeBufferAt(storage,4608).storeU32(offset,4294967295); offset=offset+4 }
+    writes=0; drop=0; return
+}
+@export("abla_dsi_p4_gpio_test")
+trusted fun testGpio(): i32 {
+    var profile=0
+    while (profile < 4) {
+        apb=u32(0x100)|(if ((profile&1) != 0) u32(8) else u32(0))
+        functional=u32(0x400)|(if ((profile&2) != 0) u32(512) else u32(0))
+        val savedApb=apb; val savedFunctional=functional
+        reset=u32(0); writes=0; drop=0
+        val owner=esp32P4IomuxClockOpenOwned(if ((profile&1) == 0) 1 else 3)
+        if (!owner.ready() || !owner.ownsApb() != ((profile&1) != 0) ||
+            !owner.ownsFunctional() != ((profile&2) != 0) || apb != u32(264) || functional != u32(1536)) return i32(25)
+        if (owner.closeOwned() != 0 || apb != savedApb || functional != savedFunctional || holdBad) return i32(26)
+        profile=profile+1
+    }
+    var failure=1
+    while (failure <= 2) {
+        apb=u32(0); functional=u32(0); writes=0; drop=failure
+        val failed=esp32P4IomuxClockOpenOwned(3)
+        if (failed.status() != failure+3 || !failed.ownsApb()) return i32(27)
+        drop=0
+        if (failed.closeOwned() != 0 || apb != u32(0) || functional != u32(0)) return i32(28)
+        apb=u32(0); functional=u32(0); writes=0
+        val opened=esp32P4IomuxClockOpenOwned(1)
+        drop=writes+failure
+        val partial=opened.closeOwned()
+        if (partial.status() != (if (failure == 1) 5 else 4) || !partial.ownsApb()) return i32(29)
+        drop=0
+        if (partial.closeOwned() != 0 || apb != u32(0) || functional != u32(0)) return i32(30)
+        failure=failure+1
+    }
+    writes=0; reset=u32(8)
+    if (esp32P4IomuxClockOpenOwned(1).status() != 3 || esp32P4IomuxClockOpenOwned(2).status() != 2 || writes != 0) return i32(31)
+    var layout=1
+    while (layout <= 3) {
+        var heldPin=0
+        while (heldPin <= 54) {
+            holdAddress=if (layout == 3) (if (heldPin < 32) 0x501101c4 else 0x501101c8) else
+                if (heldPin < 16) 0x5012b04c else if (heldPin < 48) 0x500e5074 else 0x500e5078
+            val bit=u32(1)<<u32(if (layout == 3) heldPin%32 else if (heldPin < 16) heldPin else if (heldPin < 48) heldPin-16 else heldPin-48)
+            holdValue=u32(4294967295); writes=0; drop=0
+            if (esp32P4GpioSetIndividualHoldOwned(layout,heldPin,false) != 1 || holdValue != (u32(4294967295)^bit) ||
+                esp32P4GpioIndividualHoldOwned(layout,heldPin) != 0 || writes != 1) return i32(20)
+            if (esp32P4GpioSetIndividualHoldOwned(layout,heldPin,false) != 1 || writes != 1) return i32(21)
+            drop=2
+            if (esp32P4GpioSetIndividualHoldOwned(layout,heldPin,true) != 3) return i32(22)
+            drop=0
+            if (esp32P4GpioSetIndividualHoldOwned(layout,heldPin,true) != 1 || holdValue != u32(4294967295) || holdBad) return i32(23)
+            heldPin=heldPin+1
+        }
+        layout=layout+2
+    }
+    writes=0
+    if (esp32P4GpioSetIndividualHoldOwned(2,0,true) != 2 || esp32P4GpioSetIndividualHoldOwned(3,55,true) != 2 ||
+        esp32P4GpioIndividualHoldOwned(1,-1) != -1 || writes != 0 || holdBad) return i32(24)
+    var pin=0
+    while (pin < 55) {
+        var profile=0
+        while (profile < 48) {
+            resetGpio()
+            val output=(profile&1) != 0
+            val high=(profile&2) != 0
+            val od=(profile&4) != 0
+            val input=(profile&8) != 0
+            val pull=profile/16
+            if (esp32P4GpioConfigureOwned(pin,output,high,od,input,pull) != 1) return i32(1)
+            val bit=u32(1)<<u32(pin&31)
+            val enabled=p4GpioRead(if (pin < 32) 32 else 44)
+            if (((enabled&bit) != u32(0)) != output || (enabled|bit) != u32(4294967295)) return i32(2)
+            val mux=p4GpioRead(4100+pin*4)
+            if ((mux&u32(29570)) != (u32(4096)|(if (input) u32(512) else u32(0))|(if (pull == 1) u32(256) else if (pull == 2) u32(128) else u32(0))) ||
+                (mux|u32(29570)) != u32(4294967295) || (p4GpioRead(1368+pin*4)&u32(4095)) != u32(1280)) return i32(3)
+            if (esp32P4GpioReadOwned(pin) != 1) return i32(4)
+            nativeBufferAt(storage,4608).storeU32(if (pin < 32) 60 else 64,int(u32(4294967295)^bit))
+            if (esp32P4GpioReadOwned(pin) != 0) return i32(5)
+            var lpPin=0
+            while (lpPin < 16) {
+                if (p4GpioRead(0x4b008+lpPin*4) !=
+                    (if (lpPin == pin) u32(4294967279) else u32(4294967295))) return i32(32)
+                lpPin=lpPin+1
+            }
+            profile=profile+1
+        }
+        pin=pin+1
+    }
+    var fault=1
+    while (fault <= 6) {
+        resetGpio(); drop=fault
+        if (esp32P4GpioConfigureOwned(23,true,false,false,false,0) != 3 || writes != fault) return i32(6)
+        fault=fault+1
+    }
+    resetGpio()
+    fault=1
+    while (fault <= 7) {
+        resetGpio(); drop=fault
+        if (esp32P4GpioConfigureOwned(3,true,false,false,false,0) != 3 || writes != fault) return i32(33)
+        // Retry after releasing the injected fault must complete the handoff.
+        drop=0
+        if (esp32P4GpioConfigureOwned(3,true,false,false,false,0) != 1 ||
+            p4GpioRead(0x4b014) != u32(4294967279)) return i32(34)
+        fault=fault+1
+    }
+    resetGpio()
+    if (esp32P4GpioReadOwned(-1) != -1 || esp32P4GpioWriteOwned(55,true) ||
+        esp32P4GpioConfigureOwned(55,true,true,false,false,0) != 2 ||
+        esp32P4GpioConfigureOwned(23,true,true,false,false,3) != 2 || writes != 0) return i32(7)
+    return i32(0)
+}

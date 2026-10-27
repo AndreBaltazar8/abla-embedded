@@ -1,0 +1,230 @@
+import "../src/storage/fat_volume_create_auto.ab"
+import "../src/storage/fat_file_open_path.ab"
+import "../src/storage/fat_file_resize.ab"
+import "../src/storage/fat_directory_create.ab"
+import "../src/storage/fat_remove.ab"
+import "../src/storage/fat_file_rename.ab"
+import "../src/storage/fat_directory_rename.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val image=nativeStaticAllocate(4096)
+var mode=0
+var writes=0
+var bad=false
+fun diskSlot(lba: int): int = if (mode == 0)
+    (if (lba == 1) 0 else if (lba == 10) 1 else if (lba == 19) 2 else if (lba >= 33 && lba <= 35) lba-30 else -1)
+    else (if (lba == 32) 0 else if (lba == 632) 1 else if (lba >= 1232 && lba <= 1235) lba-1230
+        else if (lba == 1) 6 else if (lba == 7) 7 else -1)
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    val selected=diskSlot(lba)
+    if (selected < 0 && lba != 0) { bad=true;return false }
+    val source=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(image+selected*512,512)
+    var i=0;while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    val selected=diskSlot(lba);writes=writes+1
+    if (selected < 0 || (mode == 2 && selected == 0)) { bad=true;return false }
+    val output=nativeBufferAt(image+selected*512,512);var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+@export("abla_fat_mutation_workflow_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val handle=nativeBufferAt(memory+576,80);val work=nativeBufferAt(memory+704,3780)
+    val output=nativeBufferAt(memory+4544,512);val input=nativeBufferAt(memory+5056,512)
+    val plan=nativeBufferAt(memory+5568,64);val name=nativeBufferAt(memory+5632,18)
+    val spelling=nativeBufferAt(nativeStaticBytes("voice.raw"),9)
+    val modified=rtcCalendarDateTime(2026,9,9,12,34,56)
+    var i=0;while (i < 9) { name.storeU16(i*2,spelling.load(i));i=i+1 }
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    while (mode < 3) {
+        writes=0;bad=false;i=0;while (i < 512) { boot.store(i,0);i=i+1 }
+        boot.storeU16(11,512);boot.store(13,1);boot.store(16,2);boot.storeU16(510,0xaa55)
+        if (mode == 0) { boot.storeU16(14,1);boot.storeU16(17,224);boot.storeU16(22,9);boot.storeU16(19,2880) }
+        else { boot.storeU16(14,32);boot.storeU32(32,70000);boot.storeU32(36,600);boot.storeU32(44,2)
+            boot.storeU16(48,1);boot.storeU16(50,6);boot.storeU16(40,if (mode == 2) 129 else 0) }
+        val total=if (mode == 0) 2880 else 70000
+        val firstCluster=if (mode == 0) 2 else 3
+        i=0;while (i < 4096) { nativeBufferAt(image,4096).store(i,77);i=i+1 }
+        i=0;while (i < 512) { nativeBufferAt(image+1024,512).store(i,0);i=i+1 }
+        var copy=0
+        while (copy < 2) {
+            val fat=nativeBufferAt(image+copy*512,512);i=0
+            while (i < 512) { fat.store(i,255);i=i+1 }
+            if (mode != 0) { i=0;while (i < 512) { fat.storeU32(i,0xafffffff);i=i+4 } }
+            var cluster=firstCluster
+            while (cluster < firstCluster+3) {
+                if (!fatLinkPatch(fatLinkLocate(boot,0,total,cluster),0,fat,NativeBuffer(0))) return i32(2)
+                cluster=cluster+1
+            }
+            val info=nativeBufferAt(image+3072+copy*512,512)
+            info.storeU32(0,0x41615252);info.storeU32(484,0x61417272);info.storeU32(508,0xaa550000)
+            info.storeU32(488,123);info.storeU32(492,7)
+            copy=copy+1
+        }
+        // Deliberately unrelated inactive FAT must never be modified/read as active.
+        if (mode == 2) { i=0;while (i < 512) { nativeBufferAt(image,512).store(i,85);i=i+1 } }
+        val volume=fatVolumeOpen(state,u32(7),reader,total,-1,boot,output)
+        if (volume == 0) return i32(3)
+        val created=volume.createLongAuto(u32(7),0,name,9,1,8,64,modified,work)
+        if (created.status() != 1 || created.entryIndex() != 1 || created.ordinal() != 0) return i32(4)
+        if (!fatFileInitializeFresh(handle,volume,u32(7))) return i32(5)
+        val file=fatFileOpenPathUtf16(handle,u32(7),name,9,64,work)
+        if (file.status() != 1 || file.resize(u32(7),1200,64,modified,NativeBuffer(0),work).status() != 1) return i32(6)
+        var offset=0
+        while (offset < 1200) {
+            val count=if (1200-offset < 512) 1200-offset else 512
+            i=0;while (i < count) { input.store(i,(offset+i)*17&255);i=i+1 }
+            val written=file.overwriteAt(u32(7),offset,count,64,input,modified,work)
+            if (written.status() != 1 || written.dataBytesWritten() != count) return i32(7)
+            offset=offset+count
+        }
+        offset=0
+        while (offset < 1200) {
+            val read=file.readAt(u32(7),offset,512,64,output,work)
+            if (read.status() != 1 || read.bytesRead() == 0) return i32(8)
+            i=0;while (i < read.bytesRead()) { if (output.load(i) != ((offset+i)*17&255)) return i32(9);i=i+1 }
+            offset=offset+read.bytesRead()
+        }
+        val shrunk=file.resize(u32(7),100,64,modified,plan,work)
+        if (shrunk.status() != 1 || shrunk.freedClusters() != 2 || file.resize(u32(7),700,64,modified,NativeBuffer(0),work).status() != 1) return i32(10)
+        offset=0
+        while (offset < 700) {
+            val read=file.readAt(u32(7),offset,512,64,output,work)
+            if (read.status() != 1 || read.bytesRead() == 0) return i32(11)
+            i=0;while (i < read.bytesRead()) {
+                if (output.load(i) != (if (offset+i < 100) (offset+i)*17&255 else 0)) return i32(12)
+                i=i+1
+            }
+            offset=offset+read.bytesRead()
+        }
+        val emptied=file.resize(u32(7),0,64,modified,plan,work)
+        if (emptied.status() != 1 || emptied.freedClusters() != 2 || file.readAt(u32(7),0,1,64,output,work).status() != 2) return i32(13)
+        copy=0
+        while (copy < 2) {
+            val fat=nativeBufferAt(image+copy*512,512)
+            if (mode == 2 && copy == 0) { i=0;while (i < 512) { if (fat.load(i) != 85) return i32(14);i=i+1 } }
+            else {
+                var cluster=firstCluster
+                while (cluster < firstCluster+3) {
+                    if (fatLinkRaw(fatLinkLocate(boot,0,total,cluster),fat,NativeBuffer(0)) != 0) return i32(15)
+                    if (mode != 0 && (fat.loadU32(cluster*4)>>>28) != 10) return i32(16)
+                    cluster=cluster+1
+                }
+                if (mode == 0 && fatLinkRaw(fatLinkLocate(boot,0,total,5),fat,NativeBuffer(0)) != 4095) return i32(17)
+            }
+            if (mode != 0) {
+                val info=nativeBufferAt(image+3072+copy*512,512)
+                if (info.loadU32(488) != 0xffffffff || info.loadU32(492) != 0xffffffff || info.load(100) != 77) return i32(18)
+            }
+            copy=copy+1
+        }
+        if (bad || !file.close(u32(7)) || !volume.invalidate(u32(7))) return i32(19)
+        val remounted=fatVolumeOpen(state,u32(7),reader,total,-1,boot,output)
+        val reopenedStorage=nativeBufferAt(memory+5760,80)
+        if (remounted == 0 || file.readAt(u32(7),0,1,64,output,work).status() != 13 ||
+            !fatFileInitializeFresh(reopenedStorage,remounted,u32(7))) return i32(20)
+        val reopened=fatFileOpenPathUtf16(reopenedStorage,u32(7),name,9,64,work)
+        if (reopened.status() != 1 || reopened.readAt(u32(7),0,1,64,output,work).status() != 2 ||
+            reopenedStorage.loadU16(66) != 0 || reopenedStorage.loadU32(68) != 0 ||
+            !reopened.close(u32(7))) return i32(21)
+        val dirName=nativeBufferAt(memory+5840,2);val nestedName=nativeBufferAt(memory+5856,2)
+        val nestedPath=nativeBufferAt(memory+5888,128)
+        dirName.storeU16(0,100);nestedName.storeU16(0,101)
+        // Explicit FAT32 root cluster must also produce a zero '..' target.
+        val rootParent=if (mode == 2) 2 else 0
+        if (remounted.createDirectory(u32(7),rootParent,dirName,1,1,8,64,modified,work).status() != 1 ||
+            remounted.createDirectory(u32(7),firstCluster,nestedName,1,1,8,64,modified,work).status() != 1) return i32(22)
+        val outer=nativeBufferAt(image+1536,512);val inner=nativeBufferAt(image+2048,512)
+        if (outer.load(0) != 46 || outer.load(33) != 46 || outer.loadU16(26) != firstCluster || outer.loadU16(58) != 0 ||
+            inner.loadU16(26) != firstCluster+1 || inner.loadU16(58) != firstCluster || inner.load(64) != 0) return i32(23)
+        if (remounted.createLongAuto(u32(7),firstCluster+1,name,9,1,8,64,modified,work).status() != 1) return i32(24)
+        val pathText=nativeBufferAt(nativeStaticBytes("d/e/../e/voice.raw"),18)
+        i=0;while (i < 18) { nestedPath.storeU16(i*2,pathText.load(i));i=i+1 }
+        var nestedFile=fatFileOpenPathUtf16(reopenedStorage,u32(7),nestedPath,18,64,work)
+        if (nestedFile.status() != 1 || nestedFile.resize(u32(7),7,64,modified,NativeBuffer(0),work).status() != 1) return i32(25)
+        i=0;while (i < 7) { input.store(i,97+i);i=i+1 }
+        if (nestedFile.overwriteAt(u32(7),0,7,64,input,modified,work).dataBytesWritten() != 7 ||
+            nestedFile.readAt(u32(7),0,7,64,output,work).bytesRead() != 7) return i32(26)
+        i=0;while (i < 7) { if (output.load(i) != 97+i) return i32(27);i=i+1 }
+        copy=0;while (copy < 2) {
+            val fat=nativeBufferAt(image+copy*512,512)
+            if (mode == 2 && copy == 0) { i=0;while (i < 512) { if (fat.load(i) != 85) return i32(28);i=i+1 } }
+            else {
+                var cluster=firstCluster
+                while (cluster < firstCluster+3) {
+                    if (fatLinkRaw(fatLinkLocate(boot,0,total,cluster),fat,NativeBuffer(0)) != (if (mode == 0) 4095 else 0xfffffff)) return i32(29)
+                    if (mode != 0 && (fat.loadU32(cluster*4)>>>28) != 10) return i32(30)
+                    cluster=cluster+1
+                }
+            }
+            copy=copy+1
+        }
+        val expectedEntry=nativeBufferAt(memory+6208,32)
+        val renameWork=nativeBufferAt(nativeStaticAllocate(5352),5352)
+        val movedName=nativeBufferAt(memory+6272,18)
+        val movedText=nativeBufferAt(nativeStaticBytes("moved.raw"),9)
+        i=0;while (i < 9) { movedName.storeU16(i*2,movedText.load(i));i=i+1 }
+        i=0;while (i < 32) { expectedEntry.store(i,reopenedStorage.load(40+i));i=i+1 }
+        if (remounted.renameFile(u32(7),firstCluster+1,0,3,expectedEntry,rootParent,movedName,9,1,8,64,renameWork).status() != 1 ||
+            nestedFile.readAt(u32(7),0,7,64,output,work).status() != 10 || !nestedFile.close(u32(7))) return i32(39)
+        nestedFile=fatFileOpenPathUtf16(reopenedStorage,u32(7),movedName,9,64,work)
+        if (nestedFile.status() != 1 || nestedFile.readAt(u32(7),0,7,64,output,work).bytesRead() != 7 || output.load(0) != 97) return i32(40)
+        i=11;while (i < 32) { if (reopenedStorage.load(40+i) != expectedEntry.load(i)) return i32(41);i=i+1 }
+        i=0;while (i < 32) { expectedEntry.store(i,reopenedStorage.load(40+i));i=i+1 }
+        if (remounted.renameFile(u32(7),rootParent,reopenedStorage.loadU32(28),reopenedStorage.loadU32(32),expectedEntry,
+            firstCluster+1,name,9,1,8,64,renameWork).status() != 1 || !nestedFile.close(u32(7))) return i32(42)
+        nestedFile=fatFileOpenPathUtf16(reopenedStorage,u32(7),nestedPath,18,64,work)
+        if (nestedFile.status() != 1 || nestedFile.readAt(u32(7),0,7,64,output,work).bytesRead() != 7 || output.load(6) != 103) return i32(43)
+        val directoryMoveWork=nativeBufferAt(nativeStaticAllocate(5864),5864)
+        val movedDirectoryName=nativeBufferAt(memory+6336,2);movedDirectoryName.storeU16(0,102)
+        val rootBeforeMove=nativeBufferAt(image+1024,512)
+        i=0;while (i < 32) { expectedEntry.store(i,rootBeforeMove.load(96+i));i=i+1 }
+        val beforeCycle=writes
+        if (remounted.renameDirectory(u32(7),rootParent,0,3,expectedEntry,firstCluster+1,movedDirectoryName,1,1,8,64,directoryMoveWork).status() != 18 ||
+            writes != beforeCycle) return i32(44)
+        i=0;while (i < 32) { expectedEntry.store(i,outer.load(96+i));i=i+1 }
+        val beforeMove=writes
+        if (remounted.renameDirectory(u32(7),firstCluster,0,3,expectedEntry,rootParent,movedDirectoryName,1,1,8,64,directoryMoveWork).status() != 1 ||
+            writes != beforeMove+3 || inner.loadU16(58) != 0 || inner.load(64) == 229) return i32(45)
+        // Child handles stay usable: their directory entry and cluster do not move.
+        if (nestedFile.readAt(u32(7),0,7,64,output,work).bytesRead() != 7 || output.load(0) != 97) return i32(46)
+        val parentPath=nativeBufferAt(memory+6400,64)
+        val parentText=nativeBufferAt(nativeStaticBytes("f/../voice.raw"),14)
+        i=0;while (i < 14) { parentPath.storeU16(i*2,parentText.load(i));i=i+1 }
+        val rootFile=fatLookupPathUtf16Owned(reader,boot,0,total,parentPath,14,64,work)
+        if (!rootFile.isFile() || rootFile.byteSize() != 0) return i32(47)
+        i=0;while (i < 32) { expectedEntry.store(i,rootBeforeMove.load(160+i));i=i+1 }
+        if (remounted.renameDirectory(u32(7),rootParent,0,5,expectedEntry,firstCluster,nestedName,1,1,8,64,directoryMoveWork).status() != 1 ||
+            inner.loadU16(58) != firstCluster || nestedFile.readAt(u32(7),0,7,64,output,work).bytesRead() != 7) return i32(48)
+        i=0;while (i < 32) { expectedEntry.store(i,outer.load(96+i));i=i+1 }
+        val beforeRemove=writes
+        if (remounted.removeEntry(u32(7),firstCluster,0,3,expectedEntry,64,plan,work).status() != 10 || writes != beforeRemove) return i32(32)
+        i=0;while (i < 32) { expectedEntry.store(i,reopenedStorage.load(40+i));i=i+1 }
+        val removedFile=remounted.removeEntry(u32(7),firstCluster+1,0,3,expectedEntry,64,plan,work)
+        if (removedFile.status() != 1 || removedFile.freedClusters() != 1 || inner.load(64) != 229 || inner.load(96) != 229 ||
+            nestedFile.readAt(u32(7),0,1,64,output,work).status() != 10 || !nestedFile.close(u32(7))) return i32(33)
+        i=0;while (i < 32) { expectedEntry.store(i,outer.load(96+i));i=i+1 }
+        if (remounted.removeEntry(u32(7),firstCluster,0,3,expectedEntry,64,plan,work).freedClusters() != 1) return i32(34)
+        val rootDirectory=nativeBufferAt(image+1024,512)
+        i=0;while (i < 32) { expectedEntry.store(i,rootDirectory.load(96+i));i=i+1 }
+        val removedOuter=remounted.removeEntry(u32(7),rootParent,0,3,expectedEntry,64,plan,work)
+        if (removedOuter.status() != 1 || removedOuter.freedClusters() != 1 || rootDirectory.load(64) != 229 || rootDirectory.load(96) != 229) return i32(35)
+        if (fatFileOpenPathUtf16(reopenedStorage,u32(7),nestedPath,18,64,work).status() != 3) return i32(36)
+        copy=0;while (copy < 2) {
+            val fat=nativeBufferAt(image+copy*512,512);var cluster=firstCluster
+            if (mode == 2 && copy == 0) { i=0;while (i < 512) { if (fat.load(i) != 85) return i32(37);i=i+1 } }
+            else { while (cluster < firstCluster+3) {
+                if (fatLinkRaw(fatLinkLocate(boot,0,total,cluster),fat,NativeBuffer(0)) != 0) return i32(38)
+                cluster=cluster+1
+            } }
+            copy=copy+1
+        }
+        if (bad || !remounted.invalidate(u32(7))) return i32(31)
+        mode=mode+1
+    }
+    return i32(0)
+}

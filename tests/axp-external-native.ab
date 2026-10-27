@@ -1,0 +1,130 @@
+import "../src/m5stack/axp_external_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var calls=0
+var trace=0
+var fail=0
+var flags=0
+var level=0
+var bad=false
+var wantedEnabled=false
+fun step(code: int,handle: int,expectedHandle: int): bool {
+    calls=calls+1; trace=trace*10+code
+    if (handle != expectedHandle) bad=true
+    calls != fail
+}
+fun axpExternalReadByte(handle: int,register: int): I2cByteResult {
+    if (register == 18 || register == 144) {
+        if (!step(if (register == 18) 8 else 9,handle,7)) return I2cByteResult(0)
+        return I2cByteResult(256|level)
+    }
+    if (!step(if (register == 0) 1 else 4,handle,7)) return I2cByteResult(0)
+    if (register != 0 && register != 164) bad=true
+    I2cByteResult(256|(if (register == 0) (if ((flags & 1) != 0) 128 else 0) else level))
+}
+fun axpExternalReadWord(handle: int,register: int): I2cWordResult {
+    val code=if (register == 92 || register == 1) 2 else 3
+    if (!step(code,handle,if (register == 92) 7 else 8)) return I2cWordResult(0)
+    if (register != 92 && register != 1 && register != 3) bad=true
+    val word=if (register == 92) (if ((flags & 2) != 0) 1 else 0) else
+        if ((flags & (if (register == 1) 1 else 2)) != 0) 65535 else 0
+    I2cWordResult(65536|word)
+}
+fun axpExternalBatteryBurst(handle: int): I2cDwordResult {
+    if (!step(4,handle,7)) return I2cDwordResult(0)
+    val voltage=if (level <= 8) 3023 else 3024
+    I2cDwordResult(4294967296|((voltage>>>4)<<24)|((voltage&15)<<16))
+}
+fun axpExternalBldo2(handle: int,enabled: bool): bool {
+    if (enabled != wantedEnabled) bad=true
+    step(5,handle,7)
+}
+fun axpExternalGpio0(handle: int,enabled: bool): bool {
+    if (enabled != wantedEnabled) bad=true
+    step(6,handle,7)
+}
+fun axpExternalExten(handle: int,enabled: bool): bool {
+    if (enabled != wantedEnabled) bad=true
+    step(7,handle,7)
+}
+@export("abla_axp_external_test")
+fun externalTest(): i32 {
+    var word=0
+    while (word < 131072) {
+        val voltage=((word & 65535)>>>8)*16+(word&255)
+        val current=if (word < 65536) 0 else 17
+        var estimated=if (voltage > 3150) (voltage-3075)*16/100 else if (voltage > 2690) (voltage-2690)*27/1000 else 0
+        if (current > 16) estimated=estimated-16
+        val raw=I2cDwordResult(4294967296|((word&65535)<<16)|current)
+        if (axp192ExternalBatteryLow(raw) != I2cByteResult(256|(if (estimated <= 8) 1 else 0))) return i32(1)
+        word=word+1
+    }
+    if (axp192ExternalBatteryLow(I2cDwordResult(0)).valid()) return i32(2)
+    var profile=0
+    while (profile < 24576) {
+        level=profile & 255; flags=(profile>>>8)&3
+        val identity=if ((profile & 1024) == 0) 3 else 74
+        wantedEnabled=(profile & 2048) != 0; fail=profile/4096
+        calls=0; trace=0; bad=false
+        // Reference path encodes upstream short-circuit order; failure at each
+        // actual operation must prevent all subsequent reads and writes.
+        var path=0; var veto=false; var invalidLevel=false
+        if (wantedEnabled) {
+            if (identity == 3) {
+                path=1
+                if ((flags & 1) == 0) {
+                    path=12
+                    if ((flags & 2) != 0) { path=124; veto=level <= 8 }
+                }
+            } else {
+                path=2
+                if ((flags & 1) == 0) path=23
+                if (flags != 0) { path=path*10+4; veto=level <= 8; invalidLevel=level > 100 }
+            }
+        }
+        val reads=if (path == 0) 0 else if (path < 10) 1 else if (path < 100) 2 else 3
+        var expectedStatus=if (invalidLevel) 4 else if (veto) 5 else 1
+        if (fail > 0 && fail <= reads) {
+            expectedStatus=4
+            var drop=reads-fail
+            while (drop > 0) { path=path/10; drop=drop-1 }
+        } else if (expectedStatus == 1) {
+            path=path*10+(if (identity == 74) 5 else 6)
+            if (fail == reads+1) expectedStatus=6
+            else if (identity == 3) {
+                path=path*10+7
+                if (fail == reads+2) expectedStatus=7
+            }
+        }
+        val result=(if ((profile & 1) == 0) m5BoardStackCore2 else m5BoardTough).setAxpExternalOwned(7,identity,8,wantedEnabled)
+        if (result.status() != expectedStatus || trace != path || bad) return i32(3)
+        profile=profile+1
+    }
+    var mode=0
+    while (mode < 8) {
+        wantedEnabled=(mode & 1) != 0; fail=if ((mode & 2) == 0) 0 else 1
+        calls=0; trace=0; bad=false
+        val board=if (mode < 4) m5BoardStickC else m5BoardStickCPlus
+        if (board.setAxpExternalOwned(7,3,0,wantedEnabled).status() != (if (fail == 0) 1 else 7) || trace != 7 || bad) return i32(4)
+        mode=mode+1
+    }
+    var reading=0
+    while (reading < 3584) {
+        level=reading & 255
+        val variant=(reading/256)%7
+        fail=reading/1792; calls=0; trace=0; bad=false
+        val board=if (variant < 2) m5BoardStackCore2 else if (variant < 4) m5BoardTough else
+            if (variant == 4) m5BoardStickC else if (variant == 5) m5BoardStickCPlus else m5BoardStation
+        val identity=if (variant == 1 || variant == 3) 74 else 3
+        val result=board.axpExternalOutputCheckedOwned(7,identity)
+        if ((result | 0) != (if (fail != 0) 0 else 256|(if ((level & (if (identity == 74) 32 else 64)) != 0) 1 else 0)) ||
+            trace != (if (identity == 74) 9 else 8) || calls != 1 || bad) return i32(6)
+        reading=reading+1
+    }
+    calls=0
+    if (m5BoardStickC.setAxpExternalOwned(7,74,8,true).status() != 2 ||
+        m5BoardStackCore2.setAxpExternalOwned(7,74,0,true).status() != 3 ||
+        m5BoardTough.setAxpExternalOwned(4294967296,3,8,false).status() != 3 ||
+        m5BoardAtomVoice.setAxpExternalOwned(7,3,8,true).status() != 2 || calls != 0) return i32(5)
+    i32(0)
+}

@@ -1,0 +1,207 @@
+import "../src/sd/mmc_read_multiple_s3_sequence.ab"
+import "../src/sd/mmc_write_multiple_s3_sequence.ab"
+import "../src/storage/sdmmc_batch.ab"
+import "../src/storage/fat_sdmmc_file_batch.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val registers=nativeStaticAllocate(256)
+val storage=nativeStaticAllocate(160)
+val descriptors=nativeStaticAllocate(80)
+val fileWorkspace=nativeStaticAllocate(18000)
+val batchReader=nativeStaticAllocate(32)
+val batchDestination=nativeStaticAllocate(8192)
+var tick=0
+var clockFailure=false
+var batchError=false
+var batchCommands=0
+trusted fun fatSdMmcNowMilliseconds(): int {
+    if (clockFailure) return -1
+    tick=tick+1
+    if ((sdMmcS3Read(44)&0x80000000) != 0) {
+        val command=sdMmcS3Read(44)&63
+        batchCommands=batchCommands+1
+        reg(44,0); reg(48,if (batchError) 0x80000900 else 0x900)
+        reg(68,if (command == 13) 4 else if (command == 18) 0x400c else 12)
+        if (command != 13) {
+            reg(140,258)
+            val count=sdMmcDmaDescriptorCount(sdMmcS3Read(32))
+            var i=0
+            while (i < count) {
+                sdMmcDmaS3Write(sdMmcS3Read(136)+i*16,16|(if (i == 0) 8 else 0)|(if (i+1 == count) 4 else 0)); i=i+1
+            }
+        }
+    }
+    if ((sdMmcS3Read(0)&4) != 0) reg(0,sdMmcS3Read(0)&~4)
+    return tick
+}
+var badAddress=false
+trusted fun sdMmcS3Read(offset: int): int = nativeBufferAt(registers,256).loadU32(offset)
+trusted fun reg(offset: int,value: int): void { nativeBufferAt(registers,256).storeU32(offset,value); return }
+trusted fun sdMmcS3Write(offset: int,value: int): void {
+    reg(offset,if (offset == 68 || offset == 140) sdMmcS3Read(offset)&~value else value); return
+}
+trusted fun sdMmcDmaS3Read(address: int): int {
+    if (address >= 0x3fc89000 && address < 0x3fc89200) return if (address == 0x3fc89004) 0xffff0003 else 0
+    if (address >= 0x3fc8a000 && address < 0x3fc8e000 && (address&3) == 0) return (address-0x3fc8a000)^0xabcdef00
+    if (address < 0x3fc88000 || address >= 0x3fc88050 || (address&3) != 0) { badAddress=true; return 0 }
+    return nativeBufferAt(descriptors,80).loadU32(address-0x3fc88000)
+}
+trusted fun sdMmcDmaS3Write(address: int,value: int): void {
+    if (address < 0x3fc88000 || address >= 0x3fc88050 || (address&3) != 0) { badAddress=true; return }
+    nativeBufferAt(descriptors,80).storeU32(address-0x3fc88000,value); return
+}
+trusted fun reset(mode: int): void {
+    var index=0
+    while (index < 256) { nativeBufferAt(registers,256).store(index,0); index=index+1 }
+    index=0
+    while (index < 160) { nativeBufferAt(storage,160).store(index,0); index=index+1 }
+    val card=nativeBufferAt(storage+80,80)
+    card.storeU32(0,0x53444901); card.store(5,mode>>1); card.storeU32(28,1)
+    card.storeU32(24,if ((mode&1) != 0) 0xc0ff8000 else 0x80ff8000)
+    card.storeU32(60,if ((mode&1) != 0) 0x40000000 else 0)
+    card.storeU32(56,if ((mode&1) != 0) 0x9003f else 0x903ff)
+    card.storeU32(52,if ((mode&1) != 0) 0xffff0000 else 0xc0038000)
+    badAddress=false; return
+}
+trusted fun begin(sector: int,count: int): int = sdMmcReadMultipleBeginOwned(nativeBufferAt(storage,72),nativeBufferAt(storage+80,80),nativeBufferAt(0x3fc88000,64),nativeBufferAt(0x3fc8a000,16384),sector,count,u32(0),100,true)
+trusted fun poll(now: int): int = sdMmcReadMultiplePollOwned(nativeBufferAt(storage,72),u32(now))
+trusted fun writeBegin(allowed: bool,released: bool): int = sdMmcWriteMultipleBeginOwned(nativeBufferAt(storage,72),nativeBufferAt(storage+80,80),nativeBufferAt(0x3fc88000,64),nativeBufferAt(0x3fc8a000,16384),123,9,u32(0),100,released,allowed)
+trusted fun writePoll(now: int): int = sdMmcWriteMultiplePollOwned(nativeBufferAt(storage,72),u32(now))
+@export("abla_sdmmc_read_multiple_test")
+trusted fun test(): i32 {
+    val context=nativeBufferAt(storage,72)
+    var mode=0
+    while (mode < 4) {
+        var order=0
+        while (order < 4) {
+            reset(mode)
+            if (begin(123,9) != 2 || sdMmcDmaS3Read(0x3fc88004) != 4096 || sdMmcDmaS3Read(0x3fc88014) != 512 || sdMmcDmaS3Read(0x3fc8800c) != 0x3fc88010) return i32(1)
+            if (sdMmcReadPollOwned(context,u32(0)) != 3 || poll(0) != 2 || sdMmcS3Read(28) != 512 || sdMmcS3Read(32) != 4608 || sdMmcS3Read(44) != (0xa0003352|((mode>>1)<<16)) || sdMmcS3Read(40) != (if ((mode&1) != 0) 123 else 62976)) return i32(2)
+            var event=0
+            while (event < 4) {
+                val selected=(event+order)%4
+                if (selected == 0) { reg(68,4); reg(48,0x900); reg(44,0) }
+                if (selected == 1) reg(68,8)
+                if (selected == 2) reg(140,258)
+                if (selected == 3) reg(68,0x4000)
+                if (poll(event+1) != 2 || context.load(4) != 2) return i32(3)
+                event=event+1
+            }
+            sdMmcDmaS3Write(0x3fc88000,24)
+            if (poll(5) != 2 || context.load(4) != 2) return i32(4)
+            sdMmcDmaS3Write(0x3fc88010,20)
+            if (poll(6) != 2 || context.load(4) != 3 || poll(7) != 2 || context.load(4) != 4) return i32(5)
+            if (poll(8) != 2 || context.load(4) != 4) return i32(6)
+            reg(0,sdMmcS3Read(0)&~4)
+            if (poll(9) != 2 || context.load(4) != 5 || poll(10) != 2 || (sdMmcS3Read(44)&63) != 13) return i32(7)
+            reg(44,0); reg(68,4); reg(48,if (order == 3) 0x80000900 else 0x900)
+            if (poll(11) != (if (order == 3) 5 else 1) || badAddress) return i32(8)
+            order=order+1
+        }
+        mode=mode+1
+    }
+    // ACD cannot be substituted by DTO, RX or returned ownership.
+    reset(1); begin(0,9); poll(0)
+    reg(44,0); reg(68,12); reg(48,0x900); reg(140,258)
+    sdMmcDmaS3Write(0x3fc88000,24); sdMmcDmaS3Write(0x3fc88010,20)
+    if (poll(1) != 2 || context.load(4) != 2 || poll(100) != 2 || context.load(7) != 6 || poll(101) != 2) return i32(9)
+    reg(0,sdMmcS3Read(0)&~4)
+    if (poll(102) != 6) return i32(10)
+    // A tail descriptor error wins over earlier OWN; DMA still must drain.
+    reset(1); begin(0,9); poll(0)
+    sdMmcDmaS3Write(0x3fc88010,0x40000014)
+    if (poll(1) != 2 || context.load(7) != 7 || poll(2) != 2 || poll(3) != 2) return i32(11)
+    reg(0,sdMmcS3Read(0)&~4)
+    if (poll(4) != 7) return i32(12)
+    reset(1)
+    if (begin(0,1) != 3 || begin(4294967295,2) != 3 || begin(-1,9) != 3 || begin(0,33) != 3 || sdMmcS3Read(44) != 0) return i32(13)
+    mode=0
+    while (mode < 4) {
+        reset(mode)
+        if (writeBegin(true,true) != 2 || poll(0) != 3 || writePoll(0) != 2 || sdMmcS3Read(44) != (0xa0003759|((mode>>1)<<16)) || sdMmcS3Read(40) != (if ((mode&1) != 0) 123 else 62976)) return i32(14)
+        // Every descriptor returned + RX + CMD/DTO/ACD still lacks TX.
+        sdMmcDmaS3Write(0x3fc88000,24); sdMmcDmaS3Write(0x3fc88010,20)
+        reg(44,0); reg(48,0x900); reg(68,0x400c); reg(140,258)
+        if (writePoll(1) != 2 || context.load(4) != 2) return i32(15)
+        reg(140,257); reg(72,512)
+        if (writePoll(2) != 2 || context.load(4) != 2) return i32(16)
+        reg(72,0)
+        if (writePoll(3) != 2 || context.load(4) != 3 || writePoll(4) != 2 || writePoll(5) != 2) return i32(17)
+        reg(0,sdMmcS3Read(0)&~4)
+        if (writePoll(6) != 2 || context.load(4) != 5 || writePoll(7) != 2 || (sdMmcS3Read(44)&63) != 13) return i32(18)
+        reg(44,0); reg(68,4); reg(48,if (mode == 2) 0x80000900 else if (mode == 3) 0xe00 else 0x900)
+        if (writePoll(8) != (if (mode >= 2) 5 else 1) || badAddress) return i32(19)
+        mode=mode+1
+    }
+    // Permission and both protection bits fail without publishing descriptors.
+    reset(1); sdMmcDmaS3Write(0x3fc88000,0x12345678)
+    if (writeBegin(false,true) != 3 || writeBegin(true,false) != 3 || sdMmcDmaS3Read(0x3fc88000) != 0x12345678) return i32(20)
+    nativeBufferAt(storage+80,80).storeU32(48,0x1000)
+    if (writeBegin(true,true) != 10) return i32(21)
+    nativeBufferAt(storage+80,80).storeU32(48,0x2000)
+    if (writeBegin(true,true) != 10 || sdMmcDmaS3Read(0x3fc88000) != 0x12345678 || sdMmcS3Read(44) != 0) return i32(22)
+    // Missing auto-stop: no success or final CMD13, even after TX completes.
+    reset(1); writeBegin(true,true); writePoll(0)
+    reg(44,0); reg(48,0x900); reg(68,12); reg(140,257)
+    sdMmcDmaS3Write(0x3fc88000,24); sdMmcDmaS3Write(0x3fc88010,20)
+    if (writePoll(1) != 2 || context.load(4) != 2 || writePoll(100) != 2 || context.load(7) != 6 || writePoll(101) != 2) return i32(23)
+    reg(0,sdMmcS3Read(0)&~4)
+    if (writePoll(102) != 6 || sdMmcS3Read(44) != 0) return i32(24)
+    // Production batch adapter: one CMD18 + CMD13 for nine sectors, atomic
+    // destination publication; one-sector calls retain CMD17 behavior.
+    reset(1); tick=0; batchCommands=0
+    val reader=nativeBufferAt(batchReader,32)
+    val session=nativeBufferAt(storage,76)
+    val card=nativeBufferAt(storage+80,80)
+    val output=nativeBufferAt(batchDestination,8192)
+    if (!sdMmcBatchReaderInitialize(reader,card,session,nativeBufferAt(0x3fc88000,64),nativeBufferAt(0x3fc8a000,16384),32,100,100,true)) return i32(25)
+    output.storeU32(4608,0xdeadbeef)
+    if (!sdMmcBatchReadOwned(reader,123,9,output) || batchCommands != 2 || session.loadU32(72) != 0 || output.loadU32(4608) != 0xdeadbeef) return i32(26)
+    var offset=0
+    while (offset < 4608) { if (output.loadU32(offset) != (offset^0xabcdef00)) return i32(27); offset=offset+4 }
+    if (!sdMmcBatchReadOwned(reader,124,1,output) || batchCommands != 3) return i32(28)
+    // Reject destination alias against the ENTIRE bounce, not only request.
+    if (sdMmcBatchReadOwned(reader,123,1,nativeBufferAt(0x3fc8a000+8192,512)) || sdMmcBatchReadOwned(reader,123,33,output) || batchCommands != 3) return i32(29)
+    output.storeU32(0,0xdeadbeef); batchError=true
+    if (sdMmcBatchReadOwned(reader,123,9,output) || output.loadU32(0) != 0xdeadbeef || session.loadU32(72) != 2 || sdMmcBatchReadOwned(reader,123,1,output)) return i32(30)
+    // Poll cap keeps DMA lease; clock failure during drain also retains it.
+    reset(1); tick=0; batchError=false
+    if (!sdMmcBatchReaderInitialize(reader,card,session,nativeBufferAt(0x3fc88000,64),nativeBufferAt(0x3fc8a000,16384),32,100,1,true)) return i32(31)
+    if (sdMmcBatchReadOwned(reader,123,9,output) || session.loadU32(72) != 1 || output.loadU32(0) != 0xdeadbeef) return i32(32)
+    clockFailure=true
+    if (sdMmcBatchDrainOwned(reader) != -1 || session.loadU32(72) != 1) return i32(33)
+    clockFailure=false; var attempts=0
+    while (session.loadU32(72) == 1 && attempts < 30) { sdMmcBatchDrainOwned(reader); attempts=attempts+1 }
+    if (session.loadU32(72) != 2 || output.loadU32(0) != 0xdeadbeef || sdMmcBatchReadOwned(reader,123,1,output) || badAddress) return i32(34)
+    // Complete FAT metadata -> contiguous extent -> CMD18 -> unaligned copy.
+    reset(1); batchCommands=0
+    val meta=nativeBufferAt(fileWorkspace,28)
+    val metaSession=nativeBufferAt(fileWorkspace+28,52)
+    val boot=nativeBufferAt(fileWorkspace+80,512)
+    val fatScratch=nativeBufferAt(fileWorkspace+592,1024)
+    val dataScratch=nativeBufferAt(fileWorkspace+1616,16384)
+    if (!fatSdMmcReaderInitialize(meta,card,metaSession,nativeBufferAt(0x3fc88040,16),nativeBufferAt(0x3fc89000,512),100,100,true) ||
+        !sdMmcBatchReaderInitialize(reader,card,session,nativeBufferAt(0x3fc88000,64),nativeBufferAt(0x3fc8a000,16384),32,100,100,true)) return i32(35)
+    offset=0
+    while (offset < 512) { boot.store(offset,0); offset=offset+1 }
+    boot.store(12,2); boot.store(13,1); boot.store(14,1); boot.store(16,2); boot.store(18,2)
+    boot.store(22,40); boot.store(19,129); boot.store(20,39); boot.store(510,85); boot.store(511,170)
+    val file=FatDirectoryEntry((1<<60)|(700<<28)|2)
+    output.store(190,42)
+    val result=fatSdMmcFileReadBatchOwned(meta,reader,boot,0,10113,file,510,512,1,output,fatScratch,dataScratch)
+    if (result.status() != 1 || result.bytesRead() != 190 || batchCommands != 3 || output.load(190) != 42 || badAddress) return i32(36)
+    offset=0
+    while (offset < 190) {
+        val source=510+offset
+        val word=(source&~3)^0xabcdef00
+        if (output.load(offset) != ((word>>((source&3)*8))&255)) return i32(37)
+        offset=offset+1
+    }
+    val before=batchCommands
+    if (fatSdMmcFileReadBatchOwned(meta,reader,boot,0,10113,file,700,512,1,output,fatScratch,dataScratch).status() != 2 || batchCommands != before) return i32(38)
+    if (fatSdMmcFileReadBatchOwned(meta,reader,boot,0,10113,file,0,512,1,boot,fatScratch,dataScratch).status() != 3 ||
+        fatSdMmcFileReadBatchOwned(meta,reader,boot,0,10113,file,0,512,1,output,nativeBufferAt(storage,1024),dataScratch).status() != 3 || batchCommands != before) return i32(39)
+    output.store(0,42); batchError=true
+    if (fatSdMmcFileReadBatchOwned(meta,reader,boot,0,10113,file,0,512,1,output,fatScratch,dataScratch).status() != 4 || output.load(0) != 42 || session.loadU32(72) != 2) return i32(40)
+    return i32(0)
+}

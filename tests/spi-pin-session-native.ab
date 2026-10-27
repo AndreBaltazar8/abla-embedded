@@ -1,0 +1,117 @@
+import "../src/esp32/spi/pin_session_s3_sequence.ab"
+import "../src/esp32/spi/master_session_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin=int
+fun Pin.number(): int = this|0
+fun Pin.valid(): bool = espChipS3().gpioValid(this)
+fun Pin.outputCapable(): bool = espChipS3().gpioOutputValid(this)
+val regs=nativeBufferAt(nativeStaticAllocate(24576),24576)
+val record=nativeBufferAt(nativeStaticAllocate(40),40)
+var routeCalls=0
+var failRoute=-1
+var writes=0
+var drop=-1
+var csFail=false
+var initResult=1
+var clockOkay=true
+var idleAfter=0
+var idleReads=0
+var initBad=false
+fun reset(): void {
+    var n=0
+    while (n < 24576) { regs.storeU32(n,0);n=n+4 }
+    n=0;while (n < 40) { record.storeU32(n,0);n=n+4 }
+    routeCalls=0;failRoute=-1;writes=0;drop=-1;csFail=false;initResult=1;clockOkay=true;idleAfter=0;idleReads=0;initBad=false;return
+}
+fun esp32s3SpiInitializeMasterOwned(peripheral: int,pins: SpiPins,select: Pin,source: int,pre: int,cycles: int,mode: int,owner: u32,polls: int): int {
+    if (record.loadU32(4) != 3 || record.loadU32(16) == 0 || record.loadU32(8) == 0) initBad=true
+    esp32s3SpiRouteMasterPinsOwned(peripheral,pins,select)
+    return initResult
+}
+fun esp32s3SpiEnableBusClock(peripheral: int,owner: u32): bool = clockOkay
+fun esp32s3SpiBase(peripheral: int): int = 0x60024000+(peripheral-2)*4096
+fun esp32s3SpiCpuBufferIdle(base: int): bool { idleReads=idleReads+1;return idleReads > idleAfter }
+fun esp32S3PinStateRead(address: int): int = regs.loadU32(address-0x60004000)
+fun esp32S3PinStateWrite(address: int,value: int): void {
+    val step=writes;writes=writes+1;if (step == drop) return
+    if (address == 0x60004028) regs.storeU32(32,regs.loadU32(32)&~value)
+    else if (address == 0x60004024) regs.storeU32(32,regs.loadU32(32)|value)
+    else if (address == 0x60004008) regs.storeU32(4,regs.loadU32(4)|value)
+    else if (address == 0x6000400c) regs.storeU32(4,regs.loadU32(4)&~value)
+    else regs.storeU32(address-0x60004000,value)
+    return
+}
+fun Pin.write(high: bool): void { regs.storeU32(4,if (high) regs.loadU32(4)|(1<<this) else regs.loadU32(4)&~(1<<this));return }
+fun Pin.setOpenDrain(enabled: bool): void { regs.storeU32(0x74+this*4,if (enabled) 4 else 0);return }
+fun Pin.outputLevelOwned(high: bool): bool {
+    if (csFail) return false
+    this.write(high);this.setOpenDrain(false);this.output();return true
+}
+fun Pin.output(): void {
+    if (csFail) return
+    regs.storeU32(esp32S3GpioMuxAddress(this)-0x60004000,0x1000)
+    regs.storeU32(0x554+this*4,1280);regs.storeU32(32,regs.loadU32(32)|(1<<this));return
+}
+fun Pin.routeOutputSignal(signal: int,inverted: bool): bool {
+    val step=routeCalls;routeCalls=routeCalls+1;if (step == failRoute) return false
+    this.output();regs.storeU32(0x554+this*4,signal);return true
+}
+fun Pin.routeInputSignal(signal: int,inverted: bool): bool {
+    val step=routeCalls;routeCalls=routeCalls+1;if (step == failRoute) return false
+    regs.storeU32(esp32S3GpioMuxAddress(this)-0x60004000,0x1200)
+    regs.storeU32(0x154+signal*4,(regs.loadU32(0x154+signal*4)&~255)|128|(this|0));return true
+}
+@export("abla_spi_pin_session_test")
+trusted fun test(): i32 {
+    val pins=spiPins(7,8,9)
+    var peripheral=2
+    while (peripheral <= 3) {
+        var fault=-1
+        while (fault < 4) {
+            reset();failRoute=fault;csFail=fault == 3
+            val input=if (peripheral == 2) 102 else 67
+            regs.storeU32(0x154+input*4,0xaabbcc45)
+            if (esp32S3SpiPinsOpenOwned(record,peripheral,pins,Pin(10),true) != (if (fault == -1) 1 else 3)) return i32(1)
+            if (esp32S3SpiPinsOpenOwned(record,peripheral,pins,Pin(10),true) != 0) return i32(2)
+            if (esp32S3SpiPinsCloseOwned(record,true) != 2 || regs.loadU32(0x154+input*4) != 0xaabbcc45 || regs.loadU32(4) != 0 || regs.loadU32(32) != 0) return i32(3)
+            fault=fault+1
+        }
+        peripheral=peripheral+1
+    }
+    reset()
+    if (esp32S3SpiPinsOpenOwned(record,2,pins,Pin(10),true) != 1) return i32(8)
+    writes=0
+    if (esp32S3SpiPinsCloseOwned(record,true) != 2) return i32(9)
+    val restoreWrites=writes
+    var fault=0
+    while (fault < restoreWrites) {
+        reset()
+        if (esp32S3SpiPinsOpenOwned(record,2,pins,Pin(10),true) != 1) return i32(4)
+        // Model a stopped transfer that has not deasserted manual CS yet.
+        Pin(10).write(false)
+        writes=0;drop=fault
+        val closed=esp32S3SpiPinsCloseOwned(record,true)
+        if (closed != 2 && closed != 3) return i32(5)
+        drop=-1
+        if (esp32S3SpiPinsCloseOwned(record,true) != 2 || regs.loadU32(4) != 0 || regs.loadU32(32) != 0 || regs.loadU32(0x154+102*4) != 0) return i32(6)
+        fault=fault+1
+    }
+    reset()
+    if (esp32S3SpiPinsOpenOwned(record,2,pins,Pin(10),false) != 0 || esp32S3SpiPinsOpenOwned(record,2,pins,Pin(7),true) != 0 || writes != 0 || routeCalls != 0) return i32(7)
+    var result=1
+    while (result <= 8) {
+        reset();initResult=result
+        if (esp32S3SpiMasterSessionBeginOwned(record,2,pins,Pin(10),1,1,16,0,u32(1),4,true) != (if (result == 1) 1 else 3) || initBad) return i32(10)
+        val before=writes
+        clockOkay=false
+        if (esp32S3SpiMasterSessionCloseOwned(record,4,true) != 3 || writes != before || record.loadU32(12) != 64) return i32(11)
+        clockOkay=true;idleAfter=4
+        if (esp32S3SpiMasterSessionCloseOwned(record,4,true) != 3 || writes != before || idleReads != 4 || record.loadU32(12) != 65) return i32(12)
+        if (esp32S3SpiMasterSessionCloseOwned(record,4,true) != 2 || regs.loadU32(4) != 0 || regs.loadU32(32) != 0) return i32(13)
+        result=result+1
+    }
+    reset()
+    if (esp32S3SpiMasterSessionBeginOwned(record,2,pins,Pin(10),1,2,1,0,u32(1),4,true) != 0 || routeCalls != 0) return i32(14)
+    return i32(0)
+}

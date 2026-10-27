@@ -1,0 +1,107 @@
+import "../src/esp32/gpio_c6_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var writes=0
+var drop=0
+var bad=false
+var pinNumber=0
+fun mapped(address: int): int {
+    if (address >= 0x60090000 && address < 0x60090080) return address-0x60090000
+    if (address >= 0x60091000 && address < 0x600915d0) return 256+address-0x60091000
+    if (address == 0x600b102c) return 4000
+    if (address == 0x600b1028) return 4004
+    if (address == 0x6000f018) return 4008
+    return -1
+}
+fun c6GpioRead(address: int): u32 {
+    val at=mapped(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c6GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    val r=nativeBufferAt(memory,4096)
+    var at=mapped(address);var wanted=value
+    if (address == 0x60091024 || address == 0x60091008) {
+        if (value != (u32(1)<<u32(pinNumber))) bad=true
+        at=at-4;wanted=u32(r.loadU32(at))|value
+    } else if (address == 0x60091028 || address == 0x6009100c) {
+        if (value != (u32(1)<<u32(pinNumber))) bad=true
+        at=at-8;wanted=u32(r.loadU32(at))&(u32(0xffffffff)^value)
+    } else if (address != 0x60090004+pinNumber*4 && address != 0x60091074+pinNumber*4 && address != 0x60091554+pinNumber*4) bad=true
+    if (at < 0 || at >= 4000 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) r.storeU32(at,int(wanted))
+    return
+}
+fun seed(noise: int): void {
+    val r=nativeBufferAt(memory,4096)
+    var i=0
+    while (i < 4096) { r.storeU32(i,(i*1337)^noise);i=i+4 }
+    r.storeU32(4000,0);r.storeU32(4004,0);r.storeU32(4008,0)
+    writes=0;drop=0;bad=false;return
+}
+fun matches(profile: int,pull: int,noise: int): bool {
+    val r=nativeBufferAt(memory,4096);val bit=1<<pinNumber
+    var i=0
+    while (i < 4000) {
+        val old=(i*1337)^noise
+        var expected=old
+        if (i == 256+4) expected=(old&(0xffffffff^bit))|(if ((profile&2) != 0) bit else 0)
+        else if (i == 256+32) expected=(old&(0xffffffff^bit))|(if ((profile&1) != 0) bit else 0)
+        else if (i == 256+116+pinNumber*4) expected=(old&0xfffffffb)|(if ((profile&4) != 0) 4 else 0)
+        else if (i == 256+1364+pinNumber*4) expected=(old&0xfffff800)|640
+        else if (i == 4+pinNumber*4) expected=(old&0xffff8c7d)|4096|(if ((profile&8) != 0) 512 else 0)|(if (pull == 1) 256 else if (pull == 2) 128 else 0)
+        if (r.loadU32(i) != expected) return false
+        i=i+4
+    }
+    return !bad
+}
+fun configure(profile: int,pull: int): int = esp32C6GpioConfigureOwned(pinNumber,(profile&1) != 0,(profile&2) != 0,(profile&4) != 0,(profile&8) != 0,pull,true)
+@export("abla_gpio_c6_test")
+fun test(): int {
+    pinNumber=0
+    while (pinNumber < 31) {
+        var profile=0
+        while (profile < 16) {
+            var pull=0
+            while (pull < 3) {
+                val noise=if ((profile&1) == 0) 0xa55a1234 else 0x5aa5edcb
+                seed(noise)
+                if (configure(profile,pull) != 1 || !matches(profile,pull,noise)) return 1
+                val count=writes
+                var failure=1
+                while (failure <= count) {
+                    seed(noise);drop=failure
+                    val result=configure(profile,pull)
+                    if ((result != 1 && result != 4) || (result == 1 && !matches(profile,pull,noise)) || bad) return 2
+                    drop=0
+                    if (configure(profile,pull) != 1 || !matches(profile,pull,noise)) return 3
+                    failure=failure+1
+                }
+                pull=pull+1
+            }
+            profile=profile+1
+        }
+        seed(0)
+        nativeBufferAt(memory,4096).storeU32(4000,1<<pinNumber)
+        if (configure(15,1) != 3 || writes != 0) return 4
+        seed(0)
+        if (pinNumber < 8) {
+            nativeBufferAt(memory,4096).storeU32(4004,1<<pinNumber)
+            if (configure(15,1) != 3 || writes != 0) return 5
+        }
+        if (pinNumber == 12 || pinNumber == 13) {
+            nativeBufferAt(memory,4096).storeU32(4008,16384)
+            if (configure(15,1) != 3 || writes != 0) return 6
+        }
+        pinNumber=pinNumber+1
+    }
+    seed(0)
+    if (esp32C6GpioConfigureOwned(0,true,true,false,true,0,false) != 3 ||
+        esp32C6GpioConfigureOwned(31,true,true,false,true,0,true) != 2 ||
+        esp32C6GpioConfigureOwned(-1,true,true,false,true,0,true) != 2 ||
+        esp32C6GpioConfigureOwned(0,true,true,false,true,3,true) != 2 ||
+        esp32C6GpioReadOwned(31) != -1 || esp32C6GpioWriteOwned(31,true) || writes != 0) return 7
+    return 0
+}

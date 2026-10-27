@@ -1,0 +1,194 @@
+import "../src/esp32/coprocessor_owner_s3_sequence.ab"
+import "../src/esp32/coprocessor_fault_s3_sequence.ab"
+import "../src/esp32/coprocessor_dispatch_s3_sequence.ab"
+import "../src/esp32/coprocessor_policy_s3_sequence.ab"
+import "abla/unsafe/native"
+import "abla/runtime/scalar"
+import "abla/build"
+var memory=nativeBufferAt(0,0)
+var registers=nativeBufferAt(0,0)
+var core=0
+var status=0x4000F
+var enabled=0
+var calls=0
+var failAt=0
+var order=0
+var resolved=0
+var resolveCalls=0
+var lockBad=false
+var irqEnabled=0
+var fallbackCalls=0
+var fallbackCause=0
+var syscallCalls=0
+fun esp32S3ExceptionCore(): int = core
+fun esp32S3ExceptionEnabled(): int = irqEnabled
+fun esp32S3ExceptionConfig(): int = 0x3FC90040
+trusted fun esp32S3ExceptionRead(address: int): int = esp32S3CpOwnerRead(address)
+trusted fun esp32S3ExceptionWrite(address: int,value: int): void { esp32S3CpOwnerWrite(address,value); return }
+fun esp32S3CoprocessorPolicyAddress(): int = 0x40379000
+fun esp32S3CpPolicySyscall(frame: NativeBuffer): bool { syscallCalls=syscallCalls+1; return frame.addressValue() == 0x3FC90300 }
+fun esp32S3CpPolicyFallback(callback: int,frame: int,cause: int,selectedCore: int,context: int): void {
+    if (callback != 0x4037A000 || frame != 0x3FC90300 || cause != fallbackCause || selectedCore != core || context != 91 || status != 0x40024) lockBad=true
+    fallbackCalls=fallbackCalls+1; return
+}
+fun xtensaGuardCore(): int = core
+fun xtensaGuardStatus(): int = status
+fun xtensaGuardMaskLocal(): int { val old=status; status=status | 15; return old }
+fun xtensaGuardRestoreLevel(level: int): void { status=(status & ~15) | level; return }
+trusted fun xtensaCriticalLockCas(address: int,expected: int,replacement: int): int {
+    if ((status & 15) != 15) lockBad=true
+    val old=esp32S3CpOwnerRead(address)
+    if (old == expected) esp32S3CpOwnerWrite(address,replacement)
+    old
+}
+trusted fun esp32S3CpDispatchResolve(callback: int,selectedCore: int,cp: int,context: int): int {
+    if (callback != 0x40378000 || selectedCore != core || context != 73 ||
+        (cp != 0 && cp != 3) || status != 0x4002F || memory.loadU32(32) != core+1) lockBad=true
+    resolveCalls=resolveCalls+1
+    resolved
+}
+fun esp32S3CpOwnerCore(): int = core
+fun esp32S3CpOwnerStatus(): int = status
+fun esp32S3CpOwnerEnabled(): int = enabled
+trusted fun esp32S3CpOwnerRead(address: int): int = memory.loadU32(address-0x3FC90000)
+trusted fun esp32S3CpOwnerWrite(address: int,value: int): void { memory.storeU32(address-0x3FC90000,value); return }
+trusted fun esp32S3CpOwnerTransfer(buffer: NativeBuffer,selectedCore: int,cp: int,restore: bool): bool {
+    calls=calls+1
+    order=order*10+(if (restore) 2 else 1)
+    if (calls == failAt || selectedCore != core) return false
+    var offset=0
+    val length=if (cp == 0) 72 else 208
+    while (offset < length) {
+        if (restore) registers.storeU32(offset,esp32S3CpOwnerRead(buffer.addressValue()+offset))
+        else esp32S3CpOwnerWrite(buffer.addressValue()+offset,registers.loadU32(offset))
+        offset=offset+4
+    }
+    true
+}
+trusted fun resetCalls(): void { calls=0; order=0; failAt=0; return }
+@export("abla_coprocessor_owner_test")
+trusted fun cpOwnerTest(): i32 {
+    memory=nativeBufferAt(nativeStaticAllocate(1024),1024)
+    registers=nativeBufferAt(nativeStaticAllocate(208),208)
+    val table=nativeBufferAt(0x3FC90000,16)
+    val first=nativeBufferAt(0x3FC90100,256)
+    val second=nativeBufferAt(0x3FC90200,256)
+    var profile=0
+    while (profile < 128) {
+        var offset=0
+        while (offset < 1024) { memory.storeU32(offset,0); offset=offset+4 }
+        core=profile & 1; status=0x4000F; enabled=0; resetCalls()
+        irqEnabled=0
+        val policy=nativeBufferAt(0x3FC90080,24)
+        val policyLock=nativeBufferAt(0x3FC90020,4)
+        val cfg=64+core*32
+        memory.storeU32(cfg,0x3FC92FD0); memory.storeU32(cfg+16,0x3FC92000); memory.storeU32(cfg+20,0x3FC93000)
+        if (esp32S3CoprocessorPolicyInstallOwned(policy,table,policyLock,core,0,91,0x40378000,73) || memory.loadU32(128) != 0) return i32(30)
+        if (esp32S3CoprocessorPolicyInstallOwned(nativeBufferAt(0x3FC90040,24),table,policyLock,core,0x4037A000,91,0x40378000,73) ||
+            esp32S3CoprocessorPolicyInstallOwned(nativeBufferAt(0x3FC92000,24),table,policyLock,core,0x4037A000,91,0x40378000,73)) return i32(31)
+        if (!esp32S3CoprocessorPolicyInstallOwned(policy,table,policyLock,core,0x4037A000,91,0x40378000,73) ||
+            memory.loadU32(cfg+24) != 0x40379000 || memory.loadU32(cfg+28) != policy.addressValue() || memory.loadU32(148) != 73) return i32(32)
+        if (esp32S3CoprocessorPolicyInstallOwned(policy,table,policyLock,core,0x4037B000,91,0x40378000,73) || memory.loadU32(128) != 0x4037A000) return i32(33)
+        val cp=if ((profile & 2) == 0) 0 else 3
+        val slot=core*8+(if (cp == 0) 0 else 4)
+        val length=if (cp == 0) 72 else 208
+        if (!esp32S3CpRecordInitializeOwned(first,cp) || !esp32S3CpRecordInitializeOwned(second,cp) ||
+            esp32S3CpRecordInitializeOwned(first,cp)) return i32(1)
+        offset=16
+        while (offset < 256) { if (memory.loadU32(256+offset) != 0) return i32(2); offset=offset+4 }
+        if (!esp32S3CpOwnerAcquireOwned(table,first,core,cp) || order != 2 ||
+            memory.loadU32(slot) != first.addressValue() || memory.loadU32(264) != core+1 || memory.loadU32(268) != 0) return i32(3)
+        offset=0
+        while (offset < length) {
+            if (registers.loadU32(offset) != 0) return i32(4)
+            registers.storeU32(offset,profile*256+offset+1); offset=offset+4
+        }
+        resetCalls()
+        if (!esp32S3CpOwnerAcquireOwned(table,first,core,cp) || calls != 0) return i32(5)
+        failAt=1
+        if (esp32S3CpOwnerAcquireOwned(table,second,core,cp) || order != 1 || memory.loadU32(slot) != first.addressValue() || memory.loadU32(268) != 0) return i32(6)
+        resetCalls(); failAt=2
+        if (esp32S3CpOwnerAcquireOwned(table,second,core,cp) || order != 12 || memory.loadU32(slot) != first.addressValue() ||
+            memory.loadU32(264) != core+1 || memory.loadU32(520) != 0 || memory.loadU32(268) != 1) return i32(7)
+        offset=0
+        while (offset < length) { if (registers.loadU32(offset) != profile*256+offset+1) return i32(8); offset=offset+4 }
+        resetCalls()
+        if (!esp32S3CpOwnerAcquireOwned(table,second,core,cp) || order != 12 || memory.loadU32(264) != 0) return i32(9)
+        resetCalls()
+        if (!esp32S3CpOwnerAcquireOwned(table,first,core,cp) || order != 12) return i32(10)
+        offset=0
+        while (offset < length) { if (registers.loadU32(offset) != profile*256+offset+1) return i32(11); offset=offset+4 }
+        core=core ^ 1; resetCalls()
+        if (esp32S3CpOwnerAcquireOwned(table,first,core,cp) || calls != 0) return i32(12)
+        core=core ^ 1
+        memory.storeU32(slot ^ 8,first.addressValue())
+        if (esp32S3CpOwnerReleaseOwned(table,core,cp) || esp32S3CpOwnerAcquireOwned(table,second,core,cp) || calls != 0) return i32(13)
+        memory.storeU32(slot ^ 8,0)
+        enabled=1<<cp
+        if (esp32S3CpOwnerReleaseOwned(table,core,cp) || calls != 0) return i32(14)
+        enabled=0; status=0x4001F
+        if (esp32S3CpOwnerReleaseOwned(table,core,cp) || calls != 0) return i32(15)
+        status=0x4000F; failAt=1
+        if (esp32S3CpOwnerReleaseOwned(table,core,cp) || memory.loadU32(slot) != first.addressValue()) return i32(16)
+        resetCalls()
+        if (!esp32S3CpOwnerReleaseOwned(table,core,cp) || order != 1 || memory.loadU32(slot) != 0 || memory.loadU32(264) != 0) return i32(17)
+        core=core ^ 1; resetCalls()
+        if (!esp32S3CpOwnerAcquireOwned(table,first,core,cp) || order != 2 || memory.loadU32(slot ^ 8) != first.addressValue()) return i32(18)
+        offset=0
+        while (offset < length) { if (registers.loadU32(offset) != profile*256+offset+1) return i32(19); offset=offset+4 }
+        val frame=nativeBufferAt(0x3FC90300,192)
+        offset=0
+        while (offset < 192) { memory.storeU32(768+offset,profile*256+offset); offset=offset+4 }
+        memory.storeU32(848,32+cp); memory.storeU32(916,9 ^ (1<<cp))
+        resetCalls()
+        if (!esp32S3CoprocessorFaultOwned(frame,table,first,core) || calls != 0) return i32(20)
+        offset=0
+        while (offset < 192) {
+            val expected=if (offset == 80) 32+cp else if (offset == 148) 9 else profile*256+offset
+            if (memory.loadU32(768+offset) != expected) return i32(21)
+            offset=offset+4
+        }
+        if (esp32S3CoprocessorFaultOwned(frame,table,first,core) || calls != 0) return i32(22)
+        memory.storeU32(916,0); memory.storeU32(848,33)
+        if (esp32S3CoprocessorFaultOwned(frame,table,first,core) || calls != 0) return i32(23)
+        memory.storeU32(848,32+cp)
+        failAt=1
+        if (esp32S3CoprocessorFaultOwned(frame,table,second,core) || memory.loadU32(916) != 0) return i32(24)
+        resetCalls()
+        if (!esp32S3CoprocessorFaultOwned(frame,table,second,core) || order != 12 || memory.loadU32(916) != (1<<cp)) return i32(25)
+        val lock=nativeBufferAt(0x3FC90020,4)
+        status=0x40024; resolved=first.addressValue(); resolveCalls=0; lockBad=false
+        memory.storeU32(916,0); resetCalls()
+        if (esp32S3CoprocessorDispatch(frame,table,lock,core,0x40378000,73) != 1 ||
+            resolveCalls != 1 || lockBad || status != 0x40024 || memory.loadU32(32) != 0 || order != 12) return i32(26)
+        memory.storeU32(916,0); memory.storeU32(32,2-core); resolveCalls=0; resetCalls()
+        if (esp32S3CoprocessorDispatch(frame,table,lock,core,0x40378000,73) != -2 ||
+            resolveCalls != 0 || status != 0x40024 || calls != 0 || memory.loadU32(916) != 0) return i32(27)
+        memory.storeU32(32,0); resolved=0
+        if (esp32S3CoprocessorDispatch(frame,table,lock,core,0x40378000,73) != -3 ||
+            resolveCalls != 1 || status != 0x40024 || memory.loadU32(32) != 0 || calls != 0) return i32(28)
+        resolved=second.addressValue(); failAt=1
+        if (esp32S3CoprocessorDispatch(frame,table,lock,core,0x40378000,73) != -3 ||
+            status != 0x40024 || memory.loadU32(32) != 0 || memory.loadU32(916) != 0 || lockBad) return i32(29)
+        resetCalls(); fallbackCalls=0; syscallCalls=0; resolved=first.addressValue()
+        esp32S3CoprocessorPolicy(u32(frame.addressValue()),u32(32+cp),u32(core),u32(policy.addressValue()))
+        if (fallbackCalls != 0 || memory.loadU32(916) != (1<<cp) || status != 0x40024 || lockBad) return i32(34)
+        memory.storeU32(916,0); resolved=0; fallbackCause=32+cp
+        esp32S3CoprocessorPolicy(u32(frame.addressValue()),u32(32+cp),u32(core),u32(policy.addressValue()))
+        if (fallbackCalls != 1 || memory.loadU32(32) != 0 || lockBad) return i32(35)
+        fallbackCause=9
+        esp32S3CoprocessorPolicy(u32(frame.addressValue()),u32(9),u32(core),u32(policy.addressValue()))
+        esp32S3CoprocessorPolicy(u32(frame.addressValue()),u32(1),u32(core),u32(policy.addressValue()))
+        if (fallbackCalls != 2 || syscallCalls != 1 || lockBad) return i32(36)
+        // Installation was on the original core, before the migration profiles.
+        core=profile & 1
+        memory.storeU32(cfg+4,1)
+        if (esp32S3CoprocessorPolicyRemoveOwned(policy,core)) return i32(37)
+        memory.storeU32(cfg+4,0); irqEnabled=1
+        if (esp32S3CoprocessorPolicyRemoveOwned(policy,core)) return i32(38)
+        irqEnabled=0
+        if (!esp32S3CoprocessorPolicyRemoveOwned(policy,core) || memory.loadU32(cfg+24) != 0 || memory.loadU32(cfg+28) != 0 || memory.loadU32(128) != 0x4037A000) return i32(39)
+        profile=profile+1
+    }
+    i32(0)
+}

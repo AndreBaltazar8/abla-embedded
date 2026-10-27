@@ -1,0 +1,142 @@
+import "../src/m5stack/detect_classic_sequence.ab"
+import "../src/m5stack/detect_classic_timed_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val regs=nativeBufferAt(nativeStaticAllocate(24576),24576)
+var package=5
+var high2=true
+var high34=true
+var reference=600
+var led=200
+var signature=56
+var inputIndex=0
+var writes=0
+var reads=0
+var drop=-1
+var done=false
+var bad=false
+var delayed=false
+var rawReads=0
+fun m5ClassicReadPackage(): int { reads=reads+1; package }
+fun touchScanRead(address: int): u32 = u32(classicProbeRead(address))
+fun touchScanWrite(address: int,value: u32): void { classicProbeWrite(address,int(value)); return }
+fun classicProbeRead(address: int): int {
+    reads=reads+1
+    if (address == 0x3FF48884) return regs.loadU32(0x4884)|(if (done) 1024 else 0)
+    if (address == 0x3FF48878) { rawReads=rawReads+1; return reference<<16 }
+    if (address == 0x3FF4887C) { rawReads=rawReads+1; return led }
+    if (address == 0x3FF4403C || address == 0x3FF44040) {
+        var result=0
+        if (inputIndex == 0) {
+            if (address != 0x3FF4403C) bad=true
+            result=if (high2) 4 else 0
+        } else if (inputIndex == 1) {
+            if (address != 0x3FF44040) bad=true
+            result=if (high34) 4 else 0
+        } else {
+            val n=inputIndex-2
+            val pin=if (n%3 == 0) 33 else if (n%3 == 1) 19 else 22
+            if (n > 5 || address != (if (pin == 33) 0x3FF44040 else 0x3FF4403C) || (n >= 3 && !delayed)) bad=true
+            result=if ((signature&(1<<(5-n))) != 0) 1<<(pin&31) else 0
+        }
+        inputIndex=inputIndex+1; return result
+    }
+    if (address >= 0x3FF44000 && address < 0x3FF4A000 && (address&3) == 0) return regs.loadU32(address-0x3FF44000)
+    bad=true; return 0
+}
+fun classicProbeWrite(address: int,value: int): void {
+    val n=writes; writes=writes+1
+    if (n == drop) return
+    if (address == 0x3FF44024 || address == 0x3FF44028 || address == 0x3FF44030 || address == 0x3FF44034) {
+        val offset=if (address < 0x3FF44030) 32 else 44
+        val set=address == 0x3FF44024 || address == 0x3FF44030
+        regs.storeU32(offset,if (set) regs.loadU32(offset)|value else regs.loadU32(offset)&~value)
+    } else if (address == 0x3FF48410 || address == 0x3FF48414) {
+        regs.storeU32(0x440C,if (address == 0x3FF48410) regs.loadU32(0x440C)|value else regs.loadU32(0x440C)&~value)
+    } else if (address >= 0x3FF44000 && address < 0x3FF4A000 && (address&3) == 0) {
+        if (address == 0x3FF48884 && (value&4096) != 0) done=false
+        regs.storeU32(address-0x3FF44000,value)
+    } else bad=true
+    return
+}
+fun m5AtomSignatureDelayMilliseconds(ms: int): void {
+    if (ms != 1 || inputIndex != 5) bad=true
+    delayed=true; return
+}
+@export("abla_detect_classic_test")
+fun test(): i32 {
+    val r=nativeBufferAt(nativeStaticAllocate(680),680)
+    var variant=0
+    while (variant < 71) {
+        var fault=-1
+        while (fault < 96) {
+            var offset=0
+            while (offset < 24576) { regs.storeU32(offset,0); offset=offset+4 }
+            regs.storeU32(32,0xFFFFFFFF); regs.storeU32(44,0xFFFFFFFF); regs.storeU32(0x440C,0xFFFFFFFF)
+            package=if (variant == 0) 0 else if (variant == 1) 6 else if (variant == 2) 7 else 5
+            high2=variant != 3; high34=variant != 4; reference=600; led=if (variant == 5) 199 else 200
+            signature=variant-6; r.storeU32(0,0); inputIndex=0; reads=0; writes=0; drop=fault; done=false; bad=false; delayed=false; rawReads=0
+            val selected=if (variant == 70) m5BoardAtomVoice else m5BoardUnknown
+            var status=m5ClassicDetectBeginWithTimingOwned(r,selected,esp32TouchTimingM5Classic(8000000,150000),true)
+            if (variant == 70 && (status != 2 || writes != 0 || reads != 0)) return i32(1)
+            if (status == 1) {
+                val count=writes
+                if (m5ClassicDetectResult(r) != m5BoardUnknown || m5ClassicDetectPollOwned(r) != 1 || writes != count) return i32(2)
+                // Deliberately opposite classification in the discarded scan.
+                reference=if (variant == 5) 1 else 65535
+                led=if (variant == 5) 65535 else 0
+                done=true
+                status=m5ClassicDetectPollOwned(r)
+                if (rawReads != 0 || (fault == -1 && status != 1)) return i32(14)
+                if (status == 1) {
+                    val secondCount=writes
+                    if (m5ClassicDetectPollOwned(r) != 1 || writes != secondCount || m5ClassicDetectResult(r) != m5BoardUnknown) return i32(15)
+                    reference=600; led=if (variant == 5) 199 else 200; done=true
+                    status=m5ClassicDetectPollOwned(r)
+                }
+            }
+            if (status == 3) {
+                drop=-1
+                if (m5ClassicDetectResult(r) != m5BoardUnknown) return i32(3)
+                status=m5ClassicDetectPollOwned(r)
+            }
+            if (status == 3) {
+                // Dropping START's falling edge leaves hardware visibly active.
+                // Cleanup must refuse it, not force success. Model an external
+                // owner repairing that injected fault before retrying cleanup.
+                if ((regs.loadU32(0x4884)&4096) == 0 || m5ClassicDetectResult(r) != m5BoardUnknown) return i32(7)
+                regs.storeU32(0x4884,regs.loadU32(0x4884)&~4096)
+                status=m5ClassicDetectPollOwned(r)
+                if (status != 4) return i32(8)
+            }
+            if (status != 2 && status != 4) return i32(100+status)
+            val expected=if (variant == 0) m5BoardTimerCam else if (variant == 1) m5BoardAtomPsram else if (variant == 2) m5BoardUnknown
+                else if (variant == 3) m5BoardStampPico else if (variant == 4) m5BoardAtomU else if (variant == 5) m5BoardAtomMatrix
+                else if (signature == 56 || variant == 70) m5BoardAtomVoice else m5BoardAtomLite
+            if ((fault == -1 && status != 2) || (status == 2 && m5ClassicDetectResult(r) != expected) || bad) return i32(5)
+            offset=0
+            while (offset < 24576) {
+                if (regs.loadU32(offset) != (if (offset == 32 || offset == 44 || offset == 0x440C) 0xFFFFFFFF else 0)) return i32(6)
+                offset=offset+4
+            }
+            fault=fault+1
+        }
+        variant=variant+1
+    }
+    var cancelPhase=0
+    while (cancelPhase < 2) {
+        r.storeU32(0,0); package=5; high2=true; high34=true; drop=-1; done=false; inputIndex=0; delayed=false; writes=0; bad=false
+        if (m5ClassicDetectBeginOwned(r,m5BoardUnknown,255,40000,48,true) != 1) return i32(9)
+        if (cancelPhase == 1) { done=true; if (m5ClassicDetectPollOwned(r) != 1) return i32(16) }
+        val count=writes
+        if (m5ClassicDetectCancelOwned(r) != 1 || m5ClassicDetectPollOwned(r) != 1 || writes != count) return i32(10)
+        done=true
+        if (m5ClassicDetectPollOwned(r) != 4 || m5ClassicDetectResult(r) != m5BoardUnknown || inputIndex != 2 || bad) return i32(11)
+        cancelPhase=cancelPhase+1
+    }
+    val readCount=reads
+    val writeCount=writes
+    if (m5ClassicDetectBeginWithTimingOwned(r,m5BoardUnknown,Esp32TouchTiming(0),true) != 0 || reads != readCount || writes != writeCount) return i32(12)
+    if (m5ClassicDetectBeginWithTimingOwned(r,m5BoardTimerCam,Esp32TouchTiming(0),false) != 2 || m5ClassicDetectResult(r) != m5BoardTimerCam || reads != readCount || writes != writeCount) return i32(13)
+    i32(0)
+}

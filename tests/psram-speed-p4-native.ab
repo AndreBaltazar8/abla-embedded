@@ -1,0 +1,124 @@
+import "../src/esp32/psram/speed_p4_sequence.ab"
+import "abla/build"
+import "./p4-clock-order-model.ab"
+val speedRecord=nativeStaticAllocate(116)
+val speedPins=nativeStaticAllocate(80)
+var speedAxi=1
+var speedMapped=0
+var speedCommand=0
+var speedOldAxi=1
+var speedOldMapped=0
+var speedOldCommand=0
+var speedLow=0
+var speedWrites=0
+var speedDrop=0
+var speedBusy=false
+var speedReady=true
+var speedMpll=true
+var speedBad=false
+fun speedPadOriginal(pin: int): int = (0xa588ef37^(pin*0x12481))&0xffffffff
+fun p4PsramSpeedMpllReady(mhz: int,polls: int): bool = speedMpll
+fun p4PsramClockRead(offset: int): int {
+    if (offset == 192) return 0
+    if (offset == 20) return if (speedReady) 0x80000000 else 0
+    if (offset == 48) return 0xd000
+    speedBad=true;return 0
+}
+fun p4PsramClockWrite(offset: int,value: int): void { speedBad=true;return }
+fun p4PsramMappedRead(offset: int): int {
+    if (offset == 60) return speedAxi
+    if (offset == 80) return speedMapped
+    if (offset == 4116) return speedCommand
+    if (offset == 376) return if (speedBusy) 0 else 0xfc000000
+    if (offset == 0 || offset == 4096) return 0
+    speedBad=true;return 0
+}
+fun p4PsramPinRead(offset: int): int {
+    if (offset < 28 || offset > 104 || (offset&3) != 0) { speedBad=true;return 0 }
+    return nativeBufferAt(speedPins,80).loadU32(offset-28)
+}
+fun speedPadsMatch(low: bool): bool {
+    var pin=0
+    while (pin < 20) {
+        val mask=if (pin == 8 || pin == 19) 0x001e0786 else 240
+        if (nativeBufferAt(speedPins,80).loadU32(pin*4) != (if (low) speedPadOriginal(pin)&(mask^0xffffffff) else speedPadOriginal(pin))) return false
+        pin=pin+1
+    }
+    return true
+}
+fun p4PsramMappedWrite(offset: int,value: int): void {
+    speedWrites=speedWrites+1
+    if (speedWrites == speedDrop) return
+    if (offset != 60 && (speedAxi&0x80000001) != 0x80000000) speedBad=true
+    if (offset == 60) {
+        if ((value&0x80000001) != 0x80000000) clockOrderMemory(false,speedMapped == (0x55000000|speedLow) && speedCommand == (0x33000000|speedLow))
+        if ((value&0x80000001) != 0x80000000 &&
+            !((speedMapped == speedOldMapped && speedCommand == speedOldCommand && speedPadsMatch(false)) ||
+              (speedMapped == (0x55000000|speedLow) && speedCommand == (0x33000000|speedLow) && speedPadsMatch(true)))) speedBad=true
+        speedAxi=value
+    } else if (offset == 80) speedMapped=value
+    else if (offset == 4116) speedCommand=value
+    else speedBad=true
+    return
+}
+fun p4PsramPinWrite(offset: int,value: int): void {
+    speedWrites=speedWrites+1
+    if (speedWrites == speedDrop) return
+    if ((speedAxi&0x80000001) != 0x80000000 || offset < 28 || offset > 104 || (offset&3) != 0) { speedBad=true;return }
+    nativeBufferAt(speedPins,80).storeU32(offset-28,value);return
+}
+fun seedSpeed(mhz: int,axi: int): NativeBuffer {
+    speedAxi=0x12345678|(axi&1)|((axi&2)<<30);speedOldAxi=speedAxi
+    speedMapped=0x55010001;speedCommand=0x33030103;speedOldMapped=speedMapped;speedOldCommand=speedCommand
+    speedLow=if (mhz == 320) 0x000f070f else if (mhz == 400) 0x00130913 else 0x00180b18
+    speedWrites=0;speedDrop=0;speedBusy=false;speedReady=true;speedMpll=true;speedBad=false
+    val r=nativeBufferAt(speedRecord,116)
+    var i=0
+    while (i < 112) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(112,0x1234abcd)
+    i=0
+    while (i < 20) { nativeBufferAt(speedPins,80).storeU32(i*4,speedPadOriginal(i));i=i+1 }
+    return r
+}
+@export("abla_psram_speed_p4_test")
+trusted fun speedTest(): i32 {
+    var mode=0
+    while (mode < 12) {
+        val mhz=if (mode/4 == 0) 320 else if (mode/4 == 1) 400 else 500
+        var fault=0
+        while (fault <= 48) {
+            val r=seedSpeed(mhz,mode&3);speedDrop=fault
+            val opened=esp32p4PsramSpeedOpenOwned(r,mhz,2,true)
+            if (opened != 1 && opened != 5) return i32(1)
+            if (opened == 5) speedDrop=0
+            if (esp32p4PsramSpeedContinueOwned(r,2,true) != 1 || speedAxi != speedOldAxi || !speedPadsMatch(true) ||
+                speedMapped != (0x55000000|speedLow) || speedCommand != (0x33000000|speedLow)) return i32(2)
+            val count=speedWrites
+            if (esp32p4PsramSpeedCloseOwned(r,2,false,true) != 2 || speedWrites != count) return i32(3)
+            val closed=esp32p4PsramSpeedCloseOwned(r,2,true,true)
+            if (closed != 6 && closed != 5) return i32(4)
+            speedDrop=0
+            if (esp32p4PsramSpeedCloseOwned(r,2,true,true) != 6 || speedAxi != speedOldAxi || speedMapped != speedOldMapped || speedCommand != speedOldCommand ||
+                !speedPadsMatch(false) || speedBad || r.loadU32(112) != 0x1234abcd) return i32(5)
+            val finished=speedWrites
+            if (esp32p4PsramSpeedContinueOwned(r,2,true) != 6 || speedWrites != finished) return i32(6)
+            fault=fault+1
+        }
+        mode=mode+1
+    }
+    val busy=seedSpeed(400,1);speedBusy=true
+    if (esp32p4PsramSpeedOpenOwned(busy,400,2,true) != 4 || speedWrites != 0 || speedAxi != speedOldAxi) return i32(7)
+    speedBusy=false
+    if (esp32p4PsramSpeedContinueOwned(busy,2,true) != 1) return i32(8)
+    speedMpll=false;val count=speedWrites
+    if (esp32p4PsramSpeedCloseOwned(busy,2,true,true) != 3 || speedWrites != count || busy.loadU32(4) != 25) return i32(9)
+    speedMpll=true;speedBusy=true
+    if (esp32p4PsramSpeedCloseOwned(busy,2,true,true) != 4 || speedWrites != count) return i32(10)
+    speedBusy=false;speedReady=false
+    if (esp32p4PsramSpeedContinueOwned(busy,2,true) != 3 || speedWrites != count) return i32(11)
+    speedReady=true
+    if (esp32p4PsramSpeedCloseOwned(busy,2,true,true) != 6 || speedBad) return i32(12)
+    val invalid=seedSpeed(400,1);speedMapped=speedMapped^256
+    if (esp32p4PsramSpeedOpenOwned(invalid,400,2,true) != 2 || invalid.loadU32(0) != 0 || speedWrites != 0) return i32(13)
+    return i32(0)
+}

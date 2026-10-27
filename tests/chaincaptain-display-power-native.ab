@@ -1,0 +1,170 @@
+import "../src/m5stack/chaincaptain_display_power.ab"
+import "../src/m5stack/pm1_control_sequence.ab"
+import "../src/m5stack/pm1_control_setup.ab"
+import "../src/m5stack/expander_open.ab"
+import "../src/m5stack/pmic_open.ab"
+import "../src/esp32/i2c/software_provider_c61.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// Real board controller, PM1/IOE drivers, generation slots, register transport
+// and bit engine. Only the pad/clock admission and physical slave are modeled;
+// pins0/1 are model wires, NOT S3 board wiring or hardware proof.
+val registers=nativeStaticAllocate(512)
+val record=nativeStaticAllocate(72)
+var bad=false
+var pads=0
+fun c61SoftwareI2cReady(sda: int,scl: int): bool = sda == 0 && scl == 1
+fun c61SoftwareI2cConfigure(pin: int,enabled: bool): bool {
+    if (pin < 0 || pin > 1) { bad=true;return false }
+    if (enabled) pads=pads|(1<<pin) else pads=pads&~(1<<pin)
+    return true
+}
+fun softwareI2cSample(pin: int): bool = if (pin == 1) clockHigh else masterHigh && slaveHigh
+fun softwareI2cDrive(pin: int,released: bool): void = wireDrive(pin,released)
+fun softwareI2cDelay(us: int): void { return }
+fun pm1ControlStorageSafe(storage: NativeBuffer): bool = softwareI2cProviderBufferSafe(storage,72)
+fun pm1ControlBusReady(bus: int,board: M5BoardId): bool = I2cBus(bus).current() && pads == 3
+var masterHigh=true
+var slaveHigh=true
+var clockHigh=true
+var mode=0
+var bits=0
+var value=0
+var index=0
+var selected=-1
+var pointer=0
+var reading=false
+var ack=true
+var ackCount=0
+var nackAt=0
+var starts=0
+var stops=0
+fun wireByte(): void {
+    ackCount=ackCount+1
+    ack=ackCount != nackAt
+    if (index == 0) {
+        selected=if ((value>>>1) == 79) 0 else if ((value>>>1) == 110) 256 else -1
+        reading=(value&1) != 0
+        if (selected < 0) ack=false
+    } else if (ack && selected >= 0) {
+        if (index == 1) pointer=value
+        else { nativeBufferAt(registers,512).store(selected+pointer,value);pointer=(pointer+1)&255 }
+    }
+    index=index+1
+    return
+}
+fun sendBit(): void {
+    val byte=nativeBufferAt(registers,512).load(selected+pointer)
+    slaveHigh=(byte&(128>>>bits)) != 0;return
+}
+fun wireDrive(pin: int,high: bool): void {
+    if (pin == 0) {
+        val old=masterHigh
+        masterHigh=high
+        if (clockHigh && slaveHigh && old != high) {
+            if (!high) { starts=starts+1;mode=1;bits=0;value=0;index=0;reading=false }
+            else { stops=stops+1;mode=0;slaveHigh=true }
+        }
+        return
+    }
+    if (pin != 1) { bad=true;return }
+    if (clockHigh == high) return
+    clockHigh=high
+    if (high) {
+        if (mode == 1) { value=(value<<1)|(if (masterHigh) 1 else 0);bits=bits+1 }
+        else if (mode == 3) bits=bits+1
+        else if (mode == 4) ack=!masterHigh
+    } else {
+        if (mode == 1 && bits == 8) { wireByte();mode=2;slaveHigh=!ack }
+        else if (mode == 2) {
+            slaveHigh=true;bits=0;value=0
+            if (!ack) mode=5
+            else if (reading) { mode=3;sendBit() }
+            else mode=1
+        } else if (mode == 3) {
+            if (bits == 8) { mode=4;slaveHigh=true } else sendBit()
+        } else if (mode == 4) {
+            bits=0
+            if (ack) { pointer=(pointer+1)&255;mode=3;sendBit() } else { mode=5;slaveHigh=true }
+        }
+    }
+    return
+}
+fun wireSeed(): void {
+    masterHigh=true;slaveHigh=true;clockHigh=true;mode=0;bits=0;value=0;index=0
+    selected=-1;pointer=0;reading=false;ack=true;ackCount=0;nackAt=0;starts=0;stops=0
+    var at=0
+    while (at < 512) { nativeBufferAt(registers,512).store(at,255);at=at+1 }
+    nativeBufferAt(registers,512).store(256,18)
+    nativeBufferAt(registers,512).store(257,52)
+    nativeBufferAt(registers,512).store(258,86)
+    nativeBufferAt(registers,512).store(259,120)
+    return
+}
+
+
+var delays=0
+var doReset=true
+fun peripheralDelayMilliseconds(ms: int): void {
+    val r=nativeBufferAt(registers,512)
+    if (ms == 10) {
+        if (!doReset || delays != 0 || (r.load(5)&1) != 0) bad=true
+        delays=1
+    } else if (ms == 20) {
+        if (delays != (if (doReset) 1 else 0) || (r.load(5)&1) == 0) bad=true
+        delays=2
+    } else bad=true
+    return
+}
+trusted fun setup(io: M5Ioe1): int {
+    val power=chainCaptainDisplayPowerOwned(io,doReset,true)
+    if ((power&255) != 1) return power
+    return chainCaptainBacklightPrepareOwned(io,255,true)
+}
+@export("abla_chaincaptain_display_power_test")
+trusted fun test(): i32 {
+    var resetIndex=0
+    while (resetIndex < 2) {
+        doReset=resetIndex == 1
+        wireSeed();bad=false;delays=0
+        val bus=i2cSoftwareMaster(0,1,5,8)
+        val io=m5Ioe1(bus)
+        if (!bus.current() || !io.valid() || !io.begin()) return i32(1)
+        val begin=ackCount
+        if ((setup(io)&255) != 1 || bad || delays != 2) return i32(2)
+        val total=ackCount-begin
+        val r=nativeBufferAt(registers,512)
+        if (r.load(20) != 243 || r.load(4) != 255 || r.load(6) != 255 ||
+            r.load(19) != 254 || r.load(3) != 255 || r.load(5) != 255 ||
+            r.load(37) != 232 || r.load(38) != 3 || r.load(31) != 255 || r.load(32) != 143) return i32(3)
+        var level=0
+        var prior=-1
+        while (level < 256) {
+            val expected=(level*level*4095+32512)/65025
+            if (chainCaptainBacklightDuty(level) != expected || expected < prior ||
+                !io.setChainCaptainBacklightOwned(level) || r.load(31) != (expected&255) ||
+                r.load(32) != ((expected>>>8)|128)) return i32(4)
+            prior=expected;level=level+1
+        }
+        val before=ackCount
+        if (chainCaptainDisplayPowerOwned(io,true,false) != 3 ||
+            chainCaptainBacklightPrepareOwned(io,-1,true) != 3 ||
+            chainCaptainBacklightPrepareOwned(io,256,true) != 3 ||
+            chainCaptainBacklightPrepareOwned(io,255,false) != 3 ||
+            io.setChainCaptainBacklightOwned(-1) || io.setChainCaptainBacklightOwned(256) || ackCount != before) return i32(5)
+        if (!io.close() || !bus.current() || !bus.close() || pads != 0) return i32(6)
+        var failed=1
+        while (failed <= total) {
+            wireSeed();bad=false;delays=0
+            val current=i2cSoftwareMaster(0,1,5,8)
+            val device=m5Ioe1(current)
+            if (!device.valid() || !device.begin()) return i32(7)
+            nackAt=ackCount+failed
+            if ((setup(device)&255) != 4 || ackCount != nackAt || bad || mode != 0) return i32(8)
+            if (!device.close() || !current.current() || !current.close() || pads != 0) return i32(9)
+            failed=failed+1
+        }
+        resetIndex=resetIndex+1
+    }
+    return i32(0)
+}

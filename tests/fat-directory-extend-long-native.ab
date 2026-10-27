@@ -1,0 +1,98 @@
+import "../src/storage/fat_volume_create_auto_growing.ab"
+import "../src/storage/fat_directory_create_growing.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val image=nativeStaticAllocate(3072)
+var directoryMode=false
+var writes=0
+var failAt=0
+var bad=false
+fun slot(lba: int): int = if (lba == 1) 0 else if (lba == 41) 1 else if (lba >= 113 && lba <= 116) lba-111 else -1
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    val selected=slot(lba)
+    if (selected < 0 && lba != 0) return false
+    val source=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(image+selected*512,512)
+    var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    writes=writes+1;val selected=slot(lba)
+    val expected=if (writes <= 5) (if (writes == 1 || writes == 4) 0 else if (writes == 2 || writes == 5) 1 else 3)
+        else if (writes <= 10) (if (writes == 6 || writes == 9) 0 else if (writes == 7 || writes == 10) 1 else 4)
+        else if (directoryMode && writes <= 14) (if (writes == 11) 0 else if (writes == 12) 1 else 5)
+        else if (writes == (if (directoryMode) 16 else 12)) 3 else 4
+    if (selected != expected) { bad=true;return false }
+    if (writes == 4 || writes == 5 || writes == 9 || writes == 10) {
+        val zero=nativeBufferAt(image+(if (writes < 6) 1536 else 2048),512);var i=0
+        while (i < 512) { if (zero.load(i) != 0) bad=true;i=i+1 }
+    }
+    // The short name remains deleted until every LFN sector is published.
+    if (writes == (if (directoryMode) 15 else 11) && source.load(128) != 229) bad=true
+    if (writes == (if (directoryMode) 17 else 13) && source.load(128) != 65) bad=true
+    if (directoryMode && writes >= 15) {
+        val child=nativeBufferAt(image+2560,512)
+        if (child.load(0) != 46 || child.loadU16(26) != 5 || child.load(33) != 46 || child.loadU16(58) != 2 || child.load(64) != 0) bad=true
+    }
+    val output=nativeBufferAt(image+selected*512,512);var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return writes != failAt
+}
+@export("abla_fat_directory_extend_long_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val work=nativeBufferAt(memory+640,3780);val scratch=nativeBufferAt(memory+4480,512)
+    val plan=nativeBufferAt(memory+4992,32);val name=nativeBufferAt(memory+5056,510);val assembly=nativeBufferAt(memory+5632,520)
+    var i=0
+    while (i < 512) { boot.store(i,0);i=i+1 }
+    boot.storeU16(11,512);boot.store(13,1);boot.storeU16(14,1);boot.store(16,2)
+    boot.storeU16(17,512);boot.storeU16(22,40);boot.storeU16(19,10113);boot.storeU16(510,0xaa55)
+    i=0;while (i < 255) { name.storeU16(i*2,65);i=i+1 }
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    val modified=rtcCalendarDateTime(2026,9,9,12,34,56)
+    var mode=0
+    while (mode < 2) {
+    directoryMode=mode == 1
+    val maximum=if (directoryMode) 17 else 13
+    var failure=0
+    while (failure <= maximum) {
+        writes=0;failAt=failure;bad=false;i=0
+        while (i < 3072) { nativeBufferAt(image,3072).store(i,255);i=i+1 }
+        var copy=0
+        while (copy < 2) { val fat=nativeBufferAt(image+copy*512,512);fat.storeU16(6,0);fat.storeU16(8,0);fat.storeU16(10,0);copy=copy+1 }
+        val directory=nativeBufferAt(image+1024,512);i=0
+        while (i < 512) { directory.store(i,0);i=i+1 }
+        var entry=0
+        while (entry < 16) {
+            i=0;while (i < 11) { directory.store(entry*32+i,if (i == 0) 79 else 32);i=i+1 }
+            directory.store(entry*32+11,32);entry=entry+1
+        }
+        val volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+        val result=if (directoryMode) volume.createDirectoryGrowing(u32(7),2,name,255,1,8,64,modified,plan,work)
+            else volume.createLongAutoGrowing(u32(7),2,name,255,1,8,64,modified,plan,work)
+        if (bad || writes != (if (failure == 0) maximum else failure)) return i32(2)
+        val expected=if (failure == 0) 1 else if (failure <= 3 || (failure >= 6 && failure <= 8)) 17
+            else if (failure <= 10) 18 else 19
+        if (result.status() != expected) return i32(3)
+        if (failure != 0 && state.loadU32(12) != 3) return i32(4)
+        if (failure == 0) {
+            if (result.ordinal() != 2 || result.entryIndex() != 4 || nativeBufferAt(image+2048,512).load(160) != 0) return i32(5)
+            var lfn=FatLongName(0);entry=0
+            while (entry < 20) { lfn=lfn.consume(nativeBufferAt(image+1536+entry*32,32),assembly);entry=entry+1 }
+            if (!lfn.matches(nativeBufferAt(image+2176,32),assembly) || lfn.length() != 255) return i32(6)
+            if (directoryMode && (nativeBufferAt(image+2176,32).load(11) != 16 || nativeBufferAt(image+2176,32).loadU16(26) != 5)) return i32(10)
+            i=0;while (i < 255) { if (assembly.loadU16(i*2) != 65) return i32(7);i=i+1 }
+            copy=0;while (copy < 2) {
+                val fat=nativeBufferAt(image+copy*512,512)
+                if (fat.loadU16(4) != 3 || fat.loadU16(6) != 4 || fat.loadU16(8) != 65535) return i32(8)
+                copy=copy+1
+            }
+        }
+        if (directory.load(0) != 79 || directory.load(480) != 79 || !volume.invalidate(u32(7))) return i32(9)
+        failure=failure+1
+    }
+    mode=mode+1
+    }
+    return i32(0)
+}

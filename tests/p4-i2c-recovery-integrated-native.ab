@@ -1,0 +1,155 @@
+import "../src/esp32/i2c/hardware_clear_idle_bindings_p4.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val gpio=nativeStaticAllocate(4608)
+val savedGpio=nativeStaticAllocate(4608)
+val controller=nativeStaticAllocate(128)
+val sessionMemory=nativeStaticAllocate(72)
+val clearMemory=nativeStaticAllocate(40)
+var selectedPort=0
+var tick=u32(0)
+var pulses=0
+var releaseAt=0
+var held=true
+var changed=0
+var drop=0
+var resets=0
+var bad=false
+fun mapped(offset: int): int = if (offset >= 0x4b008 && offset <= 0x4b044) 4400+offset-0x4b008 else offset
+fun lineHigh(pin: int): bool {
+    val r=nativeBufferAt(gpio,4608)
+    val route=r.loadU32(1368+pin*4)&4095
+    val latch=r.loadU32(if (pin < 32) 4 else 16)&(1<<(pin&31))
+    return (route != 1280 || latch != 0) && (pin != 31 || !held)
+}
+fun p4GpioRead(offset: int): u32 {
+    if (offset == 60) return if (lineHigh(31)) u32(0x80000000) else u32(0)
+    if (offset == 64) return if (lineHigh(32)) u32(1) else u32(0)
+    val at=mapped(offset)
+    if (at < 0 || at >= 4608 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(gpio,4608).loadU32(at))
+}
+fun p4GpioWrite(offset: int,value: u32): void {
+    val r=nativeBufferAt(gpio,4608)
+    var at=mapped(offset);var wanted=value
+    if (offset == 36 || offset == 48 || offset == 8 || offset == 20) { at=offset-4;wanted=p4GpioRead(at)|value }
+    else if (offset == 40 || offset == 52 || offset == 12 || offset == 24) { at=offset-8;wanted=p4GpioRead(at)&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4608 || (at&3) != 0) { bad=true;return }
+    val previous=u32(r.loadU32(at))
+    if (previous != wanted) {
+        changed=changed+1
+        if (changed == drop) return
+    }
+    r.storeU32(at,int(wanted))
+    if (at == 16 && (previous&u32(1)) == u32(0) && (wanted&u32(1)) != u32(0) &&
+        (r.loadU32(1368+32*4)&4095) == 1280) {
+        pulses=pulses+1
+        if (releaseAt > 0 && pulses >= releaseAt) held=false
+    }
+    return
+}
+fun p4GpioHoldRead(address: int): u32 = u32(0)
+fun p4GpioHoldWrite(address: int,value: u32): void { bad=true;return }
+fun p4PinSnapshotRead(address: int): int = int(p4GpioRead(address-0x500e0000))
+fun p4PinSnapshotWrite(address: int,value: int): void = p4GpioWrite(address-0x500e0000,u32(value))
+fun p4I2cCounter(): u32 { val now=tick;tick=tick+u32(1);return now }
+fun p4I2cRead(address: int): u32 {
+    if (address == 0x500e601c) return u32(0x3000)
+    if (address == 0x500e6040) return u32(0x8000002)
+    if (address == 0x500e60c4) return u32(0)
+    val at=address-p4I2cBase(selectedPort)
+    if (at < 0 || at >= 128 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(controller,128).loadU32(at))
+}
+fun p4I2cWrite(address: int,value: u32): void {
+    val r=nativeBufferAt(controller,128);val at=address-p4I2cBase(selectedPort)
+    if (at < 0 || at >= 128 || (at&3) != 0) { bad=true;return }
+    if (at == 4) {
+        if ((value&u32(32)) != u32(0)) bad=true // no START replay
+        if ((value&u32(1024)) != u32(0)) { resets=resets+1;r.storeU32(8,r.loadU32(8)&0xffffffef) }
+        r.storeU32(4,int(value&u32(0xfffff3df)));return
+    }
+    if (at == 36) { r.storeU32(32,r.loadU32(32)&(0xffffffff^int(value)));return }
+    if (at != 24 && (at < 88 || at > 116)) bad=true // timing/filter never rewritten
+    if (at == 24 && (value&u32(0x3000)) != u32(0)) r.storeU32(8,r.loadU32(8)&0xff03c0ff)
+    r.storeU32(at,int(value));return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32P4GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32P4GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { tick=tick+u32(us);return }
+// Unused session creation/transfer hooks fail loudly if this recovery calls them.
+fun p4I2cSessionClockOpen(port: int,source: int): int { bad=true;return 0 }
+fun p4I2cSessionInitialize(port: int,filter: int): int { bad=true;return 0 }
+fun p4I2cSessionTiming(port: int,timing: P4I2cTiming): int { bad=true;return 0 }
+fun p4I2cSessionPinsOpen(r: NativeBuffer,port: int,sda: int,scl: int,pullup: bool,layout: int): int { bad=true;return 0 }
+fun p4I2cSessionClockClose(token: int): int = 4102
+fun p4I2cSessionPinsClose(r: NativeBuffer): int = esp32p4I2cPinsCloseOwned(r,true)
+fun p4I2cSessionTransfer(port: int,address: int,output: NativeBuffer,written: int,input: NativeBuffer,read: int,budget: u32,prefix: int): int { bad=true;return 7 }
+fun seed(): I2cBus {
+    var i=0
+    while (i < 4608) { nativeAddressStoreU32(gpio,i,0);i=i+4 }
+    i=0
+    while (i < 128) { nativeAddressStoreU32(controller,i,0);i=i+4 }
+    i=0
+    while (i < 72) { nativeAddressStoreU32(sessionMemory,i,0);i=i+4 }
+    i=0
+    while (i < 40) { nativeAddressStoreU32(clearMemory,i,0);i=i+4 }
+    val c=nativeBufferAt(controller,128);val s=nativeBufferAt(sessionMemory,72)
+    c.storeU32(4,0x110);c.storeU32(24,0x4000)
+    changed=0;drop=0;bad=false;held=true;pulses=0;resets=0;tick=u32(0xfffffff0)
+    s.storeU32(0,0x49324234);s.storeU32(4,1);s.storeU32(16,4097);s.storeU32(20,selectedPort);s.storeU32(24,3)
+    if (esp32p4I2cPinsOpenOwned(nativeBufferAt(sessionMemory+32,40),selectedPort,31,32,true,1,true) != 1) bad=true
+    i=0
+    while (i < 4608) { nativeAddressStoreU32(savedGpio,i,nativeAddressLoadU32(gpio,i));i=i+4 }
+    val bus=i2cHardwareBindOwned(s,u32(40000000),u32(400000000))
+    s.storeU32(4,3);s.storeU32(8,5)
+    c.storeU32(4,0x130);c.storeU32(8,16|(3<<18)|(2<<8));c.storeU32(32,256)
+    changed=0;pulses=0;return bus
+}
+fun restored(): bool {
+    var i=0
+    while (i < 4608) {
+        if (nativeAddressLoadU32(gpio,i) != nativeAddressLoadU32(savedGpio,i)) return false
+        i=i+4
+    }
+    return !bad
+}
+@export("abla_p4_i2c_recovery_integrated_test")
+fun test(): int {
+    val r=nativeBufferAt(clearMemory,40);val s=nativeBufferAt(sessionMemory,72)
+    selectedPort=0
+    while (selectedPort < 2) {
+        releaseAt=1
+        while (releaseAt <= 9) {
+            val bus=seed()
+            if (!bus.valid() || bus.abortAndClearStatus(r) != 1 || resets != 1 || pulses != releaseAt+1 ||
+                !restored() || s.loadU32(4) != 1 || s.loadU32(8) != 5 || !bus.close()) return 1
+            releaseAt=releaseAt+1
+        }
+        releaseAt=3
+        val clean=seed()
+        if (clean.abortAndClearStatus(r) != 1) return 2
+        val mutations=changed
+        if (!clean.close()) return 3
+        var failure=1
+        while (failure <= mutations) {
+            val bus=seed();drop=failure
+            val result=bus.abortAndClearStatus(r)
+            if (result != 1 && result != 4 && result != 5 && result != 6 && result != 7) return 4
+            val resetCount=resets;val clockCount=pulses
+            drop=0
+            if (r.loadU32(4) == 2) {
+                val retry=bus.abortAndClearStatus(r)
+                if (retry == 4 || resets != resetCount || pulses != clockCount) return 5
+            }
+            if (!restored() || !bus.close() || bad) return 6
+            failure=failure+1
+        }
+        releaseAt=0
+        val stuck=seed()
+        if (stuck.abortAndClearStatus(r) != 6 || resets != 1 || pulses != 9 ||
+            s.loadU32(4) != 3 || !restored() || !stuck.close()) return 7
+        selectedPort=selectedPort+1
+    }
+    return 0
+}

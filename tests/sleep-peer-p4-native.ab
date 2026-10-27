@@ -1,0 +1,121 @@
+import "./sleep-smp-p4-native.ab"
+import "../src/esp32/power/sleep_peer_p4_sequence.ab"
+val peerCore=nativeStaticAllocate(164)
+var peerIrq0=u32(0)
+var peerIrq1=u32(0)
+var peerClock=u32(0)
+var peerReset=u32(0)
+var peerWrites=0
+var peerDrop=0
+var peerFences=0
+var peerBad=false
+var peerFastAck=false
+fun peerFrame(): NativeBuffer = nativeBufferAt((peerCore+15)&(~15),148)
+fun peerShared(): NativeBuffer = nativeBufferAt(smpStorage,4)
+fun p4SleepPeerFence(): void { peerFences=peerFences+1;return }
+fun p4SleepPeerRead(address: int): u32 {
+    if (address == 0x500e5018) return peerIrq0
+    if (address == 0x500e501c) return peerIrq1
+    if (address == 0x500e6014) return peerClock
+    if (address == 0x500e60c0) return peerReset
+    peerBad=true;return u32(0)
+}
+fun p4SleepPeerWrite(address: int,value: u32): void {
+    peerWrites=peerWrites+1
+    if (peerWrites == peerDrop) return
+    if (address == 0x500e5018 || address == 0x500e501c) {
+        if (value > u32(1) || (smpWord&u32(4096)) == u32(0)) peerBad=true
+        val target=if (address == 0x500e5018) 0 else 1
+        if (value == u32(1) && (target == int(smpHart) || peerFences == 0)) peerBad=true
+        if (value == u32(0) && target != int(smpHart)) peerBad=true
+        if (target == 0) peerIrq0=value else peerIrq1=value
+        if (value == u32(1) && peerFastAck) {
+            val previous=smpHart;smpHart=u32(target)
+            if (esp32p4SleepPeerAcknowledgeOwned(peerShared(),smpGeneration,4,true) != 1) peerBad=true
+            smpHart=previous
+        }
+    } else if (address == 0x500e6014) {
+        if (smpHart != u32(0) || value != (peerClock|u32(16))) peerBad=true
+        peerClock=value
+    } else if (address == 0x500e60c0) {
+        if (smpHart != u32(0) || (peerClock&u32(16)) == u32(0) || value != (peerReset&u32(0xfffffeff))) peerBad=true
+        peerReset=value
+    } else peerBad=true
+    return
+}
+fun peerSeed(): void {
+    smpSeed()
+    peerIrq0=u32(0);peerIrq1=u32(0);peerClock=u32(0xa5000200);peerReset=u32(0x65000102)
+    peerWrites=0;peerDrop=0;peerFences=0;peerBad=false;peerFastAck=false
+    val r=peerFrame()
+    var i=0
+    while (i < 148) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(0,0x50344358);r.storeU32(4,3);r.storeU32(8,0);r.storeU32(144,0x1234abcd)
+    return
+}
+@export("abla_sleep_peer_p4_test")
+fun peerTest(): int {
+    var leader=0
+    while (leader < 2) {
+        var fast=0
+        while (fast < 2) {
+            peerSeed();peerFastAck=fast == 1
+            if (smpAct(leader,0).status() != 1) return 1
+            if (esp32p4SleepPeerNotifyOwned(peerShared(),smpGeneration,4,true) != 1 || peerBad) return 2
+            val count=peerWrites
+            if (esp32p4SleepPeerNotifyOwned(peerShared(),smpGeneration,4,true) != 3 || peerWrites != count) return 3
+            if (fast == 0 && smpAct(1-leader,1).status() != 3) return 4
+            smpHart=u32(1-leader)
+            if (esp32p4SleepPeerAcknowledgeOwned(peerShared(),smpGeneration,4,true) != 1 ||
+                peerIrq0 != u32(0) || peerIrq1 != u32(0)) return 5
+            if (smpAct(1-leader,1).status() != 1 || smpAct(1-leader,2).status() != 1 ||
+                smpAct(leader,2).status() != 1 || smpAct(leader,3).status() != 1) return 6
+            fast=fast+1
+        }
+        // Pending notification survives early cancellation until real ack.
+        peerSeed()
+        if (smpAct(leader,0).status() != 1 ||
+            esp32p4SleepPeerNotifyOwned(peerShared(),smpGeneration,4,true) != 1) return 7
+        if (smpAct(leader,6).status() != 1 || smpAct(leader,7).status() != 1 ||
+            smpAct(leader,8).status() != 1 || smpAct(leader,9).status() != 3) return 8
+        smpHart=u32(1-leader);peerDrop=peerWrites+1
+        if (esp32p4SleepPeerAcknowledgeOwned(peerShared(),smpGeneration,4,true) != 4 ||
+            (smpWord&u32(8192)) != u32(0)) return 9
+        peerDrop=0
+        if (esp32p4SleepPeerAcknowledgeOwned(peerShared(),smpGeneration,4,true) != 1 ||
+            smpAct(leader,9).status() != 1 || peerBad) return 10
+        var drop=0
+        while (drop < 3) {
+            peerSeed()
+            if (smpAct(leader,0).status() != 1 || smpAct(1-leader,1).status() != 1 ||
+                smpAct(1-leader,2).status() != 1 || smpAct(leader,2).status() != 1 ||
+                smpAct(leader,3).status() != 1) return 11
+            // Both coordinator roles: core0 must release core1 even when
+            // coordinator1 has not yet been able to report the wake event.
+            smpHart=u32(0);peerDrop=drop
+            var resumed=esp32p4SleepPeerResumeOwned(peerFrame(),peerShared(),smpGeneration,true)
+            if (drop != 0) {
+                if (resumed != 4 || (drop == 1 && peerReset != u32(0x65000102))) return 12
+                resumed=esp32p4SleepPeerResumeOwned(peerFrame(),peerShared(),smpGeneration,true)
+            }
+            if (resumed != 1 || peerClock != u32(0xa5000210) || peerReset != u32(0x65000002) || peerBad) return 13
+            val count=peerWrites
+            if (esp32p4SleepPeerResumeOwned(peerFrame(),peerShared(),smpGeneration,true) != 1 || peerWrites != count) return 14
+            smpHart=u32(1)
+            if (esp32p4SleepPeerResumeOwned(peerFrame(),peerShared(),smpGeneration,true) != 2 || peerWrites != count) return 15
+            smpHart=u32(0);peerFrame().storeU32(4,2)
+            if (esp32p4SleepPeerResumeOwned(peerFrame(),peerShared(),smpGeneration,true) != 3 ||
+                peerWrites != count || peerFrame().loadU32(144) != 0x1234abcd) return 16
+            drop=drop+1
+        }
+        leader=leader+1
+    }
+    peerSeed()
+    if (smpAct(0,0).status() != 1) return 17
+    peerIrq1=u32(1)
+    if (esp32p4SleepPeerNotifyOwned(peerShared(),smpGeneration,4,true) != 3 ||
+        peerWrites != 0 || (smpWord&u32(4096)) != u32(0)) return 18
+    peerIrq1=u32(0);smpStatus=u32(8)
+    if (esp32p4SleepPeerNotifyOwned(peerShared(),smpGeneration,4,true) != 2 || peerWrites != 0) return 19
+    return 0
+}

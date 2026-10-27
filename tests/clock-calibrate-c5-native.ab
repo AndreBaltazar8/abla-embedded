@@ -1,0 +1,135 @@
+import "../src/esp32/clock_calibrate_c5_sequence.ab"
+import "../src/esp32/power/sleep_measured_periods_c5.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(200)
+var cfg=0
+var timeout=0
+var mux=0
+var gate=0
+var digital=0
+var xtal=40
+var slow=0
+var raw=0
+var writes=0
+var failAt=0
+var starts=0
+var samples=0
+var waiting=0
+var hwTimeout=false
+var oldBusy=true
+var bad=false
+trusted fun c5CalibrationRead(address: int): int {
+    if (address == 0x600b0400) return slow
+    if (address == 0x60096110) return xtal<<24
+    if (address == 0x60096054) return 1
+    if (address == 0x600b00ac) return 0x40000000
+    if (address == 0x60096160) return gate
+    if (address == 0x600b0420) return digital
+    if (address == 0x60096130) return mux
+    if (address == 0x60008068) {
+        if (starts > 0 && (cfg&0x80000000) != 0) {
+            if ((gate&4) == 0) bad=true
+            if (waiting > 0) waiting=waiting-1
+            else if (!hwTimeout) return cfg|0x8000
+        }
+        return cfg
+    }
+    if (address == 0x60008080) {
+        if (starts == 0 && (timeout&0xffffff80) == 128 && !oldBusy) return timeout|1
+        if (starts > 0 && waiting == 0 && hwTimeout) return timeout|1
+        return timeout
+    }
+    if (address == 0x6000806c) { if (starts != 1 || waiting != 0) bad=true;samples=samples+1;return raw<<7 }
+    bad=true;return 0
+}
+trusted fun c5CalibrationWrite(address: int,value: int): void {
+    writes=writes+1
+    if (writes == failAt) return
+    if (address == 0x60096160) gate=value
+    else if (address == 0x600b0420) digital=value
+    else if (address == 0x60096130) {
+        if ((cfg&0x80000000) != 0) bad=true
+        mux=value
+    } else if (address == 0x60008080) timeout=value&~1
+    else if (address == 0x60008068) {
+        if ((value&0x80000000) != 0 && (cfg&0x80000000) == 0) {
+            if ((gate&4) == 0 || (value&0x1000) != 0) bad=true
+            starts=starts+1;waiting=4
+        }
+        cfg=value&~0x8000
+    } else bad=true
+    return
+}
+@export("abla_clock_calibrate_c5_test")
+trusted fun test(): i32 {
+    val record=nativeBufferAt(memory,64)
+    var mode=0
+    while (mode < 32) {
+        val selected=(mode&3)+1;xtal=if ((mode&4) == 0) 40 else 48
+        val oldGate=if ((mode&8) == 0) 0x80 else 0x84
+        val oldDigital=if ((mode&16) == 0) 0x1234 else 0xf0001234
+        val count=256;val requested=if (selected == 4) 8192 else count
+        raw=if (selected == 1) (xtal*1000000*count)>>>15 else if (selected == 2) xtal*count*30 else if (selected == 3) xtal*count*7 else xtal*count*32/20
+        var failure=0
+        while (failure < 19) {
+            record.storeU32(0,0);cfg=0x21005;timeout=0xabcdef18;mux=0x44000700;gate=oldGate;digital=oldDigital
+            writes=0;failAt=failure;starts=0;samples=0;waiting=0;oldBusy=true;hwTimeout=false;bad=false
+            if (esp32C5ClockCalibrateOwned(record,selected,requested,true,2) != 3 || starts != 0) return i32(1)
+            oldBusy=false
+            var result=3;var retry=0
+            while (result == 3 && retry < 16) {
+                result=esp32C5ClockCalibrateOwned(record,selected,requested,true,2)
+                retry=retry+1
+            }
+            if (result != 1 || bad || starts != 1 || samples != 1) return i32(2)
+            if (record.loadU32(48) != esp32C5CalibrationPeriod(selected,count,xtal,raw) ||
+                cfg != 0x21005 || timeout != 0xabcdef18 || mux != 0x44000700 || gate != oldGate || digital != oldDigital) return i32(3)
+            val before=writes
+            if (esp32C5ClockCalibrateOwned(record,selected,requested,true) != 1 || writes != before ||
+                esp32C5ClockCalibrateOwned(record,selected,requested+1,true) != 2) return i32(4)
+            failure=failure+1
+        }
+        mode=mode+1
+    }
+    // Active slow-clock selection, hardware timeout and invalid XTAL32K sample.
+    var scenario=0
+    while (scenario < 4) {
+        record.storeU32(0,0);cfg=0x21005;timeout=0xabcdef18;mux=0x44000700;gate=0x84;digital=0xf0001234
+        writes=0;failAt=0;starts=0;samples=0;waiting=0;oldBusy=false;bad=false;xtal=40
+        slow=if (scenario == 0) 0 else if (scenario == 1) 1 else 3
+        hwTimeout=scenario == 2;raw=if (scenario == 1) 1 else 40*256*7
+        var result=3;var retry=0
+        while (result == 3 && retry < 16) { result=esp32C5ClockCalibrateOwned(record,0,256,true,2);retry=retry+1 }
+        if (result != (if (scenario == 1 || scenario == 2) 5 else 1) || bad ||
+            record.loadU32(12) != (if (slow == 0) 3 else if (slow == 1) 1 else 2)) return i32(5)
+        scenario=scenario+1
+    }
+    record.storeU32(0,0);slow=2;writes=0
+    if (esp32C5ClockCalibrateOwned(record,0,256,true) != 2 || writes != 0 || record.loadU32(0) != 0 ||
+        esp32C5ClockCalibrateOwned(record,1,8192,true) != 2 || esp32C5ClockCalibrateOwned(record,4,31,true) != 2) return i32(6)
+    if (esp32C5CalibrationPeriod(3,256,40,71680) != 3670016 || esp32C5CalibrationPeriod(4,256,40,16384) != 26214 ||
+        esp32C5CalibrationPeriod(1,256,40,1) != 0 || esp32C5CalibrationPeriod(3,0,40,1) != 0) return i32(7)
+    val fast=nativeBufferAt(memory+64,64);val request=nativeBufferAt(memory+128,68)
+    var pass=0
+    while (pass < 2) {
+        val current=if (pass == 0) record else fast
+        current.storeU32(0,0);cfg=0x21005;timeout=0xabcdef18;mux=0x44000700;gate=0x84;digital=0xf0001234
+        writes=0;failAt=0;starts=0;samples=0;waiting=0;oldBusy=false;hwTimeout=false;bad=false;xtal=40;slow=0
+        raw=if (pass == 0) 71680 else 16384
+        var result=3;var retry=0
+        while (result == 3 && retry < 16) { result=esp32C5ClockCalibrateOwned(current,if (pass == 0) 0 else 4,if (pass == 0) 256 else 8192,true,2);retry=retry+1 }
+        if (result != 1 || bad) return i32(8)
+        pass=pass+1
+    }
+    var i=0;while (i < 68) { request.store(i,0xa5);i=i+1 }
+    if (!esp32C5SleepMeasuredPeriodsOwned(request,record,fast,true) || request.loadU32(12) != 3670016 || request.loadU32(16) != 26214) return i32(9)
+    i=0;while (i < 68) { if ((i < 12 || i >= 20) && request.load(i) != 0xa5) return i32(10);i=i+1 }
+    slow=1
+    if (esp32C5SleepMeasuredPeriodsOwned(request,record,fast,true)) return i32(11)
+    slow=0;xtal=48
+    if (esp32C5SleepMeasuredPeriodsOwned(request,record,fast,true)) return i32(12)
+    xtal=40;fast.storeU32(4,3)
+    if (esp32C5SleepMeasuredPeriodsOwned(request,record,fast,true) || request.loadU32(12) != 3670016 || request.loadU32(16) != 26214) return i32(13)
+    return i32(0)
+}

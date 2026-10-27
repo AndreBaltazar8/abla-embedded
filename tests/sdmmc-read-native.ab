@@ -1,0 +1,226 @@
+import "../src/sd/mmc_read_s3_sequence.ab"
+import "../src/sd/mmc_write_s3_sequence.ab"
+import "../src/sd/mmc_scr_s3_sequence.ab"
+import "../src/sd/mmc_width_s3_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val registers=nativeStaticAllocate(256)
+val storage=nativeStaticAllocate(160)
+val descriptorMemory=nativeStaticAllocate(16)
+var writes=0
+var drop=-1
+var badAddress=false
+var scrWord=0x03008502
+trusted fun sdMmcS3Read(offset: int): int = nativeBufferAt(registers,256).loadU32(offset)
+trusted fun sdMmcS3Write(offset: int,value: int): void {
+    writes=writes+1
+    if (offset != drop) nativeBufferAt(registers,256).storeU32(offset,if (offset == 68 || offset == 140) sdMmcS3Read(offset)&~value else value)
+    return
+}
+trusted fun sdMmcDmaS3Read(address: int): int {
+    if (address == 0x3fc89000) return scrWord
+    if (address < 0x3fc88000 || address > 0x3fc8800c || (address&3) != 0) { badAddress=true; return 0 }
+    return nativeBufferAt(descriptorMemory,16).loadU32(address-0x3fc88000)
+}
+trusted fun sdMmcDmaS3Write(address: int,value: int): void {
+    if (address < 0x3fc88000 || address > 0x3fc8800c || (address&3) != 0) { badAddress=true; return }
+    nativeBufferAt(descriptorMemory,16).storeU32(address-0x3fc88000,value)
+    return
+}
+trusted fun reg(offset: int,value: int): void {
+    nativeBufferAt(registers,256).storeU32(offset,value)
+    return
+}
+trusted fun reset(high: bool,slot: int): void {
+    var n=0
+    while (n < 256) { nativeBufferAt(registers,256).store(n,0); n=n+1 }
+    n=0
+    while (n < 160) { nativeBufferAt(storage,160).store(n,0); n=n+1 }
+    val card=nativeBufferAt(storage+64,80)
+    card.storeU32(0,0x53444901); card.store(5,slot)
+    card.storeU32(24,if (high) 0xc0ff8000 else 0x80ff8000)
+    card.storeU32(60,if (high) 0x40000000 else 0)
+    card.storeU32(56,if (high) 0x9003f else 0x903ff)
+    card.storeU32(52,if (high) 0xffff0000 else 0xc0038000)
+    writes=0; drop=-1; badAddress=false
+    reg(68,0x10001)
+    return
+}
+trusted fun begin(sector: int,now: u32,budget: int): int = sdMmcReadBeginOwned(nativeBufferAt(storage,48),nativeBufferAt(storage+64,80),nativeBufferAt(0x3fc88000,16),nativeBufferAt(0x3fc89000,512),sector,now,budget,true)
+trusted fun cleanup(expected: int,now: u32): int {
+    val ctx=nativeBufferAt(storage,48)
+    if (sdMmcReadPollOwned(ctx,now) != 2 || ctx.load(4) != 4 || sdMmcReadPollOwned(ctx,now) != 2) return 1
+    reg(0,sdMmcS3Read(0)&~4)
+    reg(140,sdMmcS3Read(140)&~0x1e000)
+    if (sdMmcReadPollOwned(ctx,now) != expected || sdMmcReadStatus(ctx) != expected) return 2
+    val before=writes
+    if (sdMmcReadPollOwned(ctx,now) != expected || writes != before) return 3
+    return 0
+}
+@export("abla_sdmmc_read_test")
+trusted fun test(): i32 {
+    val ctx=nativeBufferAt(storage,48)
+    // All six command/data/DMA event orders, both addressing modes and slots.
+    var mode=0
+    while (mode < 4) {
+        var permutation=0
+        while (permutation < 6) {
+            reset((mode&1) != 0,mode>>1)
+            if (begin(123,u32(0),100) != 2 || sdMmcReadPollOwned(ctx,u32(0)) != 2 || sdMmcS3Read(40) != (if ((mode&1) != 0) 123 else 62976) || sdMmcS3Read(44) != (0xa0002351|((mode>>1)<<16))) return i32(1)
+            val first=permutation>>1
+            val second=if ((permutation&1) == 0) (first+1)%3 else (first+2)%3
+            val third=3-first-second
+            var step=0
+            while (step < 3) {
+                val event=if (step == 0) first else if (step == 1) second else third
+                if (event == 0) { reg(68,sdMmcS3Read(68)|4); reg(48,0x900); reg(44,sdMmcS3Read(44)&0x7fffffff) }
+                if (event == 1) reg(68,sdMmcS3Read(68)|8)
+                if (event == 2) reg(140,258)
+                // Completion events alone cannot release a DMA-owned buffer.
+                if (sdMmcReadPollOwned(ctx,u32(step+1)) != 2 || ctx.load(4) != 2) return i32(2)
+                step=step+1
+            }
+            sdMmcDmaS3Write(0x3fc88000,28)
+            reg(72,1024)
+            if (sdMmcReadPollOwned(ctx,u32(4)) != 2 || ctx.load(4) != 2) return i32(3)
+            reg(72,0)
+            if (sdMmcReadPollOwned(ctx,u32(5)) != 2 || ctx.load(4) != 3 || ctx.load(7) != 1 || cleanup(1,u32(6)) != 0 || sdMmcS3Read(68) != 0x10001) return i32(4)
+            permutation=permutation+1
+        }
+        mode=mode+1
+    }
+    var bit=0
+    while (bit < 16) {
+        if (((1<<bit)&0xbfc2) != 0) {
+            reset(true,0); begin(0,u32(0),100); sdMmcReadPollOwned(ctx,u32(0))
+            reg(68,0x1000d|(1<<bit))
+            if (sdMmcReadPollOwned(ctx,u32(1)) != 2 || ctx.load(7) != 4 || cleanup(4,u32(2)) != 0 || (ctx.loadU32(24)&(1<<bit)) == 0) return i32(5)
+        }
+        bit=bit+1
+    }
+    bit=0
+    while (bit < 10) {
+        if (((1<<bit)&0x234) != 0) {
+            reset(true,0); begin(0,u32(0),100); sdMmcReadPollOwned(ctx,u32(0)); reg(140,1<<bit)
+            if (sdMmcReadPollOwned(ctx,u32(1)) != 2 || ctx.load(7) != 4 || cleanup(4,u32(2)) != 0) return i32(6)
+        }
+        bit=bit+1
+    }
+    // Setup failure after DMA enable still goes through stop, and retries a
+    // dropped disable before allowing terminal failure.
+    reset(true,0); begin(1,u32(0),100); drop=40
+    if (sdMmcReadPollOwned(ctx,u32(0)) != 2 || ctx.load(7) != 9 || sdMmcS3Read(44) != 0) return i32(7)
+    drop=0
+    if (sdMmcReadPollOwned(ctx,u32(1)) != 2 || ctx.load(4) != 3) return i32(8)
+    drop=-1
+    if (cleanup(9,u32(2)) != 0) return i32(9)
+    // DMA return cannot override a bad R1 response or descriptor corruption.
+    reset(true,0); begin(0,u32(0),100); sdMmcReadPollOwned(ctx,u32(0))
+    reg(68,4); reg(48,0x80000900)
+    if (sdMmcReadPollOwned(ctx,u32(1)) != 2 || cleanup(5,u32(2)) != 0) return i32(10)
+    reset(true,0); begin(0,u32(0),100); sdMmcReadPollOwned(ctx,u32(0)); sdMmcDmaS3Write(0x3fc88004,4)
+    if (sdMmcReadPollOwned(ctx,u32(1)) != 2 || cleanup(7,u32(2)) != 0) return i32(11)
+    // Deadline wraps and only starts cleanup; reset/FSM still pin the buffers.
+    reset(true,0); begin(0,u32(0xfffffff0),32); sdMmcReadPollOwned(ctx,u32(0xfffffff0))
+    if (sdMmcReadPollOwned(ctx,u32(16)) != 2 || ctx.load(7) != 6 || cleanup(6,u32(17)) != 0) return i32(12)
+    // Late CRC during otherwise successful stop changes the final outcome.
+    reset(true,0); begin(0,u32(0),100); sdMmcReadPollOwned(ctx,u32(0)); reg(44,0); reg(48,0x900); reg(68,12); reg(140,258); sdMmcDmaS3Write(0x3fc88000,28)
+    sdMmcReadPollOwned(ctx,u32(1)); reg(68,128)
+    if (cleanup(4,u32(2)) != 0) return i32(13)
+    reset(true,0)
+    if (begin(4294967295,u32(0),100) != 2 || ctx.loadU32(36) != 4294967295 || begin(4294967296,u32(0),100) != 3 || writes != 0) return i32(14)
+    reset(false,0)
+    if (begin(2097152,u32(0),100) != 3 || begin(-1,u32(0),100) != 3 || writes != 0) return i32(15)
+    reset(true,0); begin(0,u32(0),100); reg(0,0x02000020)
+    if (sdMmcReadPollOwned(ctx,u32(1)) != 8 || writes != 0) return i32(16)
+    // CMD24 shares the real DMA engine but must wait TX (not RX), DAT0,
+    // stop quiescence, then a separate CMD13 proving programming succeeded.
+    val writer=nativeBufferAt(storage,64)
+    val card=nativeBufferAt(storage+64,80)
+    val desc=nativeBufferAt(0x3fc88000,16)
+    val payload=nativeBufferAt(0x3fc89000,512)
+    mode=0
+    while (mode < 8) {
+        reset((mode&1) != 0,(mode>>1)&1); card.storeU32(28,0x1234)
+        if (sdMmcWriteBeginOwned(writer,card,desc,payload,123,u32(0),100,true,true) != 2 || sdMmcReadPollOwned(ctx,u32(0)) != 3) return i32(18)
+        if (sdMmcWritePollOwned(writer,u32(1)) != 2 || sdMmcS3Read(44) != (0xa0002758|(((mode>>1)&1)<<16)) || sdMmcS3Read(40) != (if ((mode&1) != 0) 123 else 62976)) return i32(19)
+        reg(44,0); reg(48,0x900); reg(68,12); reg(140,258); sdMmcDmaS3Write(0x3fc88000,28)
+        if (sdMmcWritePollOwned(writer,u32(2)) != 2 || writer.load(4) != 2) return i32(20)
+        reg(140,257); reg(72,512)
+        if (sdMmcWritePollOwned(writer,u32(3)) != 2 || writer.load(4) != 2) return i32(21)
+        reg(72,0)
+        if (sdMmcWritePollOwned(writer,u32(4)) != 2 || writer.load(4) != 3 || sdMmcWritePollOwned(writer,u32(5)) != 2 || writer.load(4) != 4 || sdMmcWritePollOwned(writer,u32(6)) != 2) return i32(22)
+        reg(0,sdMmcS3Read(0)&~4)
+        if (sdMmcWritePollOwned(writer,u32(7)) != 2 || writer.load(4) != 5 || sdMmcWritePollOwned(writer,u32(8)) != 2 || writer.load(4) != 6 || sdMmcS3Read(40) != 0x12340000 || (sdMmcS3Read(44)&63) != 13) return i32(23)
+        reg(44,0); reg(68,4); reg(48,if (mode < 4) 0x900 else 0x04000900)
+        if (sdMmcWritePollOwned(writer,u32(9)) != (if (mode < 4) 1 else 5)) return i32(24)
+        mode=mode+1
+    }
+    reset(true,0); card.storeU32(28,1)
+    if (sdMmcWriteBeginOwned(writer,card,desc,payload,0,u32(0),100,true,false) != 3 || writes != 0) return i32(25)
+    card.storeU32(48,4096)
+    if (sdMmcWriteBeginOwned(writer,card,desc,payload,0,u32(0),100,true,true) != 10 || writes != 0) return i32(26)
+    card.storeU32(48,8192)
+    if (sdMmcWriteBeginOwned(writer,card,desc,payload,0,u32(0),100,true,true) != 10 || writes != 0) return i32(27)
+    card.storeU32(48,0)
+    if (sdMmcWriteBeginOwned(nativeBufferAt(storage+1,64),card,desc,payload,0,u32(0),100,true,true) != 3 || writes != 0) return i32(28)
+    val scrPayload=nativeBufferAt(0x3fc89000,8)
+    mode=0
+    while (mode < 2) {
+        reset(true,mode); card.storeU32(28,0x1234)
+        if (sdMmcScrBeginOwned(writer,card,desc,scrPayload,u32(0),100,true) != 2 || (sdMmcS3Read(44)&63) != 55 || sdMmcS3Read(40) != 0x12340000 || sdMmcScrResultOwned(writer).valid()) return i32(29)
+        reg(44,0); reg(68,4); reg(48,0x920)
+        if (sdMmcScrPollOwned(writer,u32(1)) != 2 || writer.load(4) != 1 || sdMmcDmaS3Read(0x3fc88004) != 8) return i32(30)
+        if (sdMmcScrPollOwned(writer,u32(2)) != 2 || sdMmcS3Read(44) != (0xa0002373|(mode<<16)) || sdMmcS3Read(32) != 8 || sdMmcS3Read(28) != 8 || sdMmcS3Read(40) != 0) return i32(31)
+        reg(44,0); reg(68,12); reg(48,0x900); reg(140,258); sdMmcDmaS3Write(0x3fc88000,28)
+        if (sdMmcScrPollOwned(writer,u32(3)) != 2 || writer.load(4) != 3 || sdMmcScrPollOwned(writer,u32(4)) != 2 || sdMmcScrPollOwned(writer,u32(5)) != 2) return i32(32)
+        reg(0,sdMmcS3Read(0)&~4)
+        if (sdMmcScrPollOwned(writer,u32(6)) != 1) return i32(33)
+        val info=sdMmcScrResultOwned(writer)
+        if (!info.valid() || info.specVersion() != 2 || !info.supportsFourBit() || info.busWidths() != 5 || !info.erasedHigh() || info.commandSupport() != 3) return i32(34)
+        mode=mode+1
+    }
+    reset(true,0); card.storeU32(28,1)
+    sdMmcScrBeginOwned(writer,card,desc,scrPayload,u32(0),100,true); reg(44,0); reg(68,4); reg(48,0x900)
+    if (sdMmcScrPollOwned(writer,u32(1)) != 5 || sdMmcS3Read(32) != 0 || (sdMmcS3Read(0)&0x02000020) != 0) return i32(35)
+    reset(true,0); card.storeU32(28,1)
+    sdMmcScrBeginOwned(writer,card,desc,scrPayload,u32(0xfffffff0),32,true)
+    if (sdMmcScrPollOwned(writer,u32(16)) != 6 || sdMmcS3Read(32) != 0) return i32(36)
+    if (sdScrDecode(u32(0x03008512)).valid() || sdScrDecode(u32(0x03008402)).valid() || !sdScrDecode(u32(0x100)).valid() || sdScrDecode(u32(0x100)).supportsFourBit()) return i32(37)
+    mode=0
+    while (mode < 8) {
+        val slot=(mode>>1)&1
+        val width=if ((mode&1) == 0) 4 else 1
+        val original=0x40004000|(if (width == 1) 1<<slot else 0)
+        reset(true,slot); card.storeU32(28,0x1234); reg(16,1<<slot); reg(24,original)
+        if (sdMmcWidthBeginOwned(ctx,card,sdScrDecode(u32(0x502)),width,u32(0),100,true) != 2 || (sdMmcS3Read(44)&63) != 55 || sdMmcS3Read(24) != original) return i32(38)
+        reg(44,0); reg(68,4); reg(48,0x920)
+        if (sdMmcWidthPollOwned(ctx,u32(1)) != 2 || sdMmcWidthPollOwned(ctx,u32(2)) != 2 || sdMmcS3Read(44) != (0xa0002146|(slot<<16)) || sdMmcS3Read(40) != (if (width == 4) 2 else 0) || ctx.load(7) != 1 || sdMmcS3Read(24) != original) return i32(39)
+        reg(44,0); reg(68,4); reg(48,0x900)
+        if (sdMmcWidthPollOwned(ctx,u32(3)) != 2 || ctx.load(7) != 3 || sdMmcS3Read(24) != original) return i32(40)
+        if (mode >= 4) {
+            drop=24
+            if (sdMmcWidthPollOwned(ctx,u32(4)) != 8 || ctx.load(7) != 3 || ctx.load(4) != 4 || sdMmcS3Read(24) != original) return i32(41)
+        } else {
+            if (sdMmcWidthPollOwned(ctx,u32(4)) != 2 || ctx.load(7) != 7 || sdMmcS3Read(24) != (0x40004000|(if (width == 4) 1<<slot else 0))) return i32(42)
+            if (sdMmcWidthPollOwned(ctx,u32(5)) != 2 || (sdMmcS3Read(44)&63) != 13 || sdMmcS3Read(40) != 0x12340000) return i32(43)
+            reg(44,0); reg(68,4); reg(48,0x900)
+            if (sdMmcWidthPollOwned(ctx,u32(6)) != 1) return i32(44)
+        }
+        mode=mode+1
+    }
+    reset(true,0); card.storeU32(28,1); reg(16,1)
+    if (sdMmcWidthBeginOwned(ctx,card,sdScrDecode(u32(0x100)),4,u32(0),100,true) != 3 || sdMmcWidthBeginOwned(ctx,card,sdScrDecode(u32(0x502)),4,u32(0),100,false) != 3 || writes != 0) return i32(45)
+    sdMmcWidthBeginOwned(ctx,card,sdScrDecode(u32(0x502)),4,u32(0),100,true)
+    reg(44,0); reg(68,4); reg(48,0x920)
+    sdMmcWidthPollOwned(ctx,u32(1)); sdMmcWidthPollOwned(ctx,u32(2))
+    if (sdMmcWidthPollOwned(ctx,u32(100)) != 7 || ctx.load(7) != 1 || sdMmcS3Read(24) != 0) return i32(46)
+    reset(true,0); card.storeU32(28,1); reg(16,1)
+    sdMmcWidthBeginOwned(ctx,card,sdScrDecode(u32(0x502)),4,u32(0),100,true)
+    reg(44,0); reg(68,4); reg(48,0x920)
+    sdMmcWidthPollOwned(ctx,u32(1)); sdMmcWidthPollOwned(ctx,u32(2))
+    reg(44,0); reg(68,4); reg(48,0x04000900)
+    if (sdMmcWidthPollOwned(ctx,u32(3)) != 6 || ctx.load(7) != 1 || sdMmcS3Read(24) != 0) return i32(47)
+    if (badAddress) return i32(17)
+    return i32(0)
+}

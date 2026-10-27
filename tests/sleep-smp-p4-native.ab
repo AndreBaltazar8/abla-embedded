@@ -1,0 +1,115 @@
+import "../src/esp32/power/sleep_smp_p4_sequence.ab"
+import "abla/build"
+val smpStorage=nativeStaticAllocate(8)
+var smpWord=u32(0)
+var smpHart=u32(0)
+var smpStatus=u32(0)
+var smpGeneration=0
+var smpCasCalls=0
+var smpRace=false
+var smpRaceValue=u32(0)
+fun p4SmpHart(): u32 = smpHart
+fun p4SmpStatus(): u32 = smpStatus
+fun p4SmpLoad(address: int): u32 = smpWord
+fun p4SmpCas(address: int,expected: u32,replacement: u32): u32 {
+    smpCasCalls=smpCasCalls+1
+    if (smpRace) { smpRace=false;smpWord=smpRaceValue }
+    val old=smpWord
+    if (old == expected) smpWord=replacement
+    return old
+}
+fun smpSeed(): void {
+    smpWord=u32(0);smpHart=u32(0);smpStatus=u32(0);smpGeneration=0;smpCasCalls=0;smpRace=false
+    return
+}
+fun smpAct(hart: int,operation: int): P4SleepSmp {
+    smpHart=u32(hart)
+    val r=esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,4),smpGeneration,operation,4,true)
+    if (operation == 0 && r.status() == 1) smpGeneration=r.generation()
+    return r
+}
+fun smpControl(stage: int,leader: int,leaderPhase: int,peerPhase: int): u32 =
+    u32((smpGeneration<<16)|(leader<<8)|(stage<<9)|(leaderPhase<<(leader*4))|(peerPhase<<((1-leader)*4)))
+@export("abla_sleep_smp_p4_test")
+fun test(): int {
+    var leader=0
+    while (leader < 2) {
+        var outcome=4
+        while (outcome <= 5) {
+            smpSeed()
+            if (smpAct(leader,0).status() != 1 || smpGeneration != 1 || smpWord != smpControl(1,leader,1,0)) return 1
+            if (smpAct(leader,2).status() != 1 || smpAct(leader,3).status() != 3) return 2
+            if (smpAct(1-leader,1).status() != 1 || smpAct(leader,3).status() != 3) return 3
+            if (smpAct(1-leader,2).status() != 1 || smpWord != smpControl(1,leader,2,2)) return 4
+            if (smpAct(1-leader,3).status() != 4 || smpAct(leader,3).status() != 1 ||
+                smpWord != smpControl(2,leader,2,2)) return 5
+            val calls=smpCasCalls
+            val parked=esp32p4SleepSmpObserve(nativeBufferAt(smpStorage,4),smpGeneration)
+            if (parked.status() != 1 || parked.stage() != 2 || parked.coordinator() != leader ||
+                parked.phase(0) != 2 || parked.phase(1) != 2 || smpCasCalls != calls) return 31
+            // No duplicate request authorization or unsafe unilateral unwind.
+            if (smpAct(leader,3).status() != 4 || smpAct(1-leader,7).status() != 4 ||
+                smpAct(leader,6).status() != 4 || smpAct(1-leader,outcome).status() != 4) return 6
+            if (smpAct(leader,outcome).status() != 1 || smpWord != smpControl(outcome-1,leader,2,2)) return 7
+            if (smpAct(leader,7).status() != 1 || smpAct(leader,8).status() != 1 ||
+                smpAct(leader,9).status() != 3) return 8
+            if (smpAct(1-leader,7).status() != 1 || smpAct(1-leader,8).status() != 1 ||
+                smpAct(1-leader,10).status() != 4) return 9
+            if (smpAct(leader,9).status() != 1 || smpWord != smpControl(5,leader,0,4) ||
+                smpAct(leader,0).status() != 3) return 10
+            if (smpAct(1-leader,10).status() != 1 || smpWord != smpControl(0,leader,0,0)) return 11
+            val oldGeneration=smpGeneration
+            if (smpAct(1-leader,0).status() != 1 || smpGeneration != 2) return 12
+            smpHart=u32(leader)
+            if (esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,4),oldGeneration,1,1,true).status() != 5) return 13
+            outcome=outcome+1
+        }
+        // Cancellation before peer join, during save, and after backup.
+        var peerProgress=0
+        while (peerProgress < 3) {
+            smpSeed()
+            if (smpAct(leader,0).status() != 1) return 14
+            if (peerProgress > 0 && smpAct(1-leader,1).status() != 1) return 15
+            if (peerProgress == 2 && smpAct(1-leader,2).status() != 1) return 16
+            if (smpAct(leader,6).status() != 1 || smpAct(leader,7).status() != 1 ||
+                smpAct(leader,8).status() != 1) return 17
+            if (smpAct(1-leader,1).status() != 4) return 18
+            if (peerProgress > 0) {
+                if (smpAct(leader,9).status() != 3 || smpAct(1-leader,7).status() != 1 ||
+                    smpAct(1-leader,8).status() != 1) return 19
+            }
+            if (smpAct(leader,9).status() != 1) return 20
+            if (peerProgress > 0 && smpAct(1-leader,10).status() != 1) return 21
+            if (smpWord != smpControl(0,leader,0,0)) return 22
+            peerProgress=peerProgress+1
+        }
+        // CAS failure caused by peer joining while leader cancels: preserve
+        // joined phase, so teardown cannot skip that peer's cleanup.
+        smpSeed()
+        if (smpAct(leader,0).status() != 1) return 23
+        smpRace=true;smpRaceValue=smpControl(1,leader,1,1)
+        if (smpAct(leader,6).status() != 1 || smpWord != smpControl(4,leader,1,1)) return 24
+        // Reverse race: cancellation wins and a pending join must not reopen.
+        smpSeed()
+        if (smpAct(leader,0).status() != 1) return 25
+        smpRace=true;smpRaceValue=smpControl(4,leader,1,0)
+        if (smpAct(1-leader,1).status() != 4 || smpWord != smpControl(4,leader,1,0)) return 26
+        leader=leader+1
+    }
+    smpSeed();smpStatus=u32(8)
+    if (smpAct(0,0).status() != 2 || smpCasCalls != 0) return 27
+    smpStatus=u32(0)
+    if (smpAct(2,0).status() != 2 || smpCasCalls != 0) return 28
+    smpHart=u32(0)
+    if (esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,3),0,0,1,true).status() != 2 ||
+        esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,4),0,0,0,true).status() != 2 ||
+        esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,4),0,0,1,false).status() != 2) return 29
+    smpWord=u32(0xffff0000)
+    if (smpAct(0,0).status() != 1 || smpGeneration != 0 || smpWord != u32(513)) return 30
+    // Bounded CAS retry exhaustion retains the competing peer's publication.
+    smpRace=true;smpRaceValue=u32(529)
+    val pending=esp32p4SleepSmpAdvanceOwned(nativeBufferAt(smpStorage,4),0,6,1,true)
+    if (pending.status() != 3 || smpWord != u32(529)) return 32
+    if (smpAct(0,6).status() != 1 || smpWord != u32(2065)) return 33
+    return 0
+}

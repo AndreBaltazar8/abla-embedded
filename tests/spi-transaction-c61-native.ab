@@ -1,0 +1,139 @@
+import "../src/esp32/spi/transaction_c61_sequence.ab"
+import "abla/build"
+val ram=nativeStaticAllocate(192)
+val regs=nativeStaticAllocate(256)
+var command=u32(0)
+var events=u32(4096)
+var fault=0
+var started=0
+var writes=0
+var size=0
+var txAddress=0
+var bad=false
+fun c61SpiRead(address: int): u32 {
+    if (address == 0x60096094) return u32(5)
+    if (address == 0x60096098) return u32(0x401000)
+    if (address == 0x60081000) {
+        val old=command
+        if (old == u32(1<<23) && fault != 1) command=u32(0)
+        return old
+    }
+    if (address == 0x6008103c) return events
+    if (address < 0x60081000 || address >= 0x60081100) { bad=true;return u32(0) }
+    return u32(nativeAddressLoadU32(regs,address-0x60081000))
+}
+fun c61SpiWrite(address: int,value: u32): void {
+    writes=writes+1
+    if (address == 0x60081038) { if ((value&~u32(0x61003)) != u32(0)) bad=true;if (fault != 5) events=events&~value;return }
+    if (address == 0x60081000) {
+        command=value
+        if (value == u32(1<<23)) return
+        if (value != u32(1<<24)) { bad=true;return }
+        started=started+1
+        if (csHigh) bad=true
+        if (events != u32(0) || nativeAddressLoadU32(regs,28) != size*8-1) bad=true
+        var offset=0
+        while (offset < size) {
+            var expected=u32(0)
+            var lane=0
+            while (lane < 4 && offset+lane < size) {
+                expected=expected|(u32(nativeBufferAt(txAddress,size).load(offset+lane))<<u32(lane*8));lane=lane+1
+            }
+            if (u32(nativeAddressLoadU32(regs,152+offset)) != expected) bad=true
+            nativeAddressStoreU32(regs,152+offset,int(~expected))
+            offset=offset+4
+        }
+        if (fault != 2 && fault != 3) command=u32(0)
+        if (fault != 2) events=u32(4096)
+        if (fault == 4) events=events|u32(1<<17)
+        return
+    }
+    if (fault == 6 && address == 0x60081010) return
+    if (fault == 7 && address == 0x60081098) return
+    if (address < 0x60081000 || address >= 0x60081100) { bad=true;return }
+    nativeAddressStoreU32(regs,address-0x60081000,int(value));return
+}
+fun seed(offset: int,count: int): void {
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(regs,at,0);at=at+4 }
+    at=0
+    while (at < 192) { nativeBufferAt(ram,192).store(at,90);at=at+1 }
+    txAddress=ram+offset;size=count
+    at=0
+    while (at < count) { nativeBufferAt(txAddress,count).store(at,(at*37+19)&255);at=at+1 }
+    command=u32(0);events=u32(4096);fault=0;started=0;writes=0;bad=false;return
+}
+
+val gateMemory=nativeStaticAllocate(4)
+var csHigh=true
+var csFail=0
+var csWrites=0
+var nested=false
+fun c61GpioRead(address: int): u32 {
+    if (address == 0x60091034) return u32((1<<28)|(1<<25)|(1<<27))
+    if (address == 0x60091004) return if (csHigh) u32(1<<28) else u32(0)
+    if (address == 0x60091ad4+28*4) return u32(1280)
+    if (address == 0x60090000+28*4) return u32(4096)
+    if (address == 0x60090000+25*4 || address == 0x60090000+27*4) return u32(4096)
+    if (address == 0x60090000+26*4) return u32(4608)
+    if (address == 0x60091ad4+25*4) return u32(1088)
+    if (address == 0x60091ad4+27*4) return u32(1090)
+    if (address == 0x600913d8) return u32(282)
+    if (address == 0x600910d4+25*4 || address == 0x600910d4+27*4) return u32(0)
+    if (address == 0x600910d4+28*4 || address == 0x600b102c) return u32(0)
+    bad=true;return u32(0)
+}
+fun c61GpioWrite(address: int,value: u32): void {
+    csWrites=csWrites+1
+    if (value != u32(1<<28)) bad=true
+    if (nested) {
+        nested=false
+        if (peripheralGateAt(gateMemory).tryBegin(u32(99)) != 1) bad=true
+    }
+    if (csWrites == csFail) return
+    if (address == 0x60091008) csHigh=true
+    else if (address == 0x6009100c) csHigh=false
+    else bad=true
+    return
+}
+fun master(): Esp32C61SpiMaster =
+    Esp32C61SpiMaster(25|(27<<5)|(26<<10)|(28<<15)|(1<<24)|(15<<32)|(1<<49)|(1<<59))
+fun transactionSeed(): void {
+    seed(1,7);nativeAddressStoreU32(gateMemory,0,0)
+    csHigh=true;csFail=0;csWrites=0;nested=true;return
+}
+@export("abla_spi_transaction_c61_test")
+trusted fun testTransaction(): i32 {
+    val device=master()
+    val gate=peripheralGateAt(gateMemory)
+    val tx=nativeBufferAt(ram+1,7);val rx=nativeBufferAt(ram+96,7)
+    transactionSeed()
+    if (!device.transfer(gate,u32(7),tx,rx,7,4).valid() || !csHigh || csWrites != 2 || started != 1 || bad) return i32(1)
+    var error=1
+    while (error <= 7) {
+        transactionSeed();fault=error
+        val result=device.transfer(gate,u32(7),tx,rx,7,4)
+        if (result.status() != 6 || bad || device.transfer(gate,u32(8),tx,rx,7,4).status() != 4) return i32(2)
+        if ((error == 1 || error == 2 || error == 3) && (csHigh || device.recover(gate,u32(8),true))) return i32(3)
+        // External completion is observed, not forced by recovery itself.
+        command=u32(0);fault=0
+        if (error == 4 && device.recover(gate,u32(8),true,false)) return i32(4)
+        if (!device.recover(gate,u32(8),true,true) || !csHigh || bad) return i32(5)
+        if (!device.transfer(gate,u32(9),tx,rx,7,4).valid()) return i32(6)
+        error=error+1
+    }
+    var failure=1
+    while (failure <= 2) {
+        transactionSeed();csFail=failure
+        if (device.transfer(gate,u32(7),tx,rx,7,4).status() != 6 || bad) return i32(7)
+        if (failure == 1 && started != 0) return i32(8)
+        csFail=0
+        if (!device.recover(gate,u32(8),true) || !csHigh || bad) return i32(9)
+        failure=failure+1
+    }
+    transactionSeed()
+    if (gate.tryBegin(u32(1)) != 0 || device.transfer(gate,u32(7),tx,rx,7,4).status() != 2 || csWrites != 0 ||
+        !gate.finish(u32(1),true)) return i32(10)
+    if (device.transfer(gate,u32(7),nativeBufferAt(gateMemory,7),rx,7,4).status() != 3 || csWrites != 0) return i32(11)
+    return i32(0)
+}

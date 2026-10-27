@@ -1,0 +1,104 @@
+import "../src/m5stack/corematrix_control_sequence.ab"
+import "abla/build"
+var apb=u32(0)
+var functional=u32(0)
+var gpio=u32(0)
+var gateWrites=0
+var dropGate=0
+var padWrites=0
+var dropPad=0
+var pads=0
+var bad=false
+var low=false
+var ticks=0
+fun c61DelayClockRead(address: int): int = if (address == 0x600960e8) 2<<16 else 1
+fun c61DelayClockSetRomTicks(value: int): void { ticks=value;return }
+fun c61GpioClockRead(address: int): u32 = if (address == 0x600960c0) apb else if (address == 0x600960c4) functional else gpio
+fun c61GpioClockWrite(address: int,value: u32): void {
+    gateWrites=gateWrites+1
+    if (pads != 0) bad=true
+    if (gateWrites == dropGate) return
+    if (address == 0x600960c0) apb=value else if (address == 0x600960c4) functional=value else gpio=value
+    return
+}
+fun c61SoftwareI2cReady(sda: int,scl: int): bool = apb == u32(1) && functional == u32(0x400000) && gpio == u32(1) && ticks == 80
+fun c61SoftwareI2cConfigure(pin: int,enabled: bool): bool {
+    padWrites=padWrites+1
+    if (padWrites == dropPad) return false
+    if (enabled) pads=pads|(1<<pin) else pads=pads&~(1<<pin)
+    return true
+}
+fun softwareI2cSample(pin: int): bool = !low
+fun softwareI2cDrive(pin: int,released: bool): void { return }
+fun softwareI2cDelay(us: int): void { return }
+fun seed(borrow: int): void {
+    apb=u32(borrow&1);functional=if ((borrow&2) != 0) u32(0x400000) else u32(0)
+    gpio=u32((borrow>>>2)&1)
+    gateWrites=0;dropGate=0;padWrites=0;dropPad=0;pads=0;bad=false;low=false;ticks=0
+    return
+}
+fun open(): Esp32C61I2cSession = esp32C61I2cSessionOpenOwned(0,1,40000000,20000000,true,5,8)
+
+val storage=nativeStaticAllocate(64)
+var failBegin=0
+var failClose=0
+var begins=0
+fun m5ExpanderBusValid(bus: int): bool = I2cBus(bus).current()
+fun m5PmicBusValid(bus: int): bool = I2cBus(bus).current()
+fun m5ExpanderAllocate(bus: int,address: int,hz: int): int = I2cBus(bus).device(address,hz)|0
+fun m5PmicAllocate(bus: int,address: int,hz: int): int = I2cBus(bus).device(address,hz)|0
+// Model only peripheral begin at this boundary. Real provider, slot lifecycle,
+// session clocks and board ownership code run together; not wire-device proof.
+fun m5ExpanderBegin(handle: int,kind: int): bool { begins=begins*10+1;return failBegin != 1 }
+fun m5PmicBegin(handle: int,kind: int): int { begins=begins*10+2;return if (failBegin == 2) 0 else kind }
+fun m5ExpanderClose(handle: int): bool = failClose != 1 && I2cDevice(handle).close()
+fun m5PmicClose(handle: int): bool = failClose != 2 && I2cDevice(handle).close()
+@export("abla_corematrix_control_test")
+trusted fun testControl(): i32 {
+    val owner=m5CoreMatrixControlAt(nativeBufferAt(storage,64))
+    if (m5CoreMatrixControlAt(nativeBufferAt(softwareI2cProviderState,64)) != 0 ||
+        m5CoreMatrixControlAt(nativeBufferAt(storage,63)) != 0) return i32(1)
+    var failure=0
+    while (failure < 3) {
+        var closeFailure=0
+        while (closeFailure < 3) {
+            seed(0);failBegin=failure;failClose=0;begins=0
+            if (!owner.initialize() || owner.openOwned(40000000,20000000,false) != 2 || ticks != 0) return i32(2)
+            val status=owner.openOwned(40000000,20000000,true)
+            val expected=if (failure == 0) 1 else if (failure == 1) 4 else 5
+            if (status != expected || owner.ready() != (failure == 0) || begins != (if (failure == 1) 1 else 12)) return i32(3)
+            if (owner.openOwned(40000000,20000000,true) != 2 || owner.closeOwned(false)) return i32(4)
+            val gates=gateWrites
+            failClose=closeFailure
+            val retained=(failure == 0 && closeFailure != 0) || (failure == 2 && closeFailure == 1)
+            if (owner.closeOwned(true) == retained) return i32(5)
+            if (retained && (owner.status() != 6 || gateWrites != gates || pads != 3)) return i32(6)
+            failClose=0
+            if (!owner.closeOwned(true) || owner.status() != 0 || pads != 0 || bad) return i32(7)
+            if (owner.openFailure() != (if (failure == 0) 0 else expected)) return i32(8)
+            closeFailure=closeFailure+1
+        }
+        failure=failure+1
+    }
+    // Begin failure with immediate cleanup failure retains exact child handle.
+    var which=1
+    while (which <= 2) {
+        seed(0);failBegin=which;failClose=which;begins=0
+        if (!owner.initialize() || owner.openOwned(40000000,20000000,true) != (if (which == 1) 4 else 5)) return i32(9)
+        if (owner.closeOwned(true) || owner.status() != 6 || pads != 3) return i32(10)
+        failClose=0
+        if (!owner.closeOwned(true) || pads != 0 || bad) return i32(11)
+        which=which+1
+    }
+    seed(0);failBegin=0;failClose=0;begins=0;dropPad=2
+    if (!owner.initialize() || owner.openOwned(40000000,20000000,true) != 3 || begins != 0) return i32(12)
+    dropPad=0
+    if (!owner.closeOwned(true) || pads != 0 || bad) return i32(13)
+    seed(0);begins=0
+    if (!owner.initialize() || owner.openOwned(40000000,20000000,true) != 1) return i32(14)
+    dropGate=gateWrites+1
+    if (owner.closeOwned(true) || owner.status() != 7 || pads != 0 || owner.pmic().ownsDevice() || owner.expanders().status() != 0) return i32(15)
+    dropGate=0
+    if (!owner.closeOwned(true) || bad) return i32(16)
+    return i32(0)
+}

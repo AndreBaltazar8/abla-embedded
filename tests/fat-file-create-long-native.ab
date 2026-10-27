@@ -1,0 +1,123 @@
+import "../src/storage/fat_volume_create_auto.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val image=nativeStaticAllocate(2048)
+val aliasText=nativeStaticBytes("LONGNA~1.TXT")
+val conflictingAlias=nativeStaticBytes("ABCDEFG")
+var writes=0
+var failAt=0
+var start=0
+var units=0
+var totalWrites=0
+var bad=false
+var publishedByte=76
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    if (lba != 0 && (lba < 81 || lba > 84)) return false
+    val source=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(image+(lba-81)*512,512)
+    var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    writes=writes+1
+    val count=(units+12)/13;val shortPosition=start+count;val shortSector=shortPosition>>4
+    val expected=if (shortSector > 0) (if (writes == 1 || writes == totalWrites) 81+shortSector else 82+shortSector-writes)
+        else if (totalWrites == 2 && writes == 1) 82 else 81
+    if (lba != expected) { bad=true;return false }
+    val output=nativeBufferAt(image+(lba-81)*512,512);var i=0
+    while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    val shortEntry=nativeBufferAt(image+shortPosition*32,32)
+    if (shortEntry.load(0) == publishedByte) {
+        if (writes != totalWrites) bad=true
+        var state=FatLongName(0);i=0
+        val assembled=nativeBufferAt(memory+7168,520)
+        while (i < count) { state=state.consume(nativeBufferAt(image+(start+i)*32,32),assembled);i=i+1 }
+        if (!state.matches(shortEntry,assembled) || state.length() != units) bad=true
+    }
+    return writes != failAt
+}
+@export("abla_fat_file_create_long_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val name=nativeBufferAt(memory+576,512);val work=nativeBufferAt(memory+1152,3780);val scratch=nativeBufferAt(memory+5120,512)
+    var i=0
+    while (i < 512) { boot.store(i,0);i=i+1 }
+    boot.storeU16(11,512);boot.store(13,1);boot.storeU16(14,1);boot.store(16,2)
+    boot.storeU16(17,64);boot.storeU16(22,40);boot.storeU16(19,10113);boot.storeU16(510,0xaa55)
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    val modified=rtcCalendarDateTime(2026,9,9,12,34,56)
+    var mode=0
+    while (mode < 5) {
+        units=if (mode == 0 || mode == 4) 7 else if (mode == 3) 255 else 13
+        start=if (mode == 4) 2 else if (mode == 0) 0 else if (mode == 1) 14 else 15
+        totalWrites=if (mode == 4) 1 else mode+1
+        publishedByte=if (mode == 4) 65 else 76
+        i=0
+        while (i < units) { name.storeU16(i*2,65+(i%26));i=i+1 }
+        if (units == 255) { name.storeU16(24,0xd83d);name.storeU16(26,0xde00) }
+        var failure=0
+        while (failure <= totalWrites) {
+            writes=0;failAt=failure;bad=false;i=0
+            while (i < 2048) { nativeBufferAt(image,2048).store(i,77);i=i+1 }
+            var entry=0
+            while (entry < start) {
+                val target=nativeBufferAt(image+entry*32,32);i=0
+                while (i < 32) { target.store(i,0);i=i+1 }
+                i=0
+                while (i < 11) { target.store(i,79);i=i+1 }
+                target.store(11,32);entry=entry+1
+            }
+            nativeBufferAt(image,2048).store(start*32,0)
+            if (mode == 4) {
+                entry=0
+                while (entry < 2) {
+                    val target=nativeBufferAt(image+entry*32,32)
+                    i=0
+                    while (i < 6) { target.store(i,65+i);i=i+1 }
+                    target.store(6,126);target.store(7,49+entry)
+                    target.store(8,32);target.store(9,32);target.store(10,32);entry=entry+1
+                }
+            }
+            val volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+            if (mode == 4 && (volume.createLongAuto(u32(7),0,name,units,1,2,64,modified,work).status() != 20 || writes != 0 || state.loadU32(12) != 1)) return i32(8)
+            val result=if (mode == 4) volume.createLongAuto(u32(7),0,name,units,1,3,64,modified,work)
+                else volume.createLong(u32(7),0,name,units,nativeBufferAt(aliasText,12),12,64,modified,work)
+            if (bad || writes != (if (failure == 0) totalWrites else failure) ||
+                result.status() != (if (failure == 0) 1 else 8) || (failure != 0 && state.loadU32(12) != 3)) return i32(2)
+            if (failure == 0) {
+                val position=start+(units+12)/13
+                if (result.ordinal() != position>>4 || result.entryIndex() != (position&15) ||
+                    nativeBufferAt(image,2048).load((position+1)*32) != 0) return i32(3)
+                val before=writes
+                if (volume.createLong(u32(7),0,name,units,nativeBufferAt(aliasText,12),12,64,modified,work).status() != 3 || writes != before) return i32(4)
+                if (mode == 0) {
+                    val another=nativeBufferAt(memory+6000,4);another.storeU16(0,90);another.storeU16(2,90)
+                    if (volume.createLong(u32(7),0,another,2,nativeBufferAt(conflictingAlias,7),7,64,modified,work).status() != 3 ||
+                        volume.createLong(u32(7),0,another,2,nativeBufferAt(aliasText,12),12,64,modified,work).status() != 3 || writes != before) return i32(6)
+                }
+            }
+            i=0
+            while (i < start) { if (nativeBufferAt(image,2048).load(i*32) != (if (mode == 4) 65 else 79)) return i32(7);i=i+1 }
+            if (!volume.invalidate(u32(7))) return i32(5)
+            failure=failure+1
+        }
+        mode=mode+1
+    }
+    val candidate=nativeBufferAt(memory+6000,12)
+    val canonical=nativeBufferAt(memory+6016,11)
+    var sequence=1
+    while (sequence <= 999999) {
+        val length=fatLongAliasCandidate(name,7,sequence,candidate)
+        if (length < 3 || length > 12 || !fatShortNameEncode(candidate,length,canonical)) return i32(9)
+        sequence=if (sequence == 1) 9 else if (sequence == 9) 10 else if (sequence == 10) 99999 else if (sequence == 99999) 999999 else 1000000
+    }
+    // Surrogate pair becomes one underscore, then uppercase extension.
+    name.storeU16(0,0xd83d);name.storeU16(2,0xde00);name.storeU16(4,46)
+    name.storeU16(6,116);name.storeU16(8,120);name.storeU16(10,116)
+    if (fatLongAliasCandidate(name,6,1,candidate) != 7 || candidate.load(0) != 95 || candidate.load(1) != 126 ||
+        candidate.load(2) != 49 || candidate.load(3) != 46 || candidate.load(4) != 84) return i32(10)
+    candidate.store(0,42)
+    if (fatLongAliasCandidate(name,6,0,candidate) != 0 || fatLongAliasCandidate(name,6,1000000,candidate) != 0 || candidate.load(0) != 42) return i32(11)
+    return i32(0)
+}

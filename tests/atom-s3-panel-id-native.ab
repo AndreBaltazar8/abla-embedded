@@ -1,0 +1,98 @@
+import "../src/m5stack/atom_s3_panel_probe.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin=int
+fun Pin.number(): int = this
+fun Pin.valid(): bool = this >= 0 && this <= 48
+fun Pin.outputCapable(): bool = this.valid()
+val gateMemory=nativeStaticMutableU32s([0])
+var pins=M5SpiDisplayPins(0)
+var selected=false
+var driven=true
+var dc=true
+var data=false
+var idleBits=0
+var commandBits=0
+var command=0
+var samples=0
+var releases=0
+var restores=0
+var fault=0
+var partial=false
+var id=u32(0)
+var bad=false
+trusted fun Pin.write(high: bool): void {
+    if (nativeAddressLoadU32(gateMemory,0) != 7) bad=true
+    if (this == pins.mosi()) { if (!driven) bad=true;data=high }
+    else if (this == pins.dataCommand()) dc=high
+    else if (this == pins.chipSelect()) selected=!high
+    else if (this != pins.clock()) bad=true
+    if (this == pins.clock() && high && driven) {
+        if (!selected) { idleBits=idleBits+1;if (data || dc) bad=true }
+        else { if (dc) bad=true;command=(command<<1)|(if (data) 1 else 0);commandBits=commandBits+1 }
+    }
+    return
+}
+trusted fun Pin.read(): bool {
+    if (this != pins.mosi() || driven || !selected || !dc || nativeAddressLoadU32(gateMemory,0) != 7) bad=true
+    val index=samples;samples=samples+1
+    if (index == 0) return true
+    val shift=((index-1)/8)*8+7-((index-1)%8)
+    return (id&(u32(1)<<u32(shift))) != u32(0)
+}
+fun Pin.writeLevelOwned(high: bool): bool {
+    if (this != pins.chipSelect() || !high || (nativeAddressLoadU32(gateMemory,0)&0x7fffffff) != 7) bad=true
+    releases=releases+1
+    val failed=(fault == 1 && releases == 1) || (fault == 3 && releases == 2)
+    if (!failed || partial) selected=false
+    return !failed
+}
+fun Pin.inputOwned(): bool {
+    if (this != pins.mosi() || !selected || !dc || commandBits != 8 || command != 4 || idleBits != 8) bad=true
+    if (fault != 2 || partial) driven=false
+    return fault != 2
+}
+fun Pin.outputLevelOwned(high: bool): bool {
+    if (this != pins.mosi() || selected || high || (nativeAddressLoadU32(gateMemory,0)&0x7fffffff) != 7) bad=true
+    restores=restores+1
+    if (fault != 4 || partial) { driven=true;data=false }
+    return fault != 4
+}
+fun peripheralDelayMicroseconds(us: int): void { if (us != 5 || nativeAddressLoadU32(gateMemory,0) != 7) bad=true;return }
+fun peripheralDelayMilliseconds(ms: int): void { bad=true;return }
+@export("abla_atom_s3_panel_id_test")
+trusted fun test(): i32 {
+    val gate=peripheralGateAt(gateMemory)
+    var boardIndex=0
+    while (boardIndex < 2) {
+        val board=if (boardIndex == 0) m5BoardAtomS3 else m5BoardAtomS3R
+        pins=board.gc9107DisplayPins()
+        var variant=0
+        while (variant < 4) {
+            id=if (variant == 0) u32(0x079100) else if (variant == 1) u32(0x7683) else if (variant == 2) u32(0x897c) else u32(0xffffffff)
+            var mode=0
+            while (mode < 10) {
+                fault=mode/2;partial=(mode&1) != 0
+                selected=false;driven=true;dc=true;idleBits=0;commandBits=0;command=0;samples=0;releases=0;restores=0;bad=false
+                val result=board.readAtomPanelIdChecked(gate,u32(7),if (partial) 5 else 0)
+                if (fault == 0) {
+                    if (!result.valid() || result.value() != id || idleBits != 8 || commandBits != 8 || samples != 33 || restores != 1 ||
+                        atomS3PanelFromId(board,int(result.value())).valid() != (variant != 3)) return i32(1)
+                } else {
+                    val detail=if (fault == 1) 2 else if (fault == 2) 1 else if (fault == 3) 6 else 4
+                    if (result.status() != 6 || result.value() != u32(detail) || nativeAddressLoadU32(gateMemory,0) != 0x80000000 ||
+                        samples != (if (fault <= 2) 0 else 33) || restores != (if (fault == 1 || fault == 3) 0 else 1)) return i32(2)
+                    val previous=commandBits
+                    if (board.readAtomPanelIdChecked(gate,u32(7),0).status() != 4 || commandBits != previous) return i32(3)
+                    fault=0
+                    if (!softwareSpiRegisterReadRecover(gate,u32(7),Pin(pins.chipSelect()),Pin(pins.mosi()),true) || commandBits != previous) return i32(4)
+                }
+                if (bad || selected || !driven || nativeAddressLoadU32(gateMemory,0) != 0) return i32(5)
+                mode=mode+1
+            }
+            variant=variant+1
+        }
+        boardIndex=boardIndex+1
+    }
+    return i32(0)
+}

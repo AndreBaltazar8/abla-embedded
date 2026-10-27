@@ -1,0 +1,161 @@
+import "../src/esp32/power/sleep_peer_binding_p4_sequence.ab"
+import "abla/build"
+val bindStorage=nativeStaticAllocate(68)
+val bindShared=nativeStaticAllocate(4)
+fun p4PeerBindingSharedLoad(address: int): u32 = u32(nativeBufferAt(address,4).loadU32(0))
+val bindTable=nativeStaticAllocate(272)
+val bindPayload=nativeStaticAllocate(864)
+val bindClic=nativeStaticAllocate(192)
+var bindHart=0
+var bindLine=16
+var bindRoute=u32(0xc0)
+var bindSource=u32(0)
+var bindWrites=0
+var bindDrop=0
+var bindBad=false
+fun bindRecord(): NativeBuffer = nativeBufferAt(bindStorage,68)
+fun bindDispatch(): P4IrqDispatch = p4IrqDispatchAt(nativeBufferAt(bindTable,272))
+fun bindContext(): NativeBuffer = nativeBufferAt((bindPayload+15)&(~15),848)
+fun p4DispatchCore(): int = bindHart
+fun p4DispatchMasked(): bool = true
+fun p4DispatchLineEnabled(line: int): bool = (nativeBufferAt(bindClic,192).load(line*4+1)&1) != 0
+fun p4DispatchFence(): void { return }
+fun p4DispatchCall(handler: int,frame: int,line: int,core: int,context: int): void { bindBad=true;return }
+fun p4PeerBindingSource(core: int): u32 { if (core != bindHart) bindBad=true;return bindSource }
+fun p4PeerBindingHandlerAddress(): int = 0x4ff08000
+fun p4ClicMachineStatus(): u32 = u32(0)
+fun p4ClicReadConfig(): int = 6
+fun p4ClicWriteConfig(value: int): void { bindBad=true;return }
+fun p4ClicReadByte(address: int): int = nativeBufferAt(bindClic,192).load(address-0x20801000)
+fun p4ClicWriteByte(address: int,value: int): void {
+    val offset=address-0x20801000
+    if (offset < bindLine*4+1 || offset > bindLine*4+3) bindBad=true
+    val slot=16+(bindLine-16)*8
+    val table=bindDispatch().buffer()
+    if (offset == bindLine*4+1 && (value&1) != 0 &&
+        ((bindRoute&u32(63)) != u32(bindLine) || table.loadU32(slot) != 0x4ff08000 ||
+            table.loadU32(slot+4) != bindContext().addressValue())) bindBad=true
+    if (bindRecord().loadU32(4) >= 9 && ((bindRoute&u32(63)) != u32(0) ||
+        table.loadU32(slot) != 0 || p4DispatchLineEnabled(bindLine))) bindBad=true
+    bindWrites=bindWrites+1
+    if (bindWrites != bindDrop) nativeBufferAt(bindClic,192).store(offset,value)
+    return
+}
+fun p4InterruptRouteRead(address: int): u32 {
+    if (address != 0x500d6000+bindHart*2048+(81+bindHart)*4) bindBad=true
+    return bindRoute
+}
+fun p4InterruptRouteWrite(address: int,value: u32): void {
+    if (address != 0x500d6000+bindHart*2048+(81+bindHart)*4 ||
+        (value&u32(0xffffffc0)) != u32(0xc0) || p4DispatchLineEnabled(bindLine)) bindBad=true
+    if ((value&u32(63)) != u32(0) &&
+        bindDispatch().buffer().loadU32(16+(bindLine-16)*8) != 0x4ff08000) bindBad=true
+    bindWrites=bindWrites+1
+    if (bindWrites != bindDrop) bindRoute=value
+    return
+}
+fun bindSeed(core: int,line: int): NativeBuffer {
+    bindHart=core;bindLine=line;bindRoute=u32(0xc0);bindSource=u32(0);bindWrites=0;bindDrop=0;bindBad=false
+    val r=bindRecord()
+    var offset=0
+    while (offset < 68) { r.storeU32(offset,0);offset=offset+4 }
+    r.storeU32(64,0x1234abcd)
+    bindDispatch().initialize(core)
+    offset=0
+    while (offset < 192) { nativeBufferAt(bindClic,192).store(offset,0);offset=offset+1 }
+    val bank=nativeBufferAt(bindClic,192)
+    bank.store(line*4,0x80);bank.store(line*4+1,0xa0);bank.store(line*4+2,0xc7);bank.store(line*4+3,0x5f)
+    return r
+}
+fun bindRestored(r: NativeBuffer): bool {
+    val bank=nativeBufferAt(bindClic,192)
+    val slot=16+(bindLine-16)*8
+    return !bindBad && bindRoute == u32(0xc0) && bank.load(bindLine*4) == 0x80 &&
+        bank.load(bindLine*4+1) == 0xa0 && bank.load(bindLine*4+2) == 0xc7 &&
+        bank.load(bindLine*4+3) == 0x5f && bindDispatch().buffer().loadU32(slot) == 0 &&
+        bindDispatch().buffer().loadU32(slot+4) == 0 && r.loadU32(64) == 0x1234abcd
+}
+@export("abla_sleep_peer_binding_p4_test")
+fun test(): int {
+    var profile=0
+    while (profile < 8) {
+        val core=profile&1
+        val layout=if ((profile&2) == 0) 1 else 3
+        val line=if ((profile&4) == 0) 16 else 47
+        var fault=0
+        while (fault <= 8) {
+            val r=bindSeed(core,line);bindDrop=fault
+            var opened=esp32p4SleepPeerBindingOpenOwned(r,bindDispatch(),bindContext(),layout,line,5,true)
+            if (fault >= 1 && fault <= 4) {
+                if (opened != 4) return 1
+                opened=esp32p4SleepPeerBindingContinueOwned(r,true)
+            }
+            if (opened != 1 || !p4DispatchLineEnabled(line) || bindBad) return 2
+            val writes=bindWrites
+            bindHart=1-core
+            if (esp32p4SleepPeerBindingCloseOwned(r,true) != 3 || bindWrites != writes) return 3
+            bindHart=core
+            bindDispatch().buffer().storeU32(8,1)
+            if (esp32p4SleepPeerBindingCloseOwned(r,true) != 3 || bindWrites != writes) return 4
+            bindDispatch().buffer().storeU32(8,0)
+            var closed=esp32p4SleepPeerBindingCloseOwned(r,true)
+            if (fault >= 5) {
+                if (closed != 4) return 5
+                closed=esp32p4SleepPeerBindingContinueOwned(r,true)
+            }
+            if (closed != 5 || !bindRestored(r)) return 6
+            fault=fault+1
+        }
+        // Abort incomplete installation: disconnect/unpublish before restoring.
+        var failure=1
+        while (failure <= 4) {
+            val r=bindSeed(core,line);bindDrop=failure
+            if (esp32p4SleepPeerBindingOpenOwned(r,bindDispatch(),bindContext(),layout,line,5,true) != 4 ||
+                esp32p4SleepPeerBindingCloseOwned(r,true) != 5 || !bindRestored(r)) return 7
+            failure=failure+1
+        }
+        profile=profile+1
+    }
+    val busy=bindSeed(0,16)
+    bindRoute=u32(0xd1)
+    if (esp32p4SleepPeerBindingOpenOwned(busy,bindDispatch(),bindContext(),1,16,5,true) != 3 ||
+        bindWrites != 0 || busy.loadU32(0) != 0) return 8
+    bindRoute=u32(0xc0);bindDispatch().buffer().storeU32(16,0x4ff09000)
+    if (esp32p4SleepPeerBindingOpenOwned(busy,bindDispatch(),bindContext(),1,16,5,true) != 3 || bindWrites != 0) return 9
+    val conflict=bindSeed(0,16)
+    if (esp32p4SleepPeerBindingOpenOwned(conflict,bindDispatch(),bindContext(),1,16,5,true) != 1) return 10
+    bindRoute=u32(0xd1)
+    if (esp32p4SleepPeerBindingCloseOwned(conflict,true) != 4 || bindRoute != u32(0xd1) ||
+        bindDispatch().buffer().loadU32(16) != 0x4ff08000) return 11
+    var rearm=0
+    while (rearm < 4) {
+        val hart=rearm&1;val notified=rearm >= 2
+        val r=bindSeed(hart,16)
+        if (esp32p4SleepPeerBindingOpenOwned(r,bindDispatch(),bindContext(),3,16,5,true) != 1) return 12
+        val payload=bindContext()
+        payload.storeU32(0,0x50344950);payload.storeU32(4,if (notified) 11 else 1)
+        payload.storeU32(16,bindShared);payload.storeU32(20,42);payload.storeU32(24,hart)
+        nativeBufferAt(bindShared,4).storeU32(0,(42<<16)|((1-hart)<<8)|(if (notified) 12288 else 0))
+        if (esp32p4SleepPeerPayloadRearmOwned(r,true) != 3 || payload.loadU32(0) == 0) return 13
+        if (esp32P4ClicEnableOwned(16,false) != 1) return 14
+        bindDispatch().buffer().storeU32(8,1)
+        if (esp32p4SleepPeerPayloadRearmOwned(r,true) != 3 || payload.loadU32(0) == 0) return 15
+        bindDispatch().buffer().storeU32(8,0)
+        nativeBufferAt(bindShared,4).storeU32(0,(43<<16))
+        if (esp32p4SleepPeerPayloadRearmOwned(r,true) != 4 || payload.loadU32(0) == 0) return 16
+        nativeBufferAt(bindShared,4).storeU32(0,(42<<16)|((1-hart)<<8)|(if (notified) 12288 else 0))
+        if (esp32p4SleepPeerPayloadRearmOwned(r,true) != 1) return 17
+        var offset=0
+        while (offset < 848) { if (payload.loadU32(offset) != 0) return 18;offset=offset+4 }
+        if (r.loadU32(56) != 1) return 19
+        bindDrop=bindWrites+1
+        if (esp32p4SleepPeerPayloadEnableOwned(r,true) != 4 || r.loadU32(56) != 1) return 20
+        bindDrop=0
+        if (esp32p4SleepPeerPayloadEnableOwned(r,true) != 1 || r.loadU32(56) != 0 ||
+            (p4ClicReadByte(p4ClicLineAddress(16)+1)&1) != 1) return 21
+        val enabledWrites=bindWrites
+        if (esp32p4SleepPeerPayloadEnableOwned(r,true) != 1 || enabledWrites != bindWrites) return 22
+        rearm=rearm+1
+    }
+    return 0
+}

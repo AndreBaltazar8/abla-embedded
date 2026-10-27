@@ -1,0 +1,165 @@
+import "../src/esp32/adc_oneshot_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/build"
+import "abla/runtime/scalar"
+val registers=nativeStaticAllocate(96)
+val original=nativeStaticAllocate(96)
+var writes=0
+var reads=0
+var drop=0
+var bad=false
+fun offset(address: int): int =
+    if (address == 0x500e601c) 0 else if (address == 0x500e60a0) 4
+    else if (address == 0x500e609c) 8 else if (address == 0x500e60b4) 12
+    else if (address == 0x50120000) 16 else if (address == 0x500e60c8) 20
+    else if (address == 0x500de000) 24 else if (address == 0x5012703c) 28
+    else if (address == 0x500de004) 32 else if (address == 0x500de060) 36
+    else if (address == 0x5012700c) 40 else if (address == 0x50127030) 44 else if (address == 0x50127000) 48 else if (address == 0x50127010) 52
+    else if (address == 0x50127014) 56 else if (address == 0x50127024) 60
+    else if (address == 0x50127034) 64 else if (address == 0x50127038) 68 else -1
+trusted fun p4AdcRead(address: int): u32 {
+    reads=reads+1
+    val at=offset(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(registers,96).loadU32(at))
+}
+trusted fun p4AdcWrite(address: int,value: u32): void {
+    writes=writes+1
+    val at=offset(address)
+    if (at < 0) { bad=true;return }
+    if (writes != drop) nativeBufferAt(registers,96).storeU32(at,int(value))
+    return
+}
+trusted fun seed(flags: int,source: int): void {
+    val r=nativeBufferAt(registers,96)
+    var at=0
+    while (at < 96) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0xa55555c0|((flags&1)<<5))
+    r.storeU32(4,0xfeccaa54|((flags>>1)&1))
+    r.storeU32(8,0x3555aaaa|(source<<30))
+    r.storeU32(12,0xaaac5678|(((flags>>2)&3)<<15))
+    r.storeU32(16,0x7755aabb|(((flags>>4)&1)<<23))
+    r.storeU32(24,0x81235547)
+    r.storeU32(28,0xabcd1230)
+    at=0
+    while (at < 96) { nativeBufferAt(original,96).storeU32(at,r.loadU32(at));at=at+4 }
+    writes=0;reads=0;drop=0;bad=false;return
+}
+trusted fun same(): bool {
+    var at=0
+    while (at < 96) {
+        if (nativeBufferAt(original,96).loadU32(at) != nativeBufferAt(registers,96).loadU32(at)) return false
+        at=at+4
+    }
+    return !bad
+}
+trusted fun powerSeed(unit: int,hp: int,lp: int,clock: int): void {
+    seed(31,0)
+    val r=nativeBufferAt(registers,96)
+    val shift=if (unit == 1) 26 else 28
+    val ls=if (unit == 1) 0 else 2
+    r.storeU32(24,(r.loadU32(24)&(0xffffffff^((3<<shift)|32)))|(hp<<shift)|(clock<<5))
+    r.storeU32(28,(r.loadU32(28)&(0xffffffff^(3<<ls)))|(lp<<ls))
+    nativeBufferAt(original,96).storeU32(24,r.loadU32(24))
+    nativeBufferAt(original,96).storeU32(28,r.loadU32(28))
+    return
+}
+
+trusted fun controllerSeed(unit: int): void {
+    powerSeed(unit,3,3,1)
+    val r=nativeBufferAt(registers,96)
+    r.storeU32(offset(p4AdcRtcBase(unit)),0xf1234588)
+    r.storeU32(offset(p4AdcRtcBase(unit)+16),if (unit == 1) 0x8abcdef0 else 0x12345678)
+    r.storeU32(offset(p4AdcRtcBase(unit)+20),0x55aaaa55)
+    r.storeU32(offset(p4AdcRtcBase(unit)+12),0x01400000)
+    var at=0
+    while (at < 96) { nativeBufferAt(original,96).storeU32(at,r.loadU32(at));at=at+4 }
+    return
+}
+@export("abla_adc_oneshot_p4_test")
+trusted fun oneshotTest(): i32 {
+    var unit=1
+    while (unit <= 2) {
+        var channel=0
+        while (channel < (if (unit == 1) 8 else 6)) {
+            var attenuation=0
+            while (attenuation < 4) {
+                controllerSeed(unit)
+                var c=esp32p4AdcControllerOpenOwned(unit,channel,attenuation,8,true)
+                if (c.status() != 1 || !c.hasSnapshot() || !esp32p4AdcOneshotPrepared(unit)) return i32(1)
+                val base=p4AdcRtcBase(unit)
+                val r=nativeBufferAt(registers,96)
+                if (unit == 2 && ((r.loadU32(offset(base+16))>>>28)&7) != 4) return i32(19)
+                if (((r.loadU32(offset(base+20))>>(p4AdcPadIndex(unit,channel)*2))&3) != attenuation) return i32(2)
+                val count=writes
+                if (c.closeOwned(false) != c || writes != count) return i32(3)
+                c=c.closeOwned(true)
+                if (c.status() != 6 || !same()) return i32(4)
+                val restoreCount=writes-count
+                var fault=1
+                while (fault <= count) {
+                    controllerSeed(unit);drop=fault
+                    val failed=esp32p4AdcControllerOpenOwned(unit,channel,attenuation,8,true)
+                    if (failed.status() != 5 || !failed.hasSnapshot() || writes != fault) return i32(5)
+                    drop=0
+                    if (failed.closeOwned(true).status() != 6 || !same()) return i32(6)
+                    fault=fault+1
+                }
+                fault=1
+                while (fault <= restoreCount) {
+                    controllerSeed(unit)
+                    val opened=esp32p4AdcControllerOpenOwned(unit,channel,attenuation,8,true)
+                    writes=0;drop=fault
+                    val failed=opened.closeOwned(true)
+                    if (failed.status() != 5 || !failed.hasSnapshot() || writes != fault) return i32(7)
+                    drop=0
+                    if (failed.closeOwned(true).status() != 6 || !same()) return i32(8)
+                    fault=fault+1
+                }
+                controllerSeed(unit)
+                val opened=esp32p4AdcControllerOpenOwned(unit,channel,attenuation,8,true)
+                if (esp32p4AdcOneshotStartOwned(unit,channel,true) != 257) return i32(9)
+                val active=r.loadU32(offset(base+12))
+                if (active != (0x80060000|(1<<(19+p4AdcPadIndex(unit,channel))))) return i32(10)
+                writes=0
+                if (esp32p4AdcOneshotFinishOwned(unit,channel,3,true) != 6 ||
+                    esp32p4AdcOneshotReleaseOwned(unit,channel,3,true) != 6 ||
+                    esp32p4AdcOneshotStartOwned(unit,channel,true) != 4 ||
+                    opened.closeOwned(true).status() != 4 || writes != 0) return i32(11)
+                r.storeU32(offset(base+12),active|0x10000|2345)
+                if (esp32p4AdcOneshotFinishOwned(unit,channel,1,true) != ((2345<<8)|1)) return i32(12)
+                r.storeU32(offset(base+12),active|0x10000|4096)
+                if (esp32p4AdcOneshotFinishOwned(unit,channel,1,true) != 7) return i32(13)
+                // A completed sample can be released even when raw data invalid.
+                writes=0;drop=1
+                if (esp32p4AdcOneshotReleaseOwned(unit,channel,1,true) != 5) return i32(14)
+                drop=0
+                if (esp32p4AdcOneshotReleaseOwned(unit,channel,1,true) != 1 ||
+                    opened.closeOwned(true).status() != 6 || !same()) return i32(15)
+                // Both start writes are checked; never misreport dropped START.
+                fault=1
+                while (fault <= 2) {
+                    controllerSeed(unit)
+                    val owner=esp32p4AdcControllerOpenOwned(unit,channel,attenuation,8,true)
+                    writes=0;drop=fault
+                    if (esp32p4AdcOneshotStartOwned(unit,channel,true) != 261 || writes != fault) return i32(16)
+                    drop=0
+                    if (esp32p4AdcOneshotReleaseOwned(unit,channel,1,true) != 1 ||
+                        owner.closeOwned(true).status() != 6 || !same()) return i32(17)
+                    fault=fault+1
+                }
+                attenuation=attenuation+1
+            }
+            channel=channel+1
+        }
+        unit=unit+1
+    }
+    seed(0,0)
+    if (esp32p4AdcControllerOpenOwned(2,6,0,8,true).status() != 2 ||
+        esp32p4AdcControllerOpenOwned(1,0,4,8,true).status() != 2 ||
+        esp32p4AdcControllerOpenOwned(1,0,0,0,true).status() != 2 ||
+        esp32p4AdcOneshotStartOwned(0,0,true) != 2 ||
+        esp32p4AdcOneshotFinishOwned(1,0,0,true) != 2 ||
+        esp32p4AdcOneshotReleaseOwned(1,0,1,false) != 2 || reads != 0 || writes != 0) return i32(18)
+    return i32(0)
+}

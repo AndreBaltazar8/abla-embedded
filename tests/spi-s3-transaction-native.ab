@@ -1,0 +1,134 @@
+import "../src/esp32/sdk/raw_buffer.ab"
+import "../src/spi/pins.ab"
+import "../src/esp32/spi/transaction_sequence_esp32s3.ab"
+import "../src/esp32/spi/phases_transaction_sequence_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+type Pin = int
+var pinFault=0
+trusted fun Pin.writeLevelOwned(high: bool): bool {
+    this.write(high);return (pinFault&(if (high) 2 else 1)) == 0
+}
+val storage = nativeStaticMutableU32s([0,0,0,0])
+var detail = 257
+var ready = 1
+var stage = 0
+var selects = 0
+var exchanges = 0
+var stealOwner = false
+var bad = false
+trusted fun esp32s3SpiPhasesOwned(peripheral: int,command: int,commandBits: int,address: int,addressBits: int,dummy: int,direction: int,data: NativeBuffer,bytes: int,polls: int): int {
+    checkOwner()
+    if (stage != 2 || command != 0x9f || commandBits != 8 || address != 0 || addressBits != 0 || dummy != 8 || direction != (if (bytes == 0) 0 else 2)) bad=true
+    stage=3; exchanges=exchanges+1
+    if (stealOwner) nativeAddressStoreU32(storage,0,42)
+    return detail
+}
+trusted fun runPhases(bytes: int = 4): SpiTransactionResult = esp32s3SpiPhasesTransaction(peripheralGateAt(storage),u32(41),2,spiPins(37,35,36),Pin(4),0x9f,8,0,0,8,if (bytes == 0) 0 else 2,nativeBufferAt(storage+4,4),bytes,10,2,3)
+fun esp32s3SpiMasterPinsValid(peripheral: int, pins: SpiPins, select: Pin): bool = peripheral == 2 && pins == spiPins(37,35,36) && select == 4
+fun esp32s3SpiBufferRangeValid(peripheral: int, buffer: NativeBuffer, bytes: int): bool =
+    peripheral == 2 && bytes >= 0 && bytes <= 64 && buffer.hasAddressRange(0, bytes)
+trusted fun checkOwner(): void { if (nativeAddressLoadU32(storage, 0) != 41) bad = true; return }
+trusted fun esp32s3SpiExchangeReady(peripheral: int): int { checkOwner(); if (stage != 0) bad = true; ready }
+trusted fun Pin.write(high: bool): void {
+    if (this != 4) bad = true
+    if (!high) { checkOwner(); if (stage != 0) bad = true; stage = 1 }
+    else { if (stage != (if ((pinFault&1) != 0) 1 else if ((detail & 255) == 1) 4 else 3)) bad = true; stage = 5 }
+    selects = selects + 1; return
+}
+trusted fun peripheralDelayMicroseconds(us: int): void {
+    checkOwner()
+    if (stage == 1 && us == 2) stage = 2
+    else if (stage == 3 && us == 3) stage = 4
+    else bad = true
+    return
+}
+trusted fun esp32s3SpiExchangeOwned(peripheral: int, source: NativeBuffer,
+    destination: NativeBuffer, bytes: int, polls: int): int {
+    checkOwner()
+    if (stage != 2 || peripheral != 2 || source.addressValue() != storage + 4 ||
+        destination.addressValue() != storage + 8 || bytes != 4 || polls != 10) bad = true
+    stage = 3; exchanges = exchanges + 1
+    if (stealOwner) nativeAddressStoreU32(storage, 0, 42)
+    detail
+}
+trusted fun runTransaction(bytes: int = 4): SpiTransactionResult =
+    esp32s3SpiTransaction(peripheralGateAt(storage), u32(41), 2, spiPins(37,35,36), Pin(4),
+        nativeBufferAt(storage + 4, 4), nativeBufferAt(storage + 8, 4), bytes, 10, 2, 3)
+trusted fun resetTransaction(): void {
+    nativeAddressStoreU32(storage, 0, 0); stage = 0; selects = 0; exchanges = 0; return
+}
+trusted fun transactionTest(): int {
+    var kind=0
+    while (kind < 2) {
+        pinFault=1
+        while (pinFault < 4) {
+            var failed=0
+            while (failed < 2) {
+                detail=if (failed == 0) 257 else 0x20109
+                resetTransaction()
+                val result=if (kind == 0) runTransaction() else runPhases()
+                val prior=if ((pinFault&1) != 0) 12 else detail
+                val expected=if ((pinFault&2) == 0) prior else (if (prior == 257) 266 else prior)|(1<<24)
+                if (result.status() != 6 || result.value() != u32(expected) || bad || selects != 2 ||
+                    exchanges != (if ((pinFault&1) != 0) 0 else 1) ||
+                    nativeAddressLoadU32(storage,0) != 0x80000000) return 13
+                failed=failed+1
+            }
+            pinFault=pinFault+1
+        }
+        kind=kind+1
+    }
+    pinFault=0
+    var variant = 0
+    while (variant < 7) {
+        detail = if (variant == 0) 257 else if (variant == 1) 263 else if (variant == 2) 0x20109 else
+            if (variant == 3) 6 else if (variant == 4) 3 else if (variant == 5) 4 else 264
+        resetTransaction()
+        val result = runTransaction()
+        val healthy = variant == 0
+        if (result.status() != (if (healthy) 1 else 6) || int(result.value()) != detail ||
+            nativeAddressLoadU32(storage, 0) != (if (healthy) 0 else 0x80000000) ||
+            selects != 2 || exchanges != 1 || stage != 5 || bad) return 1
+        if (!healthy && (runTransaction().status() != 4 || selects != 2 || exchanges != 1)) return 2
+        variant = variant + 1
+    }
+    ready = 3; resetTransaction()
+    val busyHardware = runTransaction()
+    if (busyHardware.status() != 6 || busyHardware.value() != u32(3) || selects != 0 || exchanges != 0 ||
+        nativeAddressLoadU32(storage, 0) != 0x80000000 || bad) return 3
+    ready = 1; resetTransaction()
+    nativeAddressStoreU32(storage, 0, 7)
+    if (runTransaction().status() != 2 || selects != 0 || exchanges != 0 || nativeAddressLoadU32(storage, 0) != 7) return 4
+    resetTransaction()
+    if (!runTransaction(0).valid() || selects != 0 || exchanges != 0 || nativeAddressLoadU32(storage, 0) != 0) return 5
+    resetTransaction()
+    val aliased = esp32s3SpiTransaction(peripheralGateAt(storage), u32(41), 2, spiPins(37,35,36), Pin(4),
+        nativeBufferAt(storage, 4), nativeBufferAt(storage + 8, 4), 4, 10)
+    if (aliased.status() != 3 || nativeAddressLoadU32(storage, 0) != 0 || selects != 0) return 6
+    resetTransaction(); stealOwner = true; detail = 263
+    val stolen = runTransaction()
+    if (stolen.status() != 5 || stolen.value() != u32(263) || selects != 2 ||
+        nativeAddressLoadU32(storage, 0) != 42 || bad) return 7
+    stealOwner=false; ready=1
+    variant=0
+    while (variant < 4) {
+        detail=if (variant == 0) 257 else if (variant == 1) 10 else if (variant == 2) 263 else 0x20109
+        resetTransaction()
+        val result=runPhases(if (variant == 0) 0 else 4)
+        if (result.status() != (if (variant == 0) 1 else 6) || result.value() != u32(detail) || selects != 2 || exchanges != 1 || stage != 5 || bad ||
+            nativeAddressLoadU32(storage,0) != (if (variant == 0) 0 else 0x80000000)) return 8
+        variant=variant+1
+    }
+    resetTransaction(); ready=3
+    if (runPhases().status() != 6 || selects != 0 || exchanges != 0) return 9
+    resetTransaction(); ready=1
+    nativeAddressStoreU32(storage,0,7)
+    if (runPhases().status() != 2 || selects != 0) return 10
+    resetTransaction()
+    if (runPhases(5).status() != 3 || selects != 0 || exchanges != 0 || nativeAddressLoadU32(storage,0) != 0) return 11
+    detail=263; stealOwner=true
+    if (runPhases().status() != 5 || nativeAddressLoadU32(storage,0) != 42 || selects != 2 || bad) return 12
+    0
+}
+#exportFunction("transactionTest", "abla_spi_transaction_test")

@@ -1,0 +1,201 @@
+import "../src/esp32/adc_power_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/build"
+import "abla/runtime/scalar"
+val registers=nativeStaticAllocate(64)
+val original=nativeStaticAllocate(64)
+var writes=0
+var reads=0
+var drop=0
+var bad=false
+fun offset(address: int): int =
+    if (address == 0x500e601c) 0 else if (address == 0x500e60a0) 4
+    else if (address == 0x500e609c) 8 else if (address == 0x500e60b4) 12
+    else if (address == 0x50120000) 16 else if (address == 0x500e60c8) 20
+    else if (address == 0x500de000) 24 else if (address == 0x5012703c) 28
+    else if (address == 0x500de004) 32 else if (address == 0x500de060) 36
+    else if (address == 0x5012700c) 40 else if (address == 0x50127030) 44 else -1
+trusted fun p4AdcRead(address: int): u32 {
+    reads=reads+1
+    val at=offset(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(registers,64).loadU32(at))
+}
+trusted fun p4AdcWrite(address: int,value: u32): void {
+    writes=writes+1
+    val at=offset(address)
+    if (at < 0) { bad=true;return }
+    if (writes != drop) nativeBufferAt(registers,64).storeU32(at,int(value))
+    return
+}
+trusted fun seed(flags: int,source: int): void {
+    val r=nativeBufferAt(registers,64)
+    var at=0
+    while (at < 64) { r.storeU32(at,0);at=at+4 }
+    r.storeU32(0,0xa55555c0|((flags&1)<<5))
+    r.storeU32(4,0xfeccaa54|((flags>>1)&1))
+    r.storeU32(8,0x3555aaaa|(source<<30))
+    r.storeU32(12,0xaaac5678|(((flags>>2)&3)<<15))
+    r.storeU32(16,0x7755aabb|(((flags>>4)&1)<<23))
+    r.storeU32(24,0x81235547)
+    r.storeU32(28,0xabcd1230)
+    at=0
+    while (at < 64) { nativeBufferAt(original,64).storeU32(at,r.loadU32(at));at=at+4 }
+    writes=0;reads=0;drop=0;bad=false;return
+}
+trusted fun same(): bool {
+    var at=0
+    while (at < 64) {
+        if (nativeBufferAt(original,64).loadU32(at) != nativeBufferAt(registers,64).loadU32(at)) return false
+        at=at+4
+    }
+    return !bad
+}
+trusted fun powerSeed(unit: int,hp: int,lp: int,clock: int): void {
+    seed(31,0)
+    val r=nativeBufferAt(registers,64)
+    val shift=if (unit == 1) 26 else 28
+    val ls=if (unit == 1) 0 else 2
+    r.storeU32(24,(r.loadU32(24)&(0xffffffff^((3<<shift)|32)))|(hp<<shift)|(clock<<5))
+    r.storeU32(28,(r.loadU32(28)&(0xffffffff^(3<<ls)))|(lp<<ls))
+    nativeBufferAt(original,64).storeU32(24,r.loadU32(24))
+    nativeBufferAt(original,64).storeU32(28,r.loadU32(28))
+    return
+}
+@export("abla_adc_clock_power_p4_test")
+trusted fun test(): i32 {
+    var flags=0
+    while (flags < 32) {
+        var source=0
+        while (source < 3) {
+            seed(flags,2)
+            var c=esp32p4AdcClockOpenOwned(source,255,254,255,true)
+            if (c.status() != 1 || !c.hasSnapshot() || !esp32p4AdcClocksReady()) return i32(1)
+            val r=nativeBufferAt(registers,64)
+            if ((r.loadU32(4)&0x1ffffff) != 0x1fffdff || (r.loadU32(8)>>>30) != source ||
+                (r.loadU32(12)&0x18000) != 0x18000) return i32(2)
+            val count=writes
+            if (c.closeOwned(false) != c || writes != count) return i32(3)
+            c=c.closeOwned(true)
+            if (c.status() != 5 || !same()) return i32(4)
+            val closedWrites=writes
+            if (c.closeOwned(true) != c || writes != closedWrites) return i32(5)
+            var fault=1
+            while (fault <= count) {
+                seed(flags,2);drop=fault
+                val failed=esp32p4AdcClockOpenOwned(source,255,254,255,true)
+                if (failed.status() != 4 || !failed.hasSnapshot() || writes != fault) return i32(6)
+                drop=0
+                if (failed.closeOwned(true).status() != 5 || !same()) return i32(7)
+                fault=fault+1
+            }
+            val restoreCount=closedWrites-count
+            fault=1
+            while (fault <= restoreCount) {
+                seed(flags,2)
+                val opened=esp32p4AdcClockOpenOwned(source,255,254,255,true)
+                writes=0;drop=fault
+                val failed=opened.closeOwned(true)
+                if (failed.status() != 4 || writes != fault || !failed.hasSnapshot()) return i32(8)
+                drop=0
+                if (failed.closeOwned(true).status() != 5 || !same()) return i32(9)
+                fault=fault+1
+            }
+            source=source+1
+        }
+        flags=flags+1
+    }
+    seed(0,0)
+    if (esp32p4AdcClockOpenOwned(3,0,0,1,true).status() != 2 ||
+        esp32p4AdcClockOpenOwned(0,256,0,1,true).status() != 2 ||
+        esp32p4AdcClockOpenOwned(0,0,0,0,true).status() != 2 ||
+        esp32p4AdcClockOpenOwned(0,0,1,1,true).status() != 2 ||
+        esp32p4AdcClockOpenOwned(0,0,0,1,false).status() != 2 || reads != 0 || writes != 0) return i32(10)
+    nativeBufferAt(registers,64).storeU32(20,1024)
+    if (esp32p4AdcClockOpenOwned(0,0,0,1,true).status() != 3 || writes != 0) return i32(11)
+    var unit=1
+    while (unit <= 2) {
+        var hp=0
+        while (hp < 4) {
+            var lp=0
+            while (lp < 4) {
+                var clock=0
+                while (clock < 2) {
+                    powerSeed(unit,hp,lp,clock)
+                    var p=esp32p4AdcPowerOpenOwned(unit,true)
+                    if (hp == 1 || lp == 1) {
+                        if (p.status() != 4 || writes != 0 || !same()) return i32(12)
+                    } else {
+                        if (p.status() != 1 || !p.hasSnapshot()) return i32(13)
+                        val count=writes
+                        if (p.closeOwned(false) != p || writes != count) return i32(14)
+                        p=p.closeOwned(true)
+                        if (p.status() != 6 || !same()) return i32(15)
+                        val closedWrites=writes
+                        if (p.closeOwned(true) != p || writes != closedWrites) return i32(16)
+                        var fault=1
+                        while (fault <= count) {
+                            powerSeed(unit,hp,lp,clock);drop=fault
+                            val failed=esp32p4AdcPowerOpenOwned(unit,true)
+                            if (failed.status() != 5 || !failed.hasSnapshot() || writes != fault) return i32(17)
+                            drop=0
+                            if (failed.closeOwned(true).status() != 6 || !same()) return i32(18)
+                            fault=fault+1
+                        }
+                        fault=1
+                        while (fault <= closedWrites-count) {
+                            powerSeed(unit,hp,lp,clock)
+                            val opened=esp32p4AdcPowerOpenOwned(unit,true)
+                            writes=0;drop=fault
+                            val failed=opened.closeOwned(true)
+                            if (failed.status() != 5 || !failed.hasSnapshot() || writes != fault) return i32(19)
+                            drop=0
+                            if (failed.closeOwned(true).status() != 6 || !same()) return i32(20)
+                            fault=fault+1
+                        }
+                    }
+                    clock=clock+1
+                }
+                lp=lp+1
+            }
+            hp=hp+1
+        }
+        // Reject every visible active producer; retries retain original modes.
+        var at=32
+        while (at <= 44) {
+            powerSeed(unit,2,2,0)
+            val opened=esp32p4AdcPowerOpenOwned(unit,true)
+            val r=nativeBufferAt(registers,64)
+            val mask=if (at == 32) 0x1000000 else if (at == 36) 0x80000000 else 0x20000
+            r.storeU32(at,mask);writes=0
+            val busy=opened.closeOwned(true)
+            if (busy.status() != 7 || !busy.hasSnapshot() || writes != 0 ||
+                esp32p4AdcPowerOpenOwned(unit,true).status() != 7 || writes != 0) return i32(21)
+            r.storeU32(at,0)
+            if (busy.closeOwned(true).status() != 6 || !same()) return i32(22)
+            at=at+4
+        }
+        unit=unit+1
+    }
+    seed(0,0)
+    if (esp32p4AdcPowerOpenOwned(1,true).status() != 3 || writes != 0 || !same()) return i32(23)
+    unit=1
+    while (unit <= 2) {
+        var other=0
+        while (other < 4) {
+            powerSeed(unit,2,2,0)
+            val r=nativeBufferAt(registers,64)
+            val lp=(2<<(if (unit == 1) 0 else 2))|(other<<(if (unit == 1) 2 else 0))
+            r.storeU32(28,lp);nativeBufferAt(original,64).storeU32(28,lp)
+            val p=esp32p4AdcPowerOpenOwned(unit,true)
+            if (other == 1) {
+                if (p.status() != 4 || writes != 0 || !same()) return i32(24)
+            } else {
+                if (p.status() != 1 || r.loadU32(28) != 15 || p.closeOwned(true).status() != 6 || !same()) return i32(25)
+            }
+            other=other+1
+        }
+        unit=unit+1
+    }
+    return i32(0)
+}

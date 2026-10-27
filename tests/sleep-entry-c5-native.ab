@@ -1,0 +1,108 @@
+import "../src/esp32/power/sleep_entry_c5_sequence.ab"
+import "../src/esp32/power/sleep_entry_session_c5_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var writes=0
+var failAt=0
+var bad=false
+var requested=false
+var powered=true
+var cpuOff=false
+var store8=0x12345679
+var wake=0
+var reject=0
+var raw=0xc8000000
+var cause=123
+var polls=0
+var efusePolls=0
+var delay=0
+var resultBits=0x80000000
+val sessionMemory=nativeStaticAllocate(32)
+var closing=false
+trusted fun c5SleepEntryRead(address: int): int {
+    if (address == 0x600b0068) return if (cpuOff) 0x20000000 else 0
+    if (address == 0x600b0090) return if (powered) 0x40000 else 0
+    if (address == 0x600b1020) return store8
+    if (address == 0x600b012c) return wake
+    if (address == 0x600b0128) return reject
+    if (address == 0x600b0148) return cause
+    if (address == 0x600b0160) {
+        if (requested) { polls=polls+1;if (polls > delay) raw=0x08000000|resultBits }
+        return raw
+    }
+    if (address == 0x600b49d4) {
+        if (!requested || (raw&0xc0000000) == 0) bad=true
+        efusePolls=efusePolls+1
+        return if (efusePolls > delay) 1 else 2
+    }
+    bad=true;return 0
+}
+trusted fun c5SleepEntryWrite(address: int,value: int): void {
+    writes=writes+1
+    val expected=if (writes == 1) 0x600b1020 else if (writes == 2) 0x600b012c else if (writes == 3) 0x600b0128 else if (writes == 4) 0x600b016c else if (writes == 5) 0x600b0134 else 0x600b0124
+    if (!closing && (address != expected || writes > 6)) bad=true
+    if (closing && address != 0x600b1020 && address != 0x600b012c && address != 0x600b0128) bad=true
+    if (writes == failAt) return
+    if (address == 0x600b1020) store8=value
+    else if (address == 0x600b012c) wake=value
+    else if (address == 0x600b0128) reject=value
+    else if (address == 0x600b016c) { if (value != 0xc0000000) bad=true;raw=raw&~value }
+    else if (address == 0x600b0134) { if (value != 0x80000000) bad=true;cause=0 }
+    else if (address == 0x600b0124) {
+        if (value != 0x80000000 || raw != 0x08000000 || cause != 0) bad=true
+        requested=true
+    } else bad=true
+    return
+}
+@export("abla_sleep_entry_c5_test")
+trusted fun test(): i32 {
+    var mode=1
+    while (mode <= 3) {
+        resultBits=int(u32(mode)<<u32(30))
+        delay=0
+        while (delay < 5) {
+            failAt=0
+            while (failAt <= 5) {
+                writes=0;bad=false;requested=false;store8=0x12345679;wake=0;reject=0;raw=0xc8000000;cause=123;polls=0;efusePolls=0
+                val result=esp32C5LightSleepEnterOwned(u32(0x80000002),0x7fffffff,true)
+                if (bad || result != (if (failAt == 0) mode&1 else -3)) return i32(1)
+                if (failAt == 0 && (!requested || writes != 6 || store8 != 0x12345678 || wake != 0x80000002 || reject != 0xffffffff ||
+                    raw != (0x08000000|resultBits) || polls < delay+1 || efusePolls != delay+1)) return i32(2)
+                if (failAt != 0 && (requested || efusePolls != 0)) return i32(3)
+                failAt=failAt+1
+            }
+            delay=delay+1
+        }
+        mode=mode+1
+    }
+    writes=0
+    if (esp32C5LightSleepEnterOwned(u32(0),0,true) != -1 || esp32C5LightSleepEnterOwned(u32(2),-1,true) != -1 ||
+        esp32C5LightSleepEnterOwned(u32(2),0x80000000,true) != -1 || esp32C5LightSleepEnterOwned(u32(2),0,false) != -1 || writes != 0) return i32(4)
+    powered=false
+    if (esp32C5LightSleepEnterOwned(u32(2),0,true) != -2 || writes != 0) return i32(5)
+    powered=true;cpuOff=true
+    if (esp32C5LightSleepEnterOwned(u32(2),0,true) != -2 || writes != 0) return i32(6)
+    val record=nativeBufferAt(sessionMemory,32)
+    cpuOff=false;powered=true;delay=0
+    var outcome=0
+    while (outcome < 3) {
+        var failedClose=0
+        while (failedClose < 4) {
+            record.storeU32(0,0);closing=false;writes=0;failAt=if (outcome == 2) 2 else 0;bad=false;requested=false
+            store8=0x12345679;wake=0x1234;reject=0x5678;raw=0xc8000000;cause=123;polls=0;efusePolls=0;resultBits=if (outcome == 0) 0x80000000 else 0x40000000
+            val result=esp32C5SleepEntryRunOwned(record,u32(0x80000002),0x7fffffff,true)
+            if (result != (if (outcome == 2) -3 else outcome) || bad) return i32(7)
+            val prior=writes
+            if (esp32C5SleepEntryRunOwned(record,u32(2),0,true) != -4 || esp32C5SleepEntryCloseOwned(record,false) != 2 || writes != prior) return i32(8)
+            closing=true;writes=0;failAt=failedClose;store8=store8^0x100
+            val savedRaw=raw;val savedCause=cause
+            esp32C5SleepEntryCloseOwned(record,true);failAt=0
+            if (esp32C5SleepEntryCloseOwned(record,true) != 4 || wake != 0x1234 || reject != 0x5678 || store8 != 0x12345779 || raw != savedRaw || cause != savedCause || int(i32(record.loadU32(20))) != result || bad) return i32(9)
+            val done=writes
+            if (esp32C5SleepEntryCloseOwned(record,true) != 4 || writes != done) return i32(10)
+            failedClose=failedClose+1
+        }
+        outcome=outcome+1
+    }
+    return i32(0)
+}

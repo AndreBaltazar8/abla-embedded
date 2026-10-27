@@ -1,0 +1,149 @@
+import "../src/sd/mmc_pin_snapshot_s3_sequence.ab"
+import "../examples/esp32s3-sdmmc-fat/pads.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val registers=nativeStaticAllocate(16384)
+val storage=nativeStaticAllocate(64)
+val exampleStorage=nativeStaticAllocate(2304)
+// GPIO-routing boundary model; the production wrapper/snapshot restoration
+// run unchanged. Host startup/shutdown sequencing has its own integrated test.
+type Pin = int
+fun Pin.outputCapable(): bool = espChipS3().gpioOutputValid(this)
+var routeCalls=0
+var failRoute=-1
+var unexpectedHost=false
+trusted fun Pin.setPull(up: bool,down: bool): void {
+    esp32S3PinStateField(esp32S3GpioMuxAddress(this),384,(if (up) 256 else 0)|(if (down) 128 else 0)); return
+}
+trusted fun Pin.setDriveStrength(drive: int): bool = esp32S3PinStateField(esp32S3GpioMuxAddress(this),3072,drive<<10)
+trusted fun Pin.routeOutputSignal(signal: int,inverted: bool): bool {
+    esp32S3PinStateField(esp32S3GpioMuxAddress(this),29184,4096)
+    esp32S3PinStateField(0x60004554+this*4,4095,signal)
+    val index=routeCalls; routeCalls=routeCalls+1
+    return index != failRoute
+}
+trusted fun Pin.routeBidirectionalSignal(input: int,output: int): bool {
+    esp32S3PinStateField(0x60004154+input*4,255,128|this)
+    return this.routeOutputSignal(output,false)
+}
+trusted fun sdMmcS3Read(offset: int): int { unexpectedHost=true; return 0 }
+trusted fun sdMmcS3Write(offset: int,value: int): void { unexpectedHost=true; return }
+trusted fun sdMmcS3SystemRead(address: int): int { unexpectedHost=true; return 0 }
+trusted fun sdMmcS3SystemWrite(address: int,value: int): void { unexpectedHost=true; return }
+trusted fun sdMmcDmaS3Read(address: int): int { unexpectedHost=true; return 0 }
+trusted fun sdMmcDmaS3Write(address: int,value: int): void { unexpectedHost=true; return }
+trusted fun fatSdMmcNowMilliseconds(): int { unexpectedHost=true; return -1 }
+var writes=0
+var drop=-1
+var invalidAddress=false
+trusted fun esp32S3PinStateRead(address: int): int {
+    if (address < 0x60004000 || address > 0x60007ffc || (address&3) != 0) { invalidAddress=true; return 0 }
+    return nativeBufferAt(registers,16384).loadU32(address-0x60004000)
+}
+trusted fun put(address: int,value: int): void { nativeBufferAt(registers,16384).storeU32(address-0x60004000,value); return }
+trusted fun esp32S3PinStateWrite(address: int,value: int): void {
+    writes=writes+1
+    if (address == drop) return
+    if (address == 0x60004008 || address == 0x60004014 || address == 0x60004024 || address == 0x60004030) put(address-4,esp32S3PinStateRead(address-4)|value)
+    else if (address == 0x6000400c || address == 0x60004018 || address == 0x60004028 || address == 0x60004034) put(address-8,esp32S3PinStateRead(address-8)&~value)
+    else put(address,value)
+    return
+}
+trusted fun initialize(pins: SdMmcPins,slot: int,snapshot: NativeBuffer): void {
+    var index=0
+    while (index < 16384) { nativeBufferAt(registers,16384).store(index,0); index=index+1 }
+    index=0
+    while (index < pins.width()+2) {
+        val pin=pins.pin(index)
+        put(esp32S3GpioMuxAddress(pin),0xabcd7f80)
+        put(0x60004554+pin*4,0xdead0abc)
+        put(0x60004074+pin*4,4)
+        index=index+1
+    }
+    index=0
+    while (index < pins.width()+1) { put(0x60004154+sdMmcInputSignal(slot,index)*4,0xdead0055); index=index+1 }
+    sdMmcPinsCaptureOwned(pins,slot,snapshot,true)
+    index=0
+    while (index < pins.width()+2) {
+        val pin=pins.pin(index)
+        put(esp32S3GpioMuxAddress(pin),0xabcd0000); put(0x60004554+pin*4,0xdead0000); put(0x60004074+pin*4,0)
+        index=index+1
+    }
+    index=0
+    while (index < pins.width()+1) { put(0x60004154+sdMmcInputSignal(slot,index)*4,0xbeef00aa); index=index+1 }
+    writes=0; drop=-1
+    return
+}
+@export("abla_sdmmc_pin_snapshot_test")
+trusted fun test(): i32 {
+    val snapshot=nativeBufferAt(storage,64)
+    var mode=0
+    while (mode < 4) {
+        val slot=mode>>1
+        val pins=if ((mode&1) == 0) sdMmcPins(17,33,48) else sdMmcPins(17,33,48,18,34,35)
+        initialize(pins,slot,snapshot)
+        if (sdMmcPinsRestoreOwned(snapshot,true) != 1) return i32(1)
+        var index=0
+        while (index < pins.width()+2) {
+            if ((esp32S3GpioSnapshotOwned(pins.pin(index),true)|0) != snapshot.loadU32(8+index*4)) return i32(2)
+            index=index+1
+        }
+        index=0
+        while (index < pins.width()+1) {
+            if (esp32S3PinStateRead(0x60004154+sdMmcInputSignal(slot,index)*4) != 0xbeef0055) return i32(3)
+            index=index+1
+        }
+        val before=writes
+        if (sdMmcPinsRestoreOwned(snapshot,false) != 1 || writes != before) return i32(4)
+        index=0
+        while (index < pins.width()+1) {
+            initialize(pins,slot,snapshot); drop=0x60004154+sdMmcInputSignal(slot,index)*4
+            if (sdMmcPinsRestoreOwned(snapshot,true) != 16+index || snapshot.loadU32(56) != 16+index || snapshot.loadU32(0) != 0x53445001) return i32(5)
+            drop=-1
+            if (sdMmcPinsRestoreOwned(snapshot,true) != 1) return i32(6)
+            index=index+1
+        }
+        index=0
+        while (index < pins.width()+2) {
+            initialize(pins,slot,snapshot); drop=esp32S3GpioMuxAddress(pins.pin(index))
+            if (sdMmcPinsRestoreOwned(snapshot,true) != 32+index || snapshot.loadU32(56) != 32+index) return i32(7)
+            drop=-1
+            if (sdMmcPinsRestoreOwned(snapshot,true) != 1) return i32(8)
+            index=index+1
+        }
+        initialize(pins,slot,snapshot)
+        snapshot.storeU32(12,snapshot.loadU32(8))
+        if (sdMmcPinsRestoreOwned(snapshot,true) != 2 || writes != 0) return i32(9)
+        initialize(pins,slot,snapshot); snapshot.storeU32(32,256)
+        if (sdMmcPinsRestoreOwned(snapshot,true) != 2 || writes != 0 || sdMmcPinsRestoreOwned(snapshot,false) != 3) return i32(10)
+        mode=mode+1
+    }
+    val example=nativeBufferAt(exampleStorage,2304)
+    val pins=sdMmcPins(17,33,48)
+    var failure=-1
+    while (failure < 3) {
+        var byte=0
+        while (byte < 2304) { example.store(byte,0); byte=byte+1 }
+        initialize(pins,0,snapshot); routeCalls=0; failRoute=failure
+        val begun=sdMmcFatWiredBegin(example,snapshot,pins,nativeBufferAt(0x3fc88000,16),nativeBufferAt(0x3fc89000,512),0,false,u32(0),true)
+        if (failure < 0) {
+            if (begun != 0 || example.loadU32(2288) != 1 || sdMmcFatWiredClose(example) != -1 || snapshot.loadU32(0) != 0x53445001) return i32(12)
+            // Supply the already-tested host-close terminal boundary. The
+            // wrapper must restore pins before reporting close completion.
+            example.storeU32(0,0x53445307); example.storeU32(2288,5)
+            if (sdMmcFatWiredPoll(example,u32(0),u32(0)) != 1) return i32(13)
+        } else {
+            if (begun != -703-failure || example.loadU32(2288) != 7 || example.loadU32(0) != 0) return i32(14)
+            drop=esp32S3GpioMuxAddress(17)
+            // Pin17's routed mux differs from its snapshot; failed restore
+            // keeps the session closed-to-IO but retains a retryable snapshot.
+            if (sdMmcFatWiredClose(example) >= 0 || example.loadU32(2296) != 4) return i32(15)
+            drop=-1
+            if (sdMmcFatWiredClose(example) != 1) return i32(16)
+        }
+        if (example.loadU32(2288) != 5 || example.loadU32(2296) != 3 || snapshot.loadU32(0) != 0x53445002 || sdMmcFatWiredClose(example) != 1) return i32(17)
+        failure=failure+1
+    }
+    if (invalidAddress || unexpectedHost) return i32(11)
+    return i32(0)
+}

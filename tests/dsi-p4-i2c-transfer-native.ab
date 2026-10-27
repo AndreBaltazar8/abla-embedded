@@ -1,0 +1,114 @@
+import "../src/i2c/software_registers.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage=nativeStaticAllocate(16)
+var sda=true
+var scl=true
+var running=false
+var reading=false
+var addressPhase=true
+var bit=0
+var accumulated=0
+var lastByte=0
+var byteCount=0
+var starts=0
+var stops=0
+var seed=0
+var received=0
+var slaveLow=false
+var nackAt=-1
+var lastMasterNack=false
+var rises=0
+var failClock=-1
+var clocked=false
+fun softwareI2cDrive(pin: int,released: bool): void {
+    if (pin == 31) {
+        if (scl && rises != failClock && released != sda) {
+            if (!released) { starts=starts+1; running=true; reading=false; addressPhase=true; bit=0; accumulated=0; clocked=false }
+            else { stops=stops+1; running=false }
+        }
+        sda=released
+    } else {
+        if (!scl && released && running) {
+            clocked=true
+            rises=rises+1
+            if (bit < 8) {
+                if (reading) slaveLow=(((seed+received)&255)&(128>>bit)) == 0
+                else { accumulated=(accumulated<<1)|(if (sda) 1 else 0); slaveLow=false }
+            } else {
+                slaveLow=!reading && byteCount != nackAt
+                if (reading) lastMasterNack=sda
+            }
+        }
+        if (scl && !released && running && clocked) {
+            clocked=false
+            bit=bit+1
+            if (bit == 9) {
+                if (reading) { received=received+1; if (lastMasterNack) reading=false }
+                else { lastByte=accumulated; byteCount=byteCount+1 }
+                if (addressPhase) { reading=(accumulated&1) != 0; addressPhase=false }
+                bit=0; accumulated=0; slaveLow=false
+            }
+        }
+        scl=released
+    }
+    return
+}
+fun softwareI2cSample(pin: int): bool = if (pin == 32) scl && rises != failClock else sda && !slaveLow
+fun softwareI2cDelay(us: int): void { return }
+fun resetTransfer(value: int): void {
+    sda=true; scl=true; running=false; reading=false; addressPhase=true; bit=0; accumulated=0
+    lastByte=0; byteCount=0; starts=0; stops=0; seed=value; received=0; slaveLow=false
+    nackAt=-1; lastMasterNack=false; rises=0; failClock=-1; clocked=false; return
+}
+@export("abla_dsi_p4_i2c_transfer_test")
+trusted fun testTransfer(): i32 {
+    val bus=softwareI2cLines(31,32,5,2)
+    val buffer=nativeBufferAt(storage,16)
+    var value=0
+    while (value < 256) {
+        resetTransfer(value); buffer.store(0,value)
+        val written=bus.transfer(67,buffer,1,NativeBuffer(0),0)
+        if (!written.complete() || written.written() != 1 || lastByte != value || starts != 1 || stops != 1) return i32(1)
+        resetTransfer(value)
+        val read=bus.transfer(67,NativeBuffer(0),0,buffer,1)
+        if (!read.complete() || read.received() != 1 || buffer.load(0) != value || !lastMasterNack || starts != 1 || stops != 1) return i32(2)
+        resetTransfer(value); buffer.store(0,1)
+        val combined=bus.transfer(67,buffer,1,buffer,2)
+        if (!combined.complete() || combined.written() != 1 || combined.received() != 2 ||
+            buffer.load(0) != value || buffer.load(1) != ((value+1)&255) || starts != 2 || stops != 1 || !lastMasterNack) return i32(3)
+        value=value+1
+    }
+    value=0
+    while (value < 256) {
+        resetTransfer(value)
+        val registerRead=bus.readRegister8Checked(67,value,buffer)
+        if (!registerRead.valid() || registerRead.value() != value || starts != 2 || stops != 1 || byteCount != 3) return i32(8)
+        resetTransfer(0)
+        if (!bus.writeRegister8(67,5,value,buffer) || lastByte != value || starts != 1 || stops != 1 || byteCount != 3) return i32(9)
+        resetTransfer(value)
+        if (!bus.updateRegister8(67,5,48,16,buffer) || lastByte != ((value&207)|16) || starts != 3 || stops != 2) return i32(10)
+        value=value+1
+    }
+    resetTransfer(0); nackAt=1
+    val prefixNack=bus.transfer(67,buffer,1,NativeBuffer(0),0,5)
+    if (prefixNack.status() != 5 || prefixNack.written() != 0 || prefixNack.stopStatus() != 1 || byteCount != 2) return i32(11)
+    resetTransfer(0); nackAt=0
+    if (bus.updateRegister8(67,5,48,16,buffer) || starts != 1 || byteCount != 1 || stops != 1) return i32(12)
+    resetTransfer(0)
+    if (!bus.transfer(67,NativeBuffer(0),0,NativeBuffer(0),0).complete() || byteCount != 1 || starts != 1 || stops != 1) return i32(4)
+    var nack=0
+    while (nack < 2) {
+        resetTransfer(0); nackAt=nack
+        val failed=bus.transfer(67,buffer,1,NativeBuffer(0),0)
+        if (failed.status() != 5 || failed.stopStatus() != 1 || failed.written() != 0 || stops != 1) return i32(5)
+        nack=nack+1
+    }
+    resetTransfer(0); failClock=3
+    val timeout=bus.transfer(67,buffer,1,NativeBuffer(0),0)
+    if (timeout.status() != 3 || timeout.stopStatus() != 0 || timeout.written() != 0 || stops != 0) return i32(6)
+    resetTransfer(0)
+    if (bus.transfer(67,nativeBufferAt(4294967295,2),2,buffer,0).status() != 2 ||
+        bus.transfer(128,buffer,1,buffer,1).status() != 2 || starts != 0) return i32(7)
+    return i32(0)
+}

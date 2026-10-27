@@ -1,0 +1,88 @@
+import "../src/storage/fat_file_rename.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val disk=nativeStaticAllocate(512)
+var writes=0
+var failWrite=false
+var failAt=1
+var commitFailure=false
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    if (lba != 0 && lba != 81) return false
+    val input=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(disk,512)
+    var i=0;while (i < 512) { output.store(i,input.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,input: NativeBuffer): bool {
+    if (lba != 81) return false
+    writes=writes+1
+    val failed=failWrite && writes == failAt
+    if (!failed || commitFailure) { var i=0;while (i < 512) { nativeBufferAt(disk,512).store(i,input.load(i));i=i+1 } }
+    return !failed
+}
+@export("abla_fat_short_case_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val expected=nativeBufferAt(memory+576,32);val work=nativeBufferAt(memory+640,5352)
+    val scratch=nativeBufferAt(memory+6016,512);val name=nativeBufferAt(memory+6592,14)
+    val alias=nativeBufferAt(nativeStaticBytes("FOO     TXT"),11);val spelling=nativeBufferAt(nativeStaticBytes("FOO.TXT"),7)
+    val entry=nativeBufferAt(disk,512)
+    var i=0;while (i < 512) { boot.store(i,0);i=i+1 }
+    boot.storeU16(11,512);boot.store(13,1);boot.storeU16(14,1);boot.store(16,2)
+    boot.storeU16(17,512);boot.storeU16(22,40);boot.storeU16(19,10113);boot.storeU16(510,0xaa55)
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    var mode=0
+    while (mode < 6) {
+        writes=0;failWrite=mode >= 4;commitFailure=mode == 5
+        i=0;while (i < 512) { entry.store(i,0);i=i+1 }
+        i=0;while (i < 11) { entry.store(i,alias.load(i));i=i+1 }
+        entry.store(11,33);entry.store(12,128);entry.storeU32(22,123456);entry.storeU16(26,2);entry.storeU32(28,100);entry.store(511,77)
+        i=0;while (i < 32) { expected.store(i,entry.load(i));i=i+1 }
+        val flags=if (mode == 0) 0 else if (mode == 1) 8 else if (mode == 2) 16 else 24
+        i=0;while (i < 7) {
+            val ch=spelling.load(i);val lower=(flags&(if (i < 3) 8 else 16)) != 0
+            name.storeU16(i*2,if (lower && ch >= 65 && ch <= 90) ch+32 else ch);i=i+1
+        }
+        val volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+        val result=volume.renameFile(u32(7),0,0,0,expected,0,name,7,1,8,64,work)
+        if (result.status() != (if (failWrite) 15 else 1) || writes != (if (mode == 0) 0 else 1)) return i32(2)
+        if (entry.load(12) != (128|(if (failWrite && !commitFailure) 0 else flags))) return i32(3)
+        i=0;while (i < 32) { if (i != 12 && entry.load(i) != expected.load(i)) return i32(4);i=i+1 }
+        if (entry.load(32) != 0 || entry.load(511) != 77 || (failWrite && state.loadU32(12) != 3)) return i32(5)
+        if (!failWrite) {
+            expected.store(12,128|flags)
+            val before=writes
+            if (volume.renameFile(u32(7),0,0,0,expected,0,name,7,1,8,64,work).status() != 1 || writes != before) return i32(6)
+        }
+        if (!volume.invalidate(u32(7))) return i32(7)
+        mode=mode+1
+    }
+    mode=0
+    while (mode < 6) {
+        writes=0;failWrite=mode >= 1 && mode <= 4;failAt=if (mode <= 2) 1 else 2;commitFailure=mode == 2 || mode == 4
+        i=0;while (i < 512) { entry.store(i,0);i=i+1 }
+        i=0;while (i < 32) { entry.store(i,expected.load(i));i=i+1 }
+        entry.store(12,128);expected.store(12,128);entry.store(511,77)
+        if (mode == 5) { i=0;while (i < 32) { entry.store(32+i,expected.load(i));i=i+1 } }
+        val mixed=nativeBufferAt(nativeStaticBytes("FoO.TxT"),7)
+        i=0;while (i < 7) { name.storeU16(i*2,mixed.load(i));i=i+1 }
+        val volume=fatVolumeOpen(state,u32(7),reader,10113,-1,boot,scratch)
+        val result=volume.renameFile(u32(7),0,0,0,expected,0,name,7,1,8,64,work)
+        val wanted=if (mode == 5) 10 else if (!failWrite) 1 else if (failAt == 1) 15 else 16
+        if (result.status() != wanted || writes != (if (mode == 5) 0 else if (failWrite) failAt else 2)) return i32(8+mode)
+        val published=mode == 0 || mode == 2 || mode == 3 || mode == 4
+        val unlinked=mode == 0 || mode == 4
+        if (entry.load(0) != (if (unlinked) 229 else 70) || entry.load(511) != 77) return i32(14)
+        if (published) {
+            i=11;while (i < 32) { if (entry.load(64+i) != (if (i == 12) 0 else expected.load(i))) return i32(15);i=i+1 }
+            val assembled=nativeBufferAt(memory+6656,520)
+            val longState=FatLongName(0).consume(nativeBufferAt(disk+32,32),assembled)
+            if (!longState.matches(nativeBufferAt(disk+64,32),assembled) || longState.length() != 7) return i32(16)
+            i=0;while (i < 7) { if (assembled.loadU16(i*2) != name.loadU16(i*2)) return i32(17);i=i+1 }
+        }
+        if (failWrite && state.loadU32(12) != 3) return i32(18)
+        if (!volume.invalidate(u32(7))) return i32(19)
+        mode=mode+1
+    }
+    return i32(0)
+}

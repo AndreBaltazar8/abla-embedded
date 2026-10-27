@@ -1,0 +1,152 @@
+import "../src/esp32/spi/buffer_sequence_esp32s3.ab"
+import "../src/esp32/spi/transfer_sequence_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val storage = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+var base = 0x60024000
+var bytes = 1
+var stage = 0
+var updates = 0
+var updateAt = 1
+var events = 0
+var doneAt = 1
+var clearAt = 1
+var words = 0
+var copied = 0
+var acks = 0
+var mode = 0
+var fifoError = 0
+var bad = false
+var receiving = true
+trusted fun testTransfer(peripheral: int, source: NativeBuffer, destination: NativeBuffer, count: int, polls: int): int =
+    if (receiving) esp32s3SpiExchangeOwned(peripheral, source, destination, count, polls)
+    else esp32s3SpiTransmitOwned(peripheral, source, count, polls)
+trusted fun esp32s3SpiRead(address: int): int {
+    if (address == base) {
+        if (mode == 1) return 0x01000000
+        if (stage == 4) { updates = updates + 1; return if (updates < updateAt) 0x00800000 else 0 }
+        if (stage == 5) return if (events < clearAt) 0x01000000 else 0
+        return 0
+    }
+    if (address == base + 0x30) return if (mode == 2) 0x08000000 else if (mode == 3) 0x00040000 else 0
+    if (address == base + 0xe0) return if (mode == 4) 0x04000000 else 0
+    if (address == base + 0x34) return if (mode == 5) 4096 else if (mode == 6) 0x20000 else if (mode == 7) 0x40000 else 0
+    if (address == base + 0x10 || address == base + 0x1c) return 0xffffffff
+    if (address == base + 0x3c) {
+        if (stage != 5 || acks != 1) bad = true
+        events = events + 1
+        return (if (events >= doneAt) 4096 else 0) | fifoError
+    }
+    val offset = address - base - 0x98
+    if (stage != 5 || events < doneAt || events < clearAt || offset != copied * 4 || offset >= bytes) bad = true
+    copied = copied + 1
+    (offset + 97) | ((offset + 98) << 8) | ((offset + 99) << 16) | ((offset + 100) << 24)
+}
+trusted fun esp32s3SpiWrite(address: int, value: int): void {
+    if (address == base + 0x10) {
+        if (stage != 0 || value != (if (receiving) 0x1cfdffff else 0x0cfdfffe)) bad = true
+        stage = 1
+    } else if (address == base + 0x1c) {
+        if (stage != 1 || value != (0xfffc0000 | (bytes * 8 - 1))) bad = true
+        stage = 2
+    } else if (address == base + 0x38) {
+        if (value != (if (stage == 2) 0x61000 else 4096) || (stage != 2 && stage != 5)) bad = true
+        if (stage == 2) { if (words != (bytes + 3) / 4) bad = true; stage = 3 }
+        else if (copied != (if (receiving) (bytes + 3) / 4 else 0)) bad = true
+        acks = acks + 1
+    } else if (address == base) {
+        if (value == 0x00800000) { if (stage != 3) bad = true; stage = 4 }
+        else if (value == 0x01000000) { if (stage != 4 || updates < updateAt) bad = true; stage = 5 }
+        else bad = true
+    } else {
+        if (stage != 2 || address != base + 0x98 + words * 4) bad = true
+        val remaining = bytes - words * 4
+        val expected = if (remaining >= 4) 0xaaaaaaaa else if (remaining == 3) 0x00aaaaaa else if (remaining == 2) 0x0000aaaa else 0xaa
+        if (value != expected) bad = true
+        words = words + 1
+    }
+    return
+}
+trusted fun resetExchange(): void {
+    stage = 0; updates = 0; events = 0; words = 0; copied = 0; acks = 0
+    val buffer = nativeBufferAt(storage, 72)
+    var index = 0
+    while (index < 72) { buffer.store(index, 170); index = index + 1 }
+    return
+}
+trusted fun exerciseTransfer(): int {
+    bad = false; mode = 0; fifoError = 0; updateAt = 1
+    val buffer = nativeBufferAt(storage + 1, 64)
+    val guards = nativeBufferAt(storage, 72)
+    var peripheral = 2
+    while (peripheral <= 3) {
+        base = 0x60024000 + (peripheral - 2) * 4096
+        bytes = 1
+        while (bytes <= 64) {
+            doneAt = 1
+            while (doneAt <= 3) {
+                clearAt = 1
+                while (clearAt <= 3) {
+                    resetExchange()
+                    if (testTransfer(peripheral, buffer, buffer, bytes, 4) != 257 ||
+                        acks != 2 || bad || events != (if (doneAt > clearAt) doneAt else clearAt)) return 1
+                    var index = 0
+                    while (index < 72) {
+                        if (guards.load(index) != (if (receiving && index >= 1 && index <= bytes) index + 96 else 170)) return 2
+                        index = index + 1
+                    }
+                    clearAt = clearAt + 1
+                }
+                doneAt = doneAt + 1
+            }
+            bytes = bytes + 1
+        }
+        peripheral = peripheral + 1
+    }
+    base = 0x60024000; bytes = 1; doneAt = 1; clearAt = 1
+    mode = 1
+    while (mode <= 7) {
+        resetExchange()
+        if (testTransfer(2, buffer, buffer, 1, 4) != (if (mode <= 2) 3 else 4) || stage != 0 || bad) return 3
+        mode = mode + 1
+    }
+    mode = 0; updateAt = 5; resetExchange()
+    if (testTransfer(2, buffer, buffer, 1, 4) != 6 || stage != 4 || copied != 0 || buffer.load(0) != 170 || bad) return 4
+    updateAt = 1; doneAt = 5; resetExchange()
+    if (testTransfer(2, buffer, buffer, 1, 4) != 263 || stage != 5 || copied != 0 || acks != 1 || buffer.load(0) != 170 || bad) return 5
+    doneAt = 1; clearAt = 5; resetExchange()
+    if (testTransfer(2, buffer, buffer, 1, 4) != 263 || copied != 0 || buffer.load(0) != 170 || bad) return 6
+    // Errors must win with/without DONE, whether the command remains active.
+    fifoError = 0x20000
+    while (fifoError <= 0x60000) {
+        doneAt = 1
+        while (doneAt <= 5) {
+            clearAt = 1
+            while (clearAt <= 5) {
+                resetExchange()
+                if (testTransfer(2, buffer, buffer, 1, 4) != (265 | fifoError) ||
+                    copied != 0 || acks != 1 || events != 1 || buffer.load(0) != 170 || bad) return 8
+                clearAt = clearAt + 4
+            }
+            doneAt = doneAt + 4
+        }
+        fifoError = fifoError + 0x20000
+    }
+    fifoError = 0
+    resetExchange()
+    if (testTransfer(0, buffer, buffer, 1, 4) != 2 ||
+        testTransfer(2, buffer, buffer, 0, 4) != 2 ||
+        testTransfer(2, buffer, buffer, 65, 4) != 2 ||
+        testTransfer(2, buffer, buffer, 1, 0) != 2 || stage != 0) return 7
+    0
+}
+trusted fun exchangeTest(): int {
+    receiving = true
+    val received = exerciseTransfer()
+    if (received != 0) return received
+    receiving = false
+    val transmitted = exerciseTransfer()
+    if (transmitted != 0) return transmitted + 100
+    0
+}
+#exportFunction("exchangeTest", "abla_spi_exchange_test")

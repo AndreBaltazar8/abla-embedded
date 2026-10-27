@@ -1,0 +1,96 @@
+import "../src/esp32/power/sleep_time_c5_sequence.ab"
+import "../src/esp32/power/sleep_time_session_c5_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var now=0
+var high=u32(0)
+var low=u32(0)
+var writes=0
+var loads=0
+var mode=0
+var bad=false
+val sessionMemory=nativeStaticAllocate(40)
+var rtcNow=0
+var snapshots=0
+var capturing=false
+trusted fun c5RtcTimerRead(offset: int): int {
+    if (offset == 0x10) return 0
+    if (offset == 0x14) return rtcNow&0xffffffff
+    if (offset == 0x18) return rtcNow>>>32
+    bad=true;return 0
+}
+trusted fun c5RtcTimerWrite(offset: int,value: int): void { if (offset != 0x10 || value != 0x8000000) bad=true;snapshots=snapshots+1;return }
+trusted fun esp32C5TimerRead(address: int): u32 {
+    if (address == 0x6009606c) return if (mode == 1) u32(0) else u32(5)
+    if (address == 0x60096070) return if (mode == 5) u32(0x500000) else u32(0x400000)
+    if (address == 0x6000a004) return if (mode == 2) u32(0) else u32(0x20000000)
+    if (address == 0x6000a040) return u32(now>>>32)
+    if (address == 0x6000a044) return u32(now)
+    if (address == 0x6000a00c) return high
+    if (address == 0x6000a010) return low
+    bad=true;return u32(0)
+}
+trusted fun esp32C5TimerWrite(address: int,value: u32): void {
+    writes=writes+1
+    if (capturing && snapshots != 1) bad=true
+    if (address == 0x6000a004) { if (value != u32(0x60000000) && value != u32(0x40000000)) bad=true }
+    else if (address == 0x6000a00c) { if (mode != 3) high=value }
+    else if (address == 0x6000a010) { if (mode != 4) low=value }
+    else if (address == 0x6000a05c) { if (value != u32(1)) bad=true;loads=loads+1 }
+    else bad=true
+    return
+}
+@export("abla_sleep_time_c5_test")
+trusted fun test(): int {
+    var outcome=-3
+    while (outcome <= 1) {
+        mode=0
+        while (mode < 6) {
+            now=1600;high=u32(0xfffff);low=u32(0xffffffff);writes=0;loads=0;bad=false
+            val result=esp32C5SleepTimeCompensateOwned(100,0xffffffffffff,9,524288,outcome,true,2)
+            val expected=if (outcome != 0) 5 else if (mode == 0) 1 else if (mode == 1 || mode == 5) 3 else if (mode == 2) 6 else 4
+            if (result != expected || loads != (if (expected == 1) 1 else 0) || bad || (outcome != 0 && writes != 0)) return 1
+            if (expected == 1 && (high != u32(0) || low != u32(1760))) return 2
+            mode=mode+1
+        }
+        outcome=outcome+1
+    }
+    mode=0;now=2000;writes=0;loads=0
+    if (esp32C5SleepTimeCompensateOwned(100,0,10,524288,0,true) != 5 || loads != 0) return 3
+    writes=0
+    if (esp32C5SleepTimeCompensateOwned(100,0,0,524288,0,true) != 5 || writes != 0) return 4
+    if (esp32C5SleepTimeTarget(0xffffffffffff,0,1,524288) != -1 || esp32C5SleepTimeTarget(0xfffffffffffe,0,1,524288) != 0xffffffffffff0 || esp32C5SleepTimeTarget(0,0,0xffffffffffff,0xffffffff) != -1) return 5
+    if (esp32C5SleepTimeCompensateOwned(0,0,1,0,0,true) != 2 || esp32C5SleepTimeCompensateOwned(0,0,1,524288,0,false) != 2 || writes != 0) return 6
+    val record=nativeBufferAt(sessionMemory,40)
+    var firstFailure=0
+    while (firstFailure < 6) {
+        record.storeU32(0,0);mode=firstFailure;now=1600;rtcNow=10;high=u32(0xfffff);low=u32(0xffffffff);loads=0;writes=0;snapshots=0;bad=false
+        if (esp32C5SleepTimePrepareOwned(record,100,0,524288,true) != 1 || snapshots != 0 || writes != 0) return 7
+        if (esp32C5SleepTimePrepareOwned(record,200,0,524288,true) != 2) return 8
+        val result=esp32C5SleepTimeFinishOwned(record,0,true,2)
+        if (result != (if (firstFailure == 0) 1 else 3) || bad) return 9
+        val prior=writes;val sampled=snapshots
+        if (esp32C5SleepTimeFinishOwned(record,1,true) != 2 || esp32C5SleepTimeFinishOwned(record,0,false) != 2 || writes != prior || snapshots != sampled) return 10
+        rtcNow=20;mode=0
+        if (esp32C5SleepTimeFinishOwned(record,0,true) != 1 || loads != 1 || low != u32(if (firstFailure == 0) 1760 else 1920) || bad) return 11
+        val doneWrites=writes;val doneSnapshots=snapshots
+        if (esp32C5SleepTimeFinishOwned(record,0,true) != 1 || writes != doneWrites || snapshots != doneSnapshots) return 12
+        firstFailure=firstFailure+1
+    }
+    record.storeU32(0,0);writes=0;snapshots=0
+    if (esp32C5SleepTimePrepareOwned(record,100,0,524288,true) != 1 || esp32C5SleepTimeFinishOwned(record,-3,true) != 1 || writes != 0 || snapshots != 0 || int(i32(record.loadU32(28))) != -3) return 13
+    capturing=true;mode=0
+    while (mode < 6) {
+        record.storeU32(0,0);snapshots=0;writes=0;loads=0;bad=false
+        now=0xfffffffffffff;rtcNow=0xfffffffffff0
+        val captured=esp32C5SleepTimeCaptureOwned(record,524288,true,2)
+        val expected=if (mode == 1 || mode == 5) 3 else if (mode == 2) 4 else 1
+        if (captured != expected || bad || loads != 0) return 14
+        if (expected == 1 && (record.loadU32(8) != 0xffffffff || record.loadU32(12) != 65535 || record.loadU32(16) != 0xfffffff0 || record.loadU32(20) != 65535)) return 15
+        if (expected != 1 && record.loadU32(0) != 0) return 16
+        if ((expected == 3 && (writes != 0 || snapshots != 0)) || (expected != 3 && snapshots != 1)) return 17
+        mode=mode+1
+    }
+    capturing=false
+    return 0
+}

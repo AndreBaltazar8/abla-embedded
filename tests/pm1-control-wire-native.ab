@@ -1,0 +1,177 @@
+import "../src/m5stack/pm1_control_sequence.ab"
+import "../src/m5stack/pm1_control_setup.ab"
+import "../src/m5stack/expander_open.ab"
+import "../src/m5stack/pmic_open.ab"
+import "../src/esp32/i2c/software_provider_c61.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+// Real board controller, PM1/IOE drivers, generation slots, register transport
+// and bit engine. Only the pad/clock admission and physical slave are modeled;
+// pins0/1 are model wires, NOT S3 board wiring or hardware proof.
+val registers=nativeStaticAllocate(512)
+val record=nativeStaticAllocate(72)
+var bad=false
+var pads=0
+fun c61SoftwareI2cReady(sda: int,scl: int): bool = sda == 0 && scl == 1
+fun c61SoftwareI2cConfigure(pin: int,enabled: bool): bool {
+    if (pin < 0 || pin > 1) { bad=true;return false }
+    if (enabled) pads=pads|(1<<pin) else pads=pads&~(1<<pin)
+    return true
+}
+fun softwareI2cSample(pin: int): bool = if (pin == 1) clockHigh else masterHigh && slaveHigh
+fun softwareI2cDrive(pin: int,released: bool): void = wireDrive(pin,released)
+fun softwareI2cDelay(us: int): void { return }
+fun pm1ControlStorageSafe(storage: NativeBuffer): bool = softwareI2cProviderBufferSafe(storage,72)
+fun pm1ControlBusReady(bus: int,board: M5BoardId): bool = I2cBus(bus).current() && pads == 3
+var masterHigh=true
+var slaveHigh=true
+var clockHigh=true
+var mode=0
+var bits=0
+var value=0
+var index=0
+var selected=-1
+var pointer=0
+var reading=false
+var ack=true
+var ackCount=0
+var nackAt=0
+var starts=0
+var stops=0
+// Optional RX8130 slave for retained-child integration; disabled by default.
+val rtcRegisters=nativeStaticAllocate(256)
+var rtcPresent=false
+var rtcNackAfterCommit=false
+// Optional MPU6886 at0x68. Off by default; existing PM1/RTC tests unchanged.
+val pm1ImuRegisters=nativeStaticAllocate(256)
+var pm1ImuPresent=false
+var pm1ImuNackAfterCommit=false
+// Optional configurable charger-register slave, default off.
+val chargeRegisters=nativeStaticAllocate(256)
+var chargeAddress=0
+var chargeNackAfterCommit=false
+fun wireByte(): void {
+    ackCount=ackCount+1
+    ack=ackCount != nackAt
+    if (index == 0) {
+        selected=if ((value>>>1) == 79) 0 else if ((value>>>1) == 110) 256 else if (rtcPresent && (value>>>1) == 50) 512 else if (pm1ImuPresent && (value>>>1) == 104) 768 else if (chargeAddress != 0 && (value>>>1) == chargeAddress) 1024 else -1
+        reading=(value&1) != 0
+        if (selected < 0) ack=false
+    } else if ((ack || (index > 1 && ((selected == 512 && rtcNackAfterCommit) || (selected == 768 && pm1ImuNackAfterCommit) || (selected == 1024 && chargeNackAfterCommit)))) && selected >= 0) {
+        if (index == 1) pointer=value
+        else {
+            if (selected == 512) nativeBufferAt(rtcRegisters,256).store(pointer,value)
+            else if (selected == 768) nativeBufferAt(pm1ImuRegisters,256).store(pointer,value)
+            else if (selected == 1024) nativeBufferAt(chargeRegisters,256).store(pointer,value)
+            else nativeBufferAt(registers,512).store(selected+pointer,value)
+            pointer=(pointer+1)&255
+        }
+    }
+    index=index+1
+    return
+}
+fun sendBit(): void {
+    val byte=if (selected == 512) nativeBufferAt(rtcRegisters,256).load(pointer) else if (selected == 768) nativeBufferAt(pm1ImuRegisters,256).load(pointer) else if (selected == 1024) nativeBufferAt(chargeRegisters,256).load(pointer) else nativeBufferAt(registers,512).load(selected+pointer)
+    slaveHigh=(byte&(128>>>bits)) != 0;return
+}
+fun wireDrive(pin: int,high: bool): void {
+    if (pin == 0) {
+        val old=masterHigh
+        masterHigh=high
+        if (clockHigh && slaveHigh && old != high) {
+            if (!high) { starts=starts+1;mode=1;bits=0;value=0;index=0;reading=false }
+            else { stops=stops+1;mode=0;slaveHigh=true }
+        }
+        return
+    }
+    if (pin != 1) { bad=true;return }
+    if (clockHigh == high) return
+    clockHigh=high
+    if (high) {
+        if (mode == 1) { value=(value<<1)|(if (masterHigh) 1 else 0);bits=bits+1 }
+        else if (mode == 3) bits=bits+1
+        else if (mode == 4) ack=!masterHigh
+    } else {
+        if (mode == 1 && bits == 8) { wireByte();mode=2;slaveHigh=!ack }
+        else if (mode == 2) {
+            slaveHigh=true;bits=0;value=0
+            if (!ack) mode=5
+            else if (reading) { mode=3;sendBit() }
+            else mode=1
+        } else if (mode == 3) {
+            if (bits == 8) { mode=4;slaveHigh=true } else sendBit()
+        } else if (mode == 4) {
+            bits=0
+            if (ack) { pointer=(pointer+1)&255;mode=3;sendBit() } else { mode=5;slaveHigh=true }
+        }
+    }
+    return
+}
+fun wireSeed(): void {
+    rtcPresent=false;rtcNackAfterCommit=false
+    pm1ImuPresent=false;pm1ImuNackAfterCommit=false
+    chargeAddress=0;chargeNackAfterCommit=false
+    masterHigh=true;slaveHigh=true;clockHigh=true;mode=0;bits=0;value=0;index=0
+    selected=-1;pointer=0;reading=false;ack=true;ackCount=0;nackAt=0;starts=0;stops=0
+    var at=0
+    while (at < 512) { nativeBufferAt(registers,512).store(at,255);at=at+1 }
+    nativeBufferAt(registers,512).store(256,18)
+    nativeBufferAt(registers,512).store(257,52)
+    nativeBufferAt(registers,512).store(258,86)
+    nativeBufferAt(registers,512).store(259,120)
+    return
+}
+
+@export("abla_pm1_control_wire_test")
+trusted fun test(): i32 {
+    val owner=m5Pm1ControlAt(nativeBufferAt(record,72))
+    if (m5Pm1ControlAt(nativeBufferAt(softwareI2cProviderState,72)) != 0) return i32(1)
+    var route=0
+    while (route < 3) {
+        val board=if (route == 0) m5BoardChainCaptain else if (route == 1) m5BoardPaperMono else m5BoardStopWatch
+        wireSeed();bad=false
+        val bus=i2cSoftwareMaster(0,1,5,8)
+        if (!bus.current() || !owner.initialize() || owner.openOwned(bus|0,board,true,true) != 1 || !owner.ready() || bad) return i32(2)
+        val total=ackCount
+        val r=nativeBufferAt(registers,512)
+        if (r.load(35) != 0 || r.load(265) != 0 || r.load(266) != 0) return i32(3)
+        if (route == 0) {
+            // Both PM1 outputs off, unrelated bits retained. IOE charger input,
+            // boost/audio rails output-off, pulls released.
+            if (r.load(278) != 60 || r.load(272) != 255 || r.load(275) != 246 || r.load(273) != 246 ||
+                r.load(3) != 251 || r.load(9) != 251 || r.load(11) != 251 ||
+                r.load(19) != 231 || r.load(5) != 231 ||
+                r.load(320) != 255 || r.load(321) != 255 || r.load(322) != 255) return i32(4)
+        } else if (route == 1) {
+            if (r.load(261) != 0 || r.load(320) != 0 || r.load(321) != 0 || r.load(322) != 0 ||
+                r.load(323) != 30 || r.load(278) != 244 || r.load(272) != 254 ||
+                r.load(275) != 253 || r.load(276) != 247 || r.load(273) != 255 ||
+                r.load(20) != 219 || r.load(4) != 255 || r.load(6) != 251) return i32(5)
+        }
+        if (route == 2) {
+            // PM1 GPIO2 input; motor PWM disabled before bit8 output; audio off.
+            if (r.load(278) != 207 || r.load(272) != 251 ||
+                r.load(27) != 0 || r.load(28) != 0 || r.load(37) != 208 || r.load(38) != 7 ||
+                r.load(20) != 252 || r.load(4) != 255 || r.load(19) != 251 ||
+                r.load(3) != 255 || r.load(5) != 251 || r.load(6) != 253 ||
+                r.load(320) != 255 || r.load(321) != 255 || r.load(322) != 255) return i32(10)
+        }
+        val before=ackCount
+        if (!owner.closeOwned(true) || !bus.current() || pads != 3 || ackCount != before ||
+            !bus.close() || pads != 0 || bad) return i32(6)
+        var failed=1
+        while (failed <= total) {
+            wireSeed();bad=false;nackAt=failed
+            val current=i2cSoftwareMaster(0,1,5,8)
+            if (!current.current() || !owner.initialize()) return i32(7)
+            val result=owner.openOwned(current|0,board,true,true)
+            if (result < 3 || result > 6 || owner.ready() || ackCount != failed || bad ||
+                owner.openFailure() != result) return i32(8)
+            if (!owner.closeOwned(true) || !current.current() || pads != 3 || mode != 0 ||
+                !masterHigh || !slaveHigh || !clockHigh || bad || !current.close() || pads != 0) return i32(9)
+            failed=failed+1
+        }
+        route=route+1
+    }
+    return i32(0)
+}

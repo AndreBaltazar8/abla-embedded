@@ -1,0 +1,84 @@
+import "../src/storage/fat_directory_rename.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+val image=nativeStaticAllocate(1536)
+var format=0
+var scenario=0
+var writes=0
+var bad=false
+fun rootLba(): int = if (format == 0) 19 else if (format == 1) 81 else 1232
+fun sourceLba(): int = if (format == 0) 33 else if (format == 1) 113 else 1233
+fun slot(lba: int): int = if (lba == rootLba()) 0 else if (lba == sourceLba()) 1 else if (lba == sourceLba()+1) 2 else -1
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,output: NativeBuffer): bool {
+    if ((scenario == 7 && writes == 1 && lba == sourceLba()) || (scenario == 8 && writes == 2 && lba == rootLba())) return false
+    val selected=slot(lba)
+    if (selected < 0 && lba != 0) { bad=true;return false }
+    val source=if (lba == 0) nativeBufferAt(memory+64,512) else nativeBufferAt(image+selected*512,512)
+    var i=0;while (i < 512) { output.store(i,source.load(i));i=i+1 }
+    return true
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,input: NativeBuffer): bool {
+    writes=writes+1;val selected=slot(lba)
+    if (selected != (if (writes == 1) 2 else if (writes == 2) 1 else if (writes == 3) 0 else -1) || selected < 0) { bad=true;return false }
+    val point=if (scenario <= 3) scenario else if (scenario <= 6) scenario-3 else 0
+    if (writes != point || scenario > 3) {
+        val output=nativeBufferAt(image+selected*512,512);var i=0
+        while (i < 512) { output.store(i,input.load(i));i=i+1 }
+    }
+    return writes != point
+}
+@export("abla_fat_directory_move_failures_test")
+trusted fun test(): i32 {
+    val state=nativeBufferAt(memory,32);val reader=nativeBufferAt(memory+32,28);val boot=nativeBufferAt(memory+64,512)
+    val expected=nativeBufferAt(memory+576,32);val work=nativeBufferAt(memory+640,5864)
+    val name=nativeBufferAt(memory+6528,2);val mountScratch=nativeBufferAt(memory+6656,512)
+    name.storeU16(0,98)
+    if (!fatVolumeInitializeFresh(state)) return i32(1)
+    while (format < 3) {
+        var i=0;while (i < 512) { boot.store(i,0);i=i+1 }
+        boot.storeU16(11,512);boot.store(13,1);boot.store(16,2);boot.storeU16(510,0xaa55)
+        if (format == 0) { boot.storeU16(14,1);boot.storeU16(17,224);boot.storeU16(22,9);boot.storeU16(19,2880) }
+        else if (format == 1) { boot.storeU16(14,1);boot.storeU16(17,512);boot.storeU16(22,40);boot.storeU16(19,10113) }
+        else { boot.storeU16(14,32);boot.storeU32(32,70000);boot.storeU32(36,600);boot.storeU32(44,2) }
+        val total=if (format == 0) 2880 else if (format == 1) 10113 else 70000
+        val sourceCluster=if (format == 2) 3 else 2
+        scenario=0
+        while (scenario < 9) {
+            writes=0;bad=false;i=0
+            while (i < 1536) { nativeBufferAt(image,1536).store(i,0);i=i+1 }
+            val root=nativeBufferAt(image,512);val source=nativeBufferAt(image+512,512);val destination=nativeBufferAt(image+1024,512)
+            i=0;while (i < 11) { root.store(i,32);i=i+1 }
+            root.store(0,65);root.store(11,16);root.storeU16(26,sourceCluster)
+            var dir=0
+            while (dir < 2) {
+                val data=if (dir == 0) source else destination;var entry=0
+                while (entry < 2) {
+                    val offset=entry*32;i=0;while (i < 11) { data.store(offset+i,32);i=i+1 }
+                    data.store(offset,46);if (entry == 1) data.store(offset+1,46)
+                    data.store(offset+11,16);data.storeU16(offset+26,if (entry == 0) sourceCluster+dir else 0)
+                    if (format == 2) data.storeU16(offset+20,0xa000)
+                    entry=entry+1
+                }
+                dir=dir+1
+            }
+            // Preserve a real child entry and unrelated trailing bytes.
+            i=0;while (i < 11) { source.store(64+i,32);i=i+1 };source.store(64,67);source.store(75,32);source.store(511,123)
+            i=0;while (i < 32) { expected.store(i,root.load(i));i=i+1 }
+            val volume=fatVolumeOpen(state,u32(7),reader,total,-1,boot,mountScratch)
+            val result=volume.renameDirectory(u32(7),0,0,0,expected,sourceCluster+1,name,1,1,8,64,work)
+            val point=if (scenario <= 3) scenario else if (scenario <= 6) scenario-3 else if (scenario == 7) 1 else 2
+            val status=if (scenario == 0) 1 else if (scenario == 7) 17 else if (scenario == 8) 16 else if (point == 1) 15 else if (point == 2) 17 else 16
+            if (result.status() != status || writes != (if (scenario == 0) 3 else point) || bad) return i32(2)
+            if (scenario != 0 && state.loadU32(12) != 3) return i32(3)
+            val changedParent=scenario == 0 || scenario == 3 || scenario == 5 || scenario == 6 || scenario == 8
+            if (source.loadU16(58) != (if (changedParent) sourceCluster+1 else 0) || source.load(64) != 67 || source.load(511) != 123) return i32(4)
+            if (format == 2 && source.loadU16(52) != 0xa000) return i32(5)
+            if (root.load(0) != (if (scenario == 0 || scenario == 6) 229 else 65)) return i32(6)
+            if (!volume.invalidate(u32(7))) return i32(7)
+            scenario=scenario+1
+        }
+        format=format+1
+    }
+    return i32(0)
+}

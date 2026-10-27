@@ -1,0 +1,159 @@
+import "../src/esp32/psram/mpll_p4_sequence.ab"
+import "../src/esp32/power/sleep_mpll_p4_sequence.ab"
+import "./p4-sleep-memory-checks.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+val mpllMemory=nativeStaticAllocate(32)
+val mpllChip=nativeStaticAllocate(256)
+var mpllTesting=false
+var mpllWrites=0
+var mpllDrop=0
+var mpllDone=true
+fun mpllOffset(address: int): int = if (address == 0x5011515c) 0 else if (address == 0x50111040) 4 else if (address == 0x50120000) 8 else if (address == 0x50120008) 12 else if (address == 0x500e6030) 16 else if (address == 0x50124034) 24 else 20
+fun p4MpllRead(address: int): int {
+    val raw=nativeBufferAt(mpllMemory,32).loadU32(mpllOffset(address))
+    if (address == 0x500e60bc && mpllDone && nativeBufferAt(mpllChip,256).load(2) != 0) return raw|256
+    return raw
+}
+fun p4MpllWrite(address: int,value: int): void {
+    mpllWrites=mpllWrites+1
+    if (mpllWrites != mpllDrop) nativeBufferAt(mpllMemory,32).storeU32(mpllOffset(address),value)
+    return
+}
+fun resetMpll(borrow: int): void {
+    resetAnalog(); mpllTesting=true; mpllWrites=0; mpllDrop=0; mpllDone=true
+    nativeBufferAt(mpllMemory,32).storeU32(0,0xfeffffff)
+    nativeBufferAt(mpllMemory,32).storeU32(4,0xefffffff|(if ((borrow&1) != 0) 1<<28 else 0))
+    nativeBufferAt(mpllMemory,32).storeU32(8,0xf7ffffff|(if ((borrow&2) != 0) 1<<27 else 0))
+    nativeBufferAt(mpllMemory,32).storeU32(12,0xfbffffff)
+    nativeBufferAt(mpllMemory,32).storeU32(16,0xffff3fff)
+    nativeBufferAt(mpllMemory,32).storeU32(20,0xfffffcff)
+    nativeBufferAt(mpllMemory,32).storeU32(24,0xfffffffe|(if ((borrow&4) != 0) 1 else 0))
+    nativeBufferAt(mpllChip,256).store(1,0xab)
+    nativeBufferAt(mpllChip,256).store(2,0)
+    nativeBufferAt(mpllChip,256).store(3,0xc5)
+    return
+}
+fun mpllChecks(): int {
+    var profile=0
+    while (profile < 3) {
+        val mhz=if (profile == 0) 320 else if (profile == 1) 400 else 500
+        var borrow=0
+        while (borrow < 8) {
+            resetMpll(borrow)
+            val root=p4MpllRead(0x50111040); val bus=p4MpllRead(0x50120000)
+            val owner=p4MpllStartColdOwned(mhz,40,2)
+            if (!owner.ready() || (owner&0x1f000000) != ((1<<24)|(if ((borrow&1) == 0) 1<<25 else 0)|(if ((borrow&2) == 0) 1<<26 else 0)|(if ((borrow&4) == 0) 1<<28 else 0)) ||
+                nativeBufferAt(mpllChip,256).load(1) != 0xab || nativeBufferAt(mpllChip,256).load(3) != 0xf5 ||
+                nativeBufferAt(mpllChip,256).load(2) != (if (profile == 0) 121 else if (profile == 1) 153 else 193)) return 20
+            if (owner.closeOwned(1).status() != 0 || p4MpllRead(0x5011515c) != 0xfeffffff || p4MpllRead(0x50111040) != root || p4MpllRead(0x50120000) != bus || p4MpllRead(0x50124034) != (0xfffffffe|(if ((borrow&4) != 0) 1 else 0))) return 21
+            borrow=borrow+1
+        }
+        profile=profile+1
+    }
+    var failure=1
+    while (failure <= 6) {
+        resetMpll(0); mpllDrop=failure
+        if (failure == 5) nativeBufferAt(mpllMemory,32).storeU32(20,0xfffffeff)
+        val owner=p4MpllStartColdOwned(400,40,2)
+        if (owner.status() != 4 || ((owner>>>8)&255) != (if (failure == 6) 10 else if (failure == 5) 4 else if (failure == 4) 11 else failure) || mpllWrites != failure) return 22
+        mpllDrop=0
+        if (owner.closeOwned(1).status() != 0) return 23
+        failure=failure+1
+    }
+    failure=1
+    while (failure <= 4) {
+        resetMpll(0)
+        val owner=p4MpllStartColdOwned(400,40,2)
+        mpllDrop=mpllWrites+failure
+        val partial=owner.closeOwned(1)
+        if (partial.status() != 4 || ((partial>>>8)&255) != (if (failure == 1) 11 else failure-1)) return 30
+        mpllDrop=0
+        if (partial.closeOwned(1).status() != 0 || p4MpllRead(0x50124034) != 0xfffffffe) return 31
+        failure=failure+1
+    }
+    resetMpll(0); mpllDone=false
+    val timeout=p4MpllStartColdOwned(400,40,2)
+    if (timeout.status() != 6 || (timeout&(1<<27)) == 0 || timeout.closeOwned(1).status() != 0) return 24
+    resetMpll(0); stuck=true
+    val analog=p4MpllStartColdOwned(400,40,2)
+    if (analog.status() != 5 || ((analog>>>16)&255) != 6) return 25
+    val count=mpllWrites
+    if (analog.closeOwned(1).status() != 3 || mpllWrites != count) return 26
+    stuck=false; nativeBufferAt(memory,64).storeU32(0,0)
+    if (analog.closeOwned(1).status() != 0) return 27
+    resetMpll(0)
+    if (p4MpllStartColdOwned(401,40,1).status() != 2 || p4MpllStartColdOwned(400,26,1).status() != 2 || mpllWrites != 0 || writes != 0) return 28
+    nativeBufferAt(mpllMemory,32).storeU32(0,0xffffffff)
+    if (p4MpllStartColdOwned(400,40,1).status() != 3 || mpllWrites != 0) return 29
+    val sleepResult=sleepMpllChecks()
+    return if (sleepResult != 0) sleepResult else sleepMemoryChecks()
+}
+fun resetSleepMpll(mhz: int): void {
+    resetMpll(7)
+    nativeBufferAt(mpllMemory,32).storeU32(0,0xffffffff)
+    nativeBufferAt(mpllMemory,32).storeU32(16,0xffff0fff)
+    nativeBufferAt(mpllMemory,32).storeU32(20,0xfffffeff)
+    nativeBufferAt(mpllChip,256).store(2,if (mhz == 320) 121 else if (mhz == 400) 153 else 193)
+    return
+}
+fun sleepMpllChecks(): int {
+    var profile=0
+    while (profile < 3) {
+        val mhz=if (profile == 0) 320 else if (profile == 1) 400 else 500
+        resetSleepMpll(mhz)
+        val lease=esp32p4SleepMpllSuspendOwned(mhz,40,2,true)
+        if (lease.status() != 1 || !lease.hasSnapshot() || (lease>>>32) != mhz ||
+            p4MpllRead(0x5011515c) != 0xfeffffff || p4MpllRead(0x50111040) != 0xffffffff) return 40
+        val count=mpllWrites
+        if (lease.restoreOwned(2,false) != lease || mpllWrites != count) return 41
+        val restored=lease.restoreOwned(2,true)
+        if (restored.status() != 8 || (restored>>>32) != mhz || p4MpllRead(0x5011515c) != 0xffffffff ||
+            p4MpllRead(0x50111040) != 0xffffffff || p4MpllRead(0x50120000) != 0xffffffff ||
+            p4MpllRead(0x50124034) != 0xffffffff || p4MpllRead(0x500e6030) != 0xffff0fff) return 42
+        val doneWrites=mpllWrites
+        if (restored.restoreOwned(2,true) != restored || mpllWrites != doneWrites) return 43
+        profile=profile+1
+    }
+    var fault=1
+    while (fault <= 4) {
+        resetSleepMpll(400)
+        val lease=esp32p4SleepMpllSuspendOwned(400,40,2,true)
+        nativeBufferAt(mpllMemory,32).storeU32(4,0xefffffff)
+        mpllDrop=mpllWrites+fault
+        val failed=lease.restoreOwned(2,true)
+        if (failed.status() != 4 || !failed.hasSnapshot() || (failed>>>32) != 400) return 44
+        mpllDrop=0
+        if (failed.restoreOwned(2,true).status() != 8) return 45
+        fault=fault+1
+    }
+    resetSleepMpll(400);mpllDrop=1
+    val failedOff=esp32p4SleepMpllSuspendOwned(400,40,2,true)
+    if (failedOff.status() != 4 || !failedOff.hasSnapshot()) return 46
+    mpllDrop=0
+    if (failedOff.restoreOwned(2,true).status() != 8) return 47
+    resetSleepMpll(400)
+    val lease=esp32p4SleepMpllSuspendOwned(400,40,2,true)
+    mpllDone=false
+    val timeout=lease.restoreOwned(2,true)
+    if (timeout.status() != 6 || !timeout.hasSnapshot()) return 48
+    mpllDone=true
+    if (timeout.restoreOwned(2,true).status() != 8) return 49
+    resetSleepMpll(400)
+    val analogLease=esp32p4SleepMpllSuspendOwned(400,40,2,true)
+    stuck=true
+    val analogFail=analogLease.restoreOwned(2,true)
+    if (analogFail.status() != 5 || !analogFail.hasSnapshot()) return 50
+    val busyWrites=mpllWrites
+    if (analogFail.restoreOwned(2,true).status() != 3 || mpllWrites != busyWrites) return 51
+    stuck=false;nativeBufferAt(memory,64).storeU32(0,0)
+    if (analogFail.restoreOwned(2,true).status() != 8) return 52
+    resetSleepMpll(400)
+    if (esp32p4SleepMpllSuspendOwned(320,40,2,true).status() != 7 || mpllWrites != 0) return 53
+    resetSleepMpll(400)
+    if (esp32p4SleepMpllSuspendOwned(400,26,2,true).status() != 2 ||
+        esp32p4SleepMpllSuspendOwned(400,40,0,true).status() != 2 ||
+        esp32p4SleepMpllSuspendOwned(400,40,2,false).status() != 2 || mpllWrites != 0 || writes != 0) return 54
+    nativeBufferAt(mpllMemory,32).storeU32(16,0xffff1fff)
+    if (esp32p4SleepMpllSuspendOwned(400,40,2,true).status() != 3 || mpllWrites != 0 || writes != 0) return 55
+    return 0
+}

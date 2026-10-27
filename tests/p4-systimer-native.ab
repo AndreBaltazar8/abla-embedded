@@ -1,0 +1,110 @@
+import "../src/esp32/timer/system_p4_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(256)
+var writes=0
+var drop=0
+var waitReads=0
+var tears=0
+var command=0
+var lowReads=0
+fun registerRead(offset: int): int = nativeBufferAt(memory,256).loadU32(offset)
+fun registerWrite(offset: int,value: int): void { nativeBufferAt(memory,256).storeU32(offset,value); return }
+fun p4SystemTimerRead(offset: int): int {
+    if (offset == 4 || offset == 8) {
+        if (waitReads > 0) { waitReads=waitReads-1; return 0 }
+        registerWrite(offset,0x20000000)
+    }
+    if (offset == 68 || offset == 76) lowReads=lowReads+1
+    if ((offset == 64 || offset == 72) && tears > 0) {
+        tears=tears-1
+        registerWrite(offset,registerRead(offset)+1)
+        registerWrite(offset+4,registerRead(offset+4)+1)
+    }
+    return registerRead(offset)
+}
+fun p4SystemTimerWrite(offset: int,value: int): void {
+    writes=writes+1
+    if (writes == drop) return
+    if (offset == 4 || offset == 8) { registerWrite(offset,0); command=value; return }
+    if (offset == 108) { registerWrite(104,registerRead(104)&(4294967295^value)); command=value; return }
+    if (offset >= 80 && offset <= 96) { command=offset; return }
+    registerWrite(offset,value)
+    return
+}
+fun resetTimer(): void {
+    var offset=0
+    while (offset < 256) { registerWrite(offset,0); offset=offset+4 }
+    writes=0; drop=0; waitReads=0; tears=0; command=0; lowReads=0; return
+}
+@export("abla_p4_systimer_test")
+trusted fun timerTest(): i32 {
+    var unit=0
+    while (unit < 2) {
+        resetTimer(); registerWrite(64+unit*8,0xffffffff); registerWrite(68+unit*8,0xffffffff)
+        if (p4SystemCounter(unit).tryTicks(1) != 4503599627370495 || command != 0x60000000 || writes != 1) return i32(1)
+        waitReads=3; lowReads=0
+        if (p4SystemCounter(unit).tryTicks(3) != -2 || lowReads != 0) return i32(2)
+        waitReads=3
+        if (p4SystemCounter(unit).tryTicks(4) != 4503599627370495) return i32(3)
+        registerWrite(64+unit*8,1); registerWrite(68+unit*8,0xffffffff); tears=1
+        if (p4SystemCounter(unit).tryTicks(2) != 8589934592) return i32(4)
+        tears=3
+        if (p4SystemCounter(unit).tryTicks(2) != -2) return i32(5)
+        var profile=0
+        while (profile < 8) {
+            resetTimer(); registerWrite(0,0x80000003)
+            val expected=0x80000003|(if ((profile&1) != 0) 1<<(30-unit) else 0)|
+                (if ((profile&2) != 0) 1<<(28-unit*2) else 0)|(if ((profile&4) != 0) 1<<(27-unit*2) else 0)
+            if (p4SystemCounter(unit).configureOwned((profile&1) != 0,(profile&2) != 0,(profile&4) != 0) != 1 || registerRead(0) != expected) return i32(6)
+            profile=profile+1
+        }
+        resetTimer(); registerWrite(12+unit*8,0xfff00000)
+        if (p4SystemCounter(unit).loadOwned(4503599627370495) != 1 || registerRead(12+unit*8) != 0xffffffff || registerRead(16+unit*8) != 0xffffffff || command != 92+unit*4) return i32(7)
+        registerWrite(0,1<<(30-unit)); writes=0
+        if (p4SystemCounter(unit).loadOwned(0) != 3 || writes != 0) return i32(8)
+        unit=unit+1
+    }
+    var alarm=0
+    while (alarm < 3) {
+        unit=0
+        while (unit < 2) {
+            var mode=0
+            while (mode < 2) {
+                resetTimer(); registerWrite(28+alarm*8,0xfff00000); registerWrite(52+alarm*4,0x3c000000)
+                val period=if (mode == 0) 0 else 67108863
+                if (p4SystemAlarmConfigureOwned(alarm,unit,4503599627370495,period) != 1 || registerRead(28+alarm*8) != 0xffffffff ||
+                    registerRead(32+alarm*8) != 0xffffffff || registerRead(52+alarm*4) != (0x3c000000|(unit<<31)|(mode<<30)|period) || command != 80+alarm*4) return i32(9)
+                if (p4SystemAlarmEnableOwned(alarm,true) != 3) return i32(10)
+                registerWrite(0,0x80000003|(1<<(30-unit)))
+                if (p4SystemAlarmEnableOwned(alarm,true) != 1 || p4SystemCounter(unit).configureOwned(false,false,false) != 3 || p4SystemCounter(unit).loadOwned(0) != 3) return i32(11)
+                if (p4SystemAlarmConfigureOwned(alarm,unit,0,0) != 3 || p4SystemAlarmEnableOwned(alarm,false) != 1) return i32(12)
+                mode=mode+1
+            }
+            unit=unit+1
+        }
+        resetTimer(); registerWrite(100,0x80000007^(1<<alarm))
+        if (p4SystemAlarmInterruptEnableOwned(alarm,true) != 1 || registerRead(100) != 0x80000007 || p4SystemAlarmConfigureOwned(alarm,0,0,0) != 3) return i32(13)
+        if (p4SystemAlarmInterruptEnableOwned(alarm,false) != 1 || registerRead(100) != (0x80000007^(1<<alarm))) return i32(14)
+        registerWrite(104,7)
+        if (p4SystemAlarmAcknowledgeOwned(alarm) != 1 || command != 1<<alarm || p4SystemAlarmPending() != (7^(1<<alarm))) return i32(15)
+        alarm=alarm+1
+    }
+    var failure=1
+    while (failure <= 3) {
+        resetTimer(); drop=failure
+        if (p4SystemAlarmConfigureOwned(0,1,4503599627370495,3) != 4 || command != 0) return i32(16)
+        failure=failure+1
+    }
+    resetTimer(); drop=1
+    if (p4SystemCounter(1).loadOwned(4503599627370495) != 4 || command != 0) return i32(17)
+    resetTimer(); drop=2
+    if (p4SystemCounter(1).loadOwned(4503599627370495) != 4 || command != 0) return i32(18)
+    resetTimer()
+    if (p4SystemCounter(-1).tryTicks(1) != -1 || p4SystemCounter(2).tryTicks(1) != -1 || p4SystemCounter(0).tryTicks(0) != -1 ||
+        p4SystemCounter(0).loadOwned(4503599627370496) != 2 || p4SystemAlarmConfigureOwned(3,0,0,0) != 2 ||
+        p4SystemAlarmConfigureOwned(0,2,0,0) != 2 || p4SystemAlarmConfigureOwned(0,0,0,67108864) != 2 || writes != 0) return i32(19)
+    if (p4SystemTimerElapsed(4503599627370494,1) != 3 || p4SystemTimerElapsed(-1,0) != -1 || p4SystemTimerXtalMicroseconds(31) != 1) return i32(20)
+    return i32(0)
+}

@@ -1,0 +1,92 @@
+import "./nesso-display-owner-wire-native.ab"
+import "../src/esp32/gpio_pin_c6_sequence.ab"
+import "../src/m5stack/nesso_display_c6_bindings.ab"
+import "../src/m5stack/touch_profile.ab"
+// Actual production lifecycle, provider/PI4 and C6 GPIO/SPI. Only MMIO,
+// ROM timing and the I2C slave are modeled. Not physical panel validation.
+val displayStorage=nativeStaticAllocate(40)
+val displayGate=nativeStaticMutableU32s([0])
+val initialStream=nativeStaticBytes("\xb7\x35\xbb\x28\xc0\x0c\xc2\x01\xff\xc3\x10\xc4\x20\xd0\xa4\xa1\xb0\x00\xc0\xe0\xd0\x00\x02\x07\x0a\x28\x32\x44\x42\x06\x0e\x12\x14\x17\xe1\xd0\x00\x02\x07\x0a\x28\x31\x54\x47\x0e\x1c\x17\x1b\x1e\x11\x38\x29\x3a\x55\x36\x08\x21\x2a\x00\x34\x00\xba\x2b\x00\x28\x01\x17\x2c")
+val fillStream=nativeStaticBytes("\x2a\x00\x34\x00\x35\x2b\x00\x28\x00\x28\x2c\xf8\x00\xf8\x00")
+val blitStream=nativeStaticBytes("\x2a\x00\x34\x00\x35\x2b\x00\x28\x00\x28\x2c\x12\x34\xab\xcd")
+val pixels=nativeStaticBytes("\x34\x12\xcd\xab")
+var touchPowerPulse=false
+var touchPowerPulses=0
+fun peripheralDelayMicroseconds(us: int): void {
+    if (touchPowerPulse && us == 512) {
+        val gpio=nativeBufferAt(gpioMemory,4096)
+        if (ticks != 80 || (gpio.loadU32(288)&8) != 0 || (gpio.loadU32(16)&384) != 128) bad=true
+        touchPowerPulses=touchPowerPulses+1;return
+    }
+    if (us != 1 || ticks != 80 || nativeAddressLoadU32(displayGate,0) != 7) bad=true
+    return
+}
+fun expectDisplay(buffer: NativeBuffer,total: int): void {
+    displayExpected=buffer;displayExpectedBytes=total;displayByteCount=0;displayBits=0;displayByte=0;displayDelays=0
+    return
+}
+fun displayStreamDone(): bool = !bad && displayByteCount == displayExpectedBytes && displayBits == 0 &&
+    nativeAddressLoadU32(displayGate,0) == 0 &&
+    (nativeBufferAt(gpioMemory,4096).loadU32(260)&0x20000) != 0
+@export("abla_nesso_display_wire_test")
+trusted fun testDisplayWire(): i32 {
+    wireSeed();chargeAddress=68;afterCommit=true;bad=false;dropClose=false;ticks=0
+    val gpioRegs=nativeBufferAt(gpioMemory,4096);var at=0
+    while (at < 4096) { gpioRegs.storeU32(at,0);at=at+4 }
+    apb=u32(0);functional=u32(0x300000);gpioClock=u32(0)
+    // Independent physical assignment, NOT copied from the bus constructor:
+    // Arduino pins_arduino.h SDA=10/SCL=8; upstream table columns SCL,SDA.
+    val boardPins=m5BoardArduinoNessoN1.i2cPins();val touch=m5BoardArduinoNessoN1.touchProfile()
+    if (boardPins.internalData() != 10 || boardPins.internalClock() != 8 ||
+        touch.sdaNumber() != 10 || touch.sclNumber() != 8 || nessoI2cPinsMatch(8,10)) return i32(16)
+    var reversed=esp32C6I2cSessionOpenOwned(8,10,40000000,20000000,true,5,8)
+    if (!reversed.ready() || nessoDisplayPowerOpenOwned(reversed.bus()|0,true).status() != 2 ||
+        nessoPowerBusCurrent(reversed.bus()|0) || ackCount != 0) return i32(17)
+    reversed=reversed.closeOwned(true)
+    if (reversed != 0 || bad) return i32(18)
+    var session=esp32C6I2cSessionOpenOwned(10,8,40000000,20000000,true,5,8)
+    if (!session.ready()) return i32(1)
+    val display=nessoDisplayAt(nativeBufferAt(displayStorage,40))
+    if (!display.initialize()) return i32(2)
+    displayGateAddress=displayGate;displayCapture=true
+    val regs=nativeBufferAt(chargeRegisters,256)
+    var variant=0
+    while (variant < 2) {
+        at=0;while (at < 256) { regs.store(at,90);at=at+1 }
+        expectDisplay(nativeBufferAt(initialStream,68),64868)
+        val before=ackCount
+        nackAt=if (variant == 0) before+27 else 0
+        val result=display.openOwned(session.bus()|0,peripheralGateAt(displayGate),u32(7),0,true,true)
+        if (result != (if (variant == 0) 7 else 1) || !displayStreamDone() ||
+            displayDelays != 1 || ackCount-before != 27 || regs.load(5) != 194) return i32(3)
+        if (variant == 0) {
+            if (display.ready() || !display.powerOwner().ownsDevice()) return i32(4)
+            nackAt=0;expectDisplay(NativeBuffer(0),0)
+            if (!display.closeOwned(true) || regs.load(5) != 130 || !displayStreamDone()) return i32(5)
+        }
+        variant=variant+1
+    }
+    expectDisplay(nativeBufferAt(fillStream,15),15)
+    if (!display.fillRectOwned(0,0,2,1,Rgb565(63488),true).valid() || !displayStreamDone()) return i32(6)
+    expectDisplay(nativeBufferAt(blitStream,15),15)
+    if (!display.blitOwned(0,0,nativeBufferAt(pixels,4),2,1,4,true,true).valid() || !displayStreamDone()) return i32(7)
+    expectDisplay(nativeBufferAt(nativeStaticBytes("\x36\x64"),2),2)
+    if (!display.setRotationOwned(1,false,true) || !displayStreamDone() || display.view().width() != 240 || display.view().height() != 135) return i32(8)
+    expectDisplay(nativeBufferAt(nativeStaticBytes("\x20\x39"),2),2)
+    if (!display.setInvertedOwned(true,true) || !display.setIdleOwned(true,true) || !displayStreamDone()) return i32(9)
+    expectDisplay(nativeBufferAt(nativeStaticBytes("\x10"),1),1)
+    if (!display.setSleepingOwned(true,130,true) || !displayStreamDone() || displayDelays != 1 || regs.load(5) != 130) return i32(10)
+    val asleep=ackCount
+    if (!display.setBrightnessOwned(42,true) || ackCount != asleep || display.view().width() != 0) return i32(11)
+    expectDisplay(nativeBufferAt(nativeStaticBytes("\x11"),1),1)
+    if (!display.setSleepingOwned(false,130,true) || !displayStreamDone() || displayDelays != 1 ||
+        regs.load(5) != 194 || !display.inverted() || !display.idle() || display.rotation() != 1) return i32(12)
+    expectDisplay(NativeBuffer(0),0)
+    if (!display.closeOwned(true) || regs.load(5) != 130 || !displayStreamDone()) return i32(13)
+    displayCapture=false
+    // Display borrows these pads; caller releases them before shared clocks.
+    if (!Pin(17).inputOwned() || !Pin(16).inputOwned() || !Pin(20).inputOwned() || !Pin(21).inputOwned()) return i32(14)
+    session=session.closeOwned(true)
+    if (session != 0 || bad) return i32(15)
+    return i32(0)
+}

@@ -1,0 +1,83 @@
+import "../src/esp32/power/sleep_flash_rev3_p4_sequence.ab"
+val flashRevRecord=nativeStaticAllocate(36)
+var flashControl=u32(0x81234560)
+var flashError=u32(0xa0)
+var flashIndex=u32(7)
+var flashEntry=u32(0x225)
+var flashReset=u32(0x200)
+var flashEncrypted=false
+var flashWrites=0
+var flashDrop=0
+var flashReads=0
+var flashFenceCount=0
+var flashBad=false
+fun p4SleepFlashEncrypted(): bool = flashEncrypted
+fun p4SleepFlashFence(): void { flashFenceCount=flashFenceCount+1;return }
+fun p4SleepFlashRead(address: int): u32 {
+    if (address == 0x5008c03c) return flashControl
+    if (address == 0x500e51a4) return flashError
+    if (address == 0x5008c380) return flashIndex
+    if (address == 0x5008c37c) { if (flashIndex != u32(0)) flashBad=true;return flashEntry }
+    if (address == 0x500e60c0) return flashReset
+    if (address == 0x80000000 || address == 0x80000080) {
+        if (address != (if (flashReads == 0) 0x80000000 else 0x80000080) || flashReads >= 2 ||
+            flashFenceCount != flashReads*2+1 || flashEntry != (if (flashEncrypted) u32(0x3000) else u32(0x1000)) ||
+            flashError != u32(0xa7) || flashControl != u32(0x01234561)) flashBad=true
+        flashReads=flashReads+1;return u32(0x12345678)
+    }
+    flashBad=true;return u32(0)
+}
+fun p4SleepFlashWrite(address: int,value: u32): void {
+    flashWrites=flashWrites+1
+    if (flashWrites == flashDrop) return
+    if (address == 0x5008c03c) flashControl=value
+    else if (address == 0x500e51a4) flashError=value
+    else if (address == 0x5008c380) flashIndex=value
+    else if (address == 0x5008c37c) { if (flashIndex != u32(0)) flashBad=true;flashEntry=value }
+    else if (address == 0x500e60c0) {
+        if (flashReads != 2 || flashEntry != (u32(0x225)|(if (flashEncrypted) u32(0x3000) else u32(0x1000))) ||
+            (value&~u32(0x01400000)) != u32(0x200)) flashBad=true
+        flashReset=value
+    } else flashBad=true
+    return
+}
+fun seedFlashRev(encrypted: bool): NativeBuffer {
+    flashControl=u32(0x81234560);flashError=u32(0xa0);flashIndex=u32(7);flashEntry=u32(0x225);flashReset=u32(0x200)
+    flashEncrypted=encrypted;flashWrites=0;flashDrop=0;flashReads=0;flashFenceCount=0;flashBad=false
+    val r=nativeBufferAt(flashRevRecord,36)
+    var i=0
+    while (i < 32) { r.storeU32(i,0);i=i+4 }
+    r.storeU32(32,0x1234abcd);return r
+}
+fun sleepFlashRev3Checks(): int {
+    var encryption=0
+    while (encryption < 2) {
+        var fault=0
+        while (fault <= 12) {
+            val r=seedFlashRev(encryption == 1);flashDrop=fault
+            val result=esp32p4SleepFlashRev3BeginOwned(r,300,true)
+            // Sixth write reselects already-selected MMU index0: a dropped
+            // redundant write is not an observable failure.
+            if (result != (if (fault == 0 || fault == 6) 1 else 4) || flashBad) return 110
+            if (result == 4) {
+                val count=flashWrites
+                flashEncrypted=!flashEncrypted
+                if (esp32p4SleepFlashRev3ContinueOwned(r,true) != 5 || flashWrites != count) return 111
+                flashEncrypted=!flashEncrypted
+            }
+            flashDrop=0
+            if (esp32p4SleepFlashRev3ContinueOwned(r,true) != 1 || flashBad || flashReads != 2 || flashFenceCount != 4 ||
+                flashIndex != u32(0) || flashEntry != (u32(0x225)|(if (encryption == 1) u32(0x3000) else u32(0x1000))) ||
+                flashError != u32(0xa0) || flashReset != u32(0x200) || r.loadU32(32) != 0x1234abcd || r.loadU32(16) != 0) return 112
+            val count=flashWrites
+            if (esp32p4SleepFlashRev3ContinueOwned(r,true) != 1 || flashWrites != count || flashReads != 2) return 113
+            fault=fault+1
+        }
+        encryption=encryption+1
+    }
+    val r=seedFlashRev(false)
+    if (esp32p4SleepFlashRev3BeginOwned(r,301,true) != 2 || esp32p4SleepFlashRev3BeginOwned(r,300,false) != 2 || flashWrites != 0 || r.loadU32(0) != 0) return 114
+    flashReset=u32(1<<22)
+    if (esp32p4SleepFlashRev3BeginOwned(r,300,true) != 3 || flashWrites != 0 || r.loadU32(0) != 0) return 115
+    return 0
+}

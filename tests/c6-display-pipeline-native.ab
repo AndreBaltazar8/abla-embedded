@@ -1,0 +1,96 @@
+import "../src/esp32/gpio_pin_c6_sequence.ab"
+import "../src/display/software_pins_checked.ab"
+import "../src/display/software_mipi_checked.ab"
+import "../src/display/software_blit_checked.ab"
+import "abla/build"
+// Real C6 GPIO configuration/latches and shared display pipeline. MMIO and
+// delay are modeled. A tiny2x2 geometry tests transport, not physical Nesso.
+val memory=nativeStaticAllocate(2048)
+val gateWord=nativeStaticMutableU32s([0])
+val baseBytes=nativeStaticBytes("\x11\x80\x05\xff\xff")
+val extraBytes=nativeStaticBytes("\x29\x00\xff\xff")
+val pixelsBE=nativeStaticBytes("\x00\x00\x12\x34\xab\xcd\xff\x00\x00\x45\x67\x89\xab")
+val pixelsLE=nativeStaticBytes("\x00\x00\x34\x12\xcd\xab\xff\x00\x00\x67\x45\xab\x89")
+val expected=nativeStaticBytes("\x11\x29\x3a\x55\x36\x08\x21\x2a\x00\x02\x00\x03\x2b\x00\x03\x00\x04\x2c\xf8\x00\xf8\x00\xf8\x00\xf8\x00\x2a\x00\x02\x00\x03\x2b\x00\x03\x00\x04\x2c\x12\x34\xab\xcd\x45\x67\x89\xab")
+var writes=0
+var drop=0
+var capture=false
+var bad=false
+var bits=0
+var byteValue=0
+var byteIndex=0
+var selections=0
+var delays=0
+fun mapped(address: int): int {
+    if (address >= 0x60090004 && address < 0x60090080) return address-0x60090000
+    if (address >= 0x60091000 && address < 0x600915d0) return 256+address-0x60091000
+    return -1
+}
+fun c6GpioRead(address: int): u32 {
+    if (address == 0x600b102c || address == 0x600b1028 || address == 0x6000f018) return u32(0)
+    val at=mapped(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,2048).loadU32(at))
+}
+fun c6GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    if ((nativeAddressLoadU32(gateWord,0)&0x7fffffff) != 7) bad=true
+    val r=nativeBufferAt(memory,2048);var at=mapped(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return }
+    val old=r.loadU32(260)
+    var wanted=value
+    if (address == 0x60091008 || address == 0x60091024) { at=at-4;wanted=u32(r.loadU32(at))|value }
+    else if (address == 0x6009100c || address == 0x60091028) { at=at-8;wanted=u32(r.loadU32(at))&~value }
+    if (writes != drop) r.storeU32(at,int(wanted))
+    if (!capture) return
+    if ((r.loadU32(288)&0x330000) != 0x330000 || (address != 0x60091008 && address != 0x6009100c)) bad=true
+    val now=r.loadU32(260);val selected=(now&0x20000) == 0;val dataMode=(now&0x10000) != 0
+    if ((old&0x20000) != (now&0x20000)) {
+        if (selected) { selections=selections+1;if (dataMode || bits != 0) bad=true }
+        else if (bits != 0) bad=true
+    }
+    if (selected && (old&0x100000) == 0 && (now&0x100000) != 0) {
+        byteValue=(byteValue<<1)|(if ((now&0x200000) != 0) 1 else 0);bits=bits+1
+        val command=byteIndex == 0 || byteIndex == 1 || byteIndex == 2 || byteIndex == 4 || byteIndex == 6 ||
+            byteIndex == 7 || byteIndex == 12 || byteIndex == 17 || byteIndex == 26 || byteIndex == 31 || byteIndex == 36
+        if (dataMode == command) bad=true
+        if (bits == 8) {
+            if (byteIndex >= 45 || byteValue != nativeBufferAt(expected,45).load(byteIndex)) bad=true
+            bits=0;byteValue=0;byteIndex=byteIndex+1
+        }
+    }
+    return
+}
+fun peripheralDelayMicroseconds(us: int): void { bad=true;return }
+fun peripheralDelayMilliseconds(ms: int): void {
+    if (ms != 5 || byteIndex != 1 || (nativeBufferAt(memory,2048).loadU32(260)&0x20000) == 0 || nativeAddressLoadU32(gateWord,0) != 7) bad=true
+    delays=delays+1;return
+}
+@export("abla_c6_display_pipeline_test")
+trusted fun testPipeline(): i32 {
+    val gate=peripheralGateAt(gateWord);val geometry=lcdGeometry(2,2,2,3,4,5);val view=geometry.view(0,true)
+    var endian=0
+    while (endian < 2) {
+        var failure=0
+        while (failure <= 28) {
+            val r=nativeBufferAt(memory,2048);var at=0
+            while (at < 2048) { r.storeU32(at,0);at=at+4 }
+            nativeAddressStoreU32(gateWord,0,0);writes=0;drop=failure;capture=false;bad=false
+            val configured=softwareLcdConfigurePinsChecked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),false,true)
+            if (!configured.valid()) {
+                val before=writes
+                if (configured.status() != 6 || softwareLcdConfigurePinsChecked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),false,true).status() != 4 || writes != before) return i32(1)
+                drop=0
+                if (!softwareLcdRecoverPinsChecked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),false,true)) return i32(2)
+            }
+            drop=0;capture=true;bits=0;byteValue=0;byteIndex=0;selections=0;delays=0
+            if (!softwareLcdBeginRgb565Checked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),geometry,0,nativeBufferAt(baseBytes,5),nativeBufferAt(extraBytes,4),true,true,0,false).valid()) return i32(3)
+            if (!softwareLcdFillRectChecked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),view,-1,0,3,2,rgb565Red,0,false).valid()) return i32(4)
+            if (!softwareLcdBlitRgb565Checked(gate,u32(7),Pin(20),Pin(21),Pin(17),Pin(16),view,-1,0,nativeBufferAt(if (endian == 0) pixelsBE else pixelsLE,13),3,2,7,endian == 1,0,false).valid()) return i32(5)
+            if (bad || bits != 0 || byteIndex != 45 || selections != 11 || delays != 1 || nativeAddressLoadU32(gateWord,0) != 0 || (r.loadU32(260)&0x20000) == 0) return i32(6)
+            failure=failure+1
+        }
+        endian=endian+1
+    }
+    return i32(0)
+}

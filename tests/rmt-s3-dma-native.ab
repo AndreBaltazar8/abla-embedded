@@ -1,0 +1,136 @@
+import "../src/esp32/rmt_dma_sequence_esp32s3.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val frameAddress = nativeStaticMutableU32s([0x00088004, 0])
+var stage = 0
+var failAt = 0
+var ticks = 0
+var doneAt = 1
+var eofAt = 1
+var parkAt = 1
+var rmtError = false
+var dmaError = false
+var rmtStops = 0
+var dmaStops = 0
+var stopMask = 7
+var disables = 0
+var finalAcks = 0
+var cleanupMask = 7
+var bad = false
+trusted fun step(expected: int): bool {
+    if (stage != expected - 1) bad = true
+    stage = expected
+    stage != failAt
+}
+// Layout itself is exhaustively tested separately; host storage is low-address
+// process RAM, not ESP internal SRAM. The real frame validation runs here.
+fun esp32s3GdmaLinearTxLayoutValid(desc: int, buffer: int, bytes: int): bool = desc == 4096 && buffer == frameAddress && bytes == 8
+trusted fun esp32s3GdmaParked(channel: int, tx: bool): bool {
+    if (channel != 2 || !tx) bad = true
+    if (stage == 0) return true
+    if (dmaStops != 0) return (stopMask & 4) != 0
+    ticks >= parkAt
+}
+trusted fun esp32s3RmtConfigureSingleBlockTxOwned(channel: int, divider: int): bool { if (channel != 3 || divider != 8) bad = true; step(1) }
+trusted fun esp32s3GdmaInitializeTxChainOwned(desc: int, buffer: int, bytes: int): int = if (step(2)) 1 else 0
+trusted fun esp32s3GdmaConfigureRmt(channel: int, desc: int): bool = step(3)
+trusted fun esp32s3RmtTxAcknowledge(channel: int, events: int): bool {
+    if (stage < 9) { if (events != 15) bad = true; return step(4) }
+    if (events != 1 || disables != 1) bad = true
+    finalAcks = finalAcks + 1; (cleanupMask & 2) != 0
+}
+trusted fun esp32s3GdmaAcknowledge(channel: int, tx: bool, events: int): bool {
+    if (stage < 9) { if (events != 255) bad = true; return step(5) }
+    if (events != 2 || finalAcks != 1) bad = true
+    finalAcks = finalAcks + 1; (cleanupMask & 4) != 0
+}
+trusted fun esp32s3RmtSetTxDmaOwned(channel: int, enabled: bool): bool {
+    if (channel != 3) bad = true
+    if (enabled) return step(6)
+    disables = disables + 1; (cleanupMask & 1) != 0
+}
+trusted fun esp32s3GdmaStart(channel: int, tx: bool): bool = step(7)
+trusted fun peripheralDelayMicroseconds(us: int): void { if (us != 1) bad = true; step(8); return }
+trusted fun esp32s3RmtTxRequestOwned(channel: int, start: bool): bool {
+    if (start) return step(9)
+    rmtStops = rmtStops + 1; (stopMask & 1) != 0
+}
+trusted fun esp32s3GdmaRequestStop(channel: int, tx: bool): bool { dmaStops = dmaStops + 1; if (rmtStops != 1) bad = true; (stopMask & 2) != 0 }
+trusted fun esp32s3RmtTxEvents(channel: int): int { ticks = ticks + 1; (if (ticks >= doneAt) 1 else 0) | (if (rmtError) 2 else 0) }
+trusted fun esp32s3GdmaEvents(channel: int, tx: bool): int = (if (ticks >= eofAt) 2 else 0) | (if (dmaError) 4 else 0)
+fun esp32s3GdmaEventErrors(events: int, tx: bool): int = events & 244
+fun esp32s3GdmaEventEof(events: int): bool = (events & 2) != 0
+trusted fun esp32s3GdmaPublish(): void { return }
+trusted fun resetTest(): void { stage = 0; ticks = 0; rmtStops = 0; dmaStops = 0; disables = 0; finalAcks = 0; return }
+trusted fun runDma(): int = esp32s3RmtTransmitDmaOwned(2, 8, 4096, nativeBufferAt(frameAddress, 8), 8, 4)
+trusted fun rmtDmaTest(): int {
+    while (doneAt <= 3) {
+        eofAt = 1
+        while (eofAt <= 3) {
+            parkAt = 1
+            while (parkAt <= 3) {
+                resetTest()
+                val result = runDma()
+                val later = if (doneAt > eofAt) doneAt else eofAt
+                val expectedTicks = if (later > parkAt) later else parkAt
+                if ((result & 255) != 1 || (result & (1 << 20)) == 0 || ticks != expectedTicks ||
+                    disables != 1 || finalAcks != 2 || rmtStops != 0 || dmaStops != 0 || bad) return 1
+                parkAt = parkAt + 1
+            }
+            eofAt = eofAt + 1
+        }
+        doneAt = doneAt + 1
+    }
+    // Every cleanup operation must run even when an earlier one fails.
+    // Preserve completion evidence, but never report clean success on failure.
+    doneAt = 1; eofAt = 1; parkAt = 1
+    cleanupMask = 0
+    while (cleanupMask < 8) {
+        resetTest()
+        val result = runDma()
+        if ((result & 255) != (if (cleanupMask == 7) 1 else 11) ||
+            ((result >>> 8) & 255) != 2 || ((result >>> 16) & 15) != 1 ||
+            ((result >>> 20) & 1) != 1 || disables != 1 || finalAcks != 2 ||
+            rmtStops != 0 || dmaStops != 0 || bad) return 8
+        cleanupMask = cleanupMask + 1
+    }
+    cleanupMask = 7
+    failAt = 1
+    while (failAt <= 9) {
+        if (failAt != 8) {
+            resetTest()
+            val expected = if (failAt == 1 || failAt == 6) 4 else if (failAt == 2) 5 else if (failAt == 3) 6 else if (failAt <= 5) 7 else 8
+            if ((runDma() & 255) != expected || stage != failAt || bad) return 2
+            if (failAt == 7 && disables != 1) return 3
+            if (failAt == 9 && (rmtStops != 1 || dmaStops != 1)) return 4
+        }
+        failAt = failAt + 1
+    }
+    failAt = 0; doneAt = 1; eofAt = 1; parkAt = 1
+    var scenario = 0
+    while (scenario < 4) {
+        rmtError = scenario == 0; dmaError = scenario == 1
+        doneAt = if (scenario == 2) 5 else 1
+        eofAt = if (scenario == 3) 5 else 1
+        stopMask = 0
+        while (stopMask < 8) {
+            resetTest()
+            val result = runDma()
+            if ((result & 255) != (if (scenario < 2) 9 else 10) ||
+                ((result >>> 20) & 1) != ((stopMask >>> 2) & 1) ||
+                ((result >>> 21) & 1) != (stopMask & 1) ||
+                ((result >>> 22) & 1) != ((stopMask >>> 1) & 1) ||
+                rmtStops != 1 || dmaStops != 1 || disables != 0 || finalAcks != 0 || bad) return 5
+            stopMask = stopMask + 1
+        }
+        scenario = scenario + 1
+    }
+    resetTest()
+    val frame = nativeBufferAt(frameAddress, 8)
+    frame.storeU32(4, 1)
+    if (runDma() != 2 || stage != 0) return 6
+    frame.storeU32(4, 0); frame.storeU32(0, 0)
+    if (runDma() != 2 || stage != 0) return 7
+    0
+}
+#exportFunction("rmtDmaTest", "abla_rmt_dma_test")

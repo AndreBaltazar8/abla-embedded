@@ -1,0 +1,137 @@
+import "../src/esp32/analog/sar_bus_p4_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(64)
+val original=nativeStaticAllocate(64)
+val record=nativeStaticAllocate(32)
+val changes=nativeStaticAllocate(128)
+var writes=0
+var drop=0
+var bad=false
+fun mapping(address: int): int = if (address == 0x50111040) 0 else if (address == 0x50120000) 4 else if (address == 0x50120008) 8 else if (address == 0x50124034) 12 else if (address == 0x5011515c) 16 else -1
+trusted fun p4AdcRead(address: int): u32 {
+    val at=mapping(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,64).loadU32(at))
+}
+trusted fun write(at: int,value: int): void {
+    writes=writes+1
+    nativeBufferAt(changes,128).store(writes,if (nativeBufferAt(memory,64).loadU32(at) != value) 1 else 0)
+    if (writes != drop) nativeBufferAt(memory,64).storeU32(at,value)
+    return
+}
+trusted fun p4AdcWrite(address: int,value: u32): void {
+    val at=mapping(address)
+    if (at < 0) { bad=true;return }
+    write(at,int(value));return
+}
+trusted fun p4AnalogRead(offset: int): int {
+    if ((nativeBufferAt(memory,64).loadU32(4)&0x8000000) == 0) bad=true
+    return nativeBufferAt(memory,64).loadU32(if (offset == 0) 20 else if (offset == 4) 24 else offset)
+}
+trusted fun p4AnalogWrite(offset: int,value: int): void {
+    if (offset != 28 && offset != 32) { bad=true;return }
+    write(offset,value);return
+}
+trusted fun p4AnalogClockReady(): bool = true
+trusted fun seed(flags: int,pmu: int): void {
+    val m=nativeBufferAt(memory,64)
+    var at=0
+    while (at < 64) { m.storeU32(at,0);at=at+4 }
+    m.storeU32(0,0x8aaaaaaa|((flags&1)<<28))
+    m.storeU32(4,0x70555555|(((flags>>1)&1)<<27))
+    m.storeU32(8,0xa0000000)
+    m.storeU32(12,0xaaaaaaa0|((flags>>2)&1))
+    m.storeU32(16,0xc0555555|(pmu<<26))
+    m.storeU32(28,0xaa000101);m.storeU32(32,0xbb000202)
+    at=0
+    while (at < 64) { nativeBufferAt(original,64).storeU32(at,m.loadU32(at));at=at+4 }
+    nativeBufferAt(record,32).storeU32(0,0)
+    writes=0;drop=0;bad=false;return
+}
+trusted fun same(): bool {
+    var at=0
+    while (at < 64) {
+        if (nativeBufferAt(original,64).loadU32(at) != nativeBufferAt(memory,64).loadU32(at)) return false
+        at=at+4
+    }
+    return !bad
+}
+trusted fun changedRoutes(): void {
+    nativeBufferAt(memory,64).storeU32(28,0xaa000000)
+    nativeBufferAt(memory,64).storeU32(32,0xbb000080)
+    return
+}
+@export("abla_adc_bus_p4_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(record,32)
+    var flags=0
+    while (flags < 8) {
+        var pmu=0
+        while (pmu < 4) {
+            if (pmu != 2) {
+                seed(flags,pmu)
+                if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 1 || r.loadU32(4) != 1 ||
+                    (nativeBufferAt(memory,64).loadU32(16)&0xc000000) != 0xc000000) return i32(1)
+                val count=writes
+                changedRoutes()
+                if (esp32p4AnalogSarBusCloseOwned(r,2,false) != 2 || writes != count) return i32(2)
+                if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || !same()) return i32(3)
+                val closed=writes
+                if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || writes != closed) return i32(4)
+                var fault=1
+                while (fault <= count) {
+                    seed(flags,pmu);drop=fault
+                    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 5 || writes != fault) return i32(5)
+                    drop=0
+                    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || !same()) return i32(6)
+                    fault=fault+1
+                }
+                fault=1
+                while (fault <= closed-count) {
+                    seed(flags,pmu)
+                    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 1) return i32(7)
+                    changedRoutes();writes=0
+                    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6) return i32(8)
+                    val changed=nativeBufferAt(changes,128).load(fault) == 1
+                    seed(flags,pmu)
+                    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 1) return i32(9)
+                    changedRoutes();writes=0;drop=fault
+                    val result=esp32p4AnalogSarBusCloseOwned(r,2,true)
+                    if ((changed && result != 5) || (!changed && result != 6)) return i32(10)
+                    drop=0
+                    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || !same()) return i32(11)
+                    fault=fault+1
+                }
+                var master=20
+                while (master <= 24) {
+                    seed(flags,pmu)
+                    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 1) return i32(12)
+                    changedRoutes()
+                    nativeBufferAt(memory,64).storeU32(master,1<<25)
+                    writes=0
+                    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 4 || writes != 0) return i32(13)
+                    nativeBufferAt(memory,64).storeU32(master,0)
+                    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || !same()) return i32(14)
+                    master=master+4
+                }
+            }
+            pmu=pmu+1
+        }
+        flags=flags+1
+    }
+    seed(0,2)
+    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 3 || writes != 0 || r.loadU32(0) != 0) return i32(15)
+    seed(0,0);nativeBufferAt(memory,64).storeU32(8,0x4000000)
+    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 3 || writes != 0 || r.loadU32(0) != 0) return i32(16)
+    seed(0,0)
+    if (esp32p4AnalogSarBusOpenOwned(r,2,false) != 2 ||
+        esp32p4AnalogSarBusOpenOwned(nativeBufferAt(record,31),2,true) != 2 || writes != 0) return i32(17)
+    seed(0,0);nativeBufferAt(memory,64).storeU32(20,1<<25)
+    if (esp32p4AnalogSarBusOpenOwned(r,2,true) != 4 || r.loadU32(20) != 0) return i32(18)
+    writes=0
+    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 4 || writes != 0) return i32(19)
+    nativeBufferAt(memory,64).storeU32(20,0)
+    if (esp32p4AnalogSarBusCloseOwned(r,2,true) != 6 || !same()) return i32(20)
+    return i32(0)
+}

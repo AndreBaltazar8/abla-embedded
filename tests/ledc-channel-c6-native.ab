@@ -1,0 +1,153 @@
+import "../src/esp32/ledc_channel_c6_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+var channel=0
+var timer=0
+var timerReg=0x7168
+var config=0
+var hpointReg=123
+var dutyReg=456
+var start=0
+var actual=0
+var gamma=0xa0000002
+var ranges=0
+var writes=0
+var drop=0
+var stall=false
+var wrong=false
+var bad=false
+val gammaRam=nativeStaticAllocate(64)
+var gammaData=0
+var writeAddress=15
+var readAddress=15
+var clockTicks=0
+var writeReady=0
+var readReady=0
+var delays=0
+fun c6LedcDelayMicroseconds(us: int): void { if (us != 5) bad=true;clockTicks=clockTicks+us;delays=delays+1;return }
+trusted fun c6LedcRead(offset: int): int {
+    if (offset == 160+timer*8) return timerReg
+    if (offset == channel*20) return config
+    if (offset == channel*20+4) return hpointReg
+    if (offset == channel*20+8) return dutyReg
+    if (offset == channel*20+12) return start
+    if (offset == channel*20+16) return actual
+    if (offset == 384+channel*4) return gamma
+    val base=256+channel*16
+    if (offset == base) return gammaData
+    if (offset == base+4) return writeAddress
+    if (offset == base+8) return readAddress
+    if (offset == base+12) {
+        if (clockTicks < readReady) bad=true
+        return nativeBufferAt(gammaRam,64).loadU32(readAddress*4)
+    }
+    bad=true; return 0
+}
+trusted fun c6LedcWrite(offset: int,value: int): void {
+    writes=writes+1
+    if (writes == drop) return
+    if (offset == channel*20) {
+        config=value
+        if ((value&16) != 0 && !stall) {
+            config=config&0xffffffef
+            if (start != 0) { actual=if (wrong) 17 else dutyReg; start=0 }
+        }
+        return
+    }
+    if (offset == channel*20+4) { hpointReg=value; return }
+    if (offset == channel*20+8) { dutyReg=value; return }
+    if (offset == channel*20+12) { start=value; return }
+    if (offset == 384+channel*4) { gamma=value;return }
+    val base=256+channel*16
+    if (offset == base+4) {
+        writeAddress=value&15;writeReady=clockTicks+5
+        nativeBufferAt(gammaRam,64).storeU32(writeAddress*4,gammaData&0x7fffffff)
+        return
+    }
+    if (offset == base) {
+        if (clockTicks < writeReady) bad=true
+        gammaData=value;nativeBufferAt(gammaRam,64).storeU32(writeAddress*4,value&0x7fffffff)
+        ranges=ranges|(1<<writeAddress);return
+    }
+    if (offset == base+8) { readAddress=value&15;readReady=clockTicks+5;return }
+    bad=true; return
+}
+fun fresh(): void {
+    timerReg=0x7168; config=0x80000000; hpointReg=123; dutyReg=456
+    var i=0;while (i < 16) { nativeBufferAt(gammaRam,64).storeU32(i*4,1234);i=i+1 }
+    gammaData=1234;writeAddress=15;readAddress=15;clockTicks=0;writeReady=0;readReady=0;delays=0
+    start=0; actual=0; gamma=0xa0000002; ranges=0; writes=0; drop=0; stall=false; wrong=false; bad=false
+    return
+}
+@export("abla_ledc_channel_c6_test")
+trusted fun channelTest(): i32 {
+    channel=0
+    while (channel < 6) {
+        timer=0
+        while (timer < 4) {
+            fresh()
+            if (c6LedcChannelSetDutyOwned(channel,timer,128,7,3) != 1 || actual != 2048 || hpointReg != 7 || ranges != 65535 || gamma != 0xa0000001 || config != (0x80000004|timer) || delays != 48 || bad) return i32(1)
+            if (c6LedcChannelSetDutyOwned(channel,timer,0,0,3) != 1 || actual != 0) return i32(2)
+            if (c6LedcChannelSetDutyOwned(channel,timer,256,0,3) != 1 || actual != 4096) return i32(3)
+            if (c6LedcChannelStopOwned(channel,true,3) != 1 || config != (0x80000008|timer) || bad) return i32(4)
+            timer=timer+1
+        }
+        channel=channel+1
+    }
+    channel=0; timer=0
+    var width=1
+    var limit=2
+    while (width <= 20) {
+        channel=0
+        while (channel < 6) {
+            timer=0
+            while (timer < 4) {
+                var boundary=0
+                while (boundary < 3) {
+                    fresh();timerReg=width|(907<<5)
+                    val duty=if (boundary == 0) 0 else if (boundary == 1) limit/2 else if (width == 20) limit-1 else limit
+                    if (c6LedcChannelSetDutyOwned(channel,timer,duty,limit-1,3) != 1 ||
+                        actual != duty*16 || hpointReg != limit-1 || ranges != 65535 || bad) return i32(15)
+                    boundary=boundary+1
+                }
+                timer=timer+1
+            }
+            channel=channel+1
+        }
+        width=width+1;limit=limit*2
+    }
+    channel=0;timer=0
+    var stage=1
+    while (stage <= 70) {
+        fresh();drop=stage
+        val result=c6LedcChannelSetDutyOwned(0,0,128,7,3)
+        if ((result != 1 && result != 4 && result != 5) || bad) return i32(5)
+        if (result == 1) {
+            if (actual != 2048 || hpointReg != 7 || gamma != 0xa0000001) return i32(6)
+            var i=0
+            while (i < 16) {
+                if (nativeBufferAt(gammaRam,64).loadU32(i*4) != (if (i == 0) 0x200003 else 0)) return i32(16)
+                i=i+1
+            }
+        }
+        stage=stage+1
+    }
+    fresh(); stall=true
+    if (c6LedcChannelSetDutyOwned(0,0,128,0,3) != 5 || c6LedcChannelStopOwned(0,false,3) != 3) return i32(7)
+    val before=writes
+    if (c6LedcChannelSetDutyOwned(0,0,10,0,3) != 3 || writes != before) return i32(8)
+    config=config&0xffffffef; start=0; actual=dutyReg; stall=false
+    if (c6LedcChannelWaitOwned(0,3) != 1 || c6LedcChannelStopOwned(0,false,3) != 1) return i32(9)
+    fresh(); wrong=true
+    if (c6LedcChannelSetDutyOwned(0,0,128,0,3) != 4) return i32(10)
+    fresh(); config=config|5
+    if (c6LedcChannelSetDutyOwned(0,0,128,0,3) != 3 || writes != 0) return i32(11)
+    fresh(); timerReg=timerReg|0x800000
+    if (c6LedcChannelSetDutyOwned(0,0,128,0,3) != 6 || writes != 0) return i32(12)
+    fresh()
+    if (c6LedcChannelSetDutyOwned(6,0,128,0,3) != 2 || c6LedcChannelSetDutyOwned(0,0,257,0,3) != 2 || c6LedcChannelSetDutyOwned(0,0,1,256,3) != 2 || writes != 0) return i32(13)
+    timerReg=0x7174
+    if (c6LedcChannelSetDutyOwned(0,0,1048576,0,3) != 2 || writes != 0 || bad) return i32(14)
+    return i32(0)
+}

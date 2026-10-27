@@ -1,0 +1,113 @@
+import "abla/runtime/scalar"
+import "abla/build"
+import "../src/esp32/i2s/pin_session_c6_sequence.ab"
+var registers=NativeBuffer(0)
+var writes=0
+var drop=0
+var bad=false
+var busy=false
+var held=u32(0)
+trusted fun c6I2sClockRead(at: int): u32 = u32(1)
+trusted fun c6I2sClockWrite(at: int,value: u32): void { bad=true;return }
+trusted fun c6I2sRead(at: int): u32 = if (at == 0x6c) u32(1) else if (at == 0x14 && busy) u32(1) else u32(0)
+fun mapped(at: int): int {
+    if (at >= 0x60090008 && at <= 0x60090014) return at-0x60090008
+    if (at >= 0x60091558 && at <= 0x60091564) return 16+at-0x60091558
+    if (at >= 0x60091078 && at <= 0x60091084) return 32+at-0x60091078
+    if (at >= 0x60091184 && at <= 0x6009119c) return 48+at-0x60091184
+    if (at == 0x60091004) return 80
+    if (at == 0x60091020) return 84
+    return -1
+}
+trusted fun c6GpioRead(at: int): u32 {
+    if (at == 0x600960e8 || at == 0x6009162c) return u32(1)
+    if (at == 0x600960ec) return u32(0x700000)
+    if (at == 0x600b102c) return held
+    if (at == 0x600b1028) return u32(0)
+    val offset=mapped(at)
+    if (offset >= 0) return u32(registers.loadU32(offset))
+    bad=true;return u32(0)
+}
+trusted fun c6GpioWrite(at: int,value: u32): void {
+    writes=writes+1
+    if (writes == drop) return
+    if (at == 0x60091008) registers.storeU32(80,registers.loadU32(80)|int(value))
+    else if (at == 0x6009100c) registers.storeU32(80,registers.loadU32(80)&~int(value))
+    else if (at == 0x60091024) registers.storeU32(84,registers.loadU32(84)|int(value))
+    else if (at == 0x60091028) registers.storeU32(84,registers.loadU32(84)&~int(value))
+    else {
+        val offset=mapped(at)
+        if (offset >= 0) registers.storeU32(offset,int(value)) else bad=true
+    }
+    return
+}
+trusted fun resetModel(r: NativeBuffer): void {
+    var at=0
+    while (at < 48) { r.storeU32(at,0);at=at+4 }
+    at=0
+    while (at < 16) {
+        registers.storeU32(at,0xa5007382);registers.storeU32(at+16,0x80000255);registers.storeU32(at+32,0x12300004);at=at+4
+    }
+    at=48
+    while (at <= 72) { registers.storeU32(at,0x800001aa);at=at+4 }
+    registers.storeU32(80,0x8000001e);registers.storeU32(84,0)
+    writes=0;drop=0;bad=false;busy=false;held=u32(0);return
+}
+trusted fun restored(): bool {
+    var at=0
+    while (at < 16) {
+        if (registers.loadU32(at) != 0xa5007382 || registers.loadU32(at+16) != 0x80000255 || registers.loadU32(at+32) != 0x12300004) return false
+        at=at+4
+    }
+    at=48
+    while (at <= 72) { if (registers.loadU32(at) != 0x800001aa) return false;at=at+4 }
+    return registers.loadU32(80) == 0x8000001e && registers.loadU32(84) == 0 && !bad
+}
+@export("abla_i2s_pin_session_c6_test")
+trusted fun test(): i32 {
+    val storage=nativeStaticAllocate(144)
+    val r=nativeBufferAt(storage,48)
+    registers=nativeBufferAt(storage+48,96)
+    var flags=0
+    while (flags < 16) {
+        val tx=(flags&1) != 0;val slave=(flags&2) != 0
+        val mclk=if ((flags&4) != 0) 4 else -1
+        var fault=0
+        while (fault <= 90) {
+            resetModel(r);drop=fault
+            val opened=c6I2sPinSessionOpenOwned(r,tx,slave,1,2,3,mclk,(flags&8) != 0,true)
+            if (opened != 1 && opened != 4) return i32(1)
+            if (opened == 1) {
+                if (r.loadU32(12) != (if (mclk < 0) 7 else 15)) return i32(2)
+                var index=0
+                while (index < (if (mclk < 0) 3 else 4)) {
+                    val role=if (index < 2) (if (tx) 2 else 6)+index*2+(if (slave) 1 else 0) else if (index == 2) (if (tx) 10 else 11) else if ((flags&8) != 0) 1 else 0
+                    val token=r.loadU32(16+index*8)|(r.loadU32(20+index*8)<<32)
+                    if (((token>>>37)&31) != index+1 || ((token>>>42)&15) != role) return i32(3)
+                    index=index+1
+                }
+            }
+            val primary=r.loadU32(8)
+            val closed=c6I2sPinSessionCloseOwned(r,true)
+            if (closed != 5 && closed != 6) return i32(4)
+            drop=0
+            if (c6I2sPinSessionCloseOwned(r,true) != 6 || !restored() || r.loadU32(12) != 0 || r.loadU32(8) != primary) return i32(5)
+            val doneWrites=writes
+            if (c6I2sPinSessionCloseOwned(r,true) != 6 || writes != doneWrites) return i32(6)
+            fault=fault+1
+        }
+        flags=flags+1
+    }
+    resetModel(r)
+    if (c6I2sPinSessionOpenOwned(r,true,false,1,2,1,4,false,true) != 2 || writes != 0) return i32(7)
+    held=u32(16)
+    if (c6I2sPinSessionOpenOwned(r,true,false,1,2,3,4,false,true) != 3 || writes != 0 || r.loadU32(0) != 0) return i32(8)
+    held=u32(0)
+    if (c6I2sPinSessionOpenOwned(r,true,false,1,2,3,4,false,true) != 1) return i32(9)
+    val before=writes
+    busy=true
+    if (c6I2sPinSessionCloseOwned(r,true) != 5 || writes != before || r.loadU32(12) != 15) return i32(10)
+    busy=false
+    if (c6I2sPinSessionCloseOwned(r,true) != 6 || !restored()) return i32(11)
+    return i32(0)
+}

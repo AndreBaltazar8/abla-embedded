@@ -1,0 +1,221 @@
+import "../src/display/spi_blit_c5_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c5GpioRead(address: int): u32 {
+    if (address == 0x600960f0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960f4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c5GpioWrite(address: int,value: u32): void {
+    if (active && (address == 0x60091008 || address == 0x6009100c)) bad=true
+    writes=writes+1
+    if ((address == 0x60091008 || address == 0x6009100c) && value == u32(1<<26)) {
+        dcWrites=dcWrites+1
+        if (dcWrites == dcDrop) return
+    }
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C5GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C5GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+
+
+
+val spi=nativeStaticAllocate(256)
+var bus=u32(4)
+var functional=u32(0x100000)
+var spiWrites=0
+var spiDrop=0
+var pending=0
+var stall=false
+var active=false
+fun c5SpiRead(address: int): u32 {
+    if (address == 0x600960c4) return bus
+    if (address == 0x600960c8) return functional
+    if (address == 0x60081000) {
+        if (active) return u32(1<<24)
+        if (pending > 0) { if (!stall) pending=pending-1;return u32(1<<23) }
+        return u32(0)
+    }
+    return u32(nativeAddressLoadU32(spi,address-0x60081000))
+}
+fun c5SpiWrite(address: int,value: u32): void {
+    spiWrites=spiWrites+1
+    if (address == 0x600960c4) { bus=value;return }
+    if (address == 0x600960c8) { functional=value;return }
+    if (address == 0x60081000) {
+        if (value == u32(1<<23)) { pending=1;return }
+        if (value != u32(1<<24)) { bad=true;return }
+        starts=starts+1
+        if ((c5GpioRead(0x60091004)&u32(1<<25)) != u32(0) ||
+            peripheralGateAt(gateStorage).tryBegin(u32(9)) != 1) bad=true
+        val data=(c5GpioRead(0x60091004)&u32(1<<26)) != u32(0)
+        val count=nativeAddressLoadU32(spi,28)/8+1
+        if (!data) {
+            phase=nativeAddressLoadU32(spi,152)&255
+            if (count != 1 || phase != (if (starts == 1) 42 else if (starts == 3) 43 else 44)) bad=true
+        } else if (phase == 42 || phase == 43) {
+            val first=if (phase == 42) expectedX else expectedY
+            val last=first+(if (phase == 42) expectedW else expectedH)-1
+            val packed=((first>>>8)&255)|((first&255)<<8)|(((last>>>8)&255)<<16)|((last&255)<<24)
+            if (count != 4 || nativeAddressLoadU32(spi,152) != packed) bad=true
+        } else {
+            if (phase != 44 || count%2 != 0) bad=true
+            var byte=0
+            while (byte < count) {
+                val word=nativeAddressLoadU32(spi,152+(byte/4)*4)
+                val pixel=observedPixels+byte/2
+                val expectedPixel=((sourceY+pixel/expectedW)*331+(sourceX+pixel%expectedW)*17)&65535
+                if (((word>>>((byte%4)*8))&255) != (if (byte%2 == 0) expectedPixel>>>8 else expectedPixel&255)) { bad=true;wireMismatch=true }
+                byte=byte+1
+            }
+        }
+        if (data && phase == 44) observedPixels=observedPixels+count/2
+        if (starts == timeoutAt) { active=true;return }
+        nativeAddressStoreU32(spi,60,4096);return
+    }
+    if (address == 0x60081038) { nativeAddressStoreU32(spi,60,nativeAddressLoadU32(spi,60)&~int(value));return }
+    nativeAddressStoreU32(spi,address-0x60081000,int(value));return
+}
+fun initialize(): void {
+    seed()
+    var at=0
+    while (at < 256) { nativeAddressStoreU32(spi,at,0);at=at+4 }
+    bus=u32(4);functional=u32(0x100000);spiWrites=0;spiDrop=0;pending=0;stall=false;active=false;return
+}
+fun openMaster(mode: int): Esp32C5SpiMaster =
+    esp32C5SpiMasterOpenOwned(spiPins(7,8,9),25,160000000,2,1,8,mode,4,true)
+
+val buffers=nativeStaticAllocate(131080)
+val gateStorage=nativeStaticAllocate(4)
+var timeout=false
+var starts=0
+
+var timeoutAt=0
+
+var dcWrites=0
+var dcDrop=0
+var wantedCommand=0
+var observed=0
+
+var phase=0
+var expectedX=0
+var expectedY=0
+var expectedW=0
+var expectedH=0
+fun c5LcdProgramAdmission(value: int,dc: int): bool {
+    val master=Esp32C5SpiMaster(value)
+    return master.ready() && dc == 26 && c5SpiMasterDataReady(master,false) && c5SpiManualSelectReady(dc)
+}
+trusted fun c5LcdProgramCommand(master: int,dc: int,command: int,data: NativeBuffer,bytes: int,polls: int): SpiBufferResult =
+    c5SpiCommandDataOwned(Esp32C5SpiMaster(master),dc,command,data,bytes,polls)
+fun peripheralDelayMilliseconds(ms: int): void { bad=true;return }
+
+val sourceMemory=nativeStaticAllocate(200000)
+val stageMemory=nativeStaticAllocate(64)
+var sourceX=0
+var sourceY=0
+var observedPixels=0
+var wireMismatch=false
+trusted fun prepareSource(width: int,height: int,stride: int,little: bool): NativeBuffer {
+    val source=nativeBufferAt(sourceMemory+1,(height-1)*stride+width*2)
+    var y=0
+    while (y < height) {
+        var x=0
+        while (x < width) {
+            val value=(y*331+x*17)&65535;val offset=y*stride+x*2
+            source.store(offset,if (little) value&255 else value>>>8)
+            source.store(offset+1,if (little) value>>>8 else value&255)
+            x=x+1
+        }
+        y=y+1
+    }
+    return source
+}
+@export("abla_spi_blit_c5_test")
+trusted fun testBlit(): int {
+    val gate=peripheralGateAt(gateStorage)
+    val stage=nativeBufferAt(stageMemory,64)
+    val view=lcdGeometry(320,240).view(0,true)
+    var variant=0
+    while (variant < 12) {
+        val little=(variant&1) != 0
+        val clipped=(variant&2) != 0
+        val width=if (variant < 4) 3 else if (variant < 8) 33 else 320
+        val height=if (variant < 8) 3 else 240
+        val stride=width*2+7
+        initialize();starts=0;timeoutAt=0;dcDrop=0;observedPixels=0;nativeAddressStoreU32(gateStorage,0,0)
+        val master=openMaster(0)
+        if (!master.ready() || esp32C5GpioConfigureOwned(26,true,true,false,false,0,true) != 1) return 1
+        sourceX=if (clipped) 2 else 0;sourceY=if (clipped) 1 else 0
+        expectedX=0;expectedY=0;expectedW=width-sourceX;expectedH=height-sourceY
+        val source=prepareSource(width,height,stride,little)
+        val result=esp32C5LcdBlitRgb565(master,gate,u32(7),26,view,-sourceX,-sourceY,source,width,height,stride,little,stage,4)
+        if (!result.valid()) return 20+variant
+        if (result.completedPixels() != expectedW*expectedH) return 40+variant
+        if (observedPixels != expectedW*expectedH) return 60+variant
+        if (starts != 5+((expectedW*2+63)/64)*expectedH) return 80+variant
+        if (bad) return (if (wireMismatch) 120 else 100)+variant
+        // Neither direct transfer nor endian staging may mutate the input.
+        var y=0
+        while (y < height) {
+            var x=0
+            while (x < width) {
+                val value=(y*331+x*17)&65535;val offset=y*stride+x*2
+                if (source.load(offset) != (if (little) value&255 else value>>>8) ||
+                    source.load(offset+1) != (if (little) value>>>8 else value&255)) return 3
+                x=x+1
+            }
+            y=y+1
+        }
+        val before=starts;val gp=writes
+        if (esp32C5LcdBlitRgb565(master,gate,u32(7),26,view,0,0,source,width,height,stride,true,nativeBufferAt(source.addressValue(),64),4).status() != 3 ||
+            esp32C5LcdBlitRgb565(master,gate,u32(7),26,view,0,0,source,width,height,width*2-1,false,stage,4).status() != 3 ||
+            starts != before || writes != gp || master.closeOwned(true) != 0 || bad) return 4
+        variant=variant+1
+    }
+    var failure=1
+    while (failure <= 8) {
+        initialize();starts=0;timeoutAt=failure;dcDrop=0;observedPixels=0;nativeAddressStoreU32(gateStorage,0,0)
+        val master=openMaster(0)
+        if (!master.ready() || esp32C5GpioConfigureOwned(26,true,true,false,false,0,true) != 1) return 5
+        sourceX=0;sourceY=0;expectedX=0;expectedY=0;expectedW=65;expectedH=1
+        val source=prepareSource(65,1,130,true)
+        val result=esp32C5LcdBlitRgb565(master,gate,u32(7),26,view,0,0,source,65,1,130,true,stage,4)
+        if (result.status() != 6 || result.completedPixels() != (if (failure <= 6) 0 else (failure-6)*32) ||
+            bad || starts != failure || master.recover(gate,u32(8),true)) return 6
+        val before=starts
+        if (esp32C5LcdBlitRgb565(master,gate,u32(8),26,view,0,0,source,65,1,130,true,stage,4).status() != 4 || starts != before) return 7
+        active=false;timeoutAt=0
+        if (!master.recover(gate,u32(8),true) || master.closeOwned(true) != 0 || bad) return 8
+        failure=failure+1
+    }
+    return 0
+}

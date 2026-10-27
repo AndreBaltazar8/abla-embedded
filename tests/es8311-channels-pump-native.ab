@@ -1,0 +1,88 @@
+import "../src/m5stack/es8311_channels_pump_sequence.ab"
+import "abla/runtime/scalar"
+import "../src/runtime/memory32.ab"
+import "abla/build"
+#requiredInternalFunction("freestandingMemorySet32", "memset")
+val sessionMemory=nativeStaticAllocate(136)
+val bankMemory=nativeStaticAllocate(32)
+val sourceMemory=nativeStaticAllocate(64)
+val metaMemory=nativeStaticAllocate(20)
+val accMemory=nativeStaticAllocate(64)
+val scratchMemory=nativeStaticAllocate(32)
+val stagingMemory=nativeStaticAllocate(16)
+var outcome=3
+var calls=0
+var bad=false
+type Esp32S3GdmaPumpResult=int
+fun Esp32S3GdmaPumpResult.status(): int = this&255
+fun m5Es8311PlaybackValid(r: NativeBuffer): bool = r.hasAddressRange(0,136) && r.loadU32(0) == 0x45545031
+fun esp32s3GdmaRingLayoutValid(desc: int,count: int,payload: int,bytes: int,stride: int): bool =
+    desc == 0x3fc88000 && count == 2 && payload == 0x3fc90000 && bytes == 16 && stride == 16
+trusted fun m5Es8311PlaybackWriteOwned(r: NativeBuffer,buffer: NativeBuffer,polls: int,exclusive: bool): Esp32S3GdmaPumpResult {
+    calls=calls+1
+    if (buffer.addressValue() != stagingMemory || buffer.capacity() != 16 || polls != 1 || !exclusive) bad=true
+    if (outcome == 1) r.storeU32(44,1-r.loadU32(44))
+    else if (outcome != 3) r.storeU32(4,3)
+    return Esp32S3GdmaPumpResult(outcome)
+}
+@export("abla_es8311_channels_pump_test")
+trusted fun test(): i32 {
+    val r=nativeBufferAt(sessionMemory,136)
+    val source=nativeBufferAt(sourceMemory,64)
+    var i=0
+    while (i < 16) { source.storeU16(i*4,10000);source.storeU16(i*4+2,-2000);i=i+1 }
+    val wav=pcmRaw(source,nativeBufferAt(metaMemory,20),16000,2,16)
+    val acc=nativeBufferAt(accMemory,64);val scratch=nativeBufferAt(scratchMemory,32);val staging=nativeBufferAt(stagingMemory,16)
+    var mode=0
+    while (mode < 2) {
+        val stereo=mode == 0
+        val bank=pcmChannelsAt(nativeBufferAt(bankMemory,32),1,16000)
+        if (bank.enqueue(wav,0) != 0) return i32(1)
+        r.storeU32(0,0x45545031);r.storeU32(4,2);r.storeU32(8,if (stereo) m5BoardStickS3|0 else m5BoardCardputerADV|0)
+        r.storeU32(28,0x3fc88000);r.storeU32(32,2);r.storeU32(36,0x3fc90000);r.storeU32(40,16);r.storeU32(44,0);r.storeU32(48,16000)
+        var state=M5Es8311ChannelsPump(0)
+        var block=0
+        while (block < 6) {
+            outcome=3
+            state=m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,true)
+            if (state.status() != 3 || !state.pending()) return i32(2)
+            val cursor=bank.channel(0).storage().loadU32(16)
+            val repeats=bank.channel(0).storage().loadU32(12)
+            val word=staging.loadU32(0)
+            var retry=0
+            while (retry < 3) {
+                state=m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,0,true)
+                if (state.status() != 3 || bank.channel(0).storage().loadU32(16) != cursor ||
+                    bank.channel(0).storage().loadU32(12) != repeats || staging.loadU32(0) != word) return i32(3)
+                retry=retry+1
+            }
+            i=0
+            while (i < 8) {
+                val expected=if (!stereo) 4000 else if ((i&1) == 0) 10000 else 63536
+                if (staging.loadU16(i*2) != expected) return i32(4)
+                i=i+1
+            }
+            outcome=1
+            state=m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,0,true)
+            if (state.status() != 1 || state.pending() || state.index() != r.loadU32(44) ||
+                bank.channel(0).storage().loadU32(16) != cursor || staging.loadU32(0) != word) return i32(5)
+            block=block+1
+        }
+        val before=bank.channel(0).storage().loadU32(16);val beforeCalls=calls
+        if (m5Es8311PumpChannelsOwned(state,r,bank,nativeBufferAt(accMemory,1),scratch,staging,32768,true).status() != 2 ||
+            m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,nativeBufferAt(sessionMemory+132,16),32768,true).status() != 2 ||
+            m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,false).status() != 2 ||
+            calls != beforeCalls || bank.channel(0).storage().loadU32(16) != before) return i32(6)
+        r.storeU32(48,16001)
+        if (m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,true).status() != 2 || calls != beforeCalls) return i32(7)
+        r.storeU32(48,16000);r.storeU32(44,1-r.loadU32(44))
+        if (m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,true).status() != 2 || calls != beforeCalls) return i32(8)
+        r.storeU32(44,1-r.loadU32(44));outcome=4
+        state=m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,true)
+        val failedCalls=calls
+        if (state.status() != 4 || !state.pending() || m5Es8311PumpChannelsOwned(state,r,bank,acc,scratch,staging,32768,true) != state || calls != failedCalls) return i32(9)
+        if (bad) return i32(10)
+        mode=mode+1
+    }
+    return i32(0)
+}

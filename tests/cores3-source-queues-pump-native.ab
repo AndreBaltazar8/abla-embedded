@@ -1,0 +1,64 @@
+import "../src/m5stack/cores3_channels_pump_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+var calls=0
+var outcome=3
+var transferBytes=960
+type PumpResult=int
+fun PumpResult.status(): int = this&255
+fun PumpResult.nextIndex(): int = (this>>>8)&7
+fun PumpResult.transferredBytes(): int = transferBytes
+fun esp32s3GdmaRingLayoutValid(d: int,n: int,b: int,size: int,stride: int): bool =
+    d == 0x3fc88000 && b == 0x3fc90000 && n == 6 && size == 960 && stride == 960
+trusted fun esp32s3GdmaPumpBlock(ch: int,tx: bool,d: int,n: int,index: int,buffer: NativeBuffer,bytes: int,polls: int): PumpResult {
+    calls=calls+1
+    return PumpResult(outcome|((if (index == 5) 0 else index+1)<<8))
+}
+@export("abla_cores3_source_queues_pump_test")
+trusted fun test(): i32 {
+    val bank=pcmSourceQueuesAt(nativeBufferAt(memory,64),2,16000)
+    val channel=pcmChannelAt(nativeBufferAt(memory+64,32),16000)
+    val tone=pcmToneWaveAt(nativeBufferAt(memory+96,40),nativeBufferAt(pcmToneWave,16),false,16000,440123,4294967295)
+    val samples=nativeBufferAt(memory+136,2);samples.storeU16(0,1234)
+    val wav=pcmRaw(samples,nativeBufferAt(memory+140,20),16000,1,16)
+    val acc=nativeBufferAt(memory+256,1920);val scratch=nativeBufferAt(memory+2176,960)
+    val stage=nativeBufferAt(memory+3136,960);val saved=nativeBufferAt(memory+4096,960)
+    if (!channel.enqueue(wav,100) || bank.enqueue(pcmPlaybackChannel(channel),0) != 0 ||
+        bank.enqueue(pcmPlaybackTone(tone),0) != 0) return i32(1)
+    var state=cores3PumpSourceQueues(CoreS3ChannelsPump(0),bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage)
+    val phase=(140*440123)%16000000
+    if (state.status() != 3 || !state.pending() || tone.storage().loadU32(12) != phase ||
+        bank.queue(0).source(0).kind() != 2 || channel.isPlaying() != 0) return i32(2)
+    var index=0
+    while (index < 960) {
+        saved.store(index,stage.load(index))
+        if (index < 100 && stage.loadU16(index*4) != 1234) return i32(3)
+        index=index+1
+    }
+    index=0
+    while (index < 3) {
+        state=cores3PumpSourceQueues(state,bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage)
+        if (state.status() != 3 || tone.storage().loadU32(12) != phase) return i32(4)
+        index=index+1
+    }
+    index=0
+    while (index < 960) { if (saved.load(index) != stage.load(index)) return i32(5);index=index+1 }
+    // Retry admission still protects source waveform and queue storage.
+    val wave=tone.storage().loadU32(32);tone.storage().storeU32(32,stage.addressValue())
+    val before=calls
+    if (cores3PumpSourceQueues(state,bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage).status() != 2 ||
+        calls != before || tone.storage().loadU32(12) != phase) return i32(6)
+    tone.storage().storeU32(32,wave)
+    outcome=1
+    state=cores3PumpSourceQueues(state,bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage)
+    if (state.status() != 1 || state.index() != 1 || state.pending() || tone.storage().loadU32(12) != phase) return i32(7)
+    // Successful short DMA is a sticky failure, never rerendered or replayed.
+    transferBytes=100
+    state=cores3PumpSourceQueues(state,bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage)
+    val after=calls;val nextPhase=(380*440123)%16000000
+    if (state.status() != 8 || !state.pending() || tone.storage().loadU32(12) != nextPhase) return i32(8)
+    state=cores3PumpSourceQueues(state,bank,0,0x3fc88000,0x3fc90000,acc,scratch,stage)
+    if (state.status() != 8 || calls != after || tone.storage().loadU32(12) != nextPhase) return i32(9)
+    return i32(0)
+}

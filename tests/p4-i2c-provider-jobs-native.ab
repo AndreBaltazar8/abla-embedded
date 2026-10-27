@@ -1,0 +1,113 @@
+import "../src/esp32/i2c/hardware_jobs_p4.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(256)
+val jobMemory=nativeStaticAllocate(64)
+val payloadMemory=nativeStaticAllocate(16)
+val pendingMemory=nativeStaticAllocate(40)
+var timings=0
+var runs=0
+var wire=1
+var timingFails=false
+var expectedFrequency=100000
+var bad=false
+// Unused lower-level hooks fail loudly; this fixture isolates provider
+// admission/lifecycle. Actual chunk/MMIO composition is tested separately.
+trusted fun p4I2cSessionClockOpen(port: int,source: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionInitialize(port: int,filter: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionPinsOpen(r: NativeBuffer,port: int,sda: int,scl: int,pullup: bool,layout: int): int { bad=true;return 0 }
+trusted fun p4I2cSessionTransfer(port: int,address: int,output: NativeBuffer,written: int,input: NativeBuffer,read: int,budget: u32,prefix: int): int { bad=true;return 7 }
+fun i2cJobsFifoBytes(port: int): int { bad=true;return 0 }
+trusted fun i2cJobsCounter(): u32 { bad=true;return u32(0) }
+trusted fun i2cJobsChunk(port: int,address: int,data: NativeBuffer,count: int,reading: bool,first: bool,finish: bool,continued: bool,started: u32,budget: u32,nackLast: bool): int { bad=true;return 7 }
+trusted fun p4I2cSessionTiming(port: int,timing: P4I2cTiming): int {
+    timings=timings+1
+    if (port != 1 || !timing.valid() || timing != esp32p4I2cTiming(u32(40000000),u32(expectedFrequency)) ||
+        p4HardwareLoad(0) != 1 || p4HardwareSession().loadU32(4) != 1) bad=true
+    return if (timingFails) 5 else 1
+}
+trusted fun p4HardwareJobsRun(r: NativeBuffer,jobs: NativeBuffer,count: int,budget: u32): int {
+    runs=runs+1
+    if (p4HardwareLoad(0) != 1 || p4HardwareLoad(20) != 1 || r.loadU32(4) != 1 || count != 2 ||
+        jobs.load(0) != 42 || jobs.load(16) != 43 || budget != u32(800000)) bad=true
+    // Reentrant admission must fail before any timing or wire work.
+    if (I2cBus(p4HardwareLoad(4)).runJobsStatus(jobs,count,100000,2) != 4) bad=true
+    r.storeU32(4,2)
+    if (wire == 1) nativeBufferAt(jobs.loadU32(24),1).store(0,0x5a)
+    r.storeU32(8,wire);r.storeU32(4,if (wire == 1) 1 else 3)
+    return wire
+}
+trusted fun p4I2cSessionClockClose(token: int): int = 4102
+trusted fun p4I2cSessionPinsClose(r: NativeBuffer): int = 2
+trusted fun prepare(): I2cBus {
+    val outer=nativeBufferAt(memory,256);var i=0
+    while (i < 256) { outer.store(i,0);i=i+1 }
+    val r=nativeBufferAt(memory+32,72)
+    r.storeU32(0,0x49324234);r.storeU32(4,1);r.storeU32(20,1);r.storeU32(24,3)
+    timings=0;runs=0;wire=1;timingFails=false;bad=false;expectedFrequency=100000
+    return i2cHardwareBindOwned(r,u32(40000000),u32(400000000),outer)
+}
+trusted fun setupJobs(): bool {
+    val jobs=nativeBufferAt(jobMemory,64)
+    return i2cJobSet(jobs,0,42,false,nativeBufferAt(payloadMemory,1),1) &&
+        i2cJobSet(jobs,1,43,true,nativeBufferAt(payloadMemory+8,1),1)
+}
+@export("abla_p4_i2c_provider_jobs_test")
+trusted fun test(): i32 {
+    val jobs=nativeBufferAt(jobMemory,64);val r=nativeBufferAt(memory+32,72)
+    var raw=1
+    while (raw <= 8) {
+        if (raw != 2) {
+            val bus=prepare();wire=raw
+            if (!bus.valid() || !setupJobs()) return i32(1)
+            val expected=if (raw == 1) 1 else if (raw == 3) 5 else if (raw == 4 || raw == 8) 4 else if (raw == 5) 3 else if (raw == 7) 2 else 6
+            if (bus.runJobsStatus(jobs,2,100000,2) != expected || runs != 1 || timings != 1 || bad ||
+                r.loadU32(8) != raw || p4HardwareLoad(0) != 0) return i32(2)
+            if (raw != 1 && (bus.runJobsStatus(jobs,2,100000,2) != 7 || runs != 1 || timings != 1)) return i32(3)
+            if (!bus.close() || bus.runJobsStatus(jobs,2,100000,2) != 2) return i32(4)
+        }
+        raw=raw+1
+    }
+    val bus=prepare()
+    if (!setupJobs()) return i32(5)
+    // Every protected class must reject a payload before timing changes.
+    var kind=0
+    while (kind < 5) {
+        val address=if (kind == 0) p4HardwareState+32 else if (kind == 1) p4HardwareSlots+199 else if (kind == 2) memory+255 else if (kind == 3) memory+32 else pendingMemory+39
+        if (kind == 4) p4HardwareStore(32,pendingMemory)
+        jobs.storeU32(24,address)
+        if (bus.runJobsStatus(jobs,2,100000,2) != 2 || runs != 0 || timings != 0 || r.loadU32(4) != 1) return i32(6)
+        p4HardwareStore(32,0);kind=kind+1
+    }
+    if (!setupJobs()) return i32(7)
+    // Table itself in outer state; valid content cannot bypass ownership.
+    val alias=nativeBufferAt(memory+128,32)
+    var i=0;while (i < 32) { alias.store(i,jobs.load(i));i=i+1 }
+    if (bus.runJobsStatus(alias,2,100000,2) != 2 || timings != 0) return i32(8)
+    // Malformed descriptor, intersecting payloads, overflow and bad frequency.
+    jobs.storeU32(28,1)
+    if (bus.runJobsStatus(jobs,2,100000,2) != 2) return i32(9)
+    jobs.storeU32(28,0);jobs.storeU32(24,payloadMemory)
+    if (bus.runJobsStatus(jobs,2,100000,2) != 2 || !setupJobs()) return i32(10)
+    if (bus.runJobsStatus(jobs,2,100000,1000000) != 2 || bus.runJobsStatus(jobs,2,400001,2) != 2 || timings != 0) return i32(11)
+    // An in-progress GPIO restore excludes this path, too.
+    p4HardwareStore(20,3);p4HardwareStore(32,payloadMemory)
+    if (bus.runJobsStatus(jobs,2,100000,2) != 2 || timings != 0) return i32(12)
+    p4HardwareStore(20,1);p4HardwareStore(32,0)
+    r.storeU32(24,1)
+    if (bus.runJobsStatus(jobs,2,100000,2) != 2 || timings != 0) return i32(13)
+    r.storeU32(24,3);timingFails=true
+    if (bus.runJobsStatus(jobs,2,100000,2) != 6 || runs != 0 || timings != 1 || r.loadU32(4) != 3 || r.loadU32(8) != 5 || bad) return i32(14)
+    if (!bus.close()) return i32(15)
+    val next=prepare()
+    if (bus.runJobsStatus(jobs,2,100000,2) != 2 || timings != 0 || runs != 0) return i32(16)
+    var speed=0
+    while (speed < 3) {
+        expectedFrequency=if (speed == 0) 1000 else if (speed == 1) 100000 else 400000
+        if (next.runJobsStatus(jobs,2,expectedFrequency,2) != 1 || timings != speed+1 || runs != speed+1 || bad ||
+            nativeBufferAt(payloadMemory+8,1).load(0) != 0x5a) return i32(17)
+        speed=speed+1
+    }
+    if (!next.close()) return i32(18)
+    return i32(0)
+}

@@ -1,0 +1,66 @@
+import "../src/esp32/power/sleep_quiesce_s3_sequence.ab"
+import "../src/esp32/peer_notify_s3_sequence.ab"
+import "../src/xtensa/peer_park_sequence.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val quiesceMemory=nativeStaticAllocate(36)
+var qCore=0
+var qLevel=0
+var qWord=0
+var qRace=false
+var qDone=false
+var qCalls=0
+var qBad=false
+fun xtensaGuardCore(): int = qCore
+fun xtensaGuardStatus(): int = 0x40000|qLevel
+fun xtensaGuardMaskLocal(): int { val before=qLevel;qLevel=15;return 0x40000|before }
+fun xtensaGuardRestoreLevel(level: int): void { qLevel=level;return }
+fun xtensaPeerParkCas(address: int,expected: int,replacement: int): int {
+    qCalls=qCalls+1
+    if (address != 4096) qBad=true
+    if (qRace && (replacement&7) == 5) { qWord=(qWord&(~7))|2;qRace=false }
+    if (qDone && (qWord&7) == 3) qWord=(qWord&(~7))|4
+    val old=qWord
+    if (old == expected) qWord=replacement
+    return old
+}
+fun esp32S3IntercoreSignalOwned(channel: int,asserted: bool): bool { if (channel != 1 || !asserted || (qWord&7) != 1) qBad=true;return true }
+@export("abla_sleep_quiesce_s3_test")
+fun testQuiesce(): int {
+    val r=nativeBufferAt(quiesceMemory,36);val mailbox=nativeBufferAt(4096,4)
+    var profile=0
+    while (profile < 48) {
+        qCore=profile&1;val original=(profile>>>1)%6;val mode=profile/12
+        qLevel=original;qRace=false;qDone=false;qBad=false;r.storeU32(0,0);r.storeU32(32,0x12345678)
+        if (esp32S3SleepQuiesceOpenOwned(r,mailbox,1,true) != 2 || qLevel != original || esp32S3SleepQuiescePollOwned(r) != 2) return 1
+        val ticket=r.loadU32(12)
+        if (mode == 0) {
+            if (esp32S3SleepQuiesceCloseOwned(r,true) != 5 || qWord != (ticket|5) || qLevel != original) return 2
+        } else {
+            if (mode == 1) qRace=true
+            else {
+                qWord=ticket|2
+                if (esp32S3SleepQuiescePollOwned(r) != 1 || qLevel != 15 || esp32S3SleepQuiescePollOwned(r) != 1) return 3
+                qCore=qCore^1
+                if (esp32S3SleepQuiesceCloseOwned(r,true) != 3) return 4
+                qCore=qCore^1
+            }
+            val calls=qCalls
+            if (esp32S3SleepQuiesceCloseOwned(r,false) != 3 || qCalls != calls) return 5
+            if (esp32S3SleepQuiesceCloseOwned(r,true) != 2 || qWord != (ticket|3) || qLevel != (if (mode == 1) original else 15)) return 6
+            qDone=true
+            if (mode == 3) {
+                qLevel=0
+                if (esp32S3SleepQuiesceCloseOwned(r,true) != 6 || r.loadU32(24) != 1) return 7
+                qLevel=15
+            }
+            if (esp32S3SleepQuiesceCloseOwned(r,true) != 5 || qLevel != original || qWord != (ticket|4)) return 8
+        }
+        val calls=qCalls
+        if (esp32S3SleepQuiesceCloseOwned(r,true) != 5 || calls != qCalls || qBad || r.loadU32(32) != 0x12345678) return 9
+        profile=profile+1
+    }
+    r.storeU32(0,0);val calls=qCalls
+    if (esp32S3SleepQuiesceOpenOwned(r,nativeBufferAt(quiesceMemory+4,4),1,true) != 3 || esp32S3SleepQuiesceOpenOwned(r,mailbox,4,true) != 3 || esp32S3SleepQuiesceOpenOwned(r,mailbox,1,false) != 3 || calls != qCalls) return 10
+    return 0
+}

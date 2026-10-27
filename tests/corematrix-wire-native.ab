@@ -1,0 +1,268 @@
+import "../src/m5stack/corematrix_control_sequence.ab"
+import "../src/m5stack/expander_open.ab"
+import "../src/m5stack/pmic_open.ab"
+import "../src/m5stack/corematrix_startup_sequence.ab"
+import "../src/m5stack/corematrix_power.ab"
+import "../src/m5stack/corematrix_charge_owner.ab"
+import "../src/m5stack/pm1_presence.ab"
+import "abla/build"
+var apb=u32(0)
+var functional=u32(0)
+var gpio=u32(0)
+var gateWrites=0
+var dropGate=0
+var padWrites=0
+var dropPad=0
+var pads=0
+var bad=false
+var low=false
+var ticks=0
+fun c61DelayClockRead(address: int): int = if (address == 0x600960e8) 2<<16 else 1
+fun c61DelayClockSetRomTicks(value: int): void { ticks=value;return }
+fun c61GpioClockRead(address: int): u32 = if (address == 0x600960c0) apb else if (address == 0x600960c4) functional else gpio
+fun c61GpioClockWrite(address: int,value: u32): void {
+    gateWrites=gateWrites+1
+    if (pads != 0) bad=true
+    if (gateWrites == dropGate) return
+    if (address == 0x600960c0) apb=value else if (address == 0x600960c4) functional=value else gpio=value
+    return
+}
+fun c61SoftwareI2cReady(sda: int,scl: int): bool = apb == u32(1) && functional == u32(0x400000) && gpio == u32(1) && ticks == 80
+fun c61SoftwareI2cConfigure(pin: int,enabled: bool): bool {
+    padWrites=padWrites+1
+    if (padWrites == dropPad) return false
+    if (enabled) pads=pads|(1<<pin) else pads=pads&~(1<<pin)
+    return true
+}
+fun softwareI2cSample(pin: int): bool = if (pin == 1) clockHigh else masterHigh && slaveHigh
+fun softwareI2cDrive(pin: int,released: bool): void = wireDrive(pin,released)
+fun softwareI2cDelay(us: int): void { return }
+fun seed(borrow: int): void {
+    apb=u32(borrow&1);functional=if ((borrow&2) != 0) u32(0x400000) else u32(0)
+    gpio=u32((borrow>>>2)&1)
+    gateWrites=0;dropGate=0;padWrites=0;dropPad=0;pads=0;bad=false;low=false;ticks=0
+    return
+}
+fun open(): Esp32C61I2cSession = esp32C61I2cSessionOpenOwned(0,1,40000000,20000000,true,5,8)
+
+val registers=nativeStaticAllocate(512)
+val record=nativeStaticAllocate(64)
+val presenceStorage=nativeStaticAllocate(32)
+var irqCalls=0
+fun coreMatrixStartupAdmission(owner: int,presence: Pm1BatteryPresence): bool = M5CoreMatrixControl(owner).ready()
+fun coreMatrixStartupInputs(owner: int): int = M5CoreMatrixControl(owner).pmic().configureCoreMatrixPm1Inputs()|0
+// GPIO2 MMIO handoff has its own register fault matrix; model only that leaf.
+fun coreMatrixStartupIrq(): int { irqCalls=irqCalls+1;return 1 }
+fun coreMatrixStartupChargeSense(owner: int): bool = M5Ioe1(M5CoreMatrixControl(owner).expanders().device(0)|0).setDirection(7,false)
+fun coreMatrixStartupPresence(owner: int,presence: Pm1BatteryPresence,now: int): int {
+    val control=M5CoreMatrixControl(owner)
+    return presence.updateBoard(m5BoardCoreMatrix,control.pmic().pm1(),M5Ioe1(control.expanders().device(0)|0),now)
+}
+fun coreMatrixStartupSd(owner: int): int = M5CoreMatrixControl(owner).expanders().configureCoreMatrixSdPower()|0
+var masterHigh=true
+var slaveHigh=true
+var clockHigh=true
+var mode=0
+var bits=0
+var value=0
+var index=0
+var selected=-1
+var pointer=0
+var reading=false
+var ack=true
+var ackCount=0
+var nackAt=0
+var nackAfterCommit=false
+var starts=0
+var stops=0
+// Optional BMI270 slave for the board-IMU integration fixture. Default off
+// keeps the existing control/charge model's address space unchanged.
+val imuRegisters=nativeStaticAllocate(256)
+var imuPresent=false
+var imuUploaded=0
+var imuExpectedConfig=0
+var imuConfigStart=0
+// Optional auxiliary slave (write-only unless explicitly enabled). Capture accepted bytes and their
+// transaction indices for transport integrations without mocking I2cDevice.
+var extraAddress=0
+val extraWire=nativeStaticAllocate(8192)
+var extraCount=0
+var extraCanRead=false
+var extraReadValue=0
+var extraReadAddress=0
+var extraReadCommand=-1
+var extraCommand=0
+fun wireCaptureExtra(): void {
+    if (extraCount >= 4096) { bad=true;return }
+    val capture=nativeBufferAt(extraWire,8192)
+    capture.store(extraCount*2,index);capture.store(extraCount*2+1,value)
+    extraCount=extraCount+1;return
+}
+fun wireLoad(): int = if (selected == 768) (if (extraReadAddress == 0 || (extraReadCommand >= 0 && extraCommand != extraReadCommand)) extraReadValue else nativeBufferAt(extraReadAddress,256).load(pointer)) else if (selected == 512) nativeBufferAt(imuRegisters,256).load(pointer) else nativeBufferAt(registers,512).load(selected+pointer)
+fun wireStore(): void {
+    if (selected != 512) { nativeBufferAt(registers,512).store(selected+pointer,value);pointer=(pointer+1)&255;return }
+    val r=nativeBufferAt(imuRegisters,256)
+    if (pointer == 94) {
+        if (imuExpectedConfig != 0 && (imuUploaded >= 8192 || value != nativeBufferAt(imuExpectedConfig,8192).load(imuUploaded))) bad=true
+        imuUploaded=imuUploaded+1;return
+    }
+    r.store(pointer,value)
+    if (pointer == 126 && value == 182) r.store(124,1)
+    if (pointer == 89 && value == 1) r.store(33,1)
+    pointer=(pointer+1)&255
+    return
+}
+fun wireByte(): void {
+    ackCount=ackCount+1
+    ack=ackCount != nackAt
+    if (index == 0) {
+        selected=if ((value>>>1) == 79) 0 else if ((value>>>1) == 110) 256 else if (imuPresent && (value>>>1) == 105) 512 else if (extraAddress != 0 && (value>>>1) == extraAddress) 768 else -1
+        reading=(value&1) != 0
+        if (selected < 0) ack=false
+        if (selected == 768) { if (reading) pointer=0;if (reading && !extraCanRead) { bad=true;ack=false } else if (ack) wireCaptureExtra() }
+    } else if ((ack || (nackAfterCommit && index > 1)) && selected >= 0) {
+        if (selected == 768) { if (index == 1) extraCommand=value;wireCaptureExtra() }
+        else if (index == 1) { pointer=value;if (selected == 512 && pointer == 94) imuConfigStart=ackCount }
+        else wireStore()
+    }
+    index=index+1
+    return
+}
+fun sendBit(): void {
+    val byte=wireLoad()
+    slaveHigh=(byte&(128>>>bits)) != 0;return
+}
+fun wireDrive(pin: int,high: bool): void {
+    if (pin == 0) {
+        val old=masterHigh
+        masterHigh=high
+        if (clockHigh && slaveHigh && old != high) {
+            if (!high) { starts=starts+1;mode=1;bits=0;value=0;index=0;reading=false }
+            else { stops=stops+1;mode=0;slaveHigh=true }
+        }
+        return
+    }
+    if (pin != 1) { bad=true;return }
+    if (clockHigh == high) return
+    clockHigh=high
+    if (high) {
+        if (mode == 1) { value=(value<<1)|(if (masterHigh) 1 else 0);bits=bits+1 }
+        else if (mode == 3) bits=bits+1
+        else if (mode == 4) ack=!masterHigh
+    } else {
+        if (mode == 1 && bits == 8) { wireByte();mode=2;slaveHigh=!ack }
+        else if (mode == 2) {
+            slaveHigh=true;bits=0;value=0
+            if (!ack) mode=5
+            else if (reading) { mode=3;sendBit() }
+            else mode=1
+        } else if (mode == 3) {
+            if (bits == 8) { mode=4;slaveHigh=true } else sendBit()
+        } else if (mode == 4) {
+            bits=0
+            if (ack) { pointer=(pointer+1)&255;mode=3;sendBit() } else { mode=5;slaveHigh=true }
+        }
+    }
+    return
+}
+fun wireSeed(): void {
+    seed(0)
+    imuPresent=false;imuUploaded=0;imuExpectedConfig=0;imuConfigStart=0;extraAddress=0;extraCount=0;extraCanRead=false;extraReadValue=0;extraReadAddress=0;extraReadCommand=-1;extraCommand=0
+    masterHigh=true;slaveHigh=true;clockHigh=true;mode=0;bits=0;value=0;index=0
+    selected=-1;pointer=0;reading=false;ack=true;ackCount=0;nackAt=0;nackAfterCommit=false;starts=0;stops=0
+    var at=0
+    while (at < 512) { nativeBufferAt(registers,512).store(at,255);at=at+1 }
+    nativeBufferAt(registers,512).store(256,18)
+    nativeBufferAt(registers,512).store(257,52)
+    nativeBufferAt(registers,512).store(258,86)
+    nativeBufferAt(registers,512).store(259,120)
+    return
+}
+@export("abla_corematrix_wire_test")
+trusted fun testWire(): i32 {
+    val owner=m5CoreMatrixControlAt(nativeBufferAt(record,64))
+    wireSeed()
+    if (!owner.initialize() || owner.openOwned(40000000,20000000,true) != 1 || !owner.ready() || bad) return i32(1)
+    val total=ackCount
+    val registersView=nativeBufferAt(registers,512)
+    if (registersView.load(35) != 0 || registersView.load(265) != 0 || registersView.load(266) != 0) return i32(2)
+    val identity=owner.pmic().device().readRegister32BigEndianChecked(0)
+    if (!identity.valid() || identity.value() != 0x12345678 || starts <= stops || stops == 0) return i32(3)
+    val presence=pm1BatteryPresenceAt(nativeBufferAt(presenceStorage,32))
+    if (!presence.initialize()) return i32(8)
+    val powered=m5CoreMatrixStartupOwned(owner|0,presence,2000,true)
+    if (!powered.valid() || irqCalls != 1 || bad || mode != 0) return i32(9)
+    // Real RMWs preserve other expander pins, configure CHG_STAT input,
+    // enable TF output high/push-pull and leave all PM1 IRQ status untouched.
+    if (registersView.load(4) != 255 || registersView.load(3) != 127 ||
+        registersView.load(5) != 255 || registersView.load(19) != 254 ||
+        registersView.load(320) != 255 || registersView.load(321) != 255 ||
+        registersView.load(322) != 255) return i32(10)
+    if (!owner.closeOwned(true) || pads != 0 || bad) return i32(4)
+    var failed=1
+    while (failed <= total) {
+        wireSeed();nackAt=failed
+        if (!owner.initialize()) return i32(5)
+        val status=owner.openOwned(40000000,20000000,true)
+        if ((status != 4 && status != 5) || owner.ready() || ackCount != failed || bad) return i32(6)
+        if (!owner.closeOwned(true) || pads != 0 || bad || mode != 0 || !masterHigh || !slaveHigh || !clockHigh) return i32(7)
+        failed=failed+1
+    }
+    return testChargeOwner(owner)
+}
+val chargeSnapshot=nativeStaticAllocate(512)
+trusted fun testChargeOwner(owner: M5CoreMatrixControl): i32 {
+    val registersView=nativeBufferAt(registers,512)
+    val snapshot=nativeBufferAt(chargeSnapshot,512)
+    var selection=0
+    while (selection < 2) {
+        val request=if (selection == 0) 649 else 650
+        var failure=0
+        var total=1
+        while (failure <= total) {
+            var commit=0
+            while (commit < 2) {
+                wireSeed()
+                if (!owner.initialize() || owner.openOwned(40000000,20000000,true) != 1) return i32(20)
+                // Different unrelated bits per case, including initially high G3.
+                var at=0
+                while (at < 512) {
+                    val value=(at*37+failure*13+commit*71)&255
+                    registersView.store(at,value);snapshot.store(at,value);at=at+1
+                }
+                val before=ackCount
+                if (owner.setChargeCurrentOwned(request,false).status() != 10 ||
+                    owner.setChargeCurrentOwned(-1,true).status() != 4 || ackCount != before) return i32(21)
+                nackAt=if (failure == 0) 0 else before+failure
+                nackAfterCommit=commit == 1
+                val result=owner.setChargeCurrentOwned(request,true)
+                val count=ackCount-before
+                if (failure == 0) {
+                    total=count
+                    if (!result.valid() || result.highRateSelected() != (selection == 1) || total != (if (selection == 0) 18 else 30)) return i32(22)
+                    if ((registersView.load(9)&4) != 0 || (registersView.load(11)&4) != 0 ||
+                        (registersView.load(3)&4) != (if (selection == 1) 4 else 0)) return i32(23)
+                    if (selection == 1 && ((registersView.load(5)&4) != 0 || (registersView.load(19)&4) != 0)) return i32(24)
+                } else {
+                    val expected=if (failure <= 12) 5 else if (selection == 0 || failure > 24) 8 else if (failure <= 18) 6 else 7
+                    if (result.status() != expected || result.highRateSelected() || count != failure) return i32(25)
+                }
+                at=0
+                while (at < 512) {
+                    val mutable=at == 9 || at == 11 || at == 3 || (selection == 1 && (at == 5 || at == 19))
+                    val mask=if (mutable) 251 else 255
+                    if ((registersView.load(at)&mask) != (snapshot.load(at)&mask)) return i32(26)
+                    at=at+1
+                }
+                if (!owner.ready() || bad || mode != 0 || !masterHigh || !slaveHigh || !clockHigh) return i32(27)
+                if (!owner.closeOwned(true) || pads != 0 || bad) return i32(28)
+                val closedCount=ackCount
+                if (owner.setChargeCurrentOwned(request,true).status() != 9 || ackCount != closedCount) return i32(29)
+                commit=commit+1
+            }
+            failure=failure+1
+        }
+        selection=selection+1
+    }
+    return i32(0)
+}

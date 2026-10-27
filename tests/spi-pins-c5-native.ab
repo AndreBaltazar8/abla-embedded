@@ -1,0 +1,131 @@
+import "../src/esp32/spi/pins_c5_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var sda=0
+var scl=1
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+fun offset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c5GpioRead(address: int): u32 {
+    if (address == 0x600960f0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960f4) return if (fault == 2) u32(0) else if (fault == 8) u32(0x700000) else u32(0x400000)
+    if (address == 0x60091df8) return if (fault == 3) u32(0) else u32(1)
+    if (address == 0x600b102c) return if (fault == 4) u32(1)<<u32(scl) else u32(0)
+    if (address == 0x600b1028) return if (fault == 5) u32(127) else u32(0)
+    if (address == 0x6000f018) return if (fault == 6) u32(16384) else u32(0)
+    if (address == 0x60091064) return if (fault == 7) u32(0) else u32(0xffffffff)
+    val at=offset(address)
+    if (at < 0 || (at&3) != 0) { bad=true;return u32(0) }
+    return u32(nativeBufferAt(memory,4096).loadU32(at))
+}
+fun c5GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=offset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    else if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&(u32(0xffffffff)^value) }
+    if (at < 0 || at >= 4096 || (at&3) != 0) { bad=true;return }
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun softwareI2cDrive(pin: int,released: bool): void { esp32C5GpioWriteOwned(pin,released);return }
+fun softwareI2cSample(pin: int): bool = esp32C5GpioReadOwned(pin) == 1
+fun softwareI2cDelay(us: int): void { if (us != 1 && us != 5) bad=true;return }
+fun seed(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;drop=0;fault=0;bad=false;return
+}
+
+
+var polarity=false
+fun c5SpiRead(address: int): u32 {
+    if (address == 0x60081000 && fault == 9) return u32(1<<24)
+    if (address == 0x600960c4) return u32(5)
+    if (address == 0x60081020) return if (polarity) u32(1<<29) else u32(0)
+    return u32(0)
+}
+fun c5SpiWrite(address: int,value: u32): void { bad=true;return }
+fun pinOpen(clock: int): Esp32C5SpiPins =
+    esp32C5SpiPinsOpenOwned(spiPins((clock+1)%29,(clock+2)%29,clock),(clock+3)%29,true)
+@export("abla_spi_pins_c5_test")
+trusted fun testPins(): i32 {
+    var clock=0
+    while (clock < 29) {
+        var mode=0
+        while (mode < 2) {
+            polarity=mode != 0
+            seed()
+            c5GpioWrite(0x600913b8,u32(0xa5a50160))
+            writes=0
+            var owner=pinOpen(clock)
+            if (!owner.ready() || bad || c5GpioRead(0x600913b8) != u32(0xa5a50100|((clock+2)%29))) return i32(1)
+            val total=writes
+            val cs=(clock+3)%29
+            if ((c5GpioRead(0x60091004)&(u32(1)<<u32(cs))) == u32(0) ||
+                (c5GpioRead(0x60091ad4+clock*4)&u32(4095)) != u32(1080) ||
+                (c5GpioRead(0x60091ad4+((clock+1)%29)*4)&u32(4095)) != u32(1082)) return i32(2)
+            if (owner.closeOwned(false) != owner || owner.closeOwned(true) != 0 ||
+                c5GpioRead(0x60091034) != u32(0) || c5GpioRead(0x600913b8) != u32(0xa5a50160) || bad) return i32(3)
+            var failed=1
+            while (failed <= total) {
+                seed();drop=failed;owner=pinOpen(clock)
+                if (owner.status() != 1 && (owner.status() < 4 || owner.status() > 8)) return i32(4)
+                drop=0
+                if (owner.closeOwned(true) != 0 || c5GpioRead(0x60091034) != u32(0) || bad) return i32(5)
+                failed=failed+1
+            }
+            seed();owner=pinOpen(clock)
+            val before=writes
+            owner=owner.closeOwned(true)
+            val cleanupWrites=writes-before
+            failed=1
+            while (failed <= cleanupWrites) {
+                seed();owner=pinOpen(clock);drop=writes+failed
+                owner=owner.closeOwned(true)
+                if (owner.status() != 0 && owner.status() != 9) return i32(6)
+                drop=0
+                if (owner.closeOwned(true) != 0 || c5GpioRead(0x60091034) != u32(0) || bad) return i32(7)
+                failed=failed+1
+            }
+            mode=mode+1
+        }
+        clock=clock+1
+    }
+    seed()
+    if (esp32C5SpiPinsOpenOwned(spiPins(1,2,0),3,false).status() != 3 ||
+        esp32C5SpiPinsOpenOwned(spiPins(1,2,0),2,true).status() != 2 || writes != 0) return i32(8)
+    var optional=0
+    while (optional < 3) {
+        seed()
+        val profile=spiPins(if (optional == 0) -1 else 27,if (optional == 1) -1 else 26,25)
+        val owner=esp32C5SpiPinsOpenOwned(profile,28,true)
+        if (!owner.ready() || owner.closeOwned(true) != 0 || bad) return i32(9)
+        optional=optional+1
+    }
+    var denied=1
+    while (denied <= 9) {
+        if (denied != 7) {
+            seed();fault=denied
+            val profile=if (denied == 6) spiPins(12,11,13) else spiPins(1,2,0)
+            val owner=esp32C5SpiPinsOpenOwned(profile,if (denied == 6) 14 else 3,true)
+            if (owner.status() != 3 || writes != 0 || bad) return i32(10)
+        }
+        denied=denied+1
+    }
+    seed();nativeAddressStoreU32(memory,256+52,1)
+    if (esp32C5SpiPinsOpenOwned(spiPins(1,2,0),3,true).status() != 3 || writes != 0) return i32(11)
+    seed()
+    if (esp32C5SpiPinsOpenOwned(spiPins(7,8,9),29,true).status() != 2 || writes != 0) return i32(12)
+    val live=esp32C5SpiPinsOpenOwned(spiPins(7,8,9),25,true)
+    if (!live.ready()) return i32(13)
+    val before=writes;fault=9
+    if (live.closeOwned(true) != live || writes != before) return i32(14)
+    fault=0
+    if (live.closeOwned(true) != 0 || bad) return i32(15)
+    return i32(0)
+}

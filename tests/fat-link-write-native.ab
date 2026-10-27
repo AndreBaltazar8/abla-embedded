@@ -1,0 +1,104 @@
+import "../src/storage/fat_link_write.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(8192)
+var baseSector=0
+var fatSectors=0
+var reads=0
+var writes=0
+var failRead=0
+var failWrite=0
+var bad=false
+trusted fun imageSlot(lba: int): int =
+    if (lba == baseSector) 0 else if (lba == baseSector+1) 1 else
+    if (lba == baseSector+fatSectors) 2 else if (lba == baseSector+fatSectors+1) 3 else -1
+trusted fun fatStorageReadOwned(reader: NativeBuffer,lba: int,destination: NativeBuffer): bool {
+    reads=reads+1;val slot=imageSlot(lba)
+    if (slot < 0) { bad=true;return false }
+    val input=nativeBufferAt(memory+4096+slot*512,512);var index=0
+    while (index < 512) { destination.store(index,input.load(index));index=index+1 }
+    return reads != failRead
+}
+trusted fun fatStorageWriteOwned(reader: NativeBuffer,lba: int,source: NativeBuffer): bool {
+    writes=writes+1;val slot=imageSlot(lba)
+    if (slot < 0) { bad=true;return false }
+    val output=nativeBufferAt(memory+4096+slot*512,512);var index=0
+    while (index < 512) { output.store(index,source.load(index));index=index+1 }
+    return writes != failWrite
+}
+@export("abla_fat_link_write_test")
+trusted fun test(): i32 {
+    val reader=nativeBufferAt(memory,28);val boot=nativeBufferAt(memory+32,512)
+    val workspace=nativeBufferAt(memory+1024,2048)
+    val a=nativeBufferAt(memory+4096,512);val b=nativeBufferAt(memory+4608,512)
+    // Every FAT12 packed offset/parity, including511, preserves other bits.
+    var parity=0
+    while (parity < 2) {
+        var offset=0
+        while (offset < 512) {
+            var index=0
+            while (index < 512) { a.store(index,165);b.store(index,165);index=index+1 }
+            val location=FatLinkLocation(1|(offset<<32)|(1<<41)|(parity<<43)|(1<<44))
+            if (!fatLinkPatch(location,291,a,b) || fatLinkRaw(location,a,b) != 291) return i32(1)
+            index=0
+            while (index < 1024) {
+                val word=if (parity == 0) 41251 else 4661
+                val expected=if (index == offset) word&255 else if (index == offset+1) word>>8 else 165
+                if (nativeBufferAt(a.addressValue(),1024).load(index) != expected) return i32(2)
+                index=index+1
+            }
+            offset=offset+1
+        }
+        parity=parity+1
+    }
+    var mode=0
+    while (mode < 4) {
+        var index=0
+        while (index < 512) { boot.store(index,0);index=index+1 }
+        boot.storeU16(11,512);boot.store(13,1);boot.store(16,2);boot.storeU16(510,0xaa55)
+        val cluster=if (mode == 0) 341 else 2
+        if (mode < 2) {
+            boot.storeU16(14,1);boot.storeU16(17,512)
+            boot.storeU16(22,if (mode == 0) 8 else 40)
+            boot.storeU16(19,if (mode == 0) 2549 else 10113)
+        } else {
+            boot.storeU16(14,32);boot.storeU32(32,70000);boot.storeU32(36,600);boot.storeU32(44,2)
+            boot.storeU16(40,if (mode == 3) 129 else 0)
+        }
+        val total=if (mode == 0) 2549 else if (mode == 1) 10113 else 70000
+        val location=fatLinkLocate(boot,0,total,cluster)
+        if (!location.valid()) return i32(3)
+        baseSector=location.sector();fatSectors=fatBootFatSectors(boot)
+        val copies=if (mode == 3) 1 else 2
+        val spans=if (mode == 0) 2 else 1
+        var scenario=0
+        while (scenario < 4) {
+            reads=0;writes=0;failRead=if (scenario == 1) copies*spans else 0
+            failWrite=if (scenario == 2) copies*spans else 0
+            index=0
+            while (index < 2048) { nativeBufferAt(memory+4096,2048).store(index,165);index=index+1 }
+            var copy=0
+            while (copy < copies) {
+                if (!fatLinkPatch(location,if (scenario == 3 && copy == copies-1) 7 else 0,
+                    nativeBufferAt(memory+4096+copy*1024,512),nativeBufferAt(memory+4608+copy*1024,512))) return i32(4)
+                copy=copy+1
+            }
+            val result=fatWriteLinkOwned(reader,boot,0,total,cluster,0,5,workspace)
+            val status=if (scenario == 0) 1 else if (scenario == 1) 3 else if (scenario == 2) 5 else 4
+            if (result.status() != status || bad || writes != (if (scenario == 0 || scenario == 2) copies*spans else 0) ||
+                result.completedSectors() != (if (scenario == 0) copies*spans else if (scenario == 2) copies*spans-1 else 0)) return i32(5)
+            if (scenario == 0) {
+                copy=0
+                while (copy < copies) {
+                    val buffer=nativeBufferAt(memory+4096+copy*1024,512)
+                    if (fatLinkRaw(location,buffer,nativeBufferAt(buffer.addressValue()+512,512)) != 5 ||
+                        (mode >= 2 && (buffer.loadU32(location.offset())&0xf0000000) != 0xa0000000)) return i32(6)
+                    copy=copy+1
+                }
+            }
+            scenario=scenario+1
+        }
+        mode=mode+1
+    }
+    return i32(0)
+}

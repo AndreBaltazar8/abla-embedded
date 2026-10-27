@@ -1,0 +1,88 @@
+import "../src/esp32/uart/pins_c5_sequence.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+import "abla/runtime/scalar"
+import "abla/build"
+val memory=nativeStaticAllocate(4096)
+var writes=0
+var drop=0
+var fault=0
+var bad=false
+var expectedUnit=0
+var txPin=0
+var rxPin=1
+fun addressOffset(address: int): int = if (address >= 0x60090000 && address < 0x60090078) address-0x60090000 else
+    if (address >= 0x60091000 && address < 0x60091b4c) 256+address-0x60091000 else -1
+fun c5GpioRead(address: int): u32 {
+    if (address == 0x600960f0) return if (fault == 1) u32(3) else u32(1)
+    if (address == 0x600960f4) return if (fault == 2) u32(0) else u32(0x400000)
+    if (address == 0x60091df8) return u32(1)
+    if (address == 0x600b102c) return if (fault == 3) u32(1)<<u32(txPin) else u32(0)
+    if (address == 0x600b1028 || address == 0x6000f018) return u32(0)
+    val at=addressOffset(address)
+    if (at < 0) { bad=true;return u32(0) }
+    return u32(nativeAddressLoadU32(memory,at))
+}
+fun c5GpioWrite(address: int,value: u32): void {
+    writes=writes+1
+    var at=addressOffset(address);var wanted=value
+    if (address == 0x60091008 || address == 0x60091038) { at=at-4;wanted=u32(nativeAddressLoadU32(memory,at))|value }
+    if (address == 0x6009100c || address == 0x6009103c) { at=at-8;wanted=u32(nativeAddressLoadU32(memory,at))&~value }
+    if (at < 0) { bad=true;return }
+    if (address == 0x60091038 &&
+        ((c5GpioRead(0x60091ad4+txPin*4)&u32(4095)) != u32(1030+expectedUnit*3) ||
+         (c5GpioRead(0x600912ec+expectedUnit*12)&u32(511)) != u32(256|rxPin))) bad=true
+    if (writes != drop) nativeAddressStoreU32(memory,at,int(wanted))
+    return
+}
+fun c5SerialBusRead(unit: int): int { if (unit != expectedUnit) bad=true;return if (fault == 4) 4 else 5 }
+fun c5SerialClockRead(unit: int): int = 0x600000
+fun c5SerialRead(unit: int,offset: int): int {
+    if (unit != expectedUnit || fault == 4) bad=true
+    if (offset == 136) return 0x3000000
+    if (offset == 32) return if (fault == 5) 65536 else if (fault == 6) 64 else 0
+    if (offset == 28) return if (fault == 7) 65536 else 0
+    return 0
+}
+fun c5SerialClockWrite(unit: int,value: int): void { bad=true;return }
+fun c5SerialConfigWrite(unit: int,offset: int,value: int): void { bad=true;return }
+fun c5SerialWriteFifo(unit: int,value: int): void { bad=true;return }
+fun clear(): void {
+    var at=0
+    while (at < 4096) { nativeAddressStoreU32(memory,at,0);at=at+4 }
+    writes=0;bad=false;return
+}
+@export("abla_serial_pins_c5_test")
+trusted fun testPins(): int {
+    var unit=0
+    while (unit < 2) {
+        expectedUnit=unit;txPin=0
+        while (txPin < 29) {
+            rxPin=(txPin+1)%29
+            clear();fault=0;drop=0
+            if (c5UartPinsConfigureOwned(unit,txPin,rxPin,true) != 1 || bad ||
+                c5GpioRead(0x60091034) != (u32(1)<<u32(txPin))) return 1
+            val totalWrites=writes
+            var failedWrite=1
+            while (failedWrite <= totalWrites) {
+                clear();drop=failedWrite
+                val result=c5UartPinsConfigureOwned(unit,txPin,rxPin,true)
+                if (bad || result < 1 || result > 7 || result == 2 || result == 3) return 2
+                // A dropped already-satisfied write may legitimately succeed.
+                if (result != 1 && (c5GpioRead(0x60091034)&(u32(1)<<u32(txPin))) != u32(0)) return 3
+                failedWrite=failedWrite+1
+            }
+            drop=0;fault=1
+            while (fault <= 7) {
+                clear()
+                if (c5UartPinsConfigureOwned(unit,txPin,rxPin,true) != 3 || writes != 0 || bad) return 4
+                fault=fault+1
+            }
+            fault=0;txPin=txPin+1
+        }
+        unit=unit+1
+    }
+    clear()
+    if (c5UartPinsConfigureOwned(2,0,1,true) != 2 || c5UartPinsConfigureOwned(0,1,1,true) != 2 ||
+        c5UartPinsConfigureOwned(0,0,1,false) != 3 || writes != 0) return 5
+    return 0
+}

@@ -1,0 +1,89 @@
+import "../src/esp32/psram/clock_p4_sequence.ab"
+import "./p4-psram-pins-checks.ab"
+import "./p4-psram-reset-checks.ab"
+import "../src/esp32/sdk/raw_buffer.ab"
+val clockMemory=nativeStaticAllocate(256)
+var clockWrites=0
+var clockDrop=0
+fun clockSet(offset: int,value: int): void { nativeBufferAt(clockMemory,256).storeU32(offset,value); return }
+fun p4PsramClockRead(offset: int): int = nativeBufferAt(clockMemory,256).loadU32(offset)
+fun p4PsramClockWrite(offset: int,value: int): void {
+    clockWrites=clockWrites+1
+    if (offset == 192 && resetWriteCount < 4) {
+        nativeBufferAt(resetWriteLog,16).storeU32(resetWriteCount*4,value)
+        resetWriteCount=resetWriteCount+1
+    }
+    if (clockWrites != clockDrop) clockSet(offset,value)
+    return
+}
+fun resetClock(source: int,divider: int,borrow: int): void {
+    resetPsram(); clockWrites=0; clockDrop=0; mappedReads=0; resetWriteCount=0
+    clockSet(192,0xfd7fffff)
+    clockSet(20,0x7fffffff|(if ((borrow&1) != 0) 0x80000000 else 0))
+    clockSet(48,0xff000fff|(source<<12)|((divider-1)<<16)|(if ((borrow&2) != 0) 0x4000 else 0)|(if ((borrow&4) != 0) 0x8000 else 0))
+    return
+}
+fun psramClockChecks(): int {
+    var source=0
+    while (source < 4) {
+        var divider=1
+        while (divider <= 256) {
+            var borrow=0
+            while (borrow < 8) {
+                resetClock(source,divider,borrow)
+                val initial=p4PsramClockRead(48); val initialSys=p4PsramClockRead(20)
+                val owner=p4PsramClockOpenOwned(source,divider)
+                if (!owner.ready() || owner.source() != source || owner.divider() != divider || (owner&1792) != ((borrow^7)<<8) ||
+                    p4PsramClockRead(48) != (initial|0xc000) || p4PsramClockRead(20) != 0xffffffff || mappedReads != 0) return 30
+                if (owner.closeOwned(1).status() != 0 || p4PsramClockRead(48) != initial || p4PsramClockRead(20) != initialSys) return 31
+                borrow=borrow+1
+            }
+            // Source/divider selection cannot affect any neighboring fields.
+            resetClock(0,1,0)
+            if (p4PsramClockSelectOwned(0,source,divider) != 1 || p4PsramClockRead(48) != (0xff000fff|(source<<12)|((divider-1)<<16))) return 32
+            divider=divider+1
+        }
+        source=source+1
+    }
+    var failure=1
+    while (failure <= 3) {
+        resetClock(1,2,0); clockDrop=failure
+        val partial=p4PsramClockOpenOwned(1,2)
+        if (partial.status() != failure+3 || clockWrites != failure || mappedReads != 0) return 33
+        clockDrop=0
+        val owner=partial.resumeOwned()
+        if (!owner.ready() || (owner&1792) != 1792 || owner.closeOwned(1).status() != 0) return 34
+        resetClock(1,2,0)
+        val opened=p4PsramClockOpenOwned(1,2)
+        clockDrop=clockWrites+failure
+        val closing=opened.closeOwned(1)
+        if (closing.status() != 7-failure || (closing&0x200000) == 0) return 35
+        val reads=mappedReads
+        clockDrop=0
+        if (closing.closeOwned(1).status() != 0 || mappedReads != reads || (p4PsramClockRead(48)&0xc000) != 0 || (p4PsramClockRead(20)&0x80000000) != 0) return 36
+        failure=failure+1
+    }
+    resetClock(1,2,0)
+    val owner=p4PsramClockOpenOwned(1,2)
+    val count=clockWrites
+    registerWrite(60,1)
+    if (owner.closeOwned(1).status() != 7 || clockWrites != count) return 37
+    registerWrite(60,0); registerWrite(4096,1<<18)
+    if (owner.closeOwned(1).status() != 7 || clockWrites != count) return 38
+    registerWrite(4096,0); registerWrite(376,0)
+    if (owner.closeOwned(1).status() != 7 || clockWrites != count) return 39
+    clockSet(48,p4PsramClockRead(48)&0xffff7fff)
+    val before=mappedReads
+    if (owner.closeOwned(1).status() != 8 || clockWrites != count || mappedReads != before) return 40
+    resetClock(1,2,0); clockSet(192,0xffffffff)
+    if (p4PsramClockOpenOwned(1,2).status() != 3 || clockWrites != 0) return 41
+    resetClock(1,2,0)
+    if (p4PsramClockOpenOwned(0,2).status() != 3 || p4PsramClockOpenOwned(1,3).status() != 3 ||
+        p4PsramClockOpenOwned(4,2).status() != 2 || p4PsramClockOpenOwned(1,0).status() != 2 || clockWrites != 0) return 42
+    resetClock(1,2,6)
+    if (p4PsramClockSelectOwned(1,2,2) != 7 || p4PsramClockSelectOwned(0,2,2) != 3 || clockWrites != 0) return 43
+    resetClock(1,2,0); clockDrop=1
+    if (p4PsramClockSelectOwned(1,2,3) != 3 || clockWrites != 1) return 44
+    val resetResult=psramResetChecks()
+    return if (resetResult != 0) resetResult else psramPinsChecks()
+}
