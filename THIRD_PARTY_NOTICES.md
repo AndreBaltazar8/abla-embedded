@@ -1,5 +1,11 @@
 # Third-party notices
 
+`src/esp32/psram/timing_tables_s3.ab` adapts PSRAM candidate tables from
+ESP-IDF v6.0.2 `mspi_timing_tuning_configs.h` for ESP32-S3, copyright
+2019-2026 Espressif Systems (Shanghai) CO LTD, Apache-2.0. The representation
+was changed to packed Abla values; ordering and default indices are preserved.
+The accompanying `timing_tables_s3.LICENSE` contains the upstream license.
+
 Some M5Stack device mappings, register sequences, and protocol behavior in
 this project are derived from M5Unified and M5GFX. Those upstream projects are
 available under the following license:
