@@ -1,27 +1,72 @@
-import "../../xtensa/assembly.ab"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "hostap_esp32.ab"
+import "ioctl_recovered_esp32.ab"
 
-// Emergency-buffer frame allocation used by the classic ESP32 MAC. The
-// arithmetic and buffer layout are Abla-owned; only ic_ebuf_alloc remains a
-// temporary call into the packet engine until that allocator is ported.
+@inline
+trusted fun esp32WifiFrameLoadU32(address:u32):u32 = u32(
+    ablaUnsafeLoadU32(nativePointerFromAddress(int(address)))
+)
 
-@naked
+@inline
+trusted fun esp32WifiFrameStoreU32(address:u32, value:u32):void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+
+@inline
+trusted fun esp32WifiFramePayload(packet:u32, headerBytes:u32):u32 =
+    esp32WifiFrameLoadU32(esp32WifiFrameLoadU32(packet + u32(4)) + u32(4)) +
+        headerBytes
+
+@inline
+trusted fun esp32WifiFinishFrame(
+    packet:u32, outputAddress:u32, headerBytes:u32, payloadBytes:u32
+):u32 {
+    esp32WifiFrameStoreU32(outputAddress,
+        esp32WifiFramePayload(packet, headerBytes))
+    ablaUnsafeStoreU16(nativePointerFromAddress(int(packet + u32(22))),
+        int(payloadBytes))
+    packet
+}
+
 trusted fun esp32WifiManagementFrame(
-    outputAddress: u32,
-    headerBytes: u32,
-    payloadBytes: u32
-): u32 = xtensaAssemblyReadU32(
-    "entry a1, 32\nadd.n a10, a3, a4\naddi a10, a10, 3\nmovi a8, -4\nand a10, a10, a8\nmovi.n a11, 4\nmovi a8, 256\nbltu a8, a10, .Labla_mgt_allocate\nmovi.n a8, 64\nmovi.n a11, 2\nbltu a8, a10, .Labla_mgt_allocate\nmovi.n a11, 3\n.Labla_mgt_allocate:\nmov.n a12, a10\nmovi.n a10, 0\nmovi a8, ic_ebuf_alloc\ncallx8 a8\nbeqz.n a10, .Labla_mgt_return\nl32i.n a8, a10, 4\nl32i.n a8, a8, 4\nadd.n a8, a8, a3\ns32i.n a8, a2, 0\ns16i a4, a10, 22\nmemw\n.Labla_mgt_return:\nmov.n a2, a10\nmemw\nretw.n",
-    "~{memory}"
-)
+    outputAddress:u32, headerBytes:u32, payloadBytes:u32
+):u32 {
+    val allocationBytes = (headerBytes + payloadBytes + u32(3)) & u32(0xfffffffc)
+    val packetType = if (allocationBytes > u32(256)) u32(4)
+        else if (allocationBytes > u32(64)) u32(2) else u32(3)
+    val packet = esp32InterfacePacketBufferAllocate(
+        u32(0), packetType, allocationBytes)
+    if (packet == u32(0)) return u32(0)
+    esp32WifiFinishFrame(packet, outputAddress, headerBytes, payloadBytes)
+}
 
-// This is deliberately internal in station firmware. It remains available to
-// an Abla SoftAP module without forcing beacon strings or code into M5Echo.
-@naked
+// SoftAP-only path. Station firmware can prune this function, its strings and
+// the beacon allocation state as one unreachable graph.
 trusted fun esp32WifiBeaconFrame(
-    outputAddress: u32,
-    headerBytes: u32,
-    payloadBytes: u32
-): u32 = xtensaAssemblyReadU32(
-    ".pushsection .rodata.abla_wifi_beacon,\"aMS\",@progbits,1\n.Labla_beacon_init:\n.asciz \"Init max length of beacon: %d/%d\"\n.Labla_beacon_alloc_fail:\n.asciz \"alloc eb len=%d type=%d fail\\n\"\n.popsection\nentry a1, 32\nmov.n a5, a2\nmovi a2, g_beacon_idx\nl8ui a8, a2, 0\nmovi a2, g_beacon_eb\naddx4 a8, a8, a2\nl32i.n a2, a8, 0\nbnez.n a2, .Labla_beacon_ready\nmovi.n a11, 1\nmov.n a10, a11\nmovi a6, g_wifi_menuconfig\nmovi.n a12, 3\nl32i.n a14, a6, 56\nmovi a6, 752\nmax a7, a14, a6\nmov.n a15, a7\nmovi a13, .Labla_beacon_init\ncall8 wifi_log\nmov.n a10, a2\nmov.n a12, a7\nmovi.n a11, 4\nmovi a8, ic_ebuf_alloc\ncallx8 a8\nmov.n a2, a10\nbeqz.n a10, .Labla_beacon_failed\n.Labla_beacon_ready:\nl32i.n a6, a2, 4\nl32i.n a8, a6, 4\nadd.n a8, a8, a3\ns32i.n a8, a5, 0\ns16i a4, a2, 22\nmemw\nmemw\nj .Labla_beacon_return\n.Labla_beacon_failed:\nmovi a13, .Labla_beacon_alloc_fail\nmovi.n a15, 4\nmov.n a14, a6\nmovi.n a12, 2\nmovi.n a11, 64\nmovi.n a10, 1\ncall8 wifi_log\n.Labla_beacon_return:\nretw.n",
-    "~{memory}"
-)
+    outputAddress:u32, headerBytes:u32, payloadBytes:u32
+):u32 {
+    val beaconIndex = u32(ablaUnsafeLoadU8(nativePointerFromAddress(
+        int(esp32Data_g_beacon_idx_a8bf1e7652))))
+    var packet = esp32WifiFrameLoadU32(
+        esp32Data_g_beacon_eb_c869f5bb9a + (beaconIndex << u32(2)))
+    if (packet == u32(0)) {
+        val configured = esp32WifiFrameLoadU32(
+            esp32Data_g_wifi_menuconfig_c8372af18b + u32(56))
+        val allocationBytes = if (configured > u32(752)) configured else u32(752)
+        esp32WifiLogValue(u32(1),u32(1),u32(3),
+            u32(nativeCStringAddress("Init max length of beacon: %d/%d")),
+            configured,allocationBytes,
+            u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+        packet = esp32InterfacePacketBufferAllocate(
+            u32(0), u32(4), allocationBytes)
+        if (packet == u32(0)) {
+            esp32WifiLogValue(u32(1),u32(64),u32(2),
+                u32(nativeCStringAddress("alloc eb len=%d type=%d fail\n")),
+                allocationBytes,u32(4),
+                u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(0))
+            return u32(0)
+        }
+    }
+    esp32WifiFinishFrame(packet, outputAddress, headerBytes, payloadBytes)
+}

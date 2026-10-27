@@ -1,0 +1,344 @@
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "../dport_esp32.ab"
+import "../rom/system_esp32.ab"
+import "../../xtensa/assembly.ab"
+
+// Small classic-ESP32 PHY ROM operations translated instruction-for-instruction
+// into typed register and integer data flow. They intentionally retain the ROM
+// write ordering where two writes can be observed by radio hardware.
+
+@inline
+trusted fun esp32PhyUpdateRegister(
+    address: u32,
+    clearMask: u32,
+    setMask: u32
+): void {
+    val previous = xtensaDeviceLoadU32(address)
+    xtensaDeviceStoreU32(address, (previous & ~clearMask) | setMask)
+}
+
+// ROM slot 4: rom_phy_disable_cca.
+trusted fun esp32PhyRomDisableCca(): void {
+    val address = u32(0x6001c074)
+    esp32PhyUpdateRegister(address, u32(0), u32(0x00280000))
+    esp32PhyUpdateRegister(address, u32(0x00500000), u32(0))
+}
+
+// ROM slot 5: rom_phy_enable_cca.
+trusted fun esp32PhyRomEnableCca(): void =
+    esp32PhyUpdateRegister(u32(0x6001c074), u32(0x00280000), u32(0))
+
+// ROM slot 11: rom_get_data_sat. Clamp value between minimum and maximum;
+// the unusual ABI order is retained from the ROM entry.
+fun esp32PhyRomGetDataSaturated(
+    value: i32,
+    maximum: i32,
+    minimum: i32
+): i32 = if (maximum < value) maximum else
+    if (value < minimum) minimum else value
+
+// ROM slot 14: rom_rx_gain_force.
+trusted fun esp32PhyRomForceRxGain(enabled: u32, gain: u32): void {
+    val address = u32(0x6001c02c)
+    esp32PhyUpdateRegister(
+        address,
+        u32(0xff000000),
+        (gain & u32(255)) << u32(24)
+    )
+    esp32PhyUpdateRegister(
+        address,
+        u32(0x00800000),
+        (enabled & u32(1)) << u32(23)
+    )
+}
+
+// ROM slot 19: rom_stop_tx_tone.
+trusted fun esp32PhyRomStopTxTone(path: u32): void {
+    if (path == u32(1)) {
+        esp32PhyUpdateRegister(u32(0x600060b8), u32(0x00040000), u32(0))
+    } else if (path == u32(2)) {
+        esp32PhyUpdateRegister(u32(0x600060bc), u32(0x00040000), u32(0))
+    } else if (path == u32(3)) {
+        esp32PhyUpdateRegister(u32(0x600060c4), u32(0x00040000), u32(0))
+    } else {
+        esp32PhyUpdateRegister(u32(0x600060b8), u32(0x00040000), u32(0))
+        esp32PhyUpdateRegister(u32(0x600060bc), u32(0x00040000), u32(0))
+        esp32PhyUpdateRegister(u32(0x600060c4), u32(0x00040000), u32(0))
+    }
+}
+
+// ROM slot 21: rom_clk_force_on_vit.
+trusted fun esp32PhyRomForceVitClock(enabled: u32): void =
+    esp32PhyUpdateRegister(
+        u32(0x6001cc40), u32(1), enabled & u32(1)
+    )
+
+// ROM slot 22: rom_bb_rx_ht20_cen_bcov_en.
+trusted fun esp32PhyRomSetRxHt20CenterCoverage(enabled: u32): void =
+    esp32PhyUpdateRegister(
+        u32(0x6001d000),
+        u32(1) << u32(6),
+        (enabled & u32(1)) << u32(6)
+    )
+
+// ROM slot 30: rom_noise_floor_auto_set.
+trusted fun esp32PhyRomSetAutomaticNoiseFloor(): void {
+    val control = u32(0x6001c018)
+    esp32PhyUpdateRegister(control, u32(0), u32(1) << u32(23))
+    esp32PhyUpdateRegister(control, u32(0), u32(1) << u32(28))
+    esp32PhyUpdateRegister(u32(0x6001d044), u32(0), u32(1))
+    esp32PhyUpdateRegister(u32(0x6001d050), u32(0), u32(1))
+}
+
+// ROM slot 34: rom_chip_v7_rx_rifs_en.
+trusted fun esp32PhyRomSetRxRifs(enabled: u32): void =
+    esp32PhyUpdateRegister(
+        u32(0x6001c0f4), u32(1), enabled & u32(1)
+    )
+
+// ROM slots 35 and 36: copy an inclusive word range to and from RTC fast
+// memory. The return value is the copied byte count, matching the ROM ABI.
+trusted fun esp32PhyRomRtcMemoryBackup(
+    startAddress: u32,
+    endAddress: u32,
+    rtcWordOffset: u32
+): u32 {
+    val wordCount = ((endAddress - startAddress) >>> u32(2)) + u32(1)
+    if (wordCount == u32(0)) return u32(0)
+
+    var index = u32(0)
+    while (index != wordCount) {
+        val byteOffset = index << u32(2)
+        val value = xtensaDeviceLoadU32(startAddress + byteOffset)
+        val destination = u32(0x60021000) + rtcWordOffset + byteOffset
+        xtensaDeviceStoreU32(destination, value)
+        index = index + u32(1)
+    }
+    return wordCount << u32(2)
+}
+
+trusted fun esp32PhyRomRtcMemoryRecovery(
+    startAddress: u32,
+    endAddress: u32,
+    rtcWordOffset: u32
+): u32 {
+    val wordCount = ((endAddress - startAddress) >>> u32(2)) + u32(1)
+    if (wordCount == u32(0)) return u32(0)
+
+    var index = u32(0)
+    while (index != wordCount) {
+        val byteOffset = index << u32(2)
+        val source = u32(0x60021000) + rtcWordOffset + byteOffset
+        val value = xtensaDeviceLoadU32(source)
+        xtensaDeviceStoreU32(startAddress + byteOffset, value)
+        index = index + u32(1)
+    }
+    return wordCount << u32(2)
+}
+
+// ROM slot 27: convert the ROM's MHz representation to its IEEE channel
+// byte. LLVM can strength-reduce both constant signed divisions.
+fun esp32PhyRomMhzToIeee(frequency: u32, flags: u32): u32 {
+    val mhz = frequency & u32(0xffff)
+    if ((flags & u32(0x80)) != u32(0)) {
+        if (mhz == u32(2484)) return u32(14)
+        if (mhz <= u32(2483)) {
+            return u32((i32(mhz) - i32(2407)) / i32(5)) & u32(255)
+        }
+        return u32(
+            ((i32(mhz) - i32(2512)) / i32(20)) + i32(15)
+        ) & u32(255)
+    }
+    if (mhz > u32(2483)) return u32(255)
+    return u32((i32(mhz) - i32(2407)) / i32(5)) & u32(255)
+}
+
+// RAM replacements installed over ROM slots 43 and 46. These are the exact
+// classic-ESP32 DPORT sequences recovered from ram_pbus_force_mode and
+// ram_pbus_force_test, expressed as typed operations.
+trusted fun esp32PhyRamPbusForceMode(enabled: u32): void {
+    val dataControl = u32(0x3ff4609c)
+    val modeControl = u32(0x3ff46094)
+    if ((enabled & u32(255)) != u32(0)) {
+        esp32DportWrite(
+            dataControl,
+            esp32DportRead(dataControl) & u32(0xf7ffffff)
+        )
+        esp32DportWrite(
+            modeControl,
+            esp32DportRead(modeControl) | u32(1)
+        )
+        return
+    }
+
+    esp32DportWrite(
+        modeControl,
+        esp32DportRead(modeControl) & u32(0xfffffffe)
+    )
+    esp32DportWrite(
+        dataControl,
+        esp32DportRead(dataControl) & u32(0xf7ffffff)
+    )
+    if ((esp32DportRead(u32(0x3ff00024)) & u32(2)) == u32(0)) return
+
+    esp32EtsDelayUs(u32(1))
+    val gainControl = u32(0x3ff5c02c)
+    esp32DportWrite(
+        gainControl,
+        (esp32DportRead(gainControl) & u32(0x00ffffff)) |
+            u32(0x32000000)
+    )
+    esp32DportWrite(
+        gainControl,
+        esp32DportRead(gainControl) | u32(0x00800000)
+    )
+    esp32EtsDelayUs(u32(2))
+    esp32DportWrite(
+        gainControl,
+        esp32DportRead(gainControl) & u32(0xff7fffff)
+    )
+}
+
+trusted fun esp32PhyRamPbusForceTest(
+    block: u32,
+    selector: u32,
+    value: u32
+): void {
+    val control = u32(0x3ff46094)
+    val fields = ((((value & u32(0xffff)) << u32(6)) |
+        ((block & u32(255)) << u32(2)) |
+        ((selector & u32(255)) << u32(15))) & u32(0x0001fffc)) |
+        u32(2)
+    esp32DportWrite(
+        control,
+        (esp32DportRead(control) & u32(0xfffe0001)) | fields
+    )
+    while ((esp32DportRead(u32(0x3ff460a0)) & u32(0x80000000)) !=
+        u32(0)) { }
+    esp32DportWrite(
+        control,
+        esp32DportRead(control) & u32(0xfffffffd)
+    )
+}
+
+// ROM slots 44 and 45: pbus register address/field selection. Keeping this as
+// typed scalar logic removes two ROM jump tables and lets constant paths fold.
+fun esp32PhyRomPbusReadAddress(block: u32, selector: u32): u32 {
+    val source = block & u32(255)
+    val index = selector & u32(255)
+    if (source == u32(0)) return u32(0x600060a8)
+    if (source == u32(1)) return if (index == u32(1))
+        u32(0x600060a8) else u32(0x600060ac)
+    if (source == u32(2)) return u32(0x600060ac)
+    if (source == u32(3) || source == u32(4)) return u32(0x600060b0)
+    if (source == u32(5)) return u32(0x600060b4)
+    return source
+}
+
+fun esp32PhyRomPbusReadShift(block: u32, selector: u32): u32 {
+    val source = block & u32(255)
+    val index = selector & u32(255)
+    if (source == u32(0)) return u32(9)
+    if (source == u32(1)) return if (index == u32(1)) u32(0) else u32(18)
+    if (source == u32(2)) return if (index == u32(1)) u32(9) else u32(0)
+    if (source == u32(3)) return if (index == u32(1)) u32(18) else u32(9)
+    if (source == u32(4) || source == u32(5)) return if (
+        index == u32(1)
+    ) u32(0) else source
+    return source
+}
+
+// ROM slot 47: rom_pbus_rd.
+trusted fun esp32PhyRomPbusRead(block: u32, selector: u32): u32 {
+    val shift = esp32PhyRomPbusReadShift(block, selector)
+    val address = esp32PhyRomPbusReadAddress(block, selector)
+    val value = xtensaDeviceLoadU32(address)
+    return (value >>> shift) & u32(0x1ff)
+}
+
+// ROM slots 49 through 55. Calls through the mutable ROM table have become
+// direct typed calls because this firmware owns the installed implementations.
+trusted fun esp32PhyRomPbusWorkMode(): void =
+    esp32PhyRamPbusForceMode(u32(0))
+
+trusted fun esp32PhyRomPbusSetRxGain(configuration: u32): void {
+    val packedLow = ((configuration & u32(7)) << u32(6)) |
+        ((configuration >>> u32(8)) & u32(1)) |
+        (configuration & u32(16)) |
+        ((configuration & u32(8)) << u32(2)) |
+        ((configuration & u32(32)) >>> u32(2)) |
+        ((configuration & u32(64)) >>> u32(4)) |
+        ((configuration & u32(128)) >>> u32(6))
+    val preserved = esp32PhyRomPbusRead(u32(0), u32(1)) & u32(0x185)
+    val packedHigh = ((configuration & u32(0x400)) >>> u32(9)) |
+        ((configuration & u32(0x7800)) >>> u32(8)) | preserved
+    esp32PhyRamPbusForceTest(u32(1), u32(2), packedLow)
+    esp32PhyRamPbusForceTest(u32(0), u32(1), packedHigh & u32(0xffff))
+}
+
+trusted fun esp32PhyRomPbusPowerDownRx(): void {
+    esp32PhyRamPbusForceTest(u32(0), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(1), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(1), u32(2), u32(0))
+}
+
+trusted fun esp32PhyRomPbusPowerUpRx(rxGain: u32): void {
+    esp32PhyRamPbusForceTest(u32(4), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(5), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(0), u32(1), u32(0x184))
+    esp32PhyRamPbusForceTest(u32(1), u32(1), u32(0x189))
+    esp32PhyRamPbusForceTest(u32(1), u32(2), rxGain & u32(0xffff))
+}
+
+trusted fun esp32PhyRomPbusPowerDownTx(): void {
+    esp32PhyRamPbusForceTest(u32(4), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(5), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(1), u32(1), u32(0))
+    esp32PhyRamPbusForceTest(u32(1), u32(2), u32(0))
+    esp32PhyRamPbusForceTest(u32(0), u32(1), u32(0))
+}
+
+trusted fun esp32PhyRomPbusSetDco(values: u32): void {
+    esp32PhyRamPbusForceTest(
+        u32(2), u32(1),
+        u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(values))))
+    )
+    esp32PhyRamPbusForceTest(
+        u32(3), u32(1),
+        u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(values + u32(2)))))
+    )
+    esp32PhyRamPbusForceTest(
+        u32(2), u32(2),
+        u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(values + u32(4)))))
+    )
+    esp32PhyRamPbusForceTest(
+        u32(3), u32(2),
+        u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(values + u32(6)))))
+    )
+}
+
+// RAM replacement installed over slot 54. Its four default DCO words are all
+// 0x0100 in the recovered image, so the temporary stack array disappears.
+trusted fun esp32PhyRamPbusPowerUpTx(
+    txGain: u32,
+    calibration: u32
+): void {
+    esp32PhyRamPbusForceTest(u32(0), u32(1), u32(1))
+    esp32PhyRamPbusForceTest(u32(1), u32(1), u32(124))
+    esp32PhyRamPbusForceTest(u32(2), u32(1), u32(0x100))
+    esp32PhyRamPbusForceTest(u32(3), u32(1), u32(0x100))
+    esp32PhyRamPbusForceTest(u32(2), u32(2), u32(0x100))
+    esp32PhyRamPbusForceTest(u32(3), u32(2), u32(0x100))
+    esp32PhyRamPbusForceTest(
+        u32(1), u32(2), calibration & u32(0xffff)
+    )
+    if ((txGain & u32(0x100)) != u32(0)) {
+        val current = esp32PhyRomPbusRead(u32(1), u32(1))
+        esp32PhyRamPbusForceTest(
+            u32(1), u32(1), (current | u32(2)) & u32(0xffff)
+        )
+    }
+    esp32PhyRamPbusForceTest(u32(4), u32(1), u32(127))
+    esp32PhyRamPbusForceTest(u32(5), u32(1), txGain & u32(0xffff))
+}

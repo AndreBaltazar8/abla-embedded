@@ -1,0 +1,2477 @@
+import "../../runtime/freestanding_memory.ab"
+import "pbuf_basic_esp32.ab"
+import "../../esp32/system/assert_esp32.ab"
+import "../../runtime/freestanding_integer.ab"
+import "abla/build"
+import "abla/runtime/self"
+import "abla/unsafe/memory"
+import "ip_common_esp32.ab"
+import "shared_storage_esp32.ab"
+import "abla/unsafe/native"
+// Abla/LLVM implementation of the complete lwIP TCP input path: header and option parsing, PCB matching, listen and time-wait handling, state processing, acknowledgements, receive-window and congestion updates, out-of-order queues, data delivery, delayed close, and reset handling.
+
+@inline
+trusted fun esp32InternalTcpInputLoadU8(address: u32): u32 =
+    u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32InternalTcpInputLoadU16(address: u32): u32 =
+    u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32InternalTcpInputLoadU32(address: u32): u32 =
+    u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(address))))
+
+@inline
+trusted fun esp32InternalTcpInputStoreU8(address: u32, value: u32): void =
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(address)), int(value))
+
+@inline
+trusted fun esp32InternalTcpInputStoreU16(address: u32, value: u32): void =
+    ablaUnsafeStoreU16(nativePointerFromAddress(int(address)), int(value))
+
+@inline
+trusted fun esp32InternalTcpInputStoreU32(address: u32, value: u32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(address)), int(value))
+
+@inline
+trusted fun esp32InternalTcpInputHeaderU16(address: u32): u32 =
+    u32(freestandingByteSwap16(u16(esp32InternalTcpInputLoadU16(address))))
+
+@inline
+trusted fun esp32InternalTcpInputHeaderU32(address: u32): u32 =
+    freestandingByteSwap32(esp32InternalTcpInputLoadU32(address))
+
+@inline
+fun esp32InternalTcpInputSequenceGreaterOrEqual(left: u32, right: u32): bool =
+    i32(left - right) >= i32(0)
+
+@inline
+fun esp32InternalTcpInputSequenceLessOrEqual(left: u32, right: u32): bool =
+    i32(right - left) >= i32(0)
+
+@inline
+fun esp32InternalTcpInputSequenceBetween(value: u32, low: u32, high: u32): bool =
+    esp32InternalTcpInputSequenceGreaterOrEqual(value, low) &&
+        esp32InternalTcpInputSequenceLessOrEqual(value, high)
+
+@inline
+trusted fun esp32InternalTcpInputAcknowledgeNow(pcb: u32): void =
+    esp32InternalTcpInputStoreU16(
+        pcb + u32(70),
+        esp32InternalTcpInputLoadU16(pcb + u32(70)) | u32(2)
+    )
+
+@inline
+fun esp32InternalTcpInputInitialCongestionWindow(mss: u32): u32 {
+    val twiceMss = mss + mss
+    val fourTimesMss = mss << u32(2)
+    val lowerBound = if (twiceMss > u32(4380)) twiceMss else u32(4380)
+    if (fourTimesMss < lowerBound) fourTimesMss else lowerBound
+}
+
+trusted fun esp32InternalTcpInputMoveToTimeWait(pcb: u32): void {
+    var current = esp32InternalTcpInputLoadU32(esp32Data_tcp_active_pcbs_ae33bb9f54)
+    if (current == pcb) {
+        esp32InternalTcpInputStoreU32(
+            esp32Data_tcp_active_pcbs_ae33bb9f54,
+            esp32InternalTcpInputLoadU32(pcb + u32(52))
+        )
+    } else {
+        while (current != u32(0)) {
+            val next = esp32InternalTcpInputLoadU32(current + u32(52))
+            if (next == pcb) {
+                esp32InternalTcpInputStoreU32(
+                    current + u32(52),
+                    esp32InternalTcpInputLoadU32(pcb + u32(52))
+                )
+                current = u32(0)
+            } else {
+                current = next
+            }
+        }
+    }
+    esp32InternalTcpInputStoreU32(pcb + u32(52), u32(0))
+    esp32InternalTcpInputStoreU8(esp32Data_tcp_active_pcbs_changed_ed35697a30, u32(1))
+    esp32InternalTcpInputStoreU32(pcb + u32(60), u32(10))
+    esp32InternalTcpInputStoreU32(
+        pcb + u32(52),
+        esp32InternalTcpInputLoadU32(esp32Data_tcp_tw_pcbs_e6864109a6)
+    )
+    esp32InternalTcpInputStoreU32(esp32Data_tcp_tw_pcbs_e6864109a6, pcb)
+    esp32RecoveredTcpTimerNeeded(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0)
+    )
+    return
+}
+
+@inline
+trusted fun esp32InternalTcpInputSegmentFlags(segment: u32): u32 =
+    esp32InternalTcpInputHeaderU16(
+        esp32InternalTcpInputLoadU32(segment + u32(12)) + u32(12)
+    )
+
+@inline
+trusted fun esp32InternalTcpInputSegmentSequence(segment: u32): u32 =
+    esp32InternalTcpInputHeaderU32(
+        esp32InternalTcpInputLoadU32(segment + u32(12)) + u32(4)
+    )
+
+@inline
+trusted fun esp32InternalTcpInputSegmentLength(segment: u32): u32 {
+    val controlLength = if ((esp32InternalTcpInputSegmentFlags(segment) & u32(3)) != u32(0)) {
+        u32(1)
+    } else {
+        u32(0)
+    }
+    esp32InternalTcpInputLoadU16(segment + u32(8)) + controlLength
+}
+
+@inline
+trusted fun esp32InternalTcpInputSetSegmentFlags(segment: u32, flags: u32): void =
+    esp32InternalTcpInputStoreU16(
+        esp32InternalTcpInputLoadU32(segment + u32(12)) + u32(12),
+        u32(freestandingByteSwap16(u16(flags)))
+    )
+
+@inline
+trusted fun esp32InternalTcpInputSetSegmentSequence(segment: u32, sequence: u32): void =
+    esp32InternalTcpInputStoreU32(
+        esp32InternalTcpInputLoadU32(segment + u32(12)) + u32(4),
+        freestandingByteSwap32(sequence)
+    )
+
+@inline
+trusted fun esp32InternalTcpInputAcknowledge(pcb: u32): void {
+    val flags = esp32InternalTcpInputLoadU16(pcb + u32(70))
+    if ((flags & u32(1)) != u32(0)) {
+        esp32InternalTcpInputStoreU16(pcb + u32(70), (flags & u32(65534)) | u32(2))
+    } else {
+        esp32InternalTcpInputStoreU16(pcb + u32(70), flags | u32(1))
+    }
+}
+
+@inline
+fun esp32InternalTcpInputWindowAdd(value: u32, increment: u32): u32 {
+    val result = value + increment
+    if (result > u32(65535) || result < value) u32(65535) else result
+}
+
+@inline
+fun esp32InternalTcpInputSigned16(value: u32): i32 = i32(i16(u16(value)))
+
+@inline
+trusted fun esp32InternalTcpInputAddressEqual(left: u32, right: u32): bool {
+    val addressType = esp32InternalTcpInputLoadU8(left + u32(20))
+    if (addressType != esp32InternalTcpInputLoadU8(right + u32(20))) return false
+    if (esp32InternalTcpInputLoadU32(left) != esp32InternalTcpInputLoadU32(right)) return false
+    if (addressType != u32(6)) return true
+    esp32InternalTcpInputLoadU32(left + u32(4)) == esp32InternalTcpInputLoadU32(right + u32(4)) &&
+        esp32InternalTcpInputLoadU32(left + u32(8)) == esp32InternalTcpInputLoadU32(right + u32(8)) &&
+        esp32InternalTcpInputLoadU32(left + u32(12)) == esp32InternalTcpInputLoadU32(right + u32(12)) &&
+        esp32InternalTcpInputLoadU8(left + u32(16)) == esp32InternalTcpInputLoadU8(right + u32(16))
+}
+
+@inline
+trusted fun esp32InternalTcpInputAddressIsAny(address: u32): bool {
+    if (esp32InternalTcpInputLoadU32(address) != u32(0)) return false
+    if (esp32InternalTcpInputLoadU8(address + u32(20)) != u32(6)) return true
+    esp32InternalTcpInputLoadU32(address + u32(4)) == u32(0) &&
+        esp32InternalTcpInputLoadU32(address + u32(8)) == u32(0) &&
+        esp32InternalTcpInputLoadU32(address + u32(12)) == u32(0)
+}
+
+@inline
+trusted fun esp32InternalTcpInputNetifMatches(pcb: u32): bool {
+    val index = esp32InternalTcpInputLoadU8(pcb + u32(48))
+    if (index == u32(0)) return true
+    val inputNetif = esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(4))
+    index == ((esp32InternalTcpInputLoadU8(inputNetif + u32(234)) + u32(1)) & u32(255))
+}
+
+// Original ABI symbol: tcp_input
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val indexAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcp_optidx_tcp_optidx_6bf3ca0360
+    val index = esp32InternalTcpInputLoadU16(indexAddress)
+    esp32InternalTcpInputStoreU16(indexAddress, index + u32(1))
+
+    val secondOptions = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44
+    )
+    val firstLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5
+    )
+    if (secondOptions == u32(0) || index < firstLength) {
+        val header = esp32InternalTcpInputLoadU32(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+        )
+        return esp32InternalTcpInputLoadU8(header + u32(20) + index)
+    }
+    esp32InternalTcpInputLoadU8(secondOptions + index - firstLength)
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt_4d8ed7eb4e(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(1969),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0f,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b
+        )
+    }
+
+    val optionLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_optlen_tcphdr_optlen_30568c08ba
+    )
+    if (optionLength == u32(0)) return a2
+
+    val indexAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcp_optidx_tcp_optidx_6bf3ca0360
+    esp32InternalTcpInputStoreU16(indexAddress, u32(0))
+    while (esp32InternalTcpInputLoadU16(indexAddress) < optionLength) {
+        val option = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0)
+        )
+        when (option) {
+            u32(0) -> return a2
+            u32(1) -> {}
+            u32(2) -> {
+                val encodedLength = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0)
+                )
+                if (encodedLength != u32(4) ||
+                    esp32InternalTcpInputLoadU16(indexAddress) + u32(2) > optionLength) return a2
+                val high = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0)
+                )
+                val low = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0)
+                )
+                val advertisedMss = (high << u32(8)) | low
+                val effectiveMss = if (advertisedMss == u32(0) || advertisedMss > u32(1440)) {
+                    u32(1440)
+                } else {
+                    advertisedMss
+                }
+                esp32InternalTcpInputStoreU16(a2 + u32(94), effectiveMss)
+            }
+            else -> {
+                val encodedLength = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_get_next_optbyte_929c8bbc81(
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0)
+                )
+                if (encodedLength < u32(2)) return a2
+                esp32InternalTcpInputStoreU16(
+                    indexAddress,
+                    esp32InternalTcpInputLoadU16(indexAddress) + encodedLength - u32(2)
+                )
+            }
+        }
+    }
+    a2
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt_4d8ed7eb4eLink = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt_4d8ed7eb4e", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close_34b724b353(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(615),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966a
+        )
+    }
+
+    val receiveFlags = esp32InternalTcpInputLoadU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+    )
+    if ((receiveFlags & u32(16)) == u32(0)) return u32(0)
+
+    val pcbFlags = esp32InternalTcpInputLoadU16(a2 + u32(70))
+    if ((pcbFlags & u32(16)) == u32(0)) {
+        val errorCallback = esp32InternalTcpInputLoadU32(a2 + u32(188))
+        if (errorCallback != u32(0)) {
+            ablaUnsafeCallI32I32I32I32I32I32I32(
+                int(errorCallback),
+                int(esp32InternalTcpInputLoadU32(a2 + u32(56))),
+                int(u32(4294967281)),
+                int(u32(0)), int(u32(0)), int(u32(0)), int(u32(0))
+            )
+        }
+    }
+    esp32RecoveredTcpPcbRemove(
+        esp32Data_tcp_active_pcbs_ae33bb9f54, a2, u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32RecoveredTcpFree(
+        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    u32(1)
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close_34b724b353Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close_34b724b353", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_timewait_input_b9e51a0376(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val packetFlags = esp32InternalTcpInputLoadU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182
+    )
+    if ((packetFlags & u32(4)) != u32(0)) return a2
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(766),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099
+        )
+    }
+
+    val sequence = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19
+    )
+    val segmentLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464
+    )
+    if ((packetFlags & u32(2)) != u32(0)) {
+        val receiveNext = esp32InternalTcpInputLoadU32(a2 + u32(80))
+        val receiveWindow = esp32InternalTcpInputLoadU16(a2 + u32(84))
+        if (esp32InternalTcpInputSequenceBetween(sequence, receiveNext, receiveNext + receiveWindow)) {
+            val header = esp32InternalTcpInputLoadU32(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+            )
+            esp32RecoveredTcpRst(
+                a2,
+                esp32InternalTcpInputLoadU32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e),
+                sequence + segmentLength,
+                esp32Data_ip_data_48d8350b61 + u32(44),
+                esp32Data_ip_data_48d8350b61 + u32(20),
+                esp32InternalTcpInputLoadU16(header + u32(2)),
+                esp32InternalTcpInputLoadU16(header),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            return a2
+        }
+    } else if ((packetFlags & u32(1)) != u32(0)) {
+        esp32InternalTcpInputStoreU32(
+            a2 + u32(76),
+            esp32InternalTcpInputLoadU32(esp32Data_tcp_ticks_02ec223afe)
+        )
+    }
+
+    if (segmentLength != u32(0)) {
+        esp32InternalTcpInputStoreU16(
+            a2 + u32(70),
+            esp32InternalTcpInputLoadU16(a2 + u32(70)) | u32(2)
+        )
+        esp32RecoveredTcpOutput(
+            a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    a2
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_timewait_input_b9e51a0376Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_timewait_input_b9e51a0376", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_timewait_input")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_listen_input_cb2521dc54(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val packetFlags = esp32InternalTcpInputLoadU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182
+    )
+    if ((packetFlags & u32(4)) != u32(0)) return a2
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(654),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598
+        )
+    }
+
+    val header = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+    )
+    val sequence = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19
+    )
+    val segmentLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464
+    )
+    if ((packetFlags & u32(16)) != u32(0)) {
+        esp32RecoveredTcpRstNetif(
+            esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(4)),
+            esp32InternalTcpInputLoadU32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e),
+            sequence + segmentLength,
+            esp32Data_ip_data_48d8350b61 + u32(44),
+            esp32Data_ip_data_48d8350b61 + u32(20),
+            esp32InternalTcpInputLoadU16(header + u32(2)),
+            esp32InternalTcpInputLoadU16(header),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        return a2
+    }
+    if ((packetFlags & u32(2)) == u32(0)) return a2
+
+    val pending = esp32InternalTcpInputLoadU8(a2 + u32(73))
+    if (pending >= esp32InternalTcpInputLoadU8(a2 + u32(72))) return a2
+
+    val newPcb = esp32RecoveredTcpAlloc(
+        esp32InternalTcpInputLoadU8(a2 + u32(64)),
+        u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (newPcb == u32(0)) {
+        val acceptCallback = esp32InternalTcpInputLoadU32(a2 + u32(68))
+        if (acceptCallback != u32(0)) {
+            ablaUnsafeCallI32I32I32I32I32I32I32(
+                int(acceptCallback),
+                int(esp32InternalTcpInputLoadU32(a2 + u32(56))),
+                int(u32(0)),
+                int(u32(4294967295)),
+                int(u32(0)), int(u32(0)), int(u32(0))
+            )
+        }
+        return a2
+    }
+
+    esp32InternalTcpInputStoreU8(a2 + u32(73), pending + u32(1))
+    esp32InternalTcpInputStoreU16(
+        newPcb + u32(70),
+        esp32InternalTcpInputLoadU16(newPcb + u32(70)) | u32(512)
+    )
+
+    val localType = esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(64))
+    esp32InternalTcpInputStoreU8(newPcb + u32(20), localType)
+    esp32InternalTcpInputStoreU32(
+        newPcb,
+        esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(44))
+    )
+    if (localType == u32(6)) {
+        esp32InternalTcpInputStoreU32(newPcb + u32(4), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(48)))
+        esp32InternalTcpInputStoreU32(newPcb + u32(8), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(52)))
+        esp32InternalTcpInputStoreU32(newPcb + u32(12), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(56)))
+        esp32InternalTcpInputStoreU8(newPcb + u32(16), esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(60)))
+    } else {
+        esp32InternalTcpInputStoreU32(newPcb + u32(4), u32(0))
+        esp32InternalTcpInputStoreU32(newPcb + u32(8), u32(0))
+        esp32InternalTcpInputStoreU32(newPcb + u32(12), u32(0))
+        esp32InternalTcpInputStoreU8(newPcb + u32(16), u32(0))
+    }
+
+    val remoteType = esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(40))
+    esp32InternalTcpInputStoreU8(newPcb + u32(44), remoteType)
+    esp32InternalTcpInputStoreU32(
+        newPcb + u32(24),
+        esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(20))
+    )
+    if (remoteType == u32(6)) {
+        esp32InternalTcpInputStoreU32(newPcb + u32(28), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(24)))
+        esp32InternalTcpInputStoreU32(newPcb + u32(32), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(28)))
+        esp32InternalTcpInputStoreU32(newPcb + u32(36), esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(32)))
+        esp32InternalTcpInputStoreU8(newPcb + u32(40), esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(36)))
+    } else {
+        esp32InternalTcpInputStoreU32(newPcb + u32(28), u32(0))
+        esp32InternalTcpInputStoreU32(newPcb + u32(32), u32(0))
+        esp32InternalTcpInputStoreU32(newPcb + u32(36), u32(0))
+        esp32InternalTcpInputStoreU8(newPcb + u32(40), u32(0))
+    }
+
+    esp32InternalTcpInputStoreU16(newPcb + u32(66), esp32InternalTcpInputLoadU16(a2 + u32(66)))
+    esp32InternalTcpInputStoreU16(newPcb + u32(68), esp32InternalTcpInputLoadU16(header))
+    esp32InternalTcpInputStoreU32(newPcb + u32(60), u32(3))
+    esp32InternalTcpInputStoreU32(newPcb + u32(80), sequence + u32(1))
+    esp32InternalTcpInputStoreU32(newPcb + u32(88), sequence + u32(1))
+
+    val initialSequence = esp32RecoveredTcpNextIss(
+        newPcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32InternalTcpInputStoreU32(newPcb + u32(132), initialSequence)
+    esp32InternalTcpInputStoreU32(newPcb + u32(124), initialSequence)
+    esp32InternalTcpInputStoreU32(newPcb + u32(112), initialSequence)
+    esp32InternalTcpInputStoreU32(newPcb + u32(136), initialSequence)
+    esp32InternalTcpInputStoreU32(newPcb + u32(128), sequence - u32(1))
+    esp32InternalTcpInputStoreU32(newPcb + u32(56), esp32InternalTcpInputLoadU32(a2 + u32(56)))
+    esp32InternalTcpInputStoreU32(newPcb + u32(168), a2)
+    esp32InternalTcpInputStoreU8(newPcb + u32(49), esp32InternalTcpInputLoadU8(a2 + u32(49)) & u32(12))
+    esp32InternalTcpInputStoreU8(newPcb + u32(48), esp32InternalTcpInputLoadU8(a2 + u32(48)))
+
+    val activeList = esp32Data_tcp_active_pcbs_ae33bb9f54
+    esp32InternalTcpInputStoreU32(newPcb + u32(52), esp32InternalTcpInputLoadU32(activeList))
+    esp32InternalTcpInputStoreU32(activeList, newPcb)
+    esp32RecoveredTcpTimerNeeded(
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32InternalTcpInputStoreU8(esp32Data_tcp_active_pcbs_changed_ed35697a30, u32(1))
+
+    esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt_4d8ed7eb4e(
+        newPcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    val advertisedWindow = esp32InternalTcpInputLoadU16(header + u32(14))
+    esp32InternalTcpInputStoreU16(newPcb + u32(140), advertisedWindow)
+    esp32InternalTcpInputStoreU16(newPcb + u32(142), advertisedWindow)
+
+    val remoteAddress = newPcb + u32(24)
+    val route = if (remoteType == u32(6)) {
+        esp32RecoveredIp6Route(
+            newPcb, remoteAddress, u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    } else {
+        esp32RecoveredIp4RouteSrc(
+            newPcb, remoteAddress, u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    val effectiveMss = esp32RecoveredTcpEffSendMssNetif(
+        esp32InternalTcpInputLoadU16(newPcb + u32(94)),
+        route,
+        remoteAddress,
+        u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    esp32InternalTcpInputStoreU16(newPcb + u32(94), effectiveMss)
+
+    val enqueueResult = esp32RecoveredTcpEnqueueFlags(
+        newPcb, u32(18), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+    if (enqueueResult != u32(0)) {
+        esp32RecoveredTcpAbandon(
+            newPcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    } else {
+        esp32RecoveredTcpOutput(
+            newPcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    a2
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_listen_input_cb2521dc54Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_listen_input_cb2521dc54", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_listen_input")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(1084),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7
+        )
+    }
+
+    val currentHeader = esp32InternalTcpInputLoadU32(a2 + u32(12))
+    var next = a3
+    if ((esp32InternalTcpInputHeaderU16(currentHeader + u32(12)) & u32(1)) != u32(0)) {
+        esp32RecoveredTcpSegsFree(
+            next, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        next = u32(0)
+    } else {
+        val sequence = esp32InternalTcpInputLoadU32(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19
+        )
+        val currentEnd = sequence + esp32InternalTcpInputLoadU16(a2 + u32(8))
+        while (next != u32(0)) {
+            val nextHeader = esp32InternalTcpInputLoadU32(next + u32(12))
+            val nextEnd = esp32InternalTcpInputHeaderU32(nextHeader + u32(4)) +
+                esp32InternalTcpInputLoadU16(next + u32(8))
+            if (!esp32InternalTcpInputSequenceGreaterOrEqual(currentEnd, nextEnd)) break
+            if ((esp32InternalTcpInputHeaderU16(nextHeader + u32(12)) & u32(1)) != u32(0)) {
+                val flags = esp32InternalTcpInputHeaderU16(currentHeader + u32(12)) | u32(1)
+                esp32InternalTcpInputStoreU16(currentHeader + u32(12), u32(freestandingByteSwap16(u16(flags))))
+            }
+            val old = next
+            next = esp32InternalTcpInputLoadU32(next)
+            esp32RecoveredTcpSegFree(
+                old, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+        }
+        if (next != u32(0)) {
+            val nextSequence = esp32InternalTcpInputHeaderU32(
+                esp32InternalTcpInputLoadU32(next + u32(12)) + u32(4)
+            )
+            if (i32(currentEnd - nextSequence) > i32(0)) {
+                val trimmedLength = nextSequence - sequence
+                esp32InternalTcpInputStoreU16(a2 + u32(8), trimmedLength)
+                esp32LwipPbufReallocateValue(
+                    esp32InternalTcpInputLoadU32(a2 + u32(4)),
+                    trimmedLength
+                )
+            }
+        }
+    }
+    esp32InternalTcpInputStoreU32(a2, next)
+    a2
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments_246a76beb7(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    var segment = a3
+    val acknowledgement = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e
+    )
+    while (segment != u32(0)) {
+        val header = esp32InternalTcpInputLoadU32(segment + u32(12))
+        val sequence = esp32InternalTcpInputHeaderU32(header + u32(4))
+        val length = esp32InternalTcpInputLoadU16(segment + u32(8))
+        val controlLength = if ((esp32InternalTcpInputHeaderU16(header + u32(12)) & u32(3)) != u32(0)) {
+            u32(1)
+        } else {
+            u32(0)
+        }
+        if (!esp32InternalTcpInputSequenceLessOrEqual(sequence + length + controlLength, acknowledgement)) break
+
+        val old = segment
+        segment = esp32InternalTcpInputLoadU32(segment)
+        val chainLength = esp32LwipPbufChainLength(esp32InternalTcpInputLoadU32(old + u32(4)))
+        val queued = esp32InternalTcpInputLoadU16(a2 + u32(146))
+        if (queued < chainLength) {
+            esp32AssertFailed(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                u32(1140),
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0,
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7
+            )
+        }
+        val remaining = queued - chainLength
+        esp32InternalTcpInputStoreU16(a2 + u32(146), remaining)
+        val receivedAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f
+        esp32InternalTcpInputStoreU16(
+            receivedAddress,
+            esp32InternalTcpInputLoadU16(receivedAddress) + length
+        )
+        esp32RecoveredTcpSegFree(
+            old, u32(0), u32(0), u32(0), u32(0), u32(0),
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+        if (remaining != u32(0) && segment == u32(0) && a5 == u32(0)) {
+            esp32AssertFailed(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                u32(1150),
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0,
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7
+            )
+        }
+    }
+    segment
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments_246a76beb7Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments_246a76beb7", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(1175),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630
+        )
+    }
+    if (esp32InternalTcpInputLoadU32(a2 + u32(60)) < u32(4)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(1176),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630
+        )
+    }
+
+    val packetFlags = esp32InternalTcpInputLoadU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182
+    )
+    var sequence = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19
+    )
+    val acknowledgement = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e
+    )
+    var segmentLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464
+    )
+    val incoming = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_inseg_inseg_a6baf24097
+    val header = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+    )
+
+    if ((packetFlags & u32(16)) != u32(0)) {
+        val oldRightEdge = esp32InternalTcpInputLoadU32(a2 + u32(132)) +
+            esp32InternalTcpInputLoadU16(a2 + u32(140))
+        val advertisedWindow = esp32InternalTcpInputLoadU16(header + u32(14))
+        val windowSequence = esp32InternalTcpInputLoadU32(a2 + u32(128))
+        val windowAcknowledgement = esp32InternalTcpInputLoadU32(a2 + u32(132))
+        if (i32(sequence - windowSequence) > i32(0) ||
+            (sequence == windowSequence && i32(acknowledgement - windowAcknowledgement) > i32(0)) ||
+            (acknowledgement == windowAcknowledgement &&
+                advertisedWindow > esp32InternalTcpInputLoadU16(a2 + u32(140)))) {
+            esp32InternalTcpInputStoreU16(a2 + u32(140), advertisedWindow)
+            if (advertisedWindow > esp32InternalTcpInputLoadU16(a2 + u32(142))) {
+                esp32InternalTcpInputStoreU16(a2 + u32(142), advertisedWindow)
+            }
+            esp32InternalTcpInputStoreU32(a2 + u32(128), sequence)
+            esp32InternalTcpInputStoreU32(a2 + u32(132), acknowledgement)
+        }
+
+        val lastAcknowledgement = esp32InternalTcpInputLoadU32(a2 + u32(112))
+        if (esp32InternalTcpInputSequenceLessOrEqual(acknowledgement, lastAcknowledgement)) {
+            if (segmentLength == u32(0) &&
+                esp32InternalTcpInputLoadU32(a2 + u32(132)) +
+                    esp32InternalTcpInputLoadU16(a2 + u32(140)) == oldRightEdge &&
+                esp32InternalTcpInputSigned16(esp32InternalTcpInputLoadU16(a2 + u32(92))) >= i32(0) &&
+                acknowledgement == lastAcknowledgement) {
+                val duplicateCount = esp32InternalTcpInputLoadU8(a2 + u32(111))
+                if (duplicateCount != u32(255)) {
+                    esp32InternalTcpInputStoreU8(a2 + u32(111), duplicateCount + u32(1))
+                }
+                val newDuplicateCount = esp32InternalTcpInputLoadU8(a2 + u32(111))
+                if (newDuplicateCount > u32(3)) {
+                    esp32InternalTcpInputStoreU16(
+                        a2 + u32(116),
+                        esp32InternalTcpInputWindowAdd(
+                            esp32InternalTcpInputLoadU16(a2 + u32(116)),
+                            esp32InternalTcpInputLoadU16(a2 + u32(94))
+                        )
+                    )
+                }
+                if (newDuplicateCount >= u32(3)) {
+                    esp32RecoveredTcpRexmitFast(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            }
+        } else if (esp32InternalTcpInputSequenceBetween(
+            acknowledgement,
+            lastAcknowledgement + u32(1),
+            esp32InternalTcpInputLoadU32(a2 + u32(124))
+        )) {
+            val pcbFlags = esp32InternalTcpInputLoadU16(a2 + u32(70))
+            if ((pcbFlags & u32(4)) != u32(0)) {
+                esp32InternalTcpInputStoreU16(a2 + u32(70), pcbFlags & u32(65531))
+                esp32InternalTcpInputStoreU16(a2 + u32(116), esp32InternalTcpInputLoadU16(a2 + u32(118)))
+                esp32InternalTcpInputStoreU16(a2 + u32(148), u32(0))
+            }
+            esp32InternalTcpInputStoreU8(a2 + u32(110), u32(0))
+            val smoothed = esp32InternalTcpInputSigned16(esp32InternalTcpInputLoadU16(a2 + u32(104)))
+            val variance = esp32InternalTcpInputSigned16(esp32InternalTcpInputLoadU16(a2 + u32(106)))
+            esp32InternalTcpInputStoreU16(a2 + u32(108), u32((smoothed >> 3) + variance))
+
+            val acknowledgedBytes = acknowledgement - lastAcknowledgement
+            esp32InternalTcpInputStoreU8(a2 + u32(111), u32(0))
+            esp32InternalTcpInputStoreU32(a2 + u32(112), acknowledgement)
+            val congestionWindow = esp32InternalTcpInputLoadU16(a2 + u32(116))
+            val slowStartThreshold = esp32InternalTcpInputLoadU16(a2 + u32(118))
+            if (esp32InternalTcpInputLoadU32(a2 + u32(60)) >= u32(4)) {
+                if (congestionWindow < slowStartThreshold) {
+                    val segments = if ((pcbFlags & u32(2048)) != u32(0)) u32(1) else u32(2)
+                    val maximumIncrease = segments * esp32InternalTcpInputLoadU16(a2 + u32(94))
+                    val increase = if (acknowledgedBytes < maximumIncrease) acknowledgedBytes else maximumIncrease
+                    esp32InternalTcpInputStoreU16(
+                        a2 + u32(116),
+                        esp32InternalTcpInputWindowAdd(congestionWindow, increase)
+                    )
+                } else {
+                    val bytesAcknowledged = esp32InternalTcpInputWindowAdd(
+                        esp32InternalTcpInputLoadU16(a2 + u32(148)),
+                        acknowledgedBytes
+                    )
+                    if (bytesAcknowledged >= congestionWindow) {
+                        esp32InternalTcpInputStoreU16(a2 + u32(148), bytesAcknowledged - congestionWindow)
+                        esp32InternalTcpInputStoreU16(
+                            a2 + u32(116),
+                            esp32InternalTcpInputWindowAdd(
+                                congestionWindow,
+                                esp32InternalTcpInputLoadU16(a2 + u32(94))
+                            )
+                        )
+                    } else {
+                        esp32InternalTcpInputStoreU16(a2 + u32(148), bytesAcknowledged)
+                    }
+                }
+            }
+
+            val unacked = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments_246a76beb7(
+                a2,
+                esp32InternalTcpInputLoadU32(a2 + u32(156)),
+                u32(0),
+                esp32InternalTcpInputLoadU32(a2 + u32(152)),
+                u32(0),
+                u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            esp32InternalTcpInputStoreU32(a2 + u32(156), unacked)
+            val unsent = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_free_acked_segments_246a76beb7(
+                a2,
+                esp32InternalTcpInputLoadU32(a2 + u32(152)),
+                u32(0),
+                unacked,
+                u32(0),
+                u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            esp32InternalTcpInputStoreU32(a2 + u32(152), unsent)
+            esp32InternalTcpInputStoreU16(a2 + u32(92), if (unacked == u32(0)) u32(65535) else u32(0))
+            esp32InternalTcpInputStoreU8(a2 + u32(72), u32(0))
+
+            if (esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(64)) == u32(6)) {
+                esp32RecoveredNd6ReachabilityHint(
+                    esp32Data_ip_data_48d8350b61 + u32(20),
+                    u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+            }
+            val receivedAcknowledged = esp32InternalTcpInputLoadU16(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f
+            )
+            esp32InternalTcpInputStoreU16(
+                a2 + u32(144),
+                esp32InternalTcpInputLoadU16(a2 + u32(144)) + receivedAcknowledged
+            )
+
+            val updatedFlags = esp32InternalTcpInputLoadU16(a2 + u32(70))
+            if ((updatedFlags & u32(2048)) != u32(0)) {
+                var retransmissionDone = false
+                if (unacked == u32(0)) {
+                    retransmissionDone = unsent == u32(0) ||
+                        esp32InternalTcpInputSequenceLessOrEqual(
+                            esp32InternalTcpInputLoadU32(a2 + u32(120)),
+                            esp32InternalTcpInputSegmentSequence(unsent)
+                        )
+                } else {
+                    retransmissionDone = esp32InternalTcpInputSequenceLessOrEqual(
+                        esp32InternalTcpInputLoadU32(a2 + u32(120)),
+                        esp32InternalTcpInputSegmentSequence(unacked)
+                    )
+                }
+                if (retransmissionDone) {
+                    esp32InternalTcpInputStoreU16(a2 + u32(70), updatedFlags & u32(63487))
+                }
+            }
+        } else {
+            esp32RecoveredTcpSendEmptyAck(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+        }
+
+        val roundTripStart = esp32InternalTcpInputLoadU32(a2 + u32(96))
+        if (roundTripStart != u32(0) &&
+            i32(acknowledgement - esp32InternalTcpInputLoadU32(a2 + u32(100))) > i32(0)) {
+            val ticks = esp32InternalTcpInputLoadU16(esp32Data_tcp_ticks_02ec223afe)
+            var measurement = esp32InternalTcpInputSigned16(ticks - roundTripStart)
+            var average = esp32InternalTcpInputSigned16(esp32InternalTcpInputLoadU16(a2 + u32(104)))
+            measurement = measurement - (average >> 3)
+            average = average + measurement
+            esp32InternalTcpInputStoreU16(a2 + u32(104), u32(average))
+            if (measurement < i32(0)) measurement = i32(0) - measurement
+            var variation = esp32InternalTcpInputSigned16(esp32InternalTcpInputLoadU16(a2 + u32(106)))
+            measurement = measurement - (variation >> 2)
+            variation = variation + measurement
+            esp32InternalTcpInputStoreU16(a2 + u32(106), u32(variation))
+            esp32InternalTcpInputStoreU16(a2 + u32(108), u32((average >> 3) + variation))
+            esp32InternalTcpInputStoreU32(a2 + u32(96), u32(0))
+        }
+    }
+
+    if (segmentLength > u32(0) && esp32InternalTcpInputLoadU32(a2 + u32(60)) < u32(7)) {
+        val receiveNext = esp32InternalTcpInputLoadU32(a2 + u32(80))
+        if (esp32InternalTcpInputSequenceBetween(
+            receiveNext,
+            sequence + u32(1),
+            sequence + segmentLength - u32(1)
+        )) {
+            var packet = esp32InternalTcpInputLoadU32(incoming + u32(4))
+            var offset = receiveNext - sequence
+            val newTotalLength = esp32InternalTcpInputLoadU16(packet + u32(8)) - offset
+            esp32InternalTcpInputStoreU16(incoming + u32(8), esp32InternalTcpInputLoadU16(incoming + u32(8)) - offset)
+            while (esp32InternalTcpInputLoadU16(packet + u32(10)) < offset) {
+                val packetLength = esp32InternalTcpInputLoadU16(packet + u32(10))
+                offset = offset - packetLength
+                esp32InternalTcpInputStoreU16(packet + u32(8), newTotalLength)
+                esp32InternalTcpInputStoreU16(packet + u32(10), u32(0))
+                packet = esp32InternalTcpInputLoadU32(packet)
+            }
+            esp32LwipPbufRemoveHeader(packet, offset)
+            sequence = receiveNext
+            esp32InternalTcpInputStoreU32(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19,
+                sequence
+            )
+            esp32InternalTcpInputSetSegmentSequence(incoming, sequence)
+        } else if (i32(sequence - receiveNext) < i32(0)) {
+            esp32InternalTcpInputAcknowledgeNow(a2)
+        }
+
+        val window = esp32InternalTcpInputLoadU16(a2 + u32(84))
+        if (window != u32(0) && esp32InternalTcpInputSequenceBetween(
+            sequence,
+            receiveNext,
+            receiveNext + window - u32(1)
+        )) {
+            if (receiveNext == sequence) {
+                segmentLength = esp32InternalTcpInputSegmentLength(incoming)
+                if (segmentLength > window) {
+                    val flags = esp32InternalTcpInputSegmentFlags(incoming)
+                    if ((flags & u32(1)) != u32(0)) {
+                        esp32InternalTcpInputSetSegmentFlags(incoming, flags & u32(65534))
+                    }
+                    var payloadLength = window
+                    if ((flags & u32(2)) != u32(0)) payloadLength = payloadLength - u32(1)
+                    esp32InternalTcpInputStoreU16(incoming + u32(8), payloadLength)
+                    esp32LwipPbufReallocateValue(
+                        esp32InternalTcpInputLoadU32(incoming + u32(4)),
+                        payloadLength
+                    )
+                    segmentLength = esp32InternalTcpInputSegmentLength(incoming)
+                }
+
+                var queued = esp32InternalTcpInputLoadU32(a2 + u32(160))
+                if (queued != u32(0)) {
+                    if ((esp32InternalTcpInputSegmentFlags(incoming) & u32(1)) != u32(0)) {
+                        esp32RecoveredTcpSegsFree(
+                            queued, u32(0), u32(0), u32(0), u32(0), u32(0),
+                            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                        )
+                        queued = u32(0)
+                    } else {
+                        while (queued != u32(0) &&
+                            esp32InternalTcpInputSequenceGreaterOrEqual(
+                                sequence + segmentLength,
+                                esp32InternalTcpInputSegmentSequence(queued) +
+                                    esp32InternalTcpInputLoadU16(queued + u32(8))
+                            )) {
+                            if ((esp32InternalTcpInputSegmentFlags(queued) & u32(1)) != u32(0) &&
+                                (esp32InternalTcpInputSegmentFlags(incoming) & u32(2)) == u32(0)) {
+                                esp32InternalTcpInputSetSegmentFlags(
+                                    incoming,
+                                    esp32InternalTcpInputSegmentFlags(incoming) | u32(1)
+                                )
+                                segmentLength = esp32InternalTcpInputSegmentLength(incoming)
+                            }
+                            val old = queued
+                            queued = esp32InternalTcpInputLoadU32(queued)
+                            esp32RecoveredTcpSegFree(
+                                old, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                            )
+                        }
+                        if (queued != u32(0) &&
+                            i32(sequence + segmentLength - esp32InternalTcpInputSegmentSequence(queued)) > i32(0)) {
+                            var trimmed = esp32InternalTcpInputSegmentSequence(queued) - sequence
+                            if ((esp32InternalTcpInputSegmentFlags(incoming) & u32(3)) != u32(0)) {
+                                trimmed = trimmed - u32(1)
+                            }
+                            esp32InternalTcpInputStoreU16(incoming + u32(8), trimmed)
+                            esp32LwipPbufReallocateValue(
+                                esp32InternalTcpInputLoadU32(incoming + u32(4)),
+                                trimmed
+                            )
+                            segmentLength = esp32InternalTcpInputSegmentLength(incoming)
+                        }
+                    }
+                    esp32InternalTcpInputStoreU32(a2 + u32(160), queued)
+                }
+
+                esp32InternalTcpInputStoreU32(a2 + u32(80), sequence + segmentLength)
+                esp32InternalTcpInputStoreU16(a2 + u32(84), window - segmentLength)
+                esp32RecoveredTcpUpdateRcvAnnWnd(
+                    a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+
+                val incomingPacket = esp32InternalTcpInputLoadU32(incoming + u32(4))
+                if (esp32InternalTcpInputLoadU16(incomingPacket + u32(8)) > u32(0)) {
+                    esp32InternalTcpInputStoreU32(
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572,
+                        incomingPacket
+                    )
+                    esp32InternalTcpInputStoreU32(incoming + u32(4), u32(0))
+                }
+                if ((esp32InternalTcpInputSegmentFlags(incoming) & u32(1)) != u32(0)) {
+                    val receiveFlagsAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                    esp32InternalTcpInputStoreU8(
+                        receiveFlagsAddress,
+                        esp32InternalTcpInputLoadU8(receiveFlagsAddress) | u32(32)
+                    )
+                }
+
+                queued = esp32InternalTcpInputLoadU32(a2 + u32(160))
+                while (queued != u32(0) &&
+                    esp32InternalTcpInputSegmentSequence(queued) ==
+                        esp32InternalTcpInputLoadU32(a2 + u32(80))) {
+                    val queuedLength = esp32InternalTcpInputSegmentLength(queued)
+                    val available = esp32InternalTcpInputLoadU16(a2 + u32(84))
+                    if (available < queuedLength) {
+                        var trimmed = available
+                        if ((esp32InternalTcpInputSegmentFlags(queued) & u32(3)) != u32(0)) {
+                            trimmed = trimmed - u32(1)
+                        }
+                        esp32InternalTcpInputStoreU16(queued + u32(8), trimmed)
+                        esp32LwipPbufReallocateValue(
+                            esp32InternalTcpInputLoadU32(queued + u32(4)),
+                            trimmed
+                        )
+                        esp32RecoveredTcpSegsFree(
+                            esp32InternalTcpInputLoadU32(queued),
+                            u32(0), u32(0), u32(0), u32(0), u32(0),
+                            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                        )
+                        esp32InternalTcpInputStoreU32(queued, u32(0))
+                    }
+                    val acceptedLength = esp32InternalTcpInputSegmentLength(queued)
+                    esp32InternalTcpInputStoreU32(
+                        a2 + u32(80),
+                        esp32InternalTcpInputLoadU32(a2 + u32(80)) + acceptedLength
+                    )
+                    esp32InternalTcpInputStoreU16(
+                        a2 + u32(84),
+                        esp32InternalTcpInputLoadU16(a2 + u32(84)) - acceptedLength
+                    )
+                    esp32RecoveredTcpUpdateRcvAnnWnd(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    val queuedPacket = esp32InternalTcpInputLoadU32(queued + u32(4))
+                    if (esp32InternalTcpInputLoadU16(queuedPacket + u32(8)) > u32(0)) {
+                        val receiveDataAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572
+                        val receiveData = esp32InternalTcpInputLoadU32(receiveDataAddress)
+                        if (receiveData != u32(0)) {
+                            esp32LwipPbufConcatenateValue(receiveData, queuedPacket)
+                        } else {
+                            esp32InternalTcpInputStoreU32(receiveDataAddress, queuedPacket)
+                        }
+                        esp32InternalTcpInputStoreU32(queued + u32(4), u32(0))
+                    }
+                    if ((esp32InternalTcpInputSegmentFlags(queued) & u32(1)) != u32(0)) {
+                        val receiveFlagsAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                        esp32InternalTcpInputStoreU8(
+                            receiveFlagsAddress,
+                            esp32InternalTcpInputLoadU8(receiveFlagsAddress) | u32(32)
+                        )
+                        if (esp32InternalTcpInputLoadU32(a2 + u32(60)) == u32(4)) {
+                            esp32InternalTcpInputStoreU32(a2 + u32(60), u32(7))
+                        }
+                    }
+                    val old = queued
+                    queued = esp32InternalTcpInputLoadU32(queued)
+                    esp32InternalTcpInputStoreU32(a2 + u32(160), queued)
+                    esp32RecoveredTcpSegFree(
+                        old, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+                esp32InternalTcpInputAcknowledge(a2)
+                if (esp32InternalTcpInputLoadU8(esp32Data_ip_data_48d8350b61 + u32(64)) == u32(6)) {
+                    esp32RecoveredNd6ReachabilityHint(
+                        esp32Data_ip_data_48d8350b61 + u32(20),
+                        u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            } else {
+                var queue = esp32InternalTcpInputLoadU32(a2 + u32(160))
+                if (queue == u32(0)) {
+                    queue = esp32RecoveredTcpSegCopy(
+                        incoming, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    esp32InternalTcpInputStoreU32(a2 + u32(160), queue)
+                } else {
+                    var previous = u32(0)
+                    var next = queue
+                    while (next != u32(0)) {
+                        val nextSequence = esp32InternalTcpInputSegmentSequence(next)
+                        if (sequence == nextSequence) {
+                            if (esp32InternalTcpInputLoadU16(incoming + u32(8)) >
+                                esp32InternalTcpInputLoadU16(next + u32(8))) {
+                                val copy = esp32RecoveredTcpSegCopy(
+                                    incoming, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                                if (copy != u32(0)) {
+                                    if (previous != u32(0)) {
+                                        esp32InternalTcpInputStoreU32(previous, copy)
+                                    } else {
+                                        esp32InternalTcpInputStoreU32(a2 + u32(160), copy)
+                                    }
+                                    esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731(
+                                        copy, next, u32(0), u32(0), u32(0), u32(0),
+                                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                    )
+                                }
+                            }
+                            break
+                        }
+                        if (previous == u32(0) && i32(sequence - nextSequence) < i32(0)) {
+                            val copy = esp32RecoveredTcpSegCopy(
+                                incoming, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                            )
+                            if (copy != u32(0)) {
+                                esp32InternalTcpInputStoreU32(a2 + u32(160), copy)
+                                esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731(
+                                    copy, next, u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                            }
+                            break
+                        }
+                        if (previous != u32(0) &&
+                            esp32InternalTcpInputSequenceBetween(
+                                sequence,
+                                esp32InternalTcpInputSegmentSequence(previous) + u32(1),
+                                nextSequence - u32(1)
+                            )) {
+                            val copy = esp32RecoveredTcpSegCopy(
+                                incoming, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                            )
+                            if (copy != u32(0)) {
+                                val previousSequence = esp32InternalTcpInputSegmentSequence(previous)
+                                if (i32(previousSequence + esp32InternalTcpInputLoadU16(previous + u32(8)) - sequence) > i32(0)) {
+                                    val trimmed = sequence - previousSequence
+                                    esp32InternalTcpInputStoreU16(previous + u32(8), trimmed)
+                                    esp32LwipPbufReallocateValue(
+                                        esp32InternalTcpInputLoadU32(previous + u32(4)),
+                                        trimmed
+                                    )
+                                }
+                                esp32InternalTcpInputStoreU32(previous, copy)
+                                esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_oos_insert_segment_910be8d731(
+                                    copy, next, u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                            }
+                            break
+                        }
+                        previous = next
+                        val following = esp32InternalTcpInputLoadU32(next)
+                        if (following == u32(0) && i32(sequence - nextSequence) > i32(0)) {
+                            if ((esp32InternalTcpInputSegmentFlags(next) & u32(1)) == u32(0)) {
+                                val copy = esp32RecoveredTcpSegCopy(
+                                    incoming, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                                esp32InternalTcpInputStoreU32(next, copy)
+                                if (copy != u32(0)) {
+                                    val nextEnd = nextSequence + esp32InternalTcpInputLoadU16(next + u32(8))
+                                    if (i32(nextEnd - sequence) > i32(0)) {
+                                        val trimmed = sequence - nextSequence
+                                        esp32InternalTcpInputStoreU16(next + u32(8), trimmed)
+                                        esp32LwipPbufReallocateValue(
+                                            esp32InternalTcpInputLoadU32(next + u32(4)),
+                                            trimmed
+                                        )
+                                    }
+                                    val rightEdge = receiveNext + window
+                                    if (i32(sequence + segmentLength - rightEdge) > i32(0)) {
+                                        var trimmed = rightEdge - sequence
+                                        val copyFlags = esp32InternalTcpInputSegmentFlags(copy)
+                                        if ((copyFlags & u32(1)) != u32(0)) {
+                                            esp32InternalTcpInputSetSegmentFlags(copy, copyFlags & u32(65534))
+                                        }
+                                        if ((copyFlags & u32(2)) != u32(0)) trimmed = trimmed - u32(1)
+                                        esp32InternalTcpInputStoreU16(copy + u32(8), trimmed)
+                                        esp32LwipPbufReallocateValue(
+                                            esp32InternalTcpInputLoadU32(copy + u32(4)),
+                                            trimmed
+                                        )
+                                    }
+                                }
+                            }
+                            break
+                        }
+                        next = following
+                    }
+                }
+
+                var queueSegment = esp32InternalTcpInputLoadU32(a2 + u32(160))
+                var previousKept = u32(0)
+                var queuedPackets = u32(0)
+                while (queueSegment != u32(0)) {
+                    queuedPackets = queuedPackets +
+                        esp32LwipPbufChainLength(esp32InternalTcpInputLoadU32(queueSegment + u32(4)))
+                    if (queuedPackets >= u32(5)) {
+                        esp32RecoveredTcpSegsFree(
+                            queueSegment, u32(0), u32(0), u32(0), u32(0), u32(0),
+                            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                        )
+                        if (previousKept == u32(0)) {
+                            esp32InternalTcpInputStoreU32(a2 + u32(160), u32(0))
+                        } else {
+                            esp32InternalTcpInputStoreU32(previousKept, u32(0))
+                        }
+                        break
+                    }
+                    previousKept = queueSegment
+                    queueSegment = esp32InternalTcpInputLoadU32(queueSegment)
+                }
+                esp32RecoveredTcpSendEmptyAck(
+                    a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+            }
+        } else {
+            esp32RecoveredTcpSendEmptyAck(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+        }
+    } else {
+        val receiveNext = esp32InternalTcpInputLoadU32(a2 + u32(80))
+        val receiveWindow = esp32InternalTcpInputLoadU16(a2 + u32(84))
+        if (receiveWindow == u32(0) ||
+            !esp32InternalTcpInputSequenceBetween(
+                sequence,
+                receiveNext,
+                receiveNext + receiveWindow - u32(1)
+            )) {
+            esp32InternalTcpInputAcknowledgeNow(a2)
+        }
+    }
+    a2
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_receive")
+
+trusted fun esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_process_49ee5961a7(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(812),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a
+        )
+    }
+
+    val packetFlags = esp32InternalTcpInputLoadU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182
+    )
+    val sequence = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19
+    )
+    val acknowledgement = esp32InternalTcpInputLoadU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e
+    )
+    val segmentLength = esp32InternalTcpInputLoadU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464
+    )
+    val state = esp32InternalTcpInputLoadU32(a2 + u32(60))
+
+    if ((packetFlags & u32(4)) != u32(0)) {
+        var acceptable = false
+        if (state == u32(2)) {
+            acceptable = acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(124))
+        } else {
+            val receiveNext = esp32InternalTcpInputLoadU32(a2 + u32(80))
+            if (sequence == receiveNext) {
+                acceptable = true
+            } else if (esp32InternalTcpInputSequenceBetween(
+                sequence,
+                receiveNext,
+                receiveNext + esp32InternalTcpInputLoadU16(a2 + u32(84))
+            )) {
+                esp32InternalTcpInputAcknowledgeNow(a2)
+            }
+        }
+        if (!acceptable) return u32(0)
+
+        if (state == u32(0)) {
+            esp32AssertFailed(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                u32(840),
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46,
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a
+            )
+        }
+        val receiveFlagsAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+        esp32InternalTcpInputStoreU8(
+            receiveFlagsAddress,
+            esp32InternalTcpInputLoadU8(receiveFlagsAddress) | u32(8)
+        )
+        esp32InternalTcpInputStoreU16(
+            a2 + u32(70),
+            esp32InternalTcpInputLoadU16(a2 + u32(70)) & u32(65533)
+        )
+        return u32(242)
+    }
+
+    if ((packetFlags & u32(2)) != u32(0) && state != u32(2) && state != u32(3)) {
+        esp32InternalTcpInputAcknowledgeNow(a2)
+        return u32(0)
+    }
+
+    if ((esp32InternalTcpInputLoadU16(a2 + u32(70)) & u32(16)) == u32(0)) {
+        esp32InternalTcpInputStoreU32(
+            a2 + u32(76),
+            esp32InternalTcpInputLoadU32(esp32Data_tcp_ticks_02ec223afe)
+        )
+    }
+    esp32InternalTcpInputStoreU8(a2 + u32(207), u32(0))
+    esp32InternalTcpInputStoreU8(a2 + u32(206), u32(0))
+    esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_parseopt_4d8ed7eb4e(
+        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    )
+
+    when (state) {
+        u32(2) -> {
+            if ((packetFlags & u32(18)) == u32(18) &&
+                acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(112)) + u32(1)) {
+                esp32InternalTcpInputStoreU32(a2 + u32(80), sequence + u32(1))
+                esp32InternalTcpInputStoreU32(a2 + u32(88), sequence + u32(1))
+                esp32InternalTcpInputStoreU32(a2 + u32(112), acknowledgement)
+                val header = esp32InternalTcpInputLoadU32(
+                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+                )
+                val advertisedWindow = esp32InternalTcpInputLoadU16(header + u32(14))
+                esp32InternalTcpInputStoreU16(a2 + u32(140), advertisedWindow)
+                esp32InternalTcpInputStoreU16(a2 + u32(142), advertisedWindow)
+                esp32InternalTcpInputStoreU32(a2 + u32(128), sequence - u32(1))
+                esp32InternalTcpInputStoreU32(a2 + u32(60), u32(4))
+
+                val remoteAddress = a2 + u32(24)
+                val route = if (esp32InternalTcpInputLoadU8(a2 + u32(44)) == u32(6)) {
+                    esp32RecoveredIp6Route(
+                        a2, remoteAddress, u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                } else {
+                    esp32RecoveredIp4RouteSrc(
+                        a2, remoteAddress, u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+                val effectiveMss = esp32RecoveredTcpEffSendMssNetif(
+                    esp32InternalTcpInputLoadU16(a2 + u32(94)),
+                    route,
+                    remoteAddress,
+                    u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                esp32InternalTcpInputStoreU16(a2 + u32(94), effectiveMss)
+                esp32InternalTcpInputStoreU16(
+                    a2 + u32(116),
+                    esp32InternalTcpInputInitialCongestionWindow(effectiveMss)
+                )
+
+                val queued = esp32InternalTcpInputLoadU16(a2 + u32(146))
+                if (queued == u32(0)) {
+                    esp32AssertFailed(
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                        u32(900),
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46,
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a
+                    )
+                }
+                esp32InternalTcpInputStoreU16(a2 + u32(146), queued - u32(1))
+                var segment = esp32InternalTcpInputLoadU32(a2 + u32(156))
+                if (segment != u32(0)) {
+                    esp32InternalTcpInputStoreU32(a2 + u32(156), esp32InternalTcpInputLoadU32(segment))
+                } else {
+                    segment = esp32InternalTcpInputLoadU32(a2 + u32(152))
+                    if (segment == u32(0)) {
+                        esp32AssertFailed(
+                            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                            u32(908),
+                            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46,
+                            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a
+                        )
+                    }
+                    esp32InternalTcpInputStoreU32(a2 + u32(152), esp32InternalTcpInputLoadU32(segment))
+                }
+                esp32RecoveredTcpSegFree(
+                    segment, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                if (esp32InternalTcpInputLoadU32(a2 + u32(156)) == u32(0)) {
+                    esp32InternalTcpInputStoreU16(a2 + u32(92), u32(65535))
+                } else {
+                    esp32InternalTcpInputStoreU16(a2 + u32(92), u32(0))
+                    esp32InternalTcpInputStoreU8(a2 + u32(110), u32(0))
+                }
+
+                val connectedCallback = esp32InternalTcpInputLoadU32(a2 + u32(180))
+                if (connectedCallback != u32(0)) {
+                    val result = u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                        int(connectedCallback),
+                        int(esp32InternalTcpInputLoadU32(a2 + u32(56))),
+                        int(a2),
+                        int(u32(0)),
+                        int(u32(0)), int(u32(0)), int(u32(0))
+                    ))
+                    if (u32(i32(result << u32(24)) >> 24) == u32(4294967283)) return u32(243)
+                }
+                esp32InternalTcpInputAcknowledgeNow(a2)
+            } else if ((packetFlags & u32(16)) != u32(0)) {
+                val header = esp32InternalTcpInputLoadU32(
+                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+                )
+                esp32RecoveredTcpRst(
+                    a2, acknowledgement, sequence + segmentLength,
+                    esp32Data_ip_data_48d8350b61 + u32(44),
+                    esp32Data_ip_data_48d8350b61 + u32(20),
+                    esp32InternalTcpInputLoadU16(header + u32(2)),
+                    esp32InternalTcpInputLoadU16(header),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                if (esp32InternalTcpInputLoadU8(a2 + u32(110)) < u32(12)) {
+                    esp32InternalTcpInputStoreU16(a2 + u32(92), u32(0))
+                    esp32RecoveredTcpRexmitRto(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            }
+        }
+        u32(3) -> {
+            if ((packetFlags & u32(2)) != u32(0)) {
+                if (sequence == esp32InternalTcpInputLoadU32(a2 + u32(80)) - u32(1)) {
+                    esp32RecoveredTcpRexmit(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            } else if ((packetFlags & u32(16)) != u32(0)) {
+                if (esp32InternalTcpInputSequenceBetween(
+                    acknowledgement,
+                    esp32InternalTcpInputLoadU32(a2 + u32(112)) + u32(1),
+                    esp32InternalTcpInputLoadU32(a2 + u32(124))
+                )) {
+                    esp32InternalTcpInputStoreU32(a2 + u32(60), u32(4))
+                    val listener = esp32InternalTcpInputLoadU32(a2 + u32(168))
+                    var acceptResult = u32(250)
+                    if (listener != u32(0)) {
+                        val acceptCallback = esp32InternalTcpInputLoadU32(listener + u32(68))
+                        if (acceptCallback == u32(0)) {
+                            esp32AssertFailed(
+                                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                                u32(965),
+                                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46,
+                                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a
+                            )
+                        }
+                        esp32RecoveredTcpBacklogAccepted(
+                            a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                        )
+                        acceptResult = u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                            int(acceptCallback),
+                            int(esp32InternalTcpInputLoadU32(a2 + u32(56))),
+                            int(a2),
+                            int(u32(0)),
+                            int(u32(0)), int(u32(0)), int(u32(0))
+                        ))
+                    }
+                    if (acceptResult != u32(0)) {
+                        if (u32(i32(acceptResult << u32(24)) >> 24) != u32(4294967283)) {
+                            esp32RecoveredTcpAbort(
+                                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                            )
+                        }
+                        return u32(243)
+                    }
+                    esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    val receivedAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f
+                    val received = esp32InternalTcpInputLoadU16(receivedAddress)
+                    if (received != u32(0)) esp32InternalTcpInputStoreU16(receivedAddress, received - u32(1))
+                    esp32InternalTcpInputStoreU16(
+                        a2 + u32(116),
+                        esp32InternalTcpInputInitialCongestionWindow(
+                            esp32InternalTcpInputLoadU16(a2 + u32(94))
+                        )
+                    )
+                    if ((esp32InternalTcpInputLoadU8(
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                    ) & u32(32)) != u32(0)) {
+                        esp32InternalTcpInputAcknowledgeNow(a2)
+                        esp32InternalTcpInputStoreU32(a2 + u32(60), u32(7))
+                    }
+                } else {
+                    val header = esp32InternalTcpInputLoadU32(
+                        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38
+                    )
+                    esp32RecoveredTcpRst(
+                        a2, acknowledgement, sequence + segmentLength,
+                        esp32Data_ip_data_48d8350b61 + u32(44),
+                        esp32Data_ip_data_48d8350b61 + u32(20),
+                        esp32InternalTcpInputLoadU16(header + u32(2)),
+                        esp32InternalTcpInputLoadU16(header),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+            }
+        }
+        u32(4) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((esp32InternalTcpInputLoadU8(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+            ) & u32(32)) != u32(0)) {
+                esp32InternalTcpInputAcknowledgeNow(a2)
+                esp32InternalTcpInputStoreU32(a2 + u32(60), u32(7))
+            }
+        }
+        u32(7) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((esp32InternalTcpInputLoadU8(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+            ) & u32(32)) != u32(0)) {
+                esp32InternalTcpInputAcknowledgeNow(a2)
+                esp32InternalTcpInputStoreU32(a2 + u32(60), u32(7))
+            }
+        }
+        u32(5) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((esp32InternalTcpInputLoadU8(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+            ) & u32(32)) != u32(0)) {
+                if ((packetFlags & u32(16)) != u32(0) &&
+                    acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(124)) &&
+                    esp32InternalTcpInputLoadU32(a2 + u32(152)) == u32(0)) {
+                    esp32InternalTcpInputAcknowledgeNow(a2)
+                    esp32RecoveredTcpPcbPurge(
+                        a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    esp32InternalTcpInputMoveToTimeWait(a2)
+                } else {
+                    esp32InternalTcpInputAcknowledgeNow(a2)
+                    esp32InternalTcpInputStoreU32(a2 + u32(60), u32(8))
+                }
+            } else if ((packetFlags & u32(16)) != u32(0) &&
+                acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(124)) &&
+                esp32InternalTcpInputLoadU32(a2 + u32(152)) == u32(0)) {
+                esp32InternalTcpInputStoreU32(a2 + u32(60), u32(6))
+            }
+        }
+        u32(6) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((esp32InternalTcpInputLoadU8(
+                esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+            ) & u32(32)) != u32(0)) {
+                esp32InternalTcpInputAcknowledgeNow(a2)
+                esp32RecoveredTcpPcbPurge(
+                    a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                esp32InternalTcpInputMoveToTimeWait(a2)
+            }
+        }
+        u32(8) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((packetFlags & u32(16)) != u32(0) &&
+                acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(124)) &&
+                esp32InternalTcpInputLoadU32(a2 + u32(152)) == u32(0)) {
+                esp32RecoveredTcpPcbPurge(
+                    a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                esp32InternalTcpInputMoveToTimeWait(a2)
+            }
+        }
+        u32(9) -> {
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_receive_a0a2db08d5(
+                a2, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if ((packetFlags & u32(16)) != u32(0) &&
+                acknowledgement == esp32InternalTcpInputLoadU32(a2 + u32(124)) &&
+                esp32InternalTcpInputLoadU32(a2 + u32(152)) == u32(0)) {
+                val receiveFlagsAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                esp32InternalTcpInputStoreU8(
+                    receiveFlagsAddress,
+                    esp32InternalTcpInputLoadU8(receiveFlagsAddress) | u32(16)
+                )
+            }
+        }
+        else -> {}
+    }
+    u32(0)
+}
+
+val esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_process_49ee5961a7Link = #internalFunction("esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_process_49ee5961a7", ".Labla_recovered_Esp32LwipTcpInput_local_tcp_process")
+
+val esp32Data_tcp_input_pcb_15af579319Storage = nativeStaticAllocate(4)
+val esp32Data_tcp_input_pcb_15af579319 = u32(esp32Data_tcp_input_pcb_15af579319Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcp_optidx_tcp_optidx_6bf3ca0360Storage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcp_optidx_tcp_optidx_6bf3ca0360 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcp_optidx_tcp_optidx_6bf3ca0360Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44Storage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5Storage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38Storage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0fStorage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x70\x61\x72\x73\x65\x6f\x70\x74\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0fInitialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0fStorage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0f = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_5_func_5_093bb37f0fInitialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_optlen_tcphdr_optlen_30568c08baStorage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_optlen_tcphdr_optlen_30568c08ba = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_optlen_tcphdr_optlen_30568c08baStorage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x5f\x64\x65\x6c\x61\x79\x65\x64\x5f\x63\x6c\x6f\x73\x65\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_0_func_0_5b88fe8252Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707Storage = nativeStaticAllocate(1)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182Storage = nativeStaticAllocate(1)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x74\x69\x6d\x65\x77\x61\x69\x74\x5f\x69\x6e\x70\x00\x00\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_7_func_7_95ac4b0784Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19Storage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464Storage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05eStorage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05eStorage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x6c\x69\x73\x74\x65\x6e\x5f\x69\x6e\x70\x75\x74\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_6_func_6_9381464de2Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x6f\x6f\x73\x5f\x69\x6e\x73\x65\x72\x74\x5f\x73\x65\x67\x6d\x65\x00\x00\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_1_func_1_da585c6644Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x66\x72\x65\x65\x5f\x61\x63\x6b\x65\x64\x5f\x73\x65\x67\x6d\x65\x6e\x74\x73\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_2_func_2_cbd95d63a0Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0fStorage = nativeStaticAllocate(2)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0fStorage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_3_func_3_fd6b0de719Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_inseg_inseg_a6baf24097Storage = nativeStaticAllocate(16)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_inseg_inseg_a6baf24097 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_inseg_inseg_a6baf24097Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572Storage = nativeStaticAllocate(4)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572Storage)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x70\x72\x6f\x63\x65\x73\x73\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_4_func_4_ecd0760f46Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2aStorage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x69\x6e\x70\x75\x00\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2aInitialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2aStorage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2a = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2aInitialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7Storage = nativeStaticBytes(
+    (
+        "\x70\x63\x62\x2d\x3e\x73\x6e\x64\x5f\x71\x75\x65\x75\x65\x6c\x65\x6e\x20\x3e\x3d\x20\x70\x62\x75\x66\x5f\x63\x6c\x65\x6e\x28\x6e" +
+        "\x65\x78\x74\x2d\x3e\x70\x29\x00\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x76\x61\x6c\x69\x64\x20\x71\x75\x65\x75\x65" +
+        "\x20\x6c\x65\x6e\x67\x74\x68\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_free_acked_segments_str1_4_acda2989e7Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8Storage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x62\x75\x66\x00\x70\x2d\x3e\x6e\x65\x78\x74\x20" +
+        "\x21\x3d\x20\x4e\x55\x4c\x4c\x00\x70\x2d\x3e\x6c\x65\x6e\x20\x3d\x3d\x20\x30\x00\x70\x2d\x3e\x74\x6f\x74\x5f\x6c\x65\x6e\x20\x3d" +
+        "\x3d\x20\x70\x2d\x3e\x6e\x65\x78\x74\x2d\x3e\x74\x6f\x74\x5f\x6c\x65\x6e\x00\x00\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x3a\x20\x61" +
+        "\x63\x74\x69\x76\x65\x20\x70\x63\x62\x2d\x3e\x73\x74\x61\x74\x65\x20\x21\x3d\x20\x43\x4c\x4f\x53\x45\x44\x00\x00\x74\x63\x70\x5f" +
+        "\x69\x6e\x70\x75\x74\x3a\x20\x61\x63\x74\x69\x76\x65\x20\x70\x63\x62\x2d\x3e\x73\x74\x61\x74\x65\x20\x21\x3d\x20\x54\x49\x4d\x45" +
+        "\x2d\x57\x41\x49\x54\x00\x00\x00\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x3a\x20\x61\x63\x74\x69\x76\x65\x20\x70\x63\x62\x2d\x3e\x73" +
+        "\x74\x61\x74\x65\x20\x21\x3d\x20\x4c\x49\x53\x54\x45\x4e\x00\x00\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x3a\x20\x70\x63\x62\x2d\x3e" +
+        "\x6e\x65\x78\x74\x20\x21\x3d\x20\x70\x63\x62\x20\x28\x62\x65\x66\x6f\x72\x65\x20\x63\x61\x63\x68\x65\x29\x00\x00\x74\x63\x70\x5f" +
+        "\x69\x6e\x70\x75\x74\x3a\x20\x70\x63\x62\x2d\x3e\x6e\x65\x78\x74\x20\x21\x3d\x20\x70\x63\x62\x20\x28\x61\x66\x74\x65\x72\x20\x63" +
+        "\x61\x63\x68\x65\x29\x00\x00\x00\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x3a\x20\x54\x49\x4d\x45\x2d\x57\x41\x49\x54\x20\x70\x63\x62" +
+        "\x2d\x3e\x73\x74\x61\x74\x65\x20\x3d\x3d\x20\x54\x49\x4d\x45\x2d\x57\x41\x49\x54\x00\x00\x00\x00\x70\x63\x62\x2d\x3e\x72\x65\x66" +
+        "\x75\x73\x65\x64\x5f\x64\x61\x74\x61\x20\x3d\x3d\x20\x4e\x55\x4c\x00\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966aStorage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x69\x6e\x70\x75\x74\x5f\x64\x65\x6c\x61\x79\x65\x64\x5f\x63\x6c\x6f\x73\x65\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64" +
+        "\x20\x70\x63\x62\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966aInitialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966aStorage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966a = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_delayed_close_str1_4_1aacb6966aInitialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x6c\x69\x73\x74\x65\x6e\x5f\x69\x6e\x70\x75\x74\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x63\x00\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_listen_input_str1_4_729f891598Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7Storage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x6f\x6f\x73\x5f\x69\x6e\x73\x65\x72\x74\x5f\x73\x65\x67\x6d\x65\x6e\x74\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20" +
+        "\x63\x73\x65\x67\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_oos_insert_segment_str1_4_74a7d4bad7Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001bStorage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x70\x61\x72\x73\x65\x6f\x70\x74\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x63\x62\x00\x00\x00\x2f\x49\x44\x46" +
+        "\x2f\x63\x6f\x6d\x70\x6f\x6e\x65\x6e\x74\x73\x2f\x6c\x77\x69\x70\x2f\x6c\x77\x69\x70\x2f\x73\x72\x63\x2f\x63\x6f\x72\x65\x2f\x74" +
+        "\x63\x70\x5f\x69\x6e\x2e\x63\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001bInitialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001bStorage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001bInitialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790aStorage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x70\x72\x6f\x63\x65\x73\x73\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x63\x62\x00\x00\x00\x00\x74\x63\x70\x5f" +
+        "\x69\x6e\x70\x75\x74\x3a\x20\x70\x63\x62\x2d\x3e\x73\x74\x61\x74\x65\x20\x21\x3d\x20\x43\x4c\x4f\x53\x45\x44\x00\x70\x63\x62\x2d" +
+        "\x3e\x73\x6e\x64\x5f\x71\x75\x65\x75\x65\x6c\x65\x6e\x20\x3e\x20\x30\x00\x00\x00\x6e\x6f\x20\x73\x65\x67\x6d\x65\x6e\x74\x20\x74" +
+        "\x6f\x20\x66\x72\x65\x65\x00\x00\x70\x63\x62\x2d\x3e\x6c\x69\x73\x74\x65\x6e\x65\x72\x2d\x3e\x61\x63\x63\x65\x70\x74\x20\x21\x3d" +
+        "\x20\x4e\x55\x4c\x00\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790aInitialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790aStorage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790a = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_process_str1_4_901b27790aInitialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630Storage = nativeStaticBytes(
+    (
+        "\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x63\x62\x00\x00\x00\x00\x74\x63\x70\x5f" +
+        "\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x77\x72\x6f\x6e\x67\x20\x73\x74\x61\x74\x65\x00\x00\x00\x00\x75\x6e\x61\x63\x6b\x65\x64\x00" +
+        "\x75\x6e\x73\x65\x6e\x74\x00\x00\x69\x6e\x73\x65\x67\x2e\x70\x20\x21\x3d\x20\x4e\x55\x4c\x4c\x00\x69\x6e\x73\x61\x6e\x65\x20\x6f" +
+        "\x66\x66\x73\x65\x74\x21\x00\x00\x70\x62\x75\x66\x20\x74\x6f\x6f\x20\x73\x68\x6f\x72\x74\x21\x00\x74\x63\x70\x5f\x72\x65\x63\x65" +
+        "\x69\x76\x65\x3a\x20\x73\x65\x67\x6d\x65\x6e\x74\x20\x6e\x6f\x74\x20\x74\x72\x69\x6d\x6d\x65\x64\x20\x63\x6f\x72\x72\x65\x63\x74" +
+        "\x6c\x79\x20\x74\x6f\x20\x72\x63\x76\x5f\x77\x6e\x64\x00\x00\x00\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x73\x65\x67" +
+        "\x6d\x65\x6e\x74\x20\x6e\x6f\x74\x20\x74\x72\x69\x6d\x6d\x65\x64\x20\x63\x6f\x72\x72\x65\x63\x74\x6c\x79\x20\x74\x6f\x20\x6f\x6f" +
+        "\x73\x65\x71\x20\x71\x75\x65\x75\x65\x00\x00\x00\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x74\x63\x70\x6c\x65\x6e\x20" +
+        "\x3e\x20\x72\x63\x76\x5f\x77\x6e\x64\x00\x00\x00\x74\x63\x70\x5f\x72\x65\x63\x65\x69\x76\x65\x3a\x20\x6f\x6f\x73\x65\x71\x20\x74" +
+        "\x63\x70\x6c\x65\x6e\x20\x3e\x20\x72\x63\x76\x5f\x77\x6e\x64\x00"
+    )
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_receive_str1_4_cbab7f7630Initialized)
+
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099Storage = nativeStaticBytes(
+    "\x74\x63\x70\x5f\x74\x69\x6d\x65\x77\x61\x69\x74\x5f\x69\x6e\x70\x75\x74\x3a\x20\x69\x6e\x76\x61\x6c\x69\x64\x20\x70\x63\x62\x00"
+)
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099Initialized = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099Storage
+val esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099 = u32(esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_timewait_input_str1_4_c8801b9099Initialized)
+
+trusted fun esp32RecoveredTcpInput(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    if (a2 == u32(0)) {
+        esp32AssertFailed(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+            u32(142),
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2a,
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8
+        )
+    }
+
+    val header = esp32InternalTcpInputLoadU32(a2 + u32(4))
+    esp32InternalTcpInputStoreU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_tcphdr_bec50a7f38,
+        header
+    )
+    if (esp32InternalTcpInputLoadU16(a2 + u32(10)) < u32(20)) {
+        esp32LwipPbufFree(a2)
+        return a2
+    }
+
+    val destinationAddress = esp32Data_ip_data_48d8350b61 + u32(44)
+    val sourceAddress = esp32Data_ip_data_48d8350b61 + u32(20)
+    val destinationType = esp32InternalTcpInputLoadU8(destinationAddress + u32(20))
+    if (destinationType != u32(6)) {
+        if (esp32LwipIp4AddressIsBroadcast(
+            esp32InternalTcpInputLoadU32(destinationAddress),
+            esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61)
+        ) != u32(0)) {
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+        if ((esp32InternalTcpInputLoadU32(destinationAddress) & u32(240)) == u32(224)) {
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+    } else if (esp32InternalTcpInputLoadU8(destinationAddress) == u32(255)) {
+        esp32LwipPbufFree(a2)
+        return a2
+    }
+
+    if (esp32RecoveredIpChksumPseudo(
+        a2,
+        u32(6),
+        esp32InternalTcpInputLoadU16(a2 + u32(8)),
+        sourceAddress,
+        destinationAddress,
+        u32(0),
+        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+    ) != u32(0)) {
+        esp32LwipPbufFree(a2)
+        return a2
+    }
+
+    val headerWords = (esp32InternalTcpInputHeaderU16(header + u32(12)) >> u32(12)) & u32(15)
+    val headerLength = headerWords << u32(2)
+    if (headerLength < u32(20) || headerLength > esp32InternalTcpInputLoadU16(a2 + u32(8))) {
+        esp32LwipPbufFree(a2)
+        return a2
+    }
+
+    val optionLength = headerLength - u32(20)
+    esp32InternalTcpInputStoreU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_optlen_tcphdr_optlen_30568c08ba,
+        optionLength
+    )
+    esp32InternalTcpInputStoreU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44,
+        u32(0)
+    )
+    if (esp32InternalTcpInputLoadU16(a2 + u32(10)) >= headerLength) {
+        esp32InternalTcpInputStoreU16(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5,
+            optionLength
+        )
+        esp32LwipPbufRemoveHeader(a2, headerLength)
+    } else {
+        val nextPacket = esp32InternalTcpInputLoadU32(a2)
+        if (nextPacket == u32(0)) {
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+        esp32LwipPbufRemoveHeader(a2, u32(20))
+        val firstOptionLength = esp32InternalTcpInputLoadU16(a2 + u32(10))
+        esp32InternalTcpInputStoreU16(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt1len_tcphdr_opt1len_1ce39b4ec5,
+            firstOptionLength
+        )
+        val secondOptionLength = optionLength - firstOptionLength
+        esp32LwipPbufRemoveHeader(a2, firstOptionLength)
+        if (secondOptionLength > esp32InternalTcpInputLoadU16(nextPacket + u32(10))) {
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+        esp32InternalTcpInputStoreU32(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcphdr_opt2_tcphdr_opt2_6b6e60dc44,
+            esp32InternalTcpInputLoadU32(nextPacket + u32(4))
+        )
+        esp32LwipPbufRemoveHeader(nextPacket, secondOptionLength)
+        esp32InternalTcpInputStoreU16(
+            a2 + u32(8),
+            esp32InternalTcpInputLoadU16(a2 + u32(8)) - secondOptionLength
+        )
+    }
+
+    val sourcePort = esp32InternalTcpInputHeaderU16(header)
+    val destinationPort = esp32InternalTcpInputHeaderU16(header + u32(2))
+    var sequence = esp32InternalTcpInputHeaderU32(header + u32(4))
+    val acknowledgement = esp32InternalTcpInputHeaderU32(header + u32(8))
+    val advertisedWindow = esp32InternalTcpInputHeaderU16(header + u32(14))
+    esp32InternalTcpInputStoreU16(header, sourcePort)
+    esp32InternalTcpInputStoreU16(header + u32(2), destinationPort)
+    esp32InternalTcpInputStoreU32(header + u32(4), sequence)
+    esp32InternalTcpInputStoreU32(header + u32(8), acknowledgement)
+    esp32InternalTcpInputStoreU16(header + u32(14), advertisedWindow)
+    esp32InternalTcpInputStoreU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_seqno_seqno_a0eb8ffe19,
+        sequence
+    )
+    esp32InternalTcpInputStoreU32(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_ackno_ackno_136051d05e,
+        acknowledgement
+    )
+
+    val packetFlags = esp32InternalTcpInputHeaderU16(header + u32(12)) & u32(63)
+    esp32InternalTcpInputStoreU8(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_flags_flags_708fcde182,
+        packetFlags
+    )
+    var tcpLength = esp32InternalTcpInputLoadU16(a2 + u32(8))
+    if ((packetFlags & u32(3)) != u32(0)) {
+        val increased = tcpLength + u32(1)
+        if (increased < tcpLength) {
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+        tcpLength = increased
+    }
+    esp32InternalTcpInputStoreU16(
+        esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_tcplen_tcplen_fb642fe464,
+        tcpLength
+    )
+
+    var pcb = esp32InternalTcpInputLoadU32(esp32Data_tcp_active_pcbs_ae33bb9f54)
+    var previous = u32(0)
+    while (pcb != u32(0)) {
+        if (esp32InternalTcpInputNetifMatches(pcb) &&
+            esp32InternalTcpInputLoadU16(pcb + u32(68)) == sourcePort &&
+            esp32InternalTcpInputLoadU16(pcb + u32(66)) == destinationPort &&
+            esp32InternalTcpInputAddressEqual(pcb + u32(24), sourceAddress) &&
+            esp32InternalTcpInputAddressEqual(pcb, destinationAddress)) {
+            if (previous != u32(0)) {
+                esp32InternalTcpInputStoreU32(previous + u32(52), esp32InternalTcpInputLoadU32(pcb + u32(52)))
+                esp32InternalTcpInputStoreU32(
+                    pcb + u32(52),
+                    esp32InternalTcpInputLoadU32(esp32Data_tcp_active_pcbs_ae33bb9f54)
+                )
+                esp32InternalTcpInputStoreU32(esp32Data_tcp_active_pcbs_ae33bb9f54, pcb)
+            }
+            break
+        }
+        previous = pcb
+        pcb = esp32InternalTcpInputLoadU32(pcb + u32(52))
+    }
+
+    if (pcb == u32(0)) {
+        var waiting = esp32InternalTcpInputLoadU32(esp32Data_tcp_tw_pcbs_e6864109a6)
+        while (waiting != u32(0)) {
+            if (esp32InternalTcpInputNetifMatches(waiting) &&
+                esp32InternalTcpInputLoadU16(waiting + u32(68)) == sourcePort &&
+                esp32InternalTcpInputLoadU16(waiting + u32(66)) == destinationPort &&
+                esp32InternalTcpInputAddressEqual(waiting + u32(24), sourceAddress) &&
+                esp32InternalTcpInputAddressEqual(waiting, destinationAddress)) {
+                esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_timewait_input_b9e51a0376(
+                    waiting, u32(0), u32(0), u32(0), u32(0), u32(0),
+                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                )
+                esp32LwipPbufFree(a2)
+                return a2
+            }
+            waiting = esp32InternalTcpInputLoadU32(waiting + u32(52))
+        }
+
+        var listener = esp32InternalTcpInputLoadU32(esp32Data_tcp_listen_pcbs_028b6484de)
+        var listenerPrevious = u32(0)
+        var anyListener = u32(0)
+        var anyPrevious = u32(0)
+        while (listener != u32(0)) {
+            if (esp32InternalTcpInputNetifMatches(listener) &&
+                esp32InternalTcpInputLoadU16(listener + u32(66)) == destinationPort) {
+                val listenerType = esp32InternalTcpInputLoadU8(listener + u32(20))
+                if (listenerType == u32(46)) {
+                    anyListener = listener
+                    anyPrevious = listenerPrevious
+                } else if (listenerType == destinationType) {
+                    if (esp32InternalTcpInputAddressEqual(listener, destinationAddress)) break
+                    if (esp32InternalTcpInputAddressIsAny(listener)) {
+                        anyListener = listener
+                        anyPrevious = listenerPrevious
+                    }
+                }
+            }
+            listenerPrevious = listener
+            listener = esp32InternalTcpInputLoadU32(listener + u32(52))
+        }
+        if (listener == u32(0)) {
+            listener = anyListener
+            listenerPrevious = anyPrevious
+        }
+        if (listener != u32(0)) {
+            if (listenerPrevious != u32(0)) {
+                esp32InternalTcpInputStoreU32(
+                    listenerPrevious + u32(52),
+                    esp32InternalTcpInputLoadU32(listener + u32(52))
+                )
+                esp32InternalTcpInputStoreU32(
+                    listener + u32(52),
+                    esp32InternalTcpInputLoadU32(esp32Data_tcp_listen_pcbs_028b6484de)
+                )
+                esp32InternalTcpInputStoreU32(esp32Data_tcp_listen_pcbs_028b6484de, listener)
+            }
+            esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_listen_input_cb2521dc54(
+                listener, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            esp32LwipPbufFree(a2)
+            return a2
+        }
+    }
+
+    if (pcb != u32(0)) {
+        val incoming = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_inseg_inseg_a6baf24097
+        esp32InternalTcpInputStoreU32(incoming, u32(0))
+        esp32InternalTcpInputStoreU16(incoming + u32(8), esp32InternalTcpInputLoadU16(a2 + u32(8)))
+        esp32InternalTcpInputStoreU32(incoming + u32(4), a2)
+        esp32InternalTcpInputStoreU32(incoming + u32(12), header)
+        esp32InternalTcpInputStoreU32(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572,
+            u32(0)
+        )
+        esp32InternalTcpInputStoreU8(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707,
+            u32(0)
+        )
+        esp32InternalTcpInputStoreU16(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f,
+            u32(0)
+        )
+        if ((packetFlags & u32(8)) != u32(0)) {
+            esp32InternalTcpInputStoreU8(a2 + u32(13), esp32InternalTcpInputLoadU8(a2 + u32(13)) | u32(1))
+        }
+
+        var aborted = false
+        if (esp32InternalTcpInputLoadU32(pcb + u32(164)) != u32(0)) {
+            val refusedResult = esp32RecoveredTcpProcessRefusedData(
+                pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if (u32(i32(refusedResult << u32(24)) >> 24) == u32(4294967283) ||
+                (esp32InternalTcpInputLoadU32(pcb + u32(164)) != u32(0) && tcpLength > u32(0))) {
+                if (esp32InternalTcpInputLoadU16(pcb + u32(86)) == u32(0)) {
+                    esp32RecoveredTcpSendEmptyAck(
+                        pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                }
+                aborted = true
+            }
+        }
+
+        if (!aborted) {
+            esp32InternalTcpInputStoreU32(esp32Data_tcp_input_pcb_15af579319, pcb)
+            val processResult = esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_process_49ee5961a7(
+                pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+            )
+            if (u32(i32(processResult << u32(24)) >> 24) != u32(4294967283)) {
+                val receiveFlags = esp32InternalTcpInputLoadU8(
+                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                )
+                if ((receiveFlags & u32(8)) != u32(0)) {
+                    val errorCallback = esp32InternalTcpInputLoadU32(pcb + u32(188))
+                    if (errorCallback != u32(0)) {
+                        ablaUnsafeCallI32I32I32I32I32I32I32(
+                            int(errorCallback),
+                            int(esp32InternalTcpInputLoadU32(pcb + u32(56))),
+                            int(u32(4294967282)),
+                            int(u32(0)), int(u32(0)), int(u32(0)), int(u32(0))
+                        )
+                    }
+                    esp32RecoveredTcpPcbRemove(
+                        esp32Data_tcp_active_pcbs_ae33bb9f54,
+                        pcb,
+                        u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    esp32RecoveredTcpFree(
+                        pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    )
+                    aborted = true
+                } else {
+                    val acknowledgedAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_acked_recv_acked_18228d6c0f
+                    val acknowledged = esp32InternalTcpInputLoadU16(acknowledgedAddress)
+                    if (acknowledged > u32(0)) {
+                        val sentCallback = esp32InternalTcpInputLoadU32(pcb + u32(172))
+                        if (sentCallback != u32(0)) {
+                            val callbackResult = u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                                int(sentCallback),
+                                int(esp32InternalTcpInputLoadU32(pcb + u32(56))),
+                                int(pcb),
+                                int(acknowledged),
+                                int(u32(0)), int(u32(0)), int(u32(0))
+                            ))
+                            if (u32(i32(callbackResult << u32(24)) >> 24) == u32(4294967283)) {
+                                aborted = true
+                            }
+                        }
+                        esp32InternalTcpInputStoreU16(acknowledgedAddress, u32(0))
+                    }
+                    if (!aborted && esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close_34b724b353(
+                        pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                    ) != u32(0)) {
+                        aborted = true
+                    }
+
+                    if (!aborted) {
+                        val receiveDataAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572
+                        val receiveData = esp32InternalTcpInputLoadU32(receiveDataAddress)
+                        if (receiveData != u32(0)) {
+                            if (esp32InternalTcpInputLoadU32(pcb + u32(164)) != u32(0)) {
+                                esp32AssertFailed(
+                                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_parseopt_str1_4_cb7898001b,
+                                    u32(497),
+                                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_func_8_func_8_fe78709b2a,
+                                    esp32Data_Labla_recovered_Esp32LwipTcpInput_data_rodata_tcp_input_str1_4_54436fe3e8
+                                )
+                            }
+                            if ((esp32InternalTcpInputLoadU16(pcb + u32(70)) & u32(16)) != u32(0)) {
+                                esp32LwipPbufFree(receiveData)
+                                esp32RecoveredTcpAbort(
+                                    pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                                aborted = true
+                            } else {
+                                val receiveCallback = esp32InternalTcpInputLoadU32(pcb + u32(176))
+                                val receiveResult = if (receiveCallback != u32(0)) {
+                                    u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                                        int(receiveCallback),
+                                        int(esp32InternalTcpInputLoadU32(pcb + u32(56))),
+                                        int(pcb),
+                                        int(receiveData),
+                                        int(u32(0)), int(u32(0)), int(u32(0))
+                                    ))
+                                } else {
+                                    esp32RecoveredTcpRecvNull(
+                                        u32(0), pcb, receiveData, u32(0), u32(0), u32(0),
+                                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                    )
+                                }
+                                if (u32(i32(receiveResult << u32(24)) >> 24) == u32(4294967283)) {
+                                    aborted = true
+                                } else if (receiveResult != u32(0)) {
+                                    esp32InternalTcpInputStoreU32(pcb + u32(164), receiveData)
+                                }
+                            }
+                        }
+
+                        if (!aborted && (esp32InternalTcpInputLoadU8(
+                            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+                        ) & u32(32)) != u32(0)) {
+                            val refusedData = esp32InternalTcpInputLoadU32(pcb + u32(164))
+                            if (refusedData != u32(0)) {
+                                esp32InternalTcpInputStoreU8(
+                                    refusedData + u32(13),
+                                    esp32InternalTcpInputLoadU8(refusedData + u32(13)) | u32(32)
+                                )
+                            } else {
+                                val receiveWindow = esp32InternalTcpInputLoadU16(pcb + u32(84))
+                                if (receiveWindow != u32(5760)) {
+                                    esp32InternalTcpInputStoreU16(pcb + u32(84), receiveWindow + u32(1))
+                                }
+                                val receiveCallback = esp32InternalTcpInputLoadU32(pcb + u32(176))
+                                val closeResult = if (receiveCallback != u32(0)) {
+                                    u32(ablaUnsafeCallI32I32I32I32I32I32I32(
+                                        int(receiveCallback),
+                                        int(esp32InternalTcpInputLoadU32(pcb + u32(56))),
+                                        int(pcb),
+                                        int(u32(0)),
+                                        int(u32(0)), int(u32(0)), int(u32(0))
+                                    ))
+                                } else {
+                                    esp32RecoveredTcpRecvNull(
+                                        u32(0), pcb, u32(0), u32(0), u32(0), u32(0),
+                                        u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                    )
+                                }
+                                val signedCloseResult = u32(i32(closeResult << u32(24)) >> 24)
+                                if (signedCloseResult == u32(4294967283)) {
+                                    aborted = true
+                                } else if (signedCloseResult == u32(4294967295)) {
+                                    esp32InternalTcpInputStoreU16(
+                                        pcb + u32(70),
+                                        esp32InternalTcpInputLoadU16(pcb + u32(70)) | u32(8)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (!aborted) {
+                            esp32InternalTcpInputStoreU32(esp32Data_tcp_input_pcb_15af579319, u32(0))
+                            if (esp32Internal_Labla_recovered_Esp32LwipTcpInput_local_tcp_input_delayed_close_34b724b353(
+                                pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                            ) == u32(0)) {
+                                esp32RecoveredTcpOutput(
+                                    pcb, u32(0), u32(0), u32(0), u32(0), u32(0),
+                                    u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        esp32InternalTcpInputStoreU32(esp32Data_tcp_input_pcb_15af579319, u32(0))
+        esp32InternalTcpInputStoreU32(
+            esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_data_recv_data_157cc6c572,
+            u32(0)
+        )
+        val inputPacket = esp32InternalTcpInputLoadU32(incoming + u32(4))
+        if (inputPacket != u32(0)) {
+            esp32LwipPbufFree(inputPacket)
+            esp32InternalTcpInputStoreU32(incoming + u32(4), u32(0))
+        }
+        return a2
+    }
+
+    if ((packetFlags & u32(4)) == u32(0)) {
+        esp32RecoveredTcpRstNetif(
+            esp32InternalTcpInputLoadU32(esp32Data_ip_data_48d8350b61 + u32(4)),
+            acknowledgement,
+            sequence + tcpLength,
+            destinationAddress,
+            sourceAddress,
+            destinationPort,
+            sourcePort,
+            u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(0)
+        )
+    }
+    esp32LwipPbufFree(a2)
+    a2
+}
+
+// Original ABI symbol: tcp_trigger_input_pcb_close
+trusted fun esp32RecoveredTcpTriggerInputPcbClose(
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    a7: u32,
+    stack0: u32,
+    stack1: u32,
+    stack2: u32,
+    stack3: u32,
+    stack4: u32,
+    stack5: u32,
+    stack6: u32,
+    stack7: u32,
+    stack8: u32,
+    stack9: u32
+): u32 {
+    val receiveFlagsAddress = esp32Data_Labla_recovered_Esp32LwipTcpInput_data_bss_recv_flags_recv_flags_38d3bf0707
+    esp32InternalTcpInputStoreU8(
+        receiveFlagsAddress,
+        esp32InternalTcpInputLoadU8(receiveFlagsAddress) | u32(16)
+    )
+    a2
+}
