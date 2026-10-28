@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Build the recovered ESP32-S3 radio unit and (optionally) link it into
+# mono-life, without flashing.
+#
+#   tools/build-recovered-radio [--skip-lift] [--link BUILD_DIR] [ARCHIVE...]
+#
+# ARCHIVE defaults to libnet80211 libpp libcoexist. --skip-lift reuses the
+# lifted members under build/recovery/esp32s3/. --link BUILD_DIR runs
+# `idf.py -B BUILD_DIR -D ABLA_RADIO_OBJECT=...` in ../mono-life (use a
+# directory of your own when several builds run at once) and reports which
+# members of the recovered archives the link map still takes.
+#
+# Environment: ABLA_PROJECTS (directory holding ablac/ and mono-life/,
+# default the parent of this checkout), ABLA_COMPILER (default ../ablac/build/ablac.bin, run inside
+# ../ablac's nix shell for its runtime libraries), EXCLUDE (comma-separated
+# archive/member stems left to the Espressif archive).
+set -uo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+projects=${ABLA_PROJECTS:-$(dirname "$root")}
+skip_lift=0
+link_dir=""
+archives=()
+while (($#)); do
+    case "$1" in
+        --skip-lift) skip_lift=1 ;;
+        --link) link_dir="$2"; shift ;;
+        *) archives+=("$1") ;;
+    esac
+    shift
+done
+((${#archives[@]})) || archives=(libnet80211 libpp libcoexist)
+compiler=${ABLA_COMPILER:-$projects/ablac/build/ablac.bin}
+
+cd "$root"
+if ((!skip_lift)); then
+    for archive in "${archives[@]}"; do
+        python3 -I tools/recover-member esp32s3 "$archive" all > "build/recovery-$archive.log" 2>&1
+        tail -2 "build/recovery-$archive.log" | head -1
+        grep -h WARNING "build/recovery-$archive.log" || true
+    done
+fi
+python3 -I tools/assemble-recovered-unit esp32s3 "${archives[@]}" --no-compile --exclude "${EXCLUDE:-}" | tail -4
+unit=$root/build/recovery/esp32s3/unit
+rm -f "$unit/unit.o"
+(cd "$unit" && nix-shell "$projects/ablac/shell.nix" --run "
+    export ABLA_ESP_CPU=esp32s3 ABLA_SYSROOT=$projects/ablac PATH=$root/tools/esp-llvm-bin:\$PATH
+    ulimit -s 131072
+    '$compiler' build build.ab -o driver 2>&1 | grep -v '^\$' | head -20
+    ./driver 2>&1 | grep -v '^\$\|Aborted\|relaxed' | head -20")
+[[ -f $unit/unit.o ]] || { echo "build-recovered-radio: unit.o was not produced" >&2; exit 1; }
+ls -l "$unit/unit.o"
+[[ -n $link_dir ]] || exit 0
+
+cd "$projects/mono-life"
+nix-shell "$root/shell.nix" --run "./tools/idf -B $link_dir -D ABLA_RADIO_OBJECT=$unit/unit.o build" > "$link_dir.log" 2>&1
+status=$?
+echo "link exit=$status (log: mono-life/$link_dir.log)"
+grep -E 'undefined reference|multiple definition' "$link_dir.log" | sed -E 's/.*(undefined reference to|multiple definition of) /\1 /;s/;.*//' | sort | uniq -c | sort -rn | head -20
+if ((status == 0)); then
+    for archive in "${archives[@]}"; do
+        printf '%s members still linked from Espressif: %s\n' "$archive" \
+            "$(grep -oE "$archive\.a\([^)]*\)" "$link_dir/mono_life.map" | sort -u | wc -l)"
+    done
+    ls -l "$link_dir/mono_life.bin"
+fi
+exit $status
