@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Scan Abla sources for bug classes seen while recovering ESP32-S3 Wi-Fi.
+
+class1  zero-argument calls to raw `(): void = $xtensa instructions` functions
+class2  nativeFunctionAddress(F) + addend, or `$xtensa address {x} + addend`
+        (section-entry offsets; see tools/repair-lifted-function-entry-offsets)
+class3  `movi aN, label` + `addi aN, aN, K` in raw bodies of files that use
+        mergeable (`"aM"`/`"aMS"`) sections
+class4  `.long/.word rawfunc+N` code-address tables into raw functions
+class7  entries `nativeFunctionAddress(F) + N` of a static u32 table: a switch
+        jump table that was not lowered to Abla control flow (indirect call into
+        the middle of a compiled function)
+class6  xtensaMemoryBarrier() followed by plain (non-volatile) loads/stores on
+        constants that look like peripheral addresses
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+
+RAW = re.compile(r"fun\s+(\w+)\s*\(\s*\)\s*:\s*void\s*=\s*\$xtensa\s+instructions")
+ADDR = re.compile(r"nativeFunctionAddress\((\w+)\)")
+INLINE_ADDEND = re.compile(r"\)\)?\s*\+\s*u32\((\d+)\)")
+NEXT_ADDEND = re.compile(r"\s*(\w+) = \1 \+ u32\((\d+)\)\s*$")
+ADDR_ASSIGN = re.compile(r"\s*(\w+) = u32\(nativeFunctionAddress\(\w+\)\)\s*$")
+ADDR_PLUS = re.compile(r"\$xtensa\s+address\s*\{[^}]*\}\s*\+\s*u32\((\d+)\)")
+MERGEABLE = re.compile(r'pushsection\s+[^,\s\\]+\s*,\s*\\?"a[wx]?M')
+MOVI_ADDI = re.compile(r"movi\s+(a\d+),\s*([.\w]+)\s*(?:\\n|\n|;)\s*addi\s+\1,\s*\1,\s*(-?\d+)")
+TABLE = re.compile(r"\.(?:long|word)\s+(\w+)\s*\+\s*(0x[0-9a-fA-F]+|\d+)")
+PLAIN = re.compile(r"ablaUnsafe(?:Load|Store)U(?:8|16|32)\(")
+MMIO = re.compile(r"\b(?:107[0-3]\d{6}|1610[67]\d{5}|0x3FF[0-9A-Fa-f]{5}|0x600[0-9A-Fa-f]{5})\b")
+
+
+def main() -> int:
+    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "src")
+    texts = {f: f.read_text(errors="replace") for f in sorted(root.rglob("*.ab"))}
+    raws = {m.group(1) for t in texts.values() for m in RAW.finditer(t)}
+    count = 0
+
+    def out(cls: int, path: pathlib.Path, line: int, msg: str) -> None:
+        nonlocal count
+        count += 1
+        print(f"class{cls} {path}:{line}: {msg}")
+
+    for path, text in texts.items():
+        lines = text.splitlines()
+        if raws:
+            pattern = re.compile(r"(?<!fun )\b(" + "|".join(map(re.escape, raws)) + r")\(\s*\)")
+            for m in pattern.finditer(text):
+                out(1, path, text.count("\n", 0, m.start()) + 1, f"zero-argument call to raw {m.group(1)}")
+        for index, line in enumerate(lines):
+            for m in ADDR.finditer(line):
+                inline = INLINE_ADDEND.match(line[m.end() - 1:])
+                if inline and int(inline.group(1)):
+                    if line.lstrip().startswith("int("):
+                        out(7, path, index + 1, f"unlowered switch-table entry {m.group(1)} + {inline.group(1)}")
+                    else:
+                        out(2, path, index + 1, f"{m.group(1)} + {inline.group(1)}")
+            if ADDR_ASSIGN.match(line) and index + 1 < len(lines):
+                nxt = NEXT_ADDEND.match(lines[index + 1])
+                if nxt and int(nxt.group(2)):
+                    out(2, path, index + 1, f"{ADDR.search(line).group(1)} then + {nxt.group(2)}")
+            for m in ADDR_PLUS.finditer(line):
+                out(2, path, index + 1, f"$xtensa address + {m.group(1)}")
+            if "xtensaMemoryBarrier()" in line:
+                for j in range(index + 1, min(index + 3, len(lines))):
+                    if PLAIN.search(lines[j]) and MMIO.search(lines[j]):
+                        out(6, path, j + 1, "plain access after memory barrier on peripheral-looking address")
+                        break
+        if MERGEABLE.search(text):
+            for m in MOVI_ADDI.finditer(text):
+                out(3, path, text.count("\n", 0, m.start()) + 1, f"movi {m.group(2)} + addi {m.group(3)} in file with mergeable sections")
+        for m in TABLE.finditer(text):
+            if m.group(1) in raws:
+                out(4, path, text.count("\n", 0, m.start()) + 1, f"{m.group(1)}+{m.group(2)} into raw function")
+    print(f"findings: {count}")
+    return 1 if count else 0
+
+
+raise SystemExit(main())
