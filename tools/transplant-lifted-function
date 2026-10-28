@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Replace a committed function whose switch was left as a code-address table by
+the freshly lifted version (jump table already lowered to `when` by
+lower-recovered-jump-tables --discover), converting raw boundary calls and
+address pseudo-operations into the committed direct-call/data names.
+
+usage: tools/transplant-lifted-function LIFTED.ab TARGET.ab ABLA_FUNCTION MODULE_TAG [--write]
+MODULE_TAG: the committed module tag used in local names, e.g. nan_discovery
+
+LIFTED.ab comes from tools/recover-member (build/recovery/<chip>/<archive>/<member>/
+lifted.ab); only functions it lifted (not `naked`) can be transplanted.
+"""
+import os, re, sys, glob
+
+lifted_path, target_path, func, tag = sys.argv[1:5]
+write = "--write" in sys.argv
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+lifted = open(lifted_path).read()
+target = open(target_path).read()
+
+FUN = r'^(?:@\w+\n)?trusted fun %s\(.*?^}\n'
+def extract(text, name):
+    m = re.search(FUN % re.escape(name), text, re.S | re.M)
+    if not m:
+        sys.exit("function %s not found" % name)
+    return m
+
+lm = extract(lifted, func)
+tm = extract(target, func)
+body = lm.group(0)
+
+# ---- name resolution -------------------------------------------------------
+all_src = {}
+for p in glob.glob(ROOT + "/src/**/*.ab", recursive=True):
+    all_src[p] = open(p).read()
+
+def abi_function(sym):
+    found = set()
+    for p, t in all_src.items():
+        for m in re.finditer(r'// Original ABI symbol: %s\n(?:@\w+\n)?trusted fun (\w+)\(' % re.escape(sym), t):
+            found.add(m.group(1))
+        for m in re.finditer(r'internalFunction\("(\w+)", "%s"\)' % re.escape(sym), t):
+            found.add(m.group(1))
+    if len(found) != 1:
+        sys.exit("cannot resolve ABI function %s: %s" % (sym, sorted(found)))
+    return found.pop()
+
+def local_function(name):
+    cands = set(re.findall(r'trusted fun (esp32Internal_Labla_recovered_%s_local_text_%s_[0-9a-f]{10})\(' % (tag, re.escape(name)), target))
+    if len(cands) != 1:
+        sys.exit("cannot resolve local function %s: %s" % (name, sorted(cands)))
+    return cands.pop()
+
+def data_symbol(sym):
+    found = set()
+    m0 = re.match(r'\.Labla_recovered_\w+?_data__(\w+)$', sym)
+    if m0:
+        rest = m0.group(1)
+        for t_ in all_src.values():
+            for m in re.finditer(r'^val (esp32Data_Labla_recovered_\w+?_data_%s_[0-9a-f]{10}) = u32\(' % re.escape(rest), t_, re.M):
+                found.add(m.group(1))
+        if len(found) != 1:
+            sys.exit("cannot resolve data label %s: %s" % (sym, sorted(found)))
+        return found.pop()
+    for t in all_src.values():
+        for m in re.finditer(r'^val (esp32Data_%s_[0-9a-f]{10}) = u32\(' % re.escape(sym), t, re.M):
+            found.add(m.group(1))
+    if len(found) != 1:
+        sys.exit("cannot resolve data %s: %s" % (sym, sorted(found)))
+    return found.pop()
+
+ZEROS = ", ".join(["u32(0)"] * 10)
+SPECIAL = {"memcpy": ("freestandingCopy", 3, None), "memmove": ("freestandingMove", 3, None), "memset": ("freestandingSet", 3, 1)}
+
+out = []
+lines = body.split("\n")
+i = 0
+tables = []
+while i < len(lines):
+    line = lines[i]
+    m = re.match(r'(\s*)val callResult(\d+) = \$xtensa callWide \{([^}]+)\}\(((?:r1[0-5](?:, )?)*)\)$', line)
+    if m:
+        ind, n_, sym, args = m.groups(); n = n_
+        if sym in SPECIAL and SPECIAL[sym]:
+            fname, n, conv = SPECIAL[sym]
+            given = [a for a in args.split(", ") if a][:n]
+            if conv is not None:
+                given[conv] = "i32(%s)" % given[conv]
+            out.append("%sr10 = %s(%s)" % (ind, fname, ", ".join(given)))
+            i += 1
+            while i < len(lines) and re.match(r'\s*r1[01] = u32\(callResult%s( >>> u64\(32\))?\)$' % n_, lines[i]):
+                i += 1
+            continue
+        fn = local_function(sym.split("_local__text_")[1]) if sym.startswith(".Labla_recovered_") and "_local__text_" in sym else abi_function(sym)
+        given = [a for a in args.split(", ") if a]
+        fill = ", ".join(given + ["u32(0)"] * (16 - len(given)))
+        out.append("%sr10 = %s(%s)" % (ind, fn, fill))
+        i += 1
+        while i < len(lines) and re.match(r'\s*r1[01] = u32\(callResult%s( >>> u64\(32\))?\)$' % n_, lines[i]):
+            i += 1
+        continue
+    m = re.match(r'(\s*)(r\d+) = \$xtensa address \{([^}]+)\}$', line)
+    if m:
+        ind, reg, sym = m.groups()
+        if i + 3 < len(lines) and "jumpTableIndex" in lines[i + 1]:
+            # jump table base: dead after lowering; drop it with its load
+            tables.append(sym)
+            out.append(lines[i + 1])  # val jumpTableIndexN = rK
+            i += 2
+            # skip the `rK = (rK << 2) + reg` and `rK = load` lines
+            while i < len(lines) and re.match(r'\s*r\d+ = (\(r\d+ << u32\(2\)\) \+ r\d+|u32\(ablaUnsafeLoadU32\(nativePointerFromAddress\(int\(r\d+\)\)\)\))$', lines[i]):
+                i += 1
+            continue
+        try:
+            value = data_symbol(sym)
+        except SystemExit:
+            value = "u32(nativeFunctionAddress(%s))" % (local_function(sym.split("_local__text_")[1]) if "_local__text_" in sym else abi_function(sym))
+        out.append("%s%s = %s" % (ind, reg, value))
+        i += 1
+        continue
+    def inline(mm):
+        sym = mm.group(1)
+        try:
+            return data_symbol(sym)
+        except SystemExit:
+            return "u32(nativeFunctionAddress(%s))" % (local_function(sym.split("_local__text_")[1]) if "_local__text_" in sym else abi_function(sym))
+    out.append(re.sub(r'\$xtensa address \{([^}]+)\}', inline, line))
+    i += 1
+new = "\n".join(out)
+dead = re.compile(r'[ ]*r\d+ = [^\n]+\n([ ]*val jumpTableIndex\d+ = r\d+\n)[ ]*r\d+ = \(r\d+ << u32\(2\)\) \+ r\d+\n[ ]*r\d+ = u32\(ablaUnsafeLoadU32\(nativePointerFromAddress\(int\(r\d+\)\)\)\)\n')
+new, ndead = dead.subn(lambda m: m.group(1), new)
+tables.extend([None] * ndead)
+def remap(m):
+    tok = m.group(0)
+    rest = m.group(1)
+    if re.search(r'^val %s =' % re.escape(tok), target, re.M):
+        return tok
+    found = set(re.findall(r'^val (esp32Data_Labla_recovered_\w+?_data_%s_[0-9a-f]{10}) = u32\(' % re.escape(rest), target, re.M))
+    if len(found) != 1:
+        sys.exit("cannot remap data %s -> %s" % (tok, sorted(found)))
+    return found.pop()
+new = re.sub(r'esp32Data_Labla_recovered_\w+?_data_(\w+?)_[0-9a-f]{10}\b', remap, new)
+if "$xtensa" in new:
+    bad = [l for l in new.split("\n") if "$xtensa" in l]
+    sys.exit("unconverted lines in %s:\n%s" % (func, "\n".join(bad[:5])))
+
+result = target[:tm.start()] + new + target[tm.end():]
+# remove the committed table trio(s) that fed this function's computed jump
+removed = 0
+pat = re.compile(r'val (esp32Data_\w+)Storage = nativeStaticU32s\(\[\n(?:    int\(\(u32\(nativeFunctionAddress\(%s\)\) \+ u32\(\d+\)\)\),?\n)+\]\)\nval \1Initialized = [^\n]*\nval \1 = [^\n]*\n\n?' % re.escape(func))
+result, removed = pat.subn("", result)
+print("%s: %d table(s) removed, %d jump-table label(s) dropped, %d lines" % (func, removed, len(tables), new.count("\n")))
+if write:
+    open(target_path, "w").write(result)
