@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Self-test for tools/merge-recovered-join-tails and mark-recovered-noinline."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import pathlib
+import sys
+
+TOOLS = pathlib.Path(__file__).resolve().parent
+
+
+def load(name: str):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(TOOLS / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+merge = load("merge-recovered-join-tails")
+noinline = load("mark-recovered-noinline")
+
+
+def function(body: str) -> str:
+    return f"// Original ABI symbol: f\ntrusted fun esp32RecoveredF(\n): u32 {{\n{body}}}\n"
+
+
+def run(body: str) -> str:
+    text, _, _ = merge.process_text(function(body))
+    return text
+
+
+def check(name: str, source: str, expected: str) -> None:
+    got = run(source)
+    if got != function(expected):
+        sys.exit(f"{name}: unexpected rewrite\n--- got\n{got}\n--- expected\n{function(expected)}")
+
+
+# if/else arms end with the same statements: hoisted after the branch.
+check("if-else",
+      "    if (r2 == u32(0)) {\n        r3 = u32(1)\n        r10 = f(r10)\n        r11 = u32(0)\n        return r2\n"
+      "    } else {\n        r3 = u32(2)\n        r10 = f(r10)\n        r11 = u32(0)\n        return r2\n    }\n",
+      "    if (r2 == u32(0)) {\n        r3 = u32(1)\n    } else {\n        r3 = u32(2)\n    }\n"
+      "    r10 = f(r10)\n    r11 = u32(0)\n    return r2\n")
+
+# `when` arms with a shared tail; a terminating arm is exempt.
+check("when",
+      "    when (r2) {\n        0 -> {\n            r3 = u32(1)\n            r10 = g(r3)\n            return r10\n        }\n"
+      "        1 -> {\n            r3 = u32(2)\n            r10 = g(r3)\n            return r10\n        }\n"
+      "        else -> {\n            return r2\n        }\n    }\n",
+      "    when (r2) {\n        0 -> {\n            r3 = u32(1)\n        }\n        1 -> {\n            r3 = u32(2)\n        }\n"
+      "        else -> {\n            return r2\n        }\n    }\n    r10 = g(r3)\n    return r10\n")
+
+# A name declared in an arm prefix and used by the tail must not move.
+source = ("    if (r2 == u32(0)) {\n        val a = u32(1)\n        r3 = a\n        r10 = f(a)\n        return r10\n"
+          "    } else {\n        val a = u32(2)\n        r3 = a\n        r10 = f(a)\n        return r10\n    }\n")
+check("scope", source, source)
+
+# A bare shared `return` is left alone.
+source = ("    if (r2 == u32(0)) {\n        r3 = u32(1)\n        return r2\n"
+          "    } else {\n        r3 = u32(2)\n        return r2\n    }\n")
+check("bare-return", source, source)
+
+# Guard cascade: terminating `if` followed by a path with the same tail.
+check("guard",
+      "    if (r2 == u32(0)) {\n        r3 = u32(1)\n        r10 = f(r10)\n        r11 = u32(0)\n        return r2\n    }\n"
+      "    r3 = u32(2)\n    r10 = f(r10)\n    r11 = u32(0)\n    return r2\n",
+      "    if (r2 == u32(0)) {\n        r3 = u32(1)\n    } else {\n        r3 = u32(2)\n    }\n"
+      "    r10 = f(r10)\n    r11 = u32(0)\n    return r2\n")
+
+text, count = noinline.process(
+    "@section(\".x\")\ntrusted fun esp32RecoveredA(\n    a2: u32\n): u32 {\n    var r2 = a2\n    r2 = r2 + u32(1)\n    return r2\n}\n"
+    "@naked\ntrusted fun esp32RecoveredB(\n): u32 = $xtensa instructions {}\n", 0)
+if count != 1 or "@section(\".x\")\n@noinline\ntrusted fun esp32RecoveredA" not in text:
+    sys.exit(f"mark-recovered-noinline: unexpected rewrite\n{text}")
+
+print("join-tail merge and noinline marking passed")

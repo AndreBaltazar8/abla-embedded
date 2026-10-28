@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Merge join tails the structurizer copied into every branch.
+
+When a branch has no common post-dominator inside the function, the
+structurizer emits the shared continuation once per arm:
+
+    when (index) { 0 -> { A0; TAIL } 1 -> { A1; TAIL } ... }
+    if (c) { B; TAIL } else { C; TAIL }
+
+LLVM does not merge these again (the copies end in returns, so there is no
+join block to hoist into), and the image carries one copy per arm. This pass
+hoists the longest suffix of statements that every non-terminating arm of an
+`if`/`else` or `when` ends with to just after the branch:
+
+    when (index) { 0 -> { A0 } 1 -> { A1 } ... }; TAIL
+
+Equivalence: an arm that ends with TAIL runs its prefix and then TAIL; after
+the rewrite it runs its prefix, leaves the branch, and runs TAIL. Arms that
+terminate (return/trap) never reach the code after the branch in either form.
+The pass refuses a merge when TAIL mentions a name declared in an arm prefix
+(scoping), when a name TAIL declares is also declared elsewhere in the
+function (the single remaining copy would clash), or when an arm would become
+empty. The rewrite repeats bottom-up until nothing changes, so nested
+branches whose tails become equal after the inner merge are merged too.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Simple:
+    lines: list[str]  # relative indentation, one or more lines
+
+
+@dataclass
+class Raw:
+    lines: list[str]  # opaque compound, relative indentation
+
+
+@dataclass
+class Loop:
+    head: str
+    body: list  # statements
+    foot: str
+
+
+@dataclass
+class If:
+    head: str
+    then: list
+    other: list | None
+
+
+@dataclass
+class When:
+    head: str
+    arms: list  # (label line, statements or None for a one-line arm, one-line text)
+
+
+class Bail(Exception):
+    pass
+
+
+IF_HEAD = re.compile(r"^if \(.*\) \{$")
+WHEN_HEAD = re.compile(r"^when \(.*\) \{$")
+LOOP_HEAD = re.compile(r"^while \(.*\) \{$")
+ARM_HEAD = re.compile(r"^(?:[0-9]+|else) -> \{$")
+ARM_LINE = re.compile(r"^(?:[0-9]+|else) -> \S.*[^{]$")
+
+
+def indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+class Parser:
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        self.position = 0
+
+    def block(self, indent: int) -> list:
+        statements = []
+        while self.position < len(self.lines):
+            line = self.lines[self.position]
+            if not line.strip():
+                raise Bail("blank line")
+            level = indent_of(line)
+            if level < indent:
+                break
+            if level != indent:
+                raise Bail("unexpected indentation")
+            text = line.strip()
+            if text.startswith("}"):
+                break
+            statements.append(self.statement(indent, text))
+        return statements
+
+    def raw(self, indent: int) -> Raw:
+        start = self.position
+        self.position += 1
+        while self.position < len(self.lines):
+            line = self.lines[self.position]
+            self.position += 1
+            if indent_of(line) == indent and line.strip() == "}":
+                break
+            if indent_of(line) == indent and line.strip().startswith("}"):
+                continue
+        else:
+            raise Bail("unterminated compound")
+        return Raw([ln[indent:] for ln in self.lines[start:self.position]])
+
+    def statement(self, indent: int, text: str):
+        if IF_HEAD.match(text):
+            return self.if_statement(indent, text)
+        if WHEN_HEAD.match(text):
+            return self.when_statement(indent, text)
+        if LOOP_HEAD.match(text):
+            self.position += 1
+            body = self.block(indent + 4)
+            self.expect(indent, "}")
+            return Loop(text, body, "}")
+        if text.endswith("{"):
+            return self.raw(indent)
+        self.position += 1
+        return Simple([text])
+
+    def expect(self, indent: int, text: str) -> None:
+        if (self.position >= len(self.lines) or
+                indent_of(self.lines[self.position]) != indent or
+                self.lines[self.position].strip() != text):
+            raise Bail(f"expected {text!r}")
+        self.position += 1
+
+    def if_statement(self, indent: int, text: str):
+        self.position += 1
+        then = self.block(indent + 4)
+        if self.position >= len(self.lines):
+            raise Bail("unterminated if")
+        closer = self.lines[self.position]
+        if indent_of(closer) != indent:
+            raise Bail("if closer indentation")
+        if closer.strip() == "}":
+            self.position += 1
+            return If(text, then, None)
+        if closer.strip() == "} else {":
+            self.position += 1
+            other = self.block(indent + 4)
+            self.expect(indent, "}")
+            return If(text, then, other)
+        raise Bail("else-if chain")
+
+    def when_statement(self, indent: int, text: str):
+        self.position += 1
+        arms = []
+        while True:
+            if self.position >= len(self.lines):
+                raise Bail("unterminated when")
+            line = self.lines[self.position]
+            if indent_of(line) == indent and line.strip() == "}":
+                self.position += 1
+                break
+            if indent_of(line) != indent + 4:
+                raise Bail("when arm indentation")
+            label = line.strip()
+            if ARM_HEAD.match(label):
+                self.position += 1
+                body = self.block(indent + 8)
+                self.expect(indent + 4, "}")
+                arms.append((label, body))
+            elif ARM_LINE.match(label):
+                self.position += 1
+                arms.append((label, None))
+            else:
+                raise Bail("when arm form")
+        return When(text, arms)
+
+
+def emit(statements: list, indent: int, out: list[str]) -> None:
+    pad = " " * indent
+    for statement in statements:
+        if isinstance(statement, (Simple, Raw)):
+            out.extend(pad + ln if ln.strip() else ln for ln in statement.lines)
+        elif isinstance(statement, Loop):
+            out.append(pad + statement.head)
+            emit(statement.body, indent + 4, out)
+            out.append(pad + "}")
+        elif isinstance(statement, If):
+            out.append(pad + statement.head)
+            emit(statement.then, indent + 4, out)
+            if statement.other is not None:
+                out.append(pad + "} else {")
+                emit(statement.other, indent + 4, out)
+            out.append(pad + "}")
+        else:
+            out.append(pad + statement.head)
+            for label, body in statement.arms:
+                if body is None:
+                    out.append(pad + "    " + label)
+                else:
+                    out.append(pad + "    " + label)
+                    emit(body, indent + 8, out)
+                    out.append(pad + "    }")
+            out.append(pad + "}")
+
+
+def render(statement) -> str:
+    out: list[str] = []
+    emit([statement], 0, out)
+    return "\n".join(out)
+
+
+# Same call count as tools/lint-recovered-unit's DRIFT-CALL.
+CALL = re.compile(r"\bablaUnsafeCall\w*\(|\$xtensa call(?:Wide|x\w*)?\b|\b(?:esp32Recovered|freestanding)\w*\(")
+GENERATED_NAME = re.compile(r"\b(callResult|jumpTableIndex)\d+\b")
+
+
+def canonical(statement) -> str:
+    """Text with the lifter's numbered temporaries renamed to a fixed spelling."""
+    return GENERATED_NAME.sub(r"\1#", render(statement))
+
+
+def terminates(statement) -> bool:
+    if isinstance(statement, Simple):
+        text = statement.lines[0]
+        return text == "return" or text.startswith("return ") or text == "ablaRuntimeTrap()"
+    if isinstance(statement, If):
+        return (statement.other is not None and block_terminates(statement.then) and
+                block_terminates(statement.other))
+    if isinstance(statement, When):
+        has_else = any(label.startswith("else ->") for label, _ in statement.arms)
+        return has_else and all(
+            (body is None and label.endswith("ablaRuntimeTrap()")) or
+            (body is not None and block_terminates(body))
+            for label, body in statement.arms
+        )
+    return False
+
+
+def terminates_label(label: str) -> bool:
+    return label.endswith("ablaRuntimeTrap()") or " -> return" in label
+
+
+def block_terminates(block: list) -> bool:
+    return bool(block) and terminates(block[-1])
+
+
+DECLARATION = re.compile(r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def declared(texts: list[str]) -> list[str]:
+    names = []
+    for text in texts:
+        names.extend(DECLARATION.findall(text))
+    return names
+
+
+def leaves(block: list) -> list | None:
+    """Leaf statement lists a branch tree ends in (None: unsupported shape).
+
+    A block that is exactly one if/else or `when` is a branch tree itself;
+    paths through it all continue with whatever follows the outermost branch,
+    so their leaves can be merged as one set of arms.
+    """
+    if len(block) == 1 and isinstance(block[0], If) and block[0].other is not None:
+        first = leaves(block[0].then)
+        second = leaves(block[0].other)
+        if first is None or second is None:
+            return None
+        return first + second
+    if len(block) == 1 and isinstance(block[0], When):
+        result: list = []
+        for label, body in block[0].arms:
+            if body is None:
+                if terminates_label(label):
+                    continue
+                return None
+            inner = leaves(body)
+            if inner is None:
+                return None
+            result.extend(inner)
+        return result
+    return [block]
+
+
+class Merger:
+    def __init__(self) -> None:
+        self.declarations: dict[str, int] = {}
+        self.merged = 0
+        self.removed_statements = 0
+        self.removed_calls = 0
+
+    def count_declarations(self, lines: list[str]) -> None:
+        self.declarations.clear()
+        for name in declared(lines):
+            self.declarations[name] = self.declarations.get(name, 0) + 1
+
+    def merge(self, arms: list) -> list:
+        """Hoist the tail shared by the arms that fall through to it.
+
+        `arms` holds one statement list per branch arm. Returns the hoisted
+        tail (taken from the first arm; the arms are edited in place), or []
+        when nothing can be merged. Tails are compared up to the numbering of
+        the lifter's `callResultN`/`jumpTableIndexN` temporaries.
+        """
+        flat: list = []
+        for body in arms:
+            inner = leaves(body)
+            if inner is None:
+                return []
+            flat.extend(inner)
+        arms = flat
+        keys = [[canonical(item) for item in body] for body in arms]
+        groups: dict[str, list[int]] = {}
+        for index, key in enumerate(keys):
+            if key:
+                groups.setdefault(key[-1], []).append(index)
+        if not groups:
+            return []
+        members = max(groups.values(), key=len)
+        if len(members) < 2:
+            return []
+        # Every arm outside the group must never reach the code after the
+        # branch, and the group's own arms must not run out of statements.
+        for index, body in enumerate(arms):
+            if index not in members and not block_terminates(body):
+                return []
+        active = [arms[index] for index in members]
+        active_keys = [keys[index] for index in members]
+        depth = 0
+        while (all(len(key) > depth + 1 for key in active_keys) and
+               len({key[-1 - depth] for key in active_keys}) == 1):
+            depth += 1
+        # `depth` counts matching suffix statements while keeping every
+        # prefix non-empty.
+        if depth == 0:
+            return []
+        # A bare `return` shared by every arm is not worth hoisting, and doing
+        # so would leave a longer tail in sibling paths that return on their
+        # own (they would then no longer end like the hoisted arms).
+        if all(isinstance(item, Simple) and terminates(item) for item in active[0][-depth:]):
+            return []
+        tails = [body[-depth:] for body in active]
+        tail_lines = [[ln for item in tail for ln in render(item).split("\n")] for tail in tails]
+        tail_names = [declared(lines) for lines in tail_lines]
+        prefix_names: set[str] = set()
+        for body in active:
+            prefix_names.update(declared(
+                [ln for item in body[:-depth] for ln in render(item).split("\n")]
+            ))
+        words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", "\n".join(tail_lines[0])))
+        if prefix_names & words:
+            return []
+        # Names the kept copy declares must not be declared anywhere else.
+        for name in set(tail_names[0]):
+            if self.declarations.get(name, 0) != sum(names.count(name) for names in tail_names):
+                return []
+        for names in tail_names[1:]:
+            for name in names:
+                self.declarations[name] = self.declarations.get(name, 0) - 1
+        for lines in tail_lines[1:]:
+            self.removed_calls += len(CALL.findall("\n".join(lines)))
+        tail = tails[0]
+        for body in active:
+            del body[-depth:]
+        self.merged += 1
+        self.removed_statements += (len(active) - 1) * depth
+        return tail
+
+    def guard(self, block: list, index: int) -> bool:
+        """Fold `if (c) { X; tail }` + rest into if/else when that merges a tail."""
+        statement = block[index]
+        if (not isinstance(statement, If) or statement.other is not None or
+                not block_terminates(statement.then)):
+            return False
+        rest = block[index + 1:]
+        if not rest:
+            return False
+        before = (self.merged, self.removed_statements)
+        saved = dict(self.declarations)
+        tail = self.merge([statement.then, rest])
+        if not tail:
+            self.declarations = saved
+            return False
+        if not rest:
+            # The rest was the shared tail itself: the else branch is empty.
+            statement.other = None
+        else:
+            statement.other = list(rest)
+        block[index + 1:] = tail
+        return True
+
+
+def branch_arms(statement) -> list | None:
+    if isinstance(statement, If) and statement.other is not None:
+        return [statement.then, statement.other]
+    if isinstance(statement, When):
+        arms = []
+        for label, body in statement.arms:
+            if body is None:
+                if terminates_label(label):
+                    continue
+                return None
+            arms.append(body)
+        return arms
+    return None
+
+
+def merge_after(statements: list, merger: Merger) -> list:
+    """Each branch statement followed by the tail hoisted out of its arms."""
+    out: list = []
+    for statement in statements:
+        out.append(statement)
+        arms = branch_arms(statement)
+        if arms:
+            out.extend(merger.merge(arms))
+    return out
+
+
+def apply_nested(block: list, merger: Merger) -> list:
+    block = merge_after(block, merger)
+    for statement in block:
+        if isinstance(statement, Loop):
+            statement.body = apply_nested(statement.body, merger)
+        elif isinstance(statement, If):
+            statement.then = apply_nested(statement.then, merger)
+            if statement.other is not None:
+                statement.other = apply_nested(statement.other, merger)
+        elif isinstance(statement, When):
+            statement.arms = [
+                (label, None if body is None else apply_nested(body, merger))
+                for label, body in statement.arms
+            ]
+    block = merge_after(block, merger)
+    for index in range(len(block) - 1, -1, -1):
+        merger.guard(block, index)
+    return block
+
+
+def splice(block: list, merger: Merger) -> list:
+    while True:
+        before = merger.merged
+        block = apply_nested(block, merger)
+        if merger.merged == before:
+            return block
+
+
+FUNCTION_HEAD = re.compile(r"^(?:@[^\n]*\n)*(?:trusted )?fun \w+\(", re.MULTILINE)
+
+
+def process_function(body_lines: list[str]) -> tuple[list[str], int, int]:
+    parser = Parser(body_lines)
+    try:
+        block = parser.block(4)
+        if parser.position != len(body_lines):
+            raise Bail("trailing lines")
+    except Bail:
+        return body_lines, 0, 0
+    merger = Merger()
+    merger.count_declarations(body_lines)
+    block = splice(block, merger)
+    if merger.merged == 0:
+        return body_lines, 0, 0
+    out: list[str] = []
+    if merger.removed_calls:
+        # Lets tools/lint-recovered-unit credit the calls whose duplicate
+        # copies were merged when it compares call counts with the original.
+        out.append(f"    // abla-merged-calls: {merger.removed_calls}")
+    emit(block, 4, out)
+    return out, merger.merged, merger.removed_statements
+
+
+def process_text(text: str) -> tuple[str, int, int]:
+    lines = text.split("\n")
+    out: list[str] = []
+    merged = removed = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        index += 1
+        # A recovered function: `): u32 {` at column 0 ends its signature.
+        if line.startswith("): ") and line.endswith("{"):
+            start = index
+            while index < len(lines) and lines[index] != "}":
+                index += 1
+            body, count, dropped = process_function(lines[start:index])
+            out.extend(body)
+            merged += count
+            removed += dropped
+    return "\n".join(out), merged, removed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root")
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    files = changed = merged = removed = 0
+    for path in sorted(pathlib.Path(arguments.root).rglob("*.ab")):
+        text = path.read_text()
+        new_text, count, dropped = process_text(text)
+        files += 1
+        if count:
+            changed += 1
+            merged += count
+            removed += dropped
+            if arguments.write:
+                path.write_text(new_text)
+    verb = "merged" if arguments.write else "would merge"
+    print(f"{verb} {merged} join tail(s) in {changed} file(s), "
+          f"removing {removed} duplicated statement(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

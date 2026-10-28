@@ -59,6 +59,31 @@ Bugs found on the way, all fixed generically in the tools:
 - memory access after `memw` is volatile (GCC's marker for MMIO); LLVM had
   narrowed a 32-bit MAC register read to `l16ui`.
 
+### Size of the lifted code (eight archives, `EXPORTS=all`: 1,013,088 -> 1,000,224 bytes)
+
+Lifted code is about 33% larger than GCC's for the same functions (213,860 bytes
+of text in the Espressif members, 266,193 + 19,020 literal bytes from the unit).
+Measured causes and the tool-side fixes (see `tools/` for each):
+
+- every call to a recovered function passed the caller's own ten dead stack
+  words (`direct-recovered-xtensa-calls`; register-only callees now get zeros):
+  -4.2 KB;
+- the structurizer copies a join tail into every arm
+  (`merge-recovered-join-tails` hoists tails shared by the arms of an
+  `if`/`when`; the function records how many call copies it merged and
+  `lint-recovered-unit` credits them in DRIFT-CALL): -3.5 KB;
+- LLVM inlines exported recovered functions into callers while the function
+  itself must stay (`mark-recovered-noinline`): -3.2 KB;
+- LLVM 23.1 never selects EXTUI or BBCI/BNONE (`esp-llvm-bin/fuse-xtensa-extui`,
+  liveness-checked rewrite of the final assembly): -2.0 KB.
+
+Not worth it: sharing literal-pool words across functions (the image keeps only
+19 KB of literals; sharing saved nothing after `--gc-sections`), the opt inline
+threshold, `ipsccp<func-spec>`, jump-threading/simplifycfg knobs (each within
++-2 KB). What remains is mostly register-machine overhead (twice the `mov.n`,
+junk register arguments to indirect calls, 16-parameter ABI functions kept alive
+by their exported aliases, so LLVM's dead-argument elimination cannot narrow them).
+
 ### Remaining Wi-Fi archives (libcore, libespnow, libmesh, libsmartconfig, libwapi)
 
 All five are in the profiles and recover with `recover-member` (libcore 4

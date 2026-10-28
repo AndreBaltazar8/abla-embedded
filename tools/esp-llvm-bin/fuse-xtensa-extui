@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Select EXTUI for `and` with a low-bit mask in LLVM Xtensa assembly.
+
+LLVM 23.1's Xtensa selector never emits EXTUI for `x & 0xff`, `(x >> n) & 1`
+and similar zero-extensions. It builds the mask in a register (`movi`, or an
+`l32r` literal for 0xffff) and uses a 3-byte `and`: 6 bytes plus a literal
+where GCC emits one 3-byte `extui`. This pass rewrites
+
+    [srli aT, aS, n] ... movi aK, 2^w-1 ... and aD, aT, aK      (w = 1..16)
+
+to `extui aD, aS, n, w` (or `extui aD, aT, 0, w` without a shift). EXTUI is
+the zero-extending field extract, so the rewritten instruction computes the
+identical value; the `movi`/`l32r`/`srli` that fed the old `and` are then
+removed only when liveness over the function's control-flow graph proves
+their result unused. A function containing an instruction this file does not
+model is left untouched. `.literal` entries nothing references any more are
+dropped.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+REG = re.compile(r"^a(?:1[0-5]|[0-9])$")
+LABEL = re.compile(r"^([.\w$]+):")
+
+DEF_FIRST = {
+    "l32i", "l32i.n", "l16ui", "l16si", "l8ui", "l32r", "movi", "movi.n", "mov.n",
+    "or", "and", "xor", "add", "add.n", "sub", "addx2", "addx4", "addx8", "subx2",
+    "subx4", "subx8", "mull", "mulh", "muluh", "quos", "quou", "rems", "remu",
+    "neg", "abs", "srli", "slli", "srai", "extui", "sext", "addi", "addi.n", "addmi",
+    "min", "max", "minu", "maxu", "src", "nsa", "nsau", "sll", "srl", "sra", "clamps",
+    "mul16s", "mul16u", "l32ai", "mulsh", "movsp",
+}
+DEF_AND_USE_FIRST = {"moveqz", "movnez", "movltz", "movgez"}
+USE_ONLY = {
+    "s32i", "s32i.n", "s16i", "s8i", "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "bltz", "bgez", "beqi", "bnei", "blti", "bgei", "bltui", "bgeui",
+    "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci", "bbsi", "beqz.n", "bnez.n",
+    "ssl", "ssr", "ssa8l", "ssa8b", "ssai", "jx", "lsi", "ssi",
+}
+NO_REGS = {"ill", "ill.n", "break", "break.n", "memw", "extw", "isync", "dsync", "esync", "rsync", "nop", "nop.n", "j", "entry"}
+BRANCHES = {
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "bltz", "bgez", "beqi", "bnei",
+    "blti", "bgei", "bltui", "bgeui", "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci",
+    "bbsi", "beqz.n", "bnez.n",
+}
+RETURNS = {"retw", "retw.n", "ret", "ret.n", "ill", "ill.n"}
+REMOVABLE = {"movi", "movi.n", "srli", "l32r"}
+
+
+SKIPPED: dict[str, int] = {}
+
+
+class Unknown(Exception):
+    pass
+
+
+def effects(opcode: str, operands: list[str]) -> tuple[set[str], set[str]]:
+    regs = [item for item in operands if REG.match(item)]
+    if opcode in DEF_FIRST:
+        return {regs[0]}, set(regs[1:])
+    if opcode in DEF_AND_USE_FIRST:
+        return {regs[0]}, set(regs)
+    if opcode in USE_ONLY:
+        return set(), set(regs)
+    if opcode in NO_REGS:
+        return set(), set()
+    if opcode in RETURNS:
+        return set(), {"a2", "a3"}
+    if opcode in ("callx8", "call8"):
+        return {f"a{n}" for n in range(8, 16)}, set(regs) | {f"a{n}" for n in range(10, 16)}
+    if opcode.startswith(("rsr.", "rur.")):
+        return {regs[0]}, set()
+    if opcode.startswith(("wsr.", "wur.")):
+        return set(), set(regs)
+    if opcode.startswith("xsr."):
+        return {regs[0]}, set(regs)
+    raise Unknown(opcode)
+
+
+class Instr:
+    __slots__ = ("text", "opcode", "operands", "label", "dead", "asm")
+
+    def __init__(self, text: str):
+        self.text = text
+        self.opcode = None
+        self.operands: list[str] = []
+        self.label = None
+        self.dead = False
+        self.asm = False
+        code = text.split("#", 1)[0].strip()
+        if not code:
+            return
+        match = LABEL.match(code)
+        if match:
+            self.label = match.group(1)
+            return
+        if code.startswith("."):
+            return
+        parts = code.split(None, 1)
+        self.opcode = parts[0]
+        self.operands = [item.strip() for item in parts[1].split(",")] if len(parts) > 1 else []
+
+
+def analyse(items: list[Instr]) -> list[set[str]]:
+    """Live-after set per item (index-aligned); raises Unknown/KeyError."""
+    live_items = [item for item in items if not item.dead]
+    n = len(live_items)
+    start = {0}
+    label_at: dict[str, int] = {}
+    for index, item in enumerate(live_items):
+        if item.label is not None:
+            label_at[item.label] = index
+            start.add(index)
+        if item.opcode in BRANCHES or item.opcode in ("j", "jx") or item.opcode in RETURNS:
+            start.add(index + 1)
+    order = sorted(s for s in start if s < n)
+    bounds = [(s, order[i + 1] if i + 1 < len(order) else n) for i, s in enumerate(order)]
+    block_of = {}
+    for number, (b, e) in enumerate(bounds):
+        for index in range(b, e):
+            block_of[index] = number
+    lbb = sorted({block_of[i] for name, i in label_at.items() if name.startswith(".LBB")})
+    successors = []
+    for number, (b, e) in enumerate(bounds):
+        last = next((live_items[i] for i in range(e - 1, b - 1, -1) if live_items[i].opcode), None)
+        targets = []
+        fall = number + 1 < len(bounds)
+        if last is not None:
+            if last.opcode == "j":
+                targets.append(block_of[label_at[last.operands[0]]])
+                fall = False
+            elif last.opcode in BRANCHES:
+                targets.append(block_of[label_at[last.operands[-1]]])
+            elif last.opcode == "jx":
+                targets.extend(lbb)
+                fall = False
+            elif last.opcode in RETURNS:
+                fall = False
+        if fall:
+            targets.append(number + 1)
+        successors.append(targets)
+    live_in = [set() for _ in bounds]
+    changed = True
+    while changed:
+        changed = False
+        for number in range(len(bounds) - 1, -1, -1):
+            live: set[str] = set()
+            for t in successors[number]:
+                live |= live_in[t]
+            b, e = bounds[number]
+            for index in range(e - 1, b - 1, -1):
+                item = live_items[index]
+                if item.opcode:
+                    defs, uses = effects(item.opcode, item.operands)
+                    live = (live - defs) | uses
+            if live != live_in[number]:
+                live_in[number] = live
+                changed = True
+    after_live: dict[int, set[str]] = {}
+    for number, (b, e) in enumerate(bounds):
+        live = set()
+        for t in successors[number]:
+            live |= live_in[t]
+        for index in range(e - 1, b - 1, -1):
+            item = live_items[index]
+            after_live[id(item)] = set(live)
+            if item.opcode:
+                defs, uses = effects(item.opcode, item.operands)
+                live = (live - defs) | uses
+    return after_live, block_of, live_items
+
+
+def mask_width(value: int) -> int | None:
+    if value > 0 and (value & (value + 1)) == 0 and value.bit_length() <= 16:
+        return value.bit_length()
+    return None
+
+
+def block_prefix(items: list[Instr], index: int) -> int:
+    """Index of the first instruction of index's basic block."""
+    cursor = index
+    while cursor > 0:
+        if items[cursor].label is not None:
+            return cursor
+        previous = items[cursor - 1]
+        if previous.opcode in BRANCHES or previous.opcode in ("j", "jx") or previous.opcode in RETURNS:
+            return cursor
+        cursor -= 1
+    return 0
+
+
+def reaching_def(items: list[Instr], index: int, register: str):
+    """Nearest earlier instruction in the block defining `register`."""
+    first = block_prefix(items, index)
+    for cursor in range(index - 1, first - 1, -1):
+        item = items[cursor]
+        if item.opcode:
+            defs, _ = effects(item.opcode, item.operands)
+            if register in defs:
+                return cursor
+    return None
+
+
+def fuse_branch(items: list[Instr], index: int, after: dict, branch_ok: bool) -> bool:
+    """`and aD, x, y ; beqz/bnez aD, L` -> bnone/bany (bbci/bbsi for one bit)."""
+    item = items[index]
+    dest, left, right = item.operands
+    following = index + 1
+    if following >= len(items) or items[following].dead:
+        return False
+    branch = items[following]
+    if (branch.asm or branch.opcode not in ("beqz", "bnez", "beqz.n", "bnez.n") or
+            len(branch.operands) != 2 or branch.operands[0] != dest):
+        return False
+    if dest in after[id(branch)]:
+        return False
+    zero = branch.opcode.startswith("beqz")
+    label = branch.operands[1]
+    for source, mask_reg in ((left, right), (right, left)):
+        mask_index = reaching_def(items, index, mask_reg)
+        if mask_index is not None and not items[mask_index].asm and items[mask_index].opcode in ("movi", "movi.n"):
+            try:
+                value = int(items[mask_index].operands[1])
+            except ValueError:
+                continue
+            if value > 0 and (value & (value - 1)) == 0 and source != mask_reg:
+                bit = value.bit_length() - 1
+                item.text = f"\t{'bbci' if zero else 'bbsi'}\t{source}, {bit}, {label}"
+                item.opcode = "bbci" if zero else "bbsi"
+                item.operands = [source, str(bit), label]
+                branch.dead = True
+                return True
+    item.text = f"\t{'bnone' if zero else 'bany'}\t{left}, {right}, {label}"
+    item.opcode = "bnone" if zero else "bany"
+    item.operands = [left, right, label]
+    branch.dead = True
+    return True
+
+
+def convert(items: list[Instr], literals: dict[str, int], branches: bool) -> int:
+    count = 0
+    after = analyse(items)[0] if branches else {}
+    for index, item in enumerate(items):
+        if item.dead or item.asm or item.opcode != "and" or len(item.operands) != 3:
+            continue
+        dest, left, right = item.operands
+        if not all(REG.match(r) for r in (dest, left, right)):
+            continue
+        if branches and fuse_branch(items, index, after, True):
+            count += 1
+            continue
+        for source, mask_reg in ((left, right), (right, left)):
+            if source == mask_reg:
+                continue
+            mask_index = reaching_def(items, index, mask_reg)
+            if mask_index is None:
+                continue
+            definition = items[mask_index]
+            if definition.asm:
+                continue
+            width = None
+            if definition.opcode in ("movi", "movi.n") and len(definition.operands) == 2:
+                try:
+                    width = mask_width(int(definition.operands[1]))
+                except ValueError:
+                    width = None
+            elif definition.opcode == "l32r" and definition.operands[1] in literals:
+                width = mask_width(literals[definition.operands[1]])
+            if width is None:
+                continue
+            base, shift = source, 0
+            shift_index = reaching_def(items, index, source)
+            if (shift_index is not None and items[shift_index].opcode == "srli" and
+                    not items[shift_index].asm):
+                shifted = items[shift_index]
+                origin = shifted.operands[1]
+                amount = int(shifted.operands[2])
+                if REG.match(origin) and amount + width <= 32:
+                    # The origin register must keep its value up to the `and`.
+                    if all(not (items[c].opcode and origin in effects(items[c].opcode, items[c].operands)[0])
+                           for c in range(shift_index + 1, index)):
+                        base, shift = origin, amount
+            item.text = f"\textui\t{dest}, {base}, {shift}, {width}"
+            item.opcode = "extui"
+            item.operands = [dest, base, str(shift), str(width)]
+            count += 1
+            break
+    return count
+
+
+def eliminate_dead(items: list[Instr], used: dict[str, int]) -> None:
+    changed = True
+    while changed:
+        changed = False
+        after, _, live_items = analyse(items)
+        for item in live_items:
+            if (item.opcode in REMOVABLE and not item.asm and item.operands and
+                    REG.match(item.operands[0]) and
+                    (item.opcode != "l32r" or item.operands[1].startswith(".LCPI"))):
+                if item.operands[0] not in after[id(item)]:
+                    item.dead = True
+                    changed = True
+                    if item.opcode == "l32r":
+                        used[item.operands[1]] = used.get(item.operands[1], 0) - 1
+        # Only recompute while something was removed.
+
+
+def process_function(lines: list[str], literals: dict[str, int], used: dict[str, int]):
+    items = [Instr(line) for line in lines]
+    inline = False
+    for item in items:
+        stripped = item.text.strip()
+        if stripped == "#APP":
+            inline = True
+        elif stripped == "#NO_APP":
+            inline = False
+        item.asm = inline
+    if not any(i.opcode == "and" for i in items):
+        return lines, 0
+    try:
+        analyse(items)
+    except (Unknown, KeyError, IndexError, ValueError) as error:
+        SKIPPED[type(error).__name__ + ":" + str(error)] = SKIPPED.get(type(error).__name__ + ":" + str(error), 0) + 1
+        return lines, 0
+    count = convert(items, literals, os.environ.get("ABLA_XTENSA_BRANCH_FUSE", "1") == "1")
+    if not count:
+        return lines, 0
+    local_used = dict(used)
+    try:
+        eliminate_dead(items, local_used)
+    except (Unknown, KeyError, IndexError, ValueError):
+        return lines, 0
+    used.update(local_used)
+    return [i.text for i in items if not i.dead], count
+
+
+def main() -> int:
+    text = sys.stdin.read().split("\n")
+    literals: dict[str, int] = {}
+    used: dict[str, int] = {}
+    for line in text:
+        match = re.match(r"^\s*\.literal\s+(\.LCPI\d+_\d+),\s*(-?\d+)\s*$", line)
+        if match:
+            literals[match.group(1)] = int(match.group(2))
+        if not line.lstrip().startswith(".literal"):
+            for name in re.findall(r"(\.LCPI\d+_\d+)", line):
+                used[name] = used.get(name, 0) + 1
+    out: list[str] = []
+    index = 0
+    total = 0
+    while index < len(text):
+        line = text[index]
+        if "-- Begin function" in line:
+            end = index + 1
+            while end < len(text) and "-- End function" not in text[end]:
+                end += 1
+            body, count = process_function(text[index + 1:end], literals, used)
+            total += count
+            out.append(line)
+            out.extend(body)
+            index = end
+            continue
+        out.append(line)
+        index += 1
+    dead = {name for name in literals if used.get(name, 0) <= 0}
+    result = [line for line in out
+              if not ((m := re.match(r"^\s*\.literal\s+(\.LCPI\d+_\d+),", line)) and m.group(1) in dead)]
+    sys.stdout.write("\n".join(result))
+    sys.stderr.write(f"fuse-xtensa-extui: {total} extui\n")
+    if SKIPPED and os.environ.get("ABLA_EXTUI_DEBUG"):
+        sys.stderr.write(f"fuse-xtensa-extui: skipped {sorted(SKIPPED.items(), key=lambda kv: -kv[1])[:20]}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
