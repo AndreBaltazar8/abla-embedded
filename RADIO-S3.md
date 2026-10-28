@@ -70,15 +70,32 @@ Classic-only assumptions to parameterize (from a tooling survey):
 
 ## Making recovery repeatable per chip
 
-1. **Chip profile** (`tools/recovery/<chip>.toml` or similar): objdump, archive
-   root, output directory/prefix (`src/esp32s3/...`, `esp32s3Recovered`), ROM
-   linker scripts, fixed-address table, and the per-corpus tables above moved
-   out of the tools.
-2. **One driver** (`tools/recover-member <chip> <archive> <member>`) running
-   the existing passes in order to a fixpoint, instead of by hand.
-3. **Reuse first**: run `compare-xtensa-archives` against an already recovered
-   chip; link identical/reordered functions to the existing Abla, generate
-   offset tables for layout-only ones, and only lift the rest.
+1. **Chip profile** (`tools/recovery/<chip>.toml`, done for `esp32` and
+   `esp32s3`): objdump, ESP-IDF archives, ROM linker scripts and the
+   reference chip. Still to move in: the fixed-address table and the
+   per-corpus tables above.
+2. **One driver** (`tools/recover-member <chip> <archive> <member>`, done):
+   extracts the member, classifies every function (`rom`, `identical`,
+   `reordered`, `layout`, `different`, `new`) against the reference chip,
+   finds the reference's recovered Abla through the link selectors, then
+   reconstructs and runs migrate / lift / lower boundaries / structurize until
+   a round changes nothing. Writes `reuse.tsv` and `status.tsv` under
+   `build/recovery/<chip>/<archive>/<member>/`; `--classify-only` stops after
+   the reuse table. First runs:
+
+   | Member | Functions | Reusable Abla | Lifted | Rounds |
+   | --- | ---: | ---: | ---: | ---: |
+   | `libnet80211/ieee80211_action_vendor.o` | 12 | 5 | 8 of 12 | 2 |
+   | `libnet80211/wl_chm.o` | 22 | 11 | 18 of 22 | 3 |
+   | `libpp/pm.o` | 147 | 15 | 124 of 144 | 3 |
+   | `libpp/trc.o` | 68 | 33 | 63 of 71 | 3 |
+
+   "Lifted" means typed Abla with `$xtensa` boundary calls left; the later
+   classic passes (direct calls, data lowering, jump tables) are not in the
+   driver yet, and the output has not been compiled.
+3. **Reuse first**: link identical/reordered functions to the existing Abla
+   (`reuse.tsv` names the file and line), generate offset tables for
+   layout-only ones, and only lift the rest.
 4. **Ledger per chip** (like `esp32-opaque-radio-parity.tsv`) with the same
    parity/link-boundary checks, plus a hardware run (Paper Mono for the S3).
 
