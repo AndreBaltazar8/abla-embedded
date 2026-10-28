@@ -12,6 +12,7 @@ outside that proof boundary is left unchanged.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 import re
@@ -1177,6 +1178,149 @@ def emit_graph(blocks: dict[int, Block], nodes: set[int]) -> str | None:
     return "\n".join(lines) + "\n"
 
 
+def emit_stackified(blocks: dict[int, Block], nodes: set[int]) -> str | None:
+    """Emit a reducible graph with every block exactly once (Ramsey's
+    "Beyond Relooper", WebAssembly's block/br stackifier).
+
+    The dominator tree drives emission. A node with two or more forward edges
+    into it (a merge) is placed right after a labeled block
+    `bN@ do { ... } while (false)` that encloses all its predecessors, which
+    reach it with `break@bN`; a loop header opens `lN@ while (true) { ... }`
+    whose back edges are `continue@lN`; every other node has exactly one
+    forward edge into it and is emitted inline there. emit_graph instead
+    copies a join that is not an immediate postdominator into each arm.
+    Hardware loops and exits it cannot express return None (emit_graph runs).
+    """
+    if any(blocks[number].kind == "hardware_loop" for number in nodes):
+        return None
+    order: list[int] = []
+    seen: set[int] = set()
+
+    def visit(number: int) -> None:
+        seen.add(number)
+        for target in blocks[number].targets:
+            if target != EXIT and target not in seen:
+                visit(target)
+        order.append(number)
+
+    visit(0)
+    order.reverse()
+    rank = {number: index for index, number in enumerate(order)}
+    predecessors: dict[int, list[int]] = {number: [] for number in order}
+    for number in order:
+        for target in blocks[number].targets:
+            if target != EXIT:
+                predecessors[target].append(number)
+    # Cooper-Harvey-Kennedy dominators over reverse postorder.
+    idom: dict[int, int] = {0: 0}
+    changed = True
+    while changed:
+        changed = False
+        for number in order[1:]:
+            done = [p for p in predecessors[number] if p in idom]
+            if not done:
+                continue
+            new = done[0]
+            for other in done[1:]:
+                a, b = new, other
+                while a != b:
+                    while rank[a] > rank[b]:
+                        a = idom[a]
+                    while rank[b] > rank[a]:
+                        b = idom[b]
+                new = a
+            if idom.get(number) != new:
+                idom[number] = new
+                changed = True
+
+    def dominates(a: int, b: int) -> bool:
+        while True:
+            if a == b:
+                return True
+            if b == 0:
+                return False
+            b = idom[b]
+
+    forward_in: dict[int, int] = {number: 0 for number in order}
+    headers: set[int] = set()
+    for number in order:
+        for target in blocks[number].targets:
+            if target == EXIT:
+                continue
+            if rank[target] <= rank[number]:
+                if not dominates(target, number):
+                    return None  # irreducible
+                headers.add(target)
+            else:
+                forward_in[target] += 1
+    merges = {number for number in order if forward_in[number] >= 2}
+    children: dict[int, list[int]] = {number: [] for number in order}
+    for number in order[1:]:
+        children[idom[number]].append(number)
+    steps = 0
+
+    def branch(source: int, target: int, indent: str) -> list[str] | None:
+        if target == EXIT:
+            return None
+        if rank[target] <= rank[source]:
+            return [f"{indent}continue@l{target}"]
+        if target in merges:
+            return [f"{indent}break@b{target}"]
+        return tree(target, indent)
+
+    def tree(number: int, indent: str) -> list[str] | None:
+        nonlocal steps
+        steps += 1
+        if steps > len(order) * 4 + 16:
+            return None
+        ys = sorted((c for c in children[number] if c in merges),
+                    key=lambda c: rank[c], reverse=True)
+        if number in headers:
+            body = within(number, ys, indent + "    ")
+            if body is None:
+                return None
+            return [f"{indent}l{number}@ while (true) {{"] + body + [f"{indent}}}"]
+        return within(number, ys, indent)
+
+    def within(number: int, ys: list[int], indent: str) -> list[str] | None:
+        if ys:
+            inner = within(number, ys[1:], indent + "    ")
+            after = tree(ys[0], indent)
+            if inner is None or after is None:
+                return None
+            return ([f"{indent}b{ys[0]}@ do {{"] + inner
+                    + [f"{indent}}} while (false)"] + after)
+        block = blocks[number]
+        output = normalized_statements(block.statements, indent)
+        if block.kind == "exit":
+            return output
+        if block.kind == "jump":
+            lines = branch(number, block.targets[0], indent)
+            return None if lines is None else output + lines
+        if block.kind == "branch":
+            yes = branch(number, block.targets[0], indent + "    ")
+            no = branch(number, block.targets[1], indent + "    ")
+            if yes is None or no is None:
+                return None
+            return (output + [f"{indent}if ({block.condition}) {{"] + yes
+                    + [f"{indent}}} else {{"] + no + [f"{indent}}}"])
+        if block.kind == "switch":
+            output.append(f"{indent}when ({block.condition}) {{")
+            for value, target in zip(block.case_values, block.targets, strict=True):
+                if value == "else" and target == EXIT:
+                    lines = [f"{indent}        ablaRuntimeTrap()"]
+                else:
+                    lines = branch(number, target, indent + "        ")
+                if lines is None:
+                    return None
+                output += [f"{indent}    {value} -> {{"] + lines + [f"{indent}    }}"]
+            return output + [f"{indent}}}"]
+        return None
+
+    lines = tree(0, "    ")
+    return None if lines is None else "\n".join(lines) + "\n"
+
+
 def lower_dispatcher(match: re.Match[str]) -> str | None:
     blocks: dict[int, Block] = {}
     for arm in ARM.finditer(match.group("arms")):
@@ -1200,6 +1344,12 @@ def lower_dispatcher(match: re.Match[str]) -> str | None:
         if split is None:
             return None
         blocks, nodes = split
+    # Labeled blocks (needs ablac's `name@` loops); ABLA_STRUCTURE=classic
+    # keeps the postdominator emitter, which duplicates non-nested joins.
+    if os.environ.get("ABLA_STRUCTURE", "stackify") == "stackify":
+        stackified = emit_stackified(blocks, nodes)
+        if stackified is not None:
+            return stackified
     return emit_graph(blocks, nodes)
 
 
@@ -1265,4 +1415,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    sys.setrecursionlimit(20000)
     sys.exit(main())
