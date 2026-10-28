@@ -17,6 +17,12 @@ sense once the whole corpus is Abla:
 
 Then it compiles the unit to one object with every link selector applied,
 which is what an application links instead of the Espressif archives.
+
+With --exports FILE only the listed symbols stay global; every other
+`exportFunction` selector becomes `internalFunction`, which keeps the exact
+link name for raw assembly in the same object but lets LLVM inline and drop
+the function. --exports-from-map regenerates FILE from an application link
+map (see link_map_references).
 """
 
 from __future__ import annotations
@@ -81,6 +87,47 @@ def read_function_tables_through_storage(unit: pathlib.Path) -> int:
     return changed
 
 
+EXPORT = re.compile(r'exportFunction\("(\w+)",\s*"([^"]+)"\)')
+
+
+def link_map_references(map_path: pathlib.Path, unit_object: str = "unit/unit.o") -> list[str]:
+    """Symbols the unit defines that some other input file references.
+
+    Reads the `-Wl,--cref` table: a symbol line names its defining file, the
+    indented lines after it name the referencing files. Only references from
+    outside unit.o need a global symbol; calls inside it are direct.
+    """
+    lines = map_path.read_text(errors="replace").split("\n")
+    start = lines.index("Cross Reference Table") + 3
+    needed: dict[str, bool] = {}
+    current, defined_here = "", False
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        if not line.startswith(" "):
+            current, _, where = line.partition(" ")
+            defined_here = unit_object in where
+            if defined_here:
+                needed[current] = False
+        elif defined_here and unit_object not in line:
+            needed[current] = True
+    return sorted(name for name, used in needed.items() if used)
+
+
+def restrict_exports(link: str, keep: set[str]) -> tuple[str, int]:
+    """Turn exportFunction selectors for symbols outside `keep` into internal ones."""
+    dropped = 0
+
+    def rewrite(match: re.Match) -> str:
+        nonlocal dropped
+        if match.group(2) in keep:
+            return match.group(0)
+        dropped += 1
+        return f'internalFunction("{match.group(1)}", "{match.group(2)}")'
+
+    return EXPORT.sub(rewrite, link), dropped
+
+
 def run_pass(command: list[str], log) -> None:
     log.write(f"== {' '.join(command)}\n")
     log.flush()
@@ -94,12 +141,23 @@ def run_pass(command: list[str], log) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("chip")
-    parser.add_argument("archives", nargs="+")
+    parser.add_argument("archives", nargs="*")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--exclude", default="",
                         help="comma-separated archive/member stems to leave to the Espressif "
                         "archive (bisecting behavioural differences), e.g. libpp/pm")
+    parser.add_argument("--exports", type=pathlib.Path,
+                        help="file listing the only symbols to keep global (one per line)")
+    parser.add_argument("--exports-from-map", type=pathlib.Path, metavar="MAP",
+                        help="write --exports FILE from the --cref table of an application link map, then exit")
     args = parser.parse_args()
+    if args.exports_from_map:
+        names = link_map_references(args.exports_from_map)
+        args.exports.write_text("".join(f"{name}\n" for name in names))
+        print(f"{len(names)} symbols referenced from outside the unit -> {args.exports}")
+        return 0
+    keep = {line.strip() for line in args.exports.read_text().splitlines() if line.strip()} if args.exports else None
+    exported = dropped = 0
 
     profile = load_driver().load_profile(args.chip)
     base = ROOT / "build" / "recovery" / args.chip
@@ -123,11 +181,16 @@ def main() -> int:
             if (member / "link.ab").exists():
                 link = f"{archive}/{member.name}_link.ab"
                 text = (member / "link.ab").read_text()
+                if keep is not None:
+                    text, count = restrict_exports(text, keep)
+                    dropped += count
+                exported += len(EXPORT.findall(text))
                 (unit / link).write_text(text)
                 selectors += [(link, name) for name in SELECTOR.findall(text)]
     shared = unit / "shared_storage.ab"
     shared.write_text('import "abla/unsafe/native"\n\n// Data owned by more than one recovered module.\n')
-    print(f"{len(modules)} modules, {len(selectors)} link selectors")
+    print(f"{len(modules)} modules, {len(selectors)} link selectors"
+          + (f" ({exported} exported, {dropped} made internal)" if keep is not None else ""))
 
     with (unit / "passes.log").open("w") as log:
         run_pass(["centralize-abla-owned-storage", "--write", "--initialized-constants", str(unit), str(shared)], log)
