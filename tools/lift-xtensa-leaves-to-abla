@@ -335,9 +335,6 @@ KEEP_RAW = {name for name in os.environ.get("ABLA_LIFT_KEEP_RAW", "").split(",")
 # Set by --keep-global-data (see main).
 KEEP_GLOBAL_DATA = False
 
-# Set by --resolve-outgoing-stack (see main and resolve_outgoing_stack).
-RESOLVE_OUTGOING_STACK = False
-
 
 def extract_liftable_data_sections(
     body: str, raw_bodies: list[str], allowed_cross: set[str] | None = None
@@ -837,104 +834,6 @@ def ambiguous_callx8_stack_arguments(body: str) -> list[int]:
     })
 
 
-def resolve_outgoing_stack(body: str) -> tuple[list[int], bool] | None:
-    """Prove which frame-bottom stores are outgoing stack arguments.
-
-    Returns None when the analysis does not apply (the caller then keeps the
-    conservative `ambiguous_callx8_stack_arguments` behaviour).  Otherwise
-    returns (ambiguous_offsets, pass_word0).
-
-    GCC lays a windowed frame out as [outgoing argument area][locals], the
-    outgoing area starting at a1+0 and sized for the largest call in the
-    function.  A call's outgoing words are owned by the callee, so correct
-    code never reads them back, while a local is read back through a1 or
-    has its address taken (ADDI aN, a1, imm).  Hence the lowest frame offset
-    L that is read through a1 or address-taken is a local, and every slot at
-    or above L is a local as well, as is any individual stored slot that is
-    itself loaded back.  Stores to such slots cannot be call arguments.
-
-    Only stores to the remaining candidate slots may feed a callee:
-      * none: no outgoing stack word exists, the calls need nothing;
-      * word 0 only: argument seven.  The typed call intrinsics carry up to
-        six register arguments plus one stack argument, which the LLVM
-        backend places at sp+0, exactly where the callee's `stack0` /
-        incomingStack0 read.  The lifter therefore appends the live word
-        (read from the emulated frame at r1+0, the value the original
-        stores left at a1+0) to every CALL8/CALLX8.  A callee that ignores
-        it is unaffected; one that reads it receives the original value.
-      * anything else: reported as still ambiguous (the intrinsics cannot
-        carry a second stack word).
-
-    The analysis bails out (None) unless every mention of a1 is ENTRY, a
-    load/store using a1 as base with a constant offset, or ADDI-family
-    address arithmetic with a constant immediate; in particular MOVSP, any
-    write to a1 and a1 used as a stored value disable it.
-    """
-    loads = {"l8ui": 1, "l16ui": 2, "l16si": 2, "l32i": 4, "l32i.n": 4}
-    stores = {"s8i": 1, "s16i": 2, "s32i": 4, "s32i.n": 4}
-    frame_size = 0
-    load_ranges: list[tuple[int, int]] = []
-    store_ranges: list[tuple[int, int]] = []
-    address_taken: list[int] = []
-    calls = 0
-    for raw in body.splitlines():
-        line = raw.strip()
-        if (not line or line.startswith(("#", ".")) or
-                LABEL.fullmatch(line)):
-            continue
-        mnemonic, operands = parse_instruction(line)
-        if mnemonic in ("call8", "callx8"):
-            calls += 1
-        if mnemonic == "entry" and len(operands) == 2 and operands[0] == "a1":
-            amount = immediate(operands[1])
-            if amount is None or amount <= 0:
-                return None
-            frame_size = amount
-            continue
-        if "a1" not in operands:
-            continue
-        if mnemonic in loads or mnemonic in stores:
-            if len(operands) != 3 or operands[0] == "a1" or operands[1] != "a1":
-                return None
-            offset = immediate(operands[2])
-            if offset is None or offset < 0:
-                return None
-            width = loads.get(mnemonic) or stores[mnemonic]
-            (load_ranges if mnemonic in loads else store_ranges).append(
-                (offset, width)
-            )
-            continue
-        if (mnemonic in ("addi", "addi.n", "addmi") and len(operands) == 3 and
-                operands[0] != "a1" and operands[1] == "a1"):
-            amount = immediate(operands[2])
-            if amount is None or amount < 0:
-                return None
-            address_taken.append(amount)
-            continue
-        return None
-    if frame_size <= 0:
-        return None
-    if not calls:
-        return [], False
-    local_floor = min(
-        [offset for offset, _ in load_ranges if offset < frame_size] +
-        address_taken + [frame_size]
-    )
-    candidates: set[int] = set()
-    for offset, width in store_ranges:
-        if offset >= min(frame_size, 40) or offset >= local_floor:
-            continue
-        if any(start < offset + width and offset < start + size
-               for start, size in load_ranges):
-            continue
-        candidates.update(range(offset - offset % 4, offset + width, 4))
-    if not candidates:
-        return [], False
-    if candidates == {0}:
-        return [], True
-    return sorted(candidates), False
-
-
 def normalize_encoded_instructions(body: str) -> str:
     # Older objdump builds emitted SSA8B aN as its three raw little-endian
     # bytes (0x403N00). This is a BYTE-index shift, not SSL's bit-index
@@ -1184,23 +1083,11 @@ def lift(
     body: str,
     assume_all_registers: bool = False,
     assume_wide_calls: bool = False,
-    outgoing_stack_word: bool | None = None,
 ) -> Lifted:
-    """Lift one body; `outgoing_stack_word` is the function-level
-    `resolve_outgoing_stack` verdict when lifting a basic block of it."""
     body = normalize_encoded_instructions(body)
     if ".pushsection" in body or ".section" in body or ".reloc" in body:
         raise Unsupported("nested assembler-owned definitions")
-    ambiguous_stack: list[int] = []
-    if outgoing_stack_word is None:
-        resolved = (
-            resolve_outgoing_stack(body) if RESOLVE_OUTGOING_STACK else None
-        )
-        if resolved is None:
-            outgoing_stack_word = False
-            ambiguous_stack = ambiguous_callx8_stack_arguments(body)
-        else:
-            ambiguous_stack, outgoing_stack_word = resolved
+    ambiguous_stack = ambiguous_callx8_stack_arguments(body)
     if ambiguous_stack:
         offsets = ", ".join(f"a1+{offset}" for offset in ambiguous_stack)
         raise Unsupported(
@@ -1208,7 +1095,7 @@ def lift(
             offsets
         )
     if body_has_control_flow(body):
-        return lift_control_flow(name, body, outgoing_stack_word)
+        return lift_control_flow(name, body)
     if re.search(r"\b(?:call0|call4|call12|callx0|callx4|callx12|jx)\b", body):
         raise Unsupported("non-windowed or non-call8 transfer")
 
@@ -1371,16 +1258,6 @@ def lift(
                 call_arguments.append(
                     register if register in assigned else "u32(0)"
                 )
-            if outgoing_stack_word:
-                # Argument seven lives at a1+0: pad the six register
-                # arguments and append the frame word the original left there.
-                while len(call_arguments) < 6:
-                    call_arguments.append("u32(0)")
-                call_arguments.append(
-                    "u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))"
-                )
-                uses_memory = True
-                uses_local_frame = True
             arguments = ", ".join(call_arguments)
             wide_result = assume_wide_calls or call_secondary_result_used(
                 instructions, instruction_index
@@ -2120,7 +1997,6 @@ def lifted_linear_statements(
     literals: list[str],
     instructions: list[str],
     frame_size: int,
-    outgoing_stack_word: bool = False,
 ) -> tuple[list[str], bool]:
     fake = "\n".join(
         literals + [f"entry a1, {frame_size}"] + instructions + ["retw.n"]
@@ -2129,9 +2005,6 @@ def lifted_linear_statements(
         name + "Block", fake,
         assume_all_registers=True,
         assume_wide_calls=True,
-        outgoing_stack_word=(
-            outgoing_stack_word if RESOLVE_OUTGOING_STACK else None
-        ),
     )
     marker = (
         "    var shiftAmount = u32(0)\n"
@@ -2172,9 +2045,7 @@ def control_flow_materializes_stack(
     return False
 
 
-def lift_control_flow(
-    name: str, body: str, outgoing_stack_word: bool = False
-) -> Lifted:
+def lift_control_flow(name: str, body: str) -> Lifted:
     if ".pushsection" in body or ".section" in body or ".reloc" in body:
         raise Unsupported("nested assembler-owned definitions")
     internal_jump_table = "ABLA_LIFT_INTERNAL_JUMP_TABLE" in body
@@ -2887,15 +2758,9 @@ def main() -> int:
         help="leave .global/.weak data assembler-defined: while other "
         "objects still reference it by name it must keep its linker symbol",
     )
-    parser.add_argument(
-        "--resolve-outgoing-stack", action="store_true",
-        help="prove which a1+N stores are not outgoing stack arguments and "
-        "pass a live seventh argument (see resolve_outgoing_stack)",
-    )
     arguments = parser.parse_args()
-    global KEEP_GLOBAL_DATA, RESOLVE_OUTGOING_STACK
+    global KEEP_GLOBAL_DATA
     KEEP_GLOBAL_DATA = arguments.keep_global_data
-    RESOLVE_OUTGOING_STACK = arguments.resolve_outgoing_stack
     files: list[pathlib.Path] = []
     for path in arguments.paths:
         if path.is_dir():
