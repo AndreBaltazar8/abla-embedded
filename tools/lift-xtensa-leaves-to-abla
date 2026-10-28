@@ -1185,9 +1185,12 @@ def lift(
     assume_all_registers: bool = False,
     assume_wide_calls: bool = False,
     outgoing_stack_word: bool | None = None,
+    call_defined: set[int] | None = None,
 ) -> Lifted:
     """Lift one body; `outgoing_stack_word` is the function-level
-    `resolve_outgoing_stack` verdict when lifting a basic block of it."""
+    `resolve_outgoing_stack` verdict when lifting a basic block of it, and
+    `call_defined` the argument registers (10..15) that may hold a value at
+    the block's entry (see call_argument_entry_sets)."""
     body = normalize_encoded_instructions(body)
     if ".pushsection" in body or ".section" in body or ".reloc" in body:
         raise Unsupported("nested assembler-owned definitions")
@@ -1303,6 +1306,10 @@ def lift(
         "s8i": 8, "s16i": 16, "s32i": 32, "s32i.n": 32,
     }
 
+    call_highest = (
+        call_argument_highest(instructions, call_defined)
+        if call_defined is not None else {}
+    )
     for instruction_index, (mnemonic, operands) in enumerate(instructions):
         if returned:
             raise Unsupported("instructions after return")
@@ -1366,6 +1373,10 @@ def lift(
             for index in range(10, 16):
                 if f"r{index}" in assigned:
                     highest_argument = index
+            if instruction_index in call_highest:
+                highest_argument = min(
+                    highest_argument, call_highest[instruction_index]
+                )
             for index in range(10, highest_argument + 1):
                 register = f"r{index}"
                 call_arguments.append(
@@ -2115,12 +2126,91 @@ def control_flow_records(body: str) -> tuple[list[str], list[BasicBlock], int]:
     return literals, blocks, frame_size
 
 
+def written_argument_register(mnemonic: str, operands: list[str]) -> int | None:
+    """The a10..a15 register an instruction may write (its first operand).
+
+    Over-approximates (stores and compares name a register they only read),
+    which only keeps an argument the callee would ignore."""
+    if operands and (match := re.fullmatch(r"a(1[0-5])", operands[0])):
+        return int(match.group(1))
+    return None
+
+
+def call_argument_highest(
+    instructions: list[tuple[str, list[str]]], defined: set[int]
+) -> dict[int, int]:
+    """Highest argument register each CALL8/CALLX8 can pass a value in.
+
+    A windowed call's arguments are a10.. as the caller last wrote them; a
+    register not written since the function entry (fresh window) or the
+    previous call (which leaves only the a10/a11 result) carries no value,
+    so the callee cannot depend on it and the lifted call need not pass it."""
+    defined = set(defined)
+    highest: dict[int, int] = {}
+    for index, (mnemonic, operands) in enumerate(instructions):
+        if mnemonic in ("call8", "callx8"):
+            highest[index] = max(defined, default=9)
+            defined = {10, 11}
+        elif (register := written_argument_register(mnemonic, operands)) is not None:
+            defined.add(register)
+    return highest
+
+
+def call_argument_entry_sets(
+    blocks: list["BasicBlock"], labels: dict[str, int]
+) -> list[set[int]] | None:
+    """Per block, the argument registers that may hold a value at entry.
+
+    A forward may-analysis over the recovered CFG (union at joins). Returns
+    None, meaning "assume every register", for a CFG it cannot follow
+    (JX, hardware loops, unknown targets)."""
+    successors: list[list[int]] = []
+    transfer: list[tuple[bool, set[int]]] = []
+    for index, block in enumerate(blocks):
+        written: set[int] = set()
+        calls = False
+        for record in block.instructions:
+            mnemonic, operands = parse_instruction(record)
+            if mnemonic in ("call8", "callx8"):
+                calls = True
+                written = {10, 11}
+            elif (register := written_argument_register(mnemonic, operands)) is not None:
+                written.add(register)
+        transfer.append((calls, written))
+        following = [index + 1] if index + 1 < len(blocks) else []
+        if not block.terminator:
+            successors.append(following)
+            continue
+        mnemonic, operands = parse_instruction(block.terminator)
+        if mnemonic in ("ret", "ret.n", "retw", "retw.n"):
+            successors.append([])
+        elif mnemonic == "j" and len(operands) == 1 and operands[0] in labels:
+            successors.append([labels[operands[0]]])
+        elif mnemonic in BRANCHES and operands and operands[-1] in labels:
+            successors.append([labels[operands[-1]]] + following)
+        else:
+            return None
+    entry: list[set[int]] = [set() for _ in blocks]
+    changed = True
+    while changed:
+        changed = False
+        for index in range(len(blocks)):
+            calls, written = transfer[index]
+            out = set(written) if calls else entry[index] | written
+            for successor in successors[index]:
+                if not out <= entry[successor]:
+                    entry[successor] |= out
+                    changed = True
+    return entry
+
+
 def lifted_linear_statements(
     name: str,
     literals: list[str],
     instructions: list[str],
     frame_size: int,
     outgoing_stack_word: bool = False,
+    call_defined: set[int] | None = None,
 ) -> tuple[list[str], bool]:
     fake = "\n".join(
         literals + [f"entry a1, {frame_size}"] + instructions + ["retw.n"]
@@ -2132,6 +2222,7 @@ def lifted_linear_statements(
         outgoing_stack_word=(
             outgoing_stack_word if RESOLVE_OUTGOING_STACK else None
         ),
+        call_defined=call_defined,
     )
     marker = (
         "    var shiftAmount = u32(0)\n"
@@ -2237,11 +2328,16 @@ def lift_control_flow(
     uses_memory = materializes_stack
 
     statements.append("        when (programCounter) {")
+    call_entry = (
+        call_argument_entry_sets(blocks, labels)
+        if os.environ.get("ABLA_LIFT_ALL_CALL_ARGUMENTS") != "1" else None
+    )
     for index, block in enumerate(blocks):
         statements.append(f"            {index} -> {{")
         lifted_statements, block_memory = lifted_linear_statements(
             name, literals, block.instructions, frame_size,
             outgoing_stack_word,
+            call_entry[index] if call_entry is not None else None,
         )
         uses_memory = uses_memory or block_memory
         for statement in lifted_statements:
