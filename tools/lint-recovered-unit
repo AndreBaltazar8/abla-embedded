@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""Static lint for the recovered ESP32-S3 Wi-Fi unit: finds latent mistranslations.
+
+  python3 -I tools/lint-recovered-unit [--root build/recovery/esp32s3]
+                                       [--check ID,...] [--limit N] [--tsv FILE]
+
+Self-test fixture: tools/testdata/lint-recovered-unit (expects 7 check groups).
+
+Scans <root>/unit/*/*.ab (the assembled unit). Every finding is a *suspect*
+that must be triaged against the original object's disassembly. Checks:
+
+  MMIO      non-volatile load/store whose address derives from a constant in a
+            peripheral window (0x60000000-0x600FFFFF, 0x3FF00000-0x3FFFFFFF,
+            0x50000000-0x5000FFFF RTC). LLVM may narrow/merge/reorder those.
+  ENTRYOFF  `nativeFunctionAddress(F) + N` / `$xtensa address {code} + N`, N != 0:
+            an address inside a function body that no longer has the original layout.
+  RAWCALL   direct Abla call to a function whose body is raw Xtensa (@naked).
+  STALEARG  direct call passing r10..r15 never assigned in the caller (and not
+            a parameter) to a callee that reads that parameter.
+  STACKARG  direct call forwarding the caller's own incoming stackN into a callee
+            that reads stackN, or a caller that stores to r1+N right before a
+            direct call to a callee with stack parameters (outgoing stack
+            arguments a lifted call cannot pass).
+  COMPJUMP  computed tail/jump through a register loaded from a table (left
+            unlowered switch).
+  LONGOFF   `.long/.word sym+0xNN` in raw asm where sym is a code symbol.
+  DATADUP   data symbol referenced by raw asm under one name and stored by Abla
+            under another (the same original symbol, two different storages).
+  DRIFT-MEM / DRIFT-CALL / DRIFT-MEMW
+            (needs xtensa objdump: --objdump or $XTENSA_OBJDUMP, run via steam-run if on PATH)
+            per original function, compares the width/direction multiset of memory ops, the
+            number of calls and the number of `memw` barriers in the original object against
+            the lifted function (typed or raw). A lifted body that lost or gained a store,
+            changed an access width, dropped a call or a barrier has drifted.
+  SYMTAB    (needs objdump) every defined global/weak symbol of the original member objects
+            versus unit/unit.o: missing symbols, weak<->strong, data size, function<->object.
+  RAWSPLIT  one original symbol defined both in raw asm and as Abla storage.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import pathlib
+import re
+import sys
+
+PERIPH = [(0x60000000, 0x600FFFFF, "periph"), (0x3FF00000, 0x3FFFFFFF, "dport/rtc-fast"),
+          (0x50000000, 0x5000FFFF, "rtc-slow")]
+
+
+def periph_name(v: int):
+    for lo, hi, n in PERIPH:
+        if lo <= v <= hi:
+            return n
+    return None
+
+
+FUN = re.compile(r"^(?:trusted\s+)?(?:export\s+)?fun\s+(\w+)\s*\(")
+IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
+NUM = re.compile(r"\b(\d{6,10}|0x[0-9a-fA-F]{6,8})\b")
+ASSIGN = re.compile(r"^\s*(?:var\s+|val\s+)?(r\d+)\s*=\s*(.*)$")
+MEM = re.compile(r"ablaUnsafe(Volatile)?(Load|Store)(U8|U16|U32|S8|S16|I8|I16|I32|U64)?\(")
+
+
+class Fn:
+    def __init__(self, name, file, line, raw, params, body, attrs):
+        self.name, self.file, self.line, self.raw = name, file, line, raw
+        self.params, self.body, self.attrs = params, body, attrs
+
+
+def parse(path: pathlib.Path):
+    lines = path.read_text(errors="replace").split("\n")
+    fns = []
+    i = 0
+    attrs: list[str] = []
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("@"):
+            attrs.append(ln)
+        m = FUN.match(ln)
+        if m:
+            start = i
+            j = i
+            sig = []
+            while j < len(lines) and not lines[j].rstrip().endswith("{"):
+                sig.append(lines[j])
+                j += 1
+            sig.append(lines[j] if j < len(lines) else "")
+            params = re.findall(r"(\w+)\s*:\s*u32", " ".join(sig).split(")")[0])
+            raw = "$xtensa instructions" in sig[-1] or any("@naked" in a for a in attrs)
+            k = j + 1
+            while k < len(lines) and lines[k] != "}":
+                k += 1
+            fns.append(Fn(m.group(1), path, start + 1, raw, params, lines[j + 1:k], list(attrs)))
+            attrs = []
+            i = k
+        elif not ln.startswith("@") and ln.strip():
+            attrs = []
+        i += 1
+    return fns
+
+
+def split_args(s: str):
+    out, depth, cur = [], 0, ""
+    for c in s:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def call_args(line: str, name: str):
+    p = line.find(name + "(")
+    if p < 0:
+        return None
+    s = line[p + len(name) + 1:]
+    depth, end = 1, 0
+    for k, c in enumerate(s):
+        depth += c == "("
+        depth -= c == ")"
+        if depth == 0:
+            end = k
+            break
+    return split_args(s[:end])
+
+
+def const_val(tok: str):
+    try:
+        return int(tok, 0)
+    except ValueError:
+        return None
+
+
+class Lint:
+    def __init__(self, root: pathlib.Path, only):
+        self.root = root
+        self.only = only
+        import os, shutil
+        self.objdump = os.environ.get("XTENSA_OBJDUMP") or str(pathlib.Path.home() / ".espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-objdump")
+        if not pathlib.Path(self.objdump).exists():
+            self.objdump = shutil.which("xtensa-esp32s3-elf-objdump")
+        self.steam_run = shutil.which("steam-run")
+        self.findings = []  # (check, file, line, fn, msg)
+        self.fns: dict[str, Fn] = {}
+
+    def add(self, check, fn: Fn, off: int, msg: str):
+        if self.only and check not in self.only:
+            return
+        self.findings.append((check, fn.file, fn.line + off, fn.name, msg))
+
+    # ------------------------------------------------------------------ typed
+    def callee_reads(self, callee: Fn):
+        """Parameters (aN / strideN) the callee body actually reads."""
+        if hasattr(callee, "_reads"):
+            return callee._reads
+        text = "\n".join(callee.body)
+        reads = set()
+        for p in callee.params:
+            m = re.fullmatch(r"a(\d+)", p)
+            if m:
+                reg = "r" + m.group(1)
+                for ln in callee.body:
+                    if re.match(r"\s*var\s+" + reg + r"\s*=\s*" + p + r"\s*$", ln):
+                        continue
+                    if not re.search(r"\b" + reg + r"\b", ln):
+                        continue
+                    if re.match(r"\s*" + reg + r"\s*=", ln) and not re.search(r"\b" + reg + r"\b", ln.split("=", 1)[1]):
+                        break  # written before read
+                    reads.add(p)
+                    break
+                continue
+            m = re.fullmatch(r"stack(\d+)", p)
+            if m:
+                inc = "incomingStack" + m.group(1)
+                for ln in callee.body:
+                    if re.match(r"\s*var\s+" + inc + r"\s*=", ln):
+                        continue
+                    if re.search(r"\b(" + inc + "|" + p + r")\b", ln) and not re.search(r"\besp32Recovered\w*\(", ln):
+                        reads.add(p)
+                        break
+        callee._reads = reads
+        return reads
+
+    def check_typed(self, fn: Fn):
+        tracked: dict[str, str] = {}  # reg -> why (peripheral-derived)
+        scopes: list[dict] = []
+        assigned = set(p for p in fn.params)
+        mem_tbl: dict[str, int] = {}  # reg -> line of table load
+        pending_stack_store = None  # (offset-in-body, slot)
+        body = fn.body
+        callnames = None
+        for idx, ln in enumerate(body):
+            s = ln.strip()
+            if not s or s.startswith("//"):
+                continue
+            if s.startswith("}") and "else" in s and s.endswith("{") and scopes:
+                tracked = dict(scopes[-1])
+            elif s.startswith("}") and scopes:
+                scopes.pop()
+            elif s.endswith("{"):
+                scopes.append(dict(tracked))
+            m = ASSIGN.match(ln)
+            lhs, rhs = (m.group(1), m.group(2)) if m else (None, None)
+
+            # ENTRYOFF
+            for mm in re.finditer(r"nativeFunctionAddress\((\w+)\)\)?\s*\+\s*u32\((\d+)\)", ln):
+                if int(mm.group(2)) != 0:
+                    tgt = self.fns.get(mm.group(1))
+                    kind = "RAW" if tgt is not None and tgt.raw else "TYPED-ABLA"
+                    dead = any(st in fn.name or fn.name.replace("Initialize", "Storage") == st for st in self.dead_tables)
+                    if dead:
+                        kind += ", dead lowered-switch table"
+                    self.add("ENTRYOFF-DEAD" if dead else "ENTRYOFF", fn, idx + 1, f"[{kind} target] nativeFunctionAddress({mm.group(1)}) + {mm.group(2)}")
+            for mm in re.finditer(r"\$xtensa address \{(\w+)\}\)?\s*\+\s*u32\((\d+)\)", ln):
+                tgt = self.fns.get(mm.group(1))
+                if int(mm.group(2)) != 0 and tgt is not None:
+                    self.add("ENTRYOFF", fn, idx + 1, f"$xtensa address {{{mm.group(1)}}} + {mm.group(2)} (code symbol)")
+
+            # MMIO taint
+            if lhs:
+                taint = None
+                for nm in NUM.findall(rhs):
+                    v = const_val(nm)
+                    if v is not None and periph_name(v):
+                        taint = f"{periph_name(v)} const {nm}"
+                for idn in IDENT.findall(rhs):
+                    if idn in tracked and idn != "r1":
+                        taint = taint or tracked[idn]
+                # only follow simple arithmetic (not loads) so loaded values are not tainted
+                if "ablaUnsafe" in rhs or "(" in rhs and re.search(r"[A-Za-z]\w*\(", re.sub(r"\b(u32|int|u64)\(", "", rhs)):
+                    taint = None if "ablaUnsafe" in rhs else taint
+                if taint:
+                    tracked[lhs] = taint
+                else:
+                    tracked.pop(lhs, None)
+                if not s.startswith("var "):
+                    assigned.add(lhs)
+            for mm in MEM.finditer(ln):
+                if mm.group(1):
+                    continue
+                args = call_args(ln[mm.start():], mm.group(0)[:-1])
+                if not args:
+                    continue
+                addr = args[0]
+                why = None
+                for nm in NUM.findall(addr):
+                    v = const_val(nm)
+                    if v is not None and periph_name(v):
+                        why = f"literal {nm} ({periph_name(v)})"
+                for idn in IDENT.findall(addr):
+                    if idn in tracked:
+                        why = tracked[idn] + f" via {idn}"
+                if why:
+                    self.add("MMIO", fn, idx + 1, f"non-volatile {mm.group(2).lower()} {mm.group(3)} at {why}: {s[:110]}")
+
+            # frame-slot stores
+            mm = re.search(r"ablaUnsafeStoreU(?:32|16|8)\(nativePointerFromAddress\(int\((?:\(r1 \+ u32\((\d+)\)\)|r1)\)", ln)
+            if mm:
+                pending_stack_store = (idx, int(mm.group(1) or 0))
+
+            # computed jumps / tail calls
+            cm = re.search(r"ablaUnsafeCall\w*\(int\((r\d+)\)", ln)
+            if cm and ln.strip().startswith("return"):
+                self.add("COMPJUMP", fn, idx + 1, f"computed tail call through {cm.group(1)} (definition: "
+                         f"{mem_tbl.get(cm.group(1), 'unknown')})")
+            if lhs and re.search(r"ablaUnsafeLoadU32\(", rhs) and re.search(r"\+ \(?r\d+ <<|\* u32\(4\)|\bu32\(2\)", rhs):
+                mem_tbl[lhs] = f"line {fn.line + idx + 1}: indexed load"
+            elif lhs:
+                mem_tbl.pop(lhs, None)
+
+            # direct calls to Abla functions
+            if lhs and "esp32Recovered" in rhs:
+                cmm = re.search(r"\b(esp32Recovered\w*)\(", rhs)
+                callee = self.fns.get(cmm.group(1)) if cmm else None
+                if callee is not None:
+                    args = call_args(rhs, callee.name) or []
+                    if callee.raw:
+                        self.add("RAWCALL", fn, idx + 1, f"direct call to raw-body {callee.name}")
+                    else:
+                        self.callee_reads(callee)
+                        # parameters in order: a2..a7 (r10..r15) then stack0..
+                        for pi, (p, a) in enumerate(zip(callee.params, args)):
+                            if p not in callee._reads:
+                                continue
+                            ma = re.fullmatch(r"r(\d+)", a)
+                            if ma and 10 <= int(ma.group(1)) <= 15 and a not in assigned:
+                                self.add("STALEARG", fn, idx + 1,
+                                         f"{callee.name} reads {p} but caller never set {a}")
+                            if re.fullmatch(r"stack\d+", a) and p.startswith("stack"):
+                                self.add("STACKARG", fn, idx + 1,
+                                         f"{callee.name} reads {p}; caller forwards its own incoming {a}")
+                        if pending_stack_store and idx - pending_stack_store[0] <= 12:
+                            slot = pending_stack_store[1]
+                            sp = f"stack{slot // 4}"
+                            if sp in callee._reads:
+                                self.add("STACKARG", fn, idx + 1,
+                                         f"store to r1+{slot} before call to {callee.name}, which reads {sp}; "
+                                         "lifted call cannot pass it")
+                        # after a call the registers are dead; keep assigned set (flow-insensitive)
+                        assigned.add(lhs)
+            if pending_stack_store and idx - pending_stack_store[0] <= 12 and pending_stack_store[1] < 40 \
+                    and pending_stack_store[0] != idx and not (lhs and "esp32Recovered" in rhs):
+                mm2 = re.search(r"ablaUnsafeCall\w*\(int\((r\d+)\)|\$xtensa call(?:Wide)? \{(\w+)\}|\$xtensa call(?:x|Wide)\w*", ln)
+                if mm2:
+                    tgt = self.fns.get(mm2.group(2) or "")
+                    if tgt is None or (not tgt.raw and any(p.startswith("stack") for p in self.callee_reads(tgt))) or tgt.raw:
+                        self.add("FRAMEARG", fn, idx + 1,
+                                 f"store to r1+{pending_stack_store[1]} (line {fn.line + pending_stack_store[0] + 1}) "
+                                 f"before {'indirect' if not mm2.group(2) else 'symbolic'} call: possible outgoing stack arg")
+                        pending_stack_store = None
+
+    # ------------------------------------------------------------------- raw
+    def check_raw(self, fn: Fn, code_syms: set[str]):
+        label = ""
+        for idx, ln in enumerate(fn.body):
+            lm = re.match(r"^(\.?[A-Za-z_][\w.$]*):\s*$", ln)
+            if lm:
+                label = lm.group(1)
+            mm = re.match(r"\s*\.(?:long|word|4byte)\s+([\w.$]+)\+(0x[0-9a-fA-F]+|\d+)\s*$", ln)
+            if mm and mm.group(1) in code_syms and int(mm.group(2), 0) != 0:
+                dead = label in self.dead_labels
+                self.add("LONGOFF-DEAD" if dead else "LONGOFF", fn, idx + 1,
+                         f".long {mm.group(1)}+{mm.group(2)} in table {label}" + (" (dead: only feeds a lowered `when`)" if dead else ""))
+
+    # ------------------------------------------------------------- drift
+    OPS = {"l8ui": ("L", 8), "l16ui": ("L", 16), "l16si": ("L", 16), "l32i": ("L", 32), "l32i.n": ("L", 32),
+           "l32ai": ("L", 32), "s8i": ("S", 8), "s16i": ("S", 16), "s32i": ("S", 32), "s32i.n": ("S", 32),
+           "s32ri": ("S", 32)}
+
+    def objdump_functions(self, obj: pathlib.Path):
+        import subprocess
+        cmd = [self.objdump, "-dr", str(obj)]
+        if self.steam_run:
+            cmd = [self.steam_run] + cmd
+        out = subprocess.run(cmd, capture_output=True, text=True).stdout
+        funcs, cur = {}, None
+        for ln in out.split("\n"):
+            m = re.match(r"^[0-9a-f]{8} <([^>+]+?)(?:-0x[0-9a-f]+)?>:$", ln)
+            if m:
+                cur = funcs.setdefault(m.group(1), {"ops": collections.Counter(), "calls": 0, "memw": 0, "a1": 0, "refs": set(), "wins": collections.Counter()})
+                continue
+            if cur is None:
+                continue
+            rm = re.match(r"^\s+[0-9a-f]+:\s+R_XTENSA_\w+\s+([A-Za-z_][\w.$]*)(?:[+-]0x[0-9a-f]+)?$", ln)
+            if rm:
+                if not rm.group(1).startswith("."):
+                    cur["refs"].add(rm.group(1))
+                continue
+            m = re.match(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+(\S+)\s*(.*)$", ln)
+            if not m:
+                continue
+            op, rest = m.group(1), m.group(2)
+            if op in self.OPS:
+                if re.match(r"a\d+,\s*a1,", rest):
+                    continue  # frame slot / incoming stack argument
+                cur["ops"][self.OPS[op]] += 1
+            elif re.fullmatch(r"call(x)?(0|4|8|12)", op):
+                cur["calls"] += 1
+            elif op == "memw":
+                cur["memw"] += 1
+            if op in ("l16si", "sext", "srai", "sra"):
+                cur["ops"][("SIGNEXT", 0)] += 1
+            elif op in ("blt", "bge", "blti", "bgei", "bltz", "bgez", "min", "max"):
+                cur["ops"][("SGNCMP", 0)] += 1
+        return funcs
+
+    @staticmethod
+    def lifted_stats(fn: Fn):
+        ops, calls, memw = collections.Counter(), 0, 0
+        text = "\n".join(fn.body)
+        if fn.raw:
+            for ln in fn.body:
+                m = re.match(r"\s*([a-z0-9.]+)\b", ln)
+                if not m:
+                    continue
+                op = m.group(1)
+                if op in Lint.OPS:
+                    if re.match(r"\s*[a-z0-9.]+\s+a\d+,\s*a1,", ln):
+                        continue
+                    ops[Lint.OPS[op]] += 1
+                elif re.fullmatch(r"call(x)?(0|4|8|12)", op):
+                    calls += 1
+                elif op == "memw":
+                    memw += 1
+                if op in ("l16si", "sext", "srai", "sra"):
+                    ops[("SIGNEXT", 0)] += 1
+                elif op in ("blt", "bge", "blti", "bgei", "bltz", "bgez", "min", "max"):
+                    ops[("SGNCMP", 0)] += 1
+            return ops, calls, memw
+        for m in re.finditer(r"ablaUnsafe(?:Volatile)?(Load|Store)U(8|16|32)\((?!nativePointerFromAddress\(int\((?:\(r1\b|r1\)))", text):
+            ops[("L" if m.group(1) == "Load" else "S", int(m.group(2)))] += 1
+        ops[("SIGNEXT", 0)] = len(re.findall(r"\bi(?:8|16)\(", text))
+        ops[("SGNCMP", 0)] = len(re.findall(r"i32\([^()]*\)\s*(?:<|>)|i32\(r\d+\) (?:<|>)", text))
+        ops[("SIGNEXT", 0)] += len(re.findall(r"[^>]>>[^>]", text))
+        calls = len(re.findall(r"\bablaUnsafeCall\w*\(|\$xtensa call(?:Wide|x\w*)?\b|\b(?:esp32Recovered|freestanding)\w*\(", text))
+        calls -= len(re.findall(r"^\s*(?:trusted )?fun ", text, flags=re.M))
+        memw = text.count("xtensaMemoryBarrier()")
+        return ops, calls, memw
+
+    LIBC = {"memset", "memcpy", "memcmp", "memmove", "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strchr",
+            "bzero", "abs", "__divsi3", "__udivsi3", "__modsi3", "__umodsi3", "__mulsi3", "__ashldi3", "__lshrdi3",
+            "__muldi3", "__udivdi3", "__umoddi3", "__divdi3", "__moddi3", "__ashrdi3", "__clzsi2", "__ctzsi2",
+            "memchr", "strncasecmp", "strcasecmp", "strstr", "strcat", "strrchr"}
+
+    def check_drift(self, files, abi_for):
+        abi_for_rev = {v: k for k, v in abi_for.items()}  # abi symbol -> unit function name
+        if self.only and not any(c.startswith("DRIFT") for c in self.only):
+            return
+        if not self.objdump:
+            return
+        for f in files:
+            member = f.stem
+            if member.endswith("_link"):
+                continue
+            objs = sorted((self.root / f.parent.name / member / "object").glob("*.o"))
+            if not objs:
+                continue
+            orig = self.objdump_functions(objs[0])
+            for fn in parse(f):
+                sym = abi_for.get(fn.name)
+                if sym is None or sym not in orig:
+                    continue
+                o = orig[sym]
+                ops, calls, memw = self.lifted_stats(fn)
+                # structurizing duplicates join tails, so only losses are suspicious
+                lost = {k for k in o["ops"] if ops[k] < o["ops"][k]}
+                if lost:
+                    diff = {f"{k[0]}{k[1] or ''}": (o["ops"][k], ops[k]) for k in set(o["ops"]) | set(ops) if o["ops"][k] != ops[k]}
+                    self.add("DRIFT-MEM", fn, 0, f"{sym}: mem ops orig->lifted {diff}")
+                odd = {k: v for k, v in o["wins"].items() if not k.endswith("8")}
+                if odd:
+                    self.add("CALLWIN", fn, 0, f"{sym}: original uses non-call8 window calls {odd} (argument registers differ from a10..a15)")
+                if o["refs"]:
+                    text = "\n".join(fn.body)
+                    absent = sorted(r for r in o["refs"] if r != sym and r not in text and
+                                    (abi_for_rev.get(r) is None or abi_for_rev[r] not in text) and
+                                    r not in self.LIBC and r not in {"__stack_chk_fail"})
+                    if absent:
+                        self.add("DRIFT-REF", fn, 0, f"{sym}: original references absent from lifted: {absent[:6]}")
+                if memw < o["memw"]:
+                    self.add("DRIFT-MEMW", fn, 0, f"{sym}: memw orig {o['memw']} lifted {memw}")
+                if calls < o["calls"]:
+                    self.add("DRIFT-CALL", fn, 0, f"{sym}: calls orig {o['calls']} lifted {calls}")
+
+    SYM = re.compile(r"^([0-9a-f]{8}) (.{7}) (\S+)\s+([0-9a-f]{8}) (?:\.hidden )?(\S+)$")
+
+    def symtab(self, obj: pathlib.Path):
+        import subprocess
+        cmd = [self.objdump, "-t", str(obj)]
+        if self.steam_run:
+            cmd = [self.steam_run] + cmd
+        out = subprocess.run(cmd, capture_output=True, text=True).stdout
+        syms = {}
+        for ln in out.split("\n"):
+            m = self.SYM.match(ln)
+            if not m:
+                continue
+            flags, sec, size, name = m.group(2), m.group(3), int(m.group(4), 16), m.group(5)
+            if sec in ("*UND*", "*ABS*") or (flags[0] not in "gu" and flags[1] != "w"):
+                continue
+            syms[name] = ("weak" if flags[1] == "w" else "strong", size,
+                          "F" if "F" in flags else ("O" if "O" in flags else "?"), sec)
+        return syms
+
+    def check_symtab(self):
+        if self.only and "SYMTAB" not in self.only:
+            return
+        unit_o = self.root / "unit" / "unit.o"
+        if not self.objdump or not unit_o.exists():
+            return
+        new = self.symtab(unit_o)
+        dummy = Fn("symtab", unit_o, 0, False, [], [], [])
+        for obj in sorted(self.root.glob("*/*/object/*.o")):
+            for name, (bind, size, kind, sec) in self.symtab(obj).items():
+                nm = new.get(name)
+                if nm is None:
+                    self.add("SYMTAB", dummy, 0, f"{obj.parent.parent.name}: `{name}` ({bind} {kind}, {size} bytes) missing in unit.o")
+                    continue
+                if nm[0] != bind:
+                    self.add("SYMTAB", dummy, 0, f"`{name}` binding {bind} -> {nm[0]}")
+                if kind == "O" and nm[2] == "O" and nm[1] != size:
+                    self.add("SYMTAB", dummy, 0, f"`{name}` data size {size} -> {nm[1]}")
+                if kind != nm[2] and "?" not in (kind, nm[2]):
+                    self.add("SYMTAB", dummy, 0, f"`{name}` type {kind} -> {nm[2]}")
+
+    def run(self):
+        files = sorted(self.root.glob("unit/*/*.ab"))
+        allfns = []
+        for f in files:
+            allfns += parse(f)
+        for fn in allfns:
+            self.fns[fn.name] = fn
+        # abi symbol names of functions (comment `// Original ABI symbol: X`)
+        abi_to_fn = {}
+        for f in files:
+            cur = None
+            for ln in f.read_text(errors="replace").split("\n"):
+                m = re.match(r"// Original ABI symbol: (\S+)", ln)
+                if m:
+                    cur = m.group(1)
+                m = FUN.match(ln)
+                if m and cur:
+                    abi_to_fn[cur] = m.group(1)
+                    cur = None
+        code_syms = set(abi_to_fn) | set(self.fns)
+        self.dead_tables = self.lowered_tables(files)
+        for fn in allfns:
+            if fn.raw:
+                self.check_raw(fn, code_syms)
+            else:
+                self.check_typed(fn)
+        self.check_data(files, abi_to_fn)
+        fn_to_abi = {v: k for k, v in abi_to_fn.items()}
+        self.check_drift(files, fn_to_abi)
+        self.check_symtab()
+        return self.findings
+
+    def lowered_tables(self, files):
+        """Storage symbols that only feed an already-lowered `when` (dead leftover jump tables)."""
+        uses = collections.defaultdict(list)
+        for f in files:
+            lines = f.read_text(errors="replace").split("\n")
+            for n, ln in enumerate(lines):
+                for m in re.finditer(r"\b(esp32Data_\w+Storage)\b", ln):
+                    st = m.group(1)
+                    if re.match(r"\s*val " + st + r" =", ln) or "StoreU32(nativePointerFromAddress(" + st in ln \
+                            or re.match(r"\s*" + st + r"\s*$", ln):
+                        continue
+                    uses[st].append("\n".join(lines[n:n + 3]))
+        # raw data tables addressed from typed code
+        labels = collections.defaultdict(list)
+        for f in files:
+            lines = f.read_text(errors="replace").split("\n")
+            for n, ln in enumerate(lines):
+                for m in re.finditer(r"[\s,{(]((?:\.L)?[A-Za-z_][\w.$]*_data_[\w.$]*)\b", ln):
+                    lab = m.group(1)
+                    if re.match(r"^" + re.escape(lab) + r":\s*$", ln):
+                        continue
+                    if "$xtensa address {" + lab + "}" in ln:
+                        labels[lab].append("\n".join(lines[n:n + 4]))
+                    else:
+                        labels[lab].append("USE")
+        self.dead_labels = {lab for lab, u in labels.items() if u and all(x != "USE" and "jumpTableIndex" in x for x in u)}
+        return {st for st, u in uses.items() if u and all("jumpTableIndex" in x for x in u)}
+
+    def check_data(self, files, abi_to_fn):
+        if self.only and not (self.only & {"DATADUP", "RAWSPLIT"}):
+            return
+        raw_defs = collections.defaultdict(list)   # sym -> [(file,line)]
+        raw_refs = set()
+        abla_storage = {}                          # storage-name stem -> (file,line)
+        for f in files:
+            in_raw = False
+            for n, ln in enumerate(f.read_text(errors="replace").split("\n"), 1):
+                if "$xtensa instructions" in ln or ln.startswith("$xtensa data"):
+                    in_raw = True
+                elif ln == "}":
+                    in_raw = False
+                if in_raw:
+                    m = re.match(r"^([A-Za-z_][\w.$]*):\s*$", ln)
+                    if m and not m.group(1).startswith(".L"):
+                        raw_defs[m.group(1)].append((f, n))
+                    for t in re.findall(r"[\s,]([A-Za-z_][\w.$]*)(?:\+\w+)?\s*$", ln):
+                        raw_refs.add(t)
+                m = re.match(r"^(?:var|val)\s+(esp32Data_\w+Storage)\b", ln)
+                if m:
+                    abla_storage[m.group(1)] = (f, n)
+        # Abla storage naming: esp32Data_<ABI symbol>_<hash>Storage or esp32Data_<sanitised>Storage
+        by_suffix = collections.defaultdict(list)
+        for st, loc in abla_storage.items():
+            m = re.match(r"esp32Data_.*?_data_(?:bss|data|dram\d*(?:_\d+)?|rodata|literal\d*)_(\w+?)(?:_[0-9a-f]{10})?Storage$", st)
+            if m:
+                by_suffix[m.group(1)].append((st, loc))
+        for sym, locs in raw_defs.items():
+            key = re.sub(r"[^A-Za-z0-9_]", "_", sym)
+            for st, (f, n) in by_suffix.get(key, []):
+                fobj = Fn(sym, locs[0][0], locs[0][1], True, [], [], [])
+                self.add("RAWSPLIT", fobj, 0, f"`{sym}` defined in raw asm (line {locs[0][1]}) and as Abla storage {st[:90]} ({f.name}:{n})")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default="build/recovery/esp32s3")
+    ap.add_argument("--check", default="")
+    ap.add_argument("--limit", type=int, default=15, help="max findings printed per check")
+    ap.add_argument("--tsv", default="")
+    args = ap.parse_args()
+    root = pathlib.Path(args.root)
+    if not (root / "unit").is_dir():
+        sys.exit(f"lint-recovered-unit: {root}/unit not found (run tools/build-recovered-radio first)")
+    lint = Lint(root, set(filter(None, args.check.split(","))))
+    findings = lint.run()
+    by = collections.defaultdict(list)
+    for f in findings:
+        by[f[0]].append(f)
+    for check in sorted(by):
+        items = by[check]
+        print(f"== {check}: {len(items)} finding(s), {len({i[3] for i in items})} function(s)")
+        for c, f, ln, fn, msg in items[:args.limit]:
+            try:
+                f = f.relative_to(root)
+            except ValueError:
+                pass
+            print(f"  {f}:{ln} {fn}: {msg}")
+        if len(items) > args.limit:
+            print(f"  ... {len(items) - args.limit} more (--limit)")
+    if args.tsv:
+        with open(args.tsv, "w") as o:
+            for c, f, ln, fn, msg in findings:
+                o.write(f"{c}\t{f}\t{ln}\t{fn}\t{msg}\n")
+    return 1 if any(not f[0].endswith("-DEAD") for f in findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
