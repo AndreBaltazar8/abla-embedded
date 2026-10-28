@@ -130,6 +130,50 @@ def restrict_exports(link: str, keep: set[str]) -> tuple[str, int]:
     return EXPORT.sub(rewrite, link), dropped
 
 
+CALL_LINE = r"^(?P<ind>\s*)(?P<lhs>r\d+|val callResult\d+) = (?:\$xtensa call(?:Wide)? \{%s\}\([^)]*\))\n"
+
+
+def apply_feature_rewrites(text: str, rewrites: list[dict], applied: dict[str, int]) -> str:
+    """Null address-of and skip direct calls to feature symbols in named functions.
+
+    A profile `[[features.NAME.rewrite]]` names the function (its original ABI
+    symbol, the `// Original ABI symbol:` comment above its Abla body) and the
+    symbols whose address stores (`null_addresses`) or direct calls
+    (`skip_calls`) it must not make. The edit is textual and local: the
+    callee stays in its module, so with nothing else referencing it the
+    section is dropped by --gc-sections.
+    """
+    for item in rewrites:
+        marker = f"// Original ABI symbol: {item['function']}\n"
+        start = text.find(marker)
+        if start < 0:
+            continue
+        end = text.find("\n}\n", start)
+        body = text[start:end]
+        for symbol in item.get("null_addresses", []):
+            body, count = re.subn(r"\$xtensa address \{%s\}" % re.escape(symbol), "u32(0)", body)
+            applied[f"{item['function']}:addr:{symbol}"] = count
+        for symbol in item.get("skip_calls", []):
+            count = 0
+
+            def drop(match: re.Match) -> str:
+                nonlocal count
+                count += 1
+                lhs = match.group("lhs")
+                return f"{match.group('ind')}{lhs} = " + ("u64(0)" if lhs.startswith("val") else "u32(0)") + "\n"
+
+            body = re.sub(CALL_LINE % re.escape(symbol), drop, body, flags=re.MULTILINE)
+            applied[f"{item['function']}:call:{symbol}"] = count
+        # lint-recovered-unit credits the dropped references and calls.
+        refs = [*item.get("null_addresses", []), *item.get("skip_calls", [])]
+        dropped_calls = sum(applied[f"{item['function']}:call:{s}"] for s in item.get("skip_calls", []))
+        header = re.search(r"^\)[^\n]*\{\n", body, re.MULTILINE)
+        body = (body[:header.end()] + f"    // abla-feature-rewrite: calls={dropped_calls} refs={','.join(refs)}\n"
+                + body[header.end():])
+        text = text[:start] + body + text[end:]
+    return text
+
+
 def run_pass(command: list[str], log) -> None:
     log.write(f"== {' '.join(command)}\n")
     log.flush()
@@ -152,6 +196,10 @@ def main() -> int:
                         help="file listing the only symbols to keep global (one per line)")
     parser.add_argument("--exports-from-map", type=pathlib.Path, metavar="MAP",
                         help="write --exports FILE from the --cref table of an application link map, then exit")
+    parser.add_argument("--features", default=os.environ.get("ABLA_FEATURES", ""),
+                        help="comma-separated feature profile names from [features.NAME] in the chip "
+                        "profile (for example `sta`): drops the registration of Wi-Fi features the "
+                        "application never uses so --gc-sections can remove them")
     args = parser.parse_args()
     if args.exports_from_map:
         names = link_map_references(args.exports_from_map)
@@ -162,6 +210,12 @@ def main() -> int:
     exported = dropped = 0
 
     profile = load_driver().load_profile(args.chip)
+    rewrites: list[dict] = []
+    for name in (n for n in args.features.split(",") if n):
+        if name not in profile.get("features", {}):
+            sys.exit(f"assemble-recovered-unit: no [features.{name}] in the {args.chip} profile")
+        rewrites += profile["features"][name].get("rewrite", [])
+    applied: dict[str, int] = {}
     base = ROOT / "build" / "recovery" / args.chip
     unit = base / "unit"
     if unit.exists():
@@ -178,7 +232,10 @@ def main() -> int:
             module = f"{archive}/{member.name}.ab"
             # Same directory depth as the member work directory, so the
             # relative src/ imports stay valid.
-            shutil.copyfile(member / "lifted.ab", unit / module)
+            if rewrites:
+                (unit / module).write_text(apply_feature_rewrites((member / "lifted.ab").read_text(), rewrites, applied))
+            else:
+                shutil.copyfile(member / "lifted.ab", unit / module)
             modules.append(module)
             if (member / "link.ab").exists():
                 link = f"{archive}/{member.name}_link.ab"
@@ -189,6 +246,12 @@ def main() -> int:
                 exported += len(EXPORT.findall(text))
                 (unit / link).write_text(text)
                 selectors += [(link, name) for name in SELECTOR.findall(text)]
+    if rewrites:
+        missing = [key for key in {f"{r['function']}:{kind}:{s}" for r in rewrites
+                   for kind, field in (("addr", "null_addresses"), ("call", "skip_calls")) for s in r.get(field, [])}
+                   if not applied.get(key)]
+        print(f"features {args.features}: {sum(applied.values())} edits in {len(rewrites)} functions"
+              + (f"; NOT APPLIED: {sorted(missing)}" if missing else ""))
     shared = unit / "shared_storage.ab"
     shared.write_text('import "abla/unsafe/native"\n\n// Data owned by more than one recovered module.\n')
     print(f"{len(modules)} modules, {len(selectors)} link selectors"

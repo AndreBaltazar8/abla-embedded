@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Attribute the bytes of a recovered unit.o that survive --gc-sections.
+
+  tools/report-recovered-retention UNIT.O MAP [--top N] [--chain SYMBOL] [--dump FILE]
+
+MAP is the -Wl,-Map output of a link with -Wl,--cref. Kept sections are the
+unit.o input sections placed at a non-zero address. Roots are the unit symbols
+the cross-reference table shows as referenced from other files. The
+relocation graph of UNIT.O is walked breadth-first from the roots so every
+kept section gets a shortest chain back to an external reference (an ESP-IDF
+or app object). Sections are grouped by feature with the regex table below.
+"""
+import re, struct, sys, collections
+
+FEATURES = [
+    ("mesh (libmesh)", r"^(esp_mesh|mesh_|mwifi|mesh)"),
+    ("esp-now", r"espnow|esp_now"),
+    ("FTM", r"ftm"),
+    ("NAN", r"nan_|_nan|ieee80211_nan"),
+    ("WPS/WAPI/smartconfig", r"wps|wapi|sms4|smartconfig"),
+    ("WEP/TKIP", r"wep|tkip|michael|\barc4\b|rc4"),
+    ("softAP / hostap", r"softap|hostap|(^|_)ap_|_ap($|_)|ieee80211_.*_ap|ieee80211_beacon|ieee80211_proberesp"),
+    ("GCMP/CCMP/crypto", r"gcmp|ccmp|cmac|aes|crypto"),
+    ("BT coexist / btbb", r"^(coex|btdm|bt_|btbb|lc_|ble|bb_)|coexist|btbb"),
+    ("11ax/HE/TWT", r"(^|_)he_|_he($|_)|twt|11ax|heop|mu_edca|bss_color"),
+    ("CSI/sniffer/promisc", r"csi|promisc|sniff"),
+    ("regulatory/country", r"country|regulatory|regdomain"),
+    ("A-MPDU/BA", r"ampdu|(^|_)ba_|addba|delba"),
+    ("power save / TIM / pm", r"(^|_)pm_|tim_|(^|_)ps_|powersave|dtim"),
+    ("phy cal / rf", r"phy_|(^|_)rf_|^pll|cal_|txpwr|tx_pwctrl"),
+    ("rate / rssi / scan", r"rate|rssi|scan|roam|rc_"),
+    ("ioctl/config/log", r"ioctl|printf|log|config"),
+]
+
+
+def elf(path):
+    d = open(path, "rb").read()
+    (shoff,) = struct.unpack_from("<I", d, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x2E)
+    sh = []
+    for i in range(shnum):
+        n, t, f, a, o, s, l, inf, al, es = struct.unpack_from("<10I", d, shoff + i * shentsize)
+        sh.append(dict(name=n, type=t, off=o, size=s, link=l, info=inf, ent=es))
+    stro = sh[shstrndx]["off"]
+
+    def cstr(base, off):
+        e = d.index(b"\0", base + off)
+        return d[base + off:e].decode()
+
+    for s in sh:
+        s["name"] = cstr(stro, s["name"])
+    syms = []
+    symtab = next(s for s in sh if s["type"] == 2)
+    strb = sh[symtab["link"]]["off"]
+    for i in range(symtab["size"] // 16):
+        n, v, sz, info, oth, shn = struct.unpack_from("<IIIBBH", d, symtab["off"] + i * 16)
+        syms.append(dict(name=cstr(strb, n), val=v, size=sz, bind=info >> 4, type=info & 15, shn=shn))
+    rels = collections.defaultdict(list)
+    for s in sh:
+        if s["type"] in (4, 9):
+            tgt = s["info"]
+            for i in range(s["size"] // s["ent"]):
+                o = s["off"] + i * s["ent"]
+                _, info = struct.unpack_from("<II", d, o)
+                rels[tgt].append(info >> 8)
+    return sh, syms, rels
+
+
+def parse_map(path):
+    kept = {}
+    cref = {}
+    lines = open(path, errors="replace").read().split("\n")
+    cr = next(k for k, l in enumerate(lines) if l.startswith("Cross Reference Table"))
+    start = next(k for k, l in enumerate(lines) if l.startswith("Linker script and memory map"))
+    pat = re.compile(r"^\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(\S.*unit\.o)\s*$")
+    for k in range(start, cr):
+        l = lines[k]
+        m = re.match(r"^ (\.\S+)\s*$", l)
+        if m and k + 1 < cr:
+            m2 = pat.match(lines[k + 1])
+            if m2 and int(m2.group(1), 16):
+                kept[m.group(1)] = kept.get(m.group(1), 0) + int(m2.group(2), 16)
+                continue
+        m = re.match(r"^ (\.\S+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(\S.*unit\.o)\s*$", l)
+        if m and int(m.group(2), 16):
+            kept[m.group(1)] = kept.get(m.group(1), 0) + int(m.group(3), 16)
+    cur = None
+    for l in lines[cr + 3:]:
+        if not l.strip():
+            continue
+        if l[0] != " ":
+            parts = l.split(None, 1)
+            cur = parts[0]
+            cref[cur] = [parts[1].strip()] if len(parts) > 1 else []
+        elif cur:
+            cref[cur].append(l.strip())
+    return kept, cref
+
+
+def main():
+    a = sys.argv[1:]
+    top = 15
+    chain_sym = None
+    dump = None
+    if "--top" in a:
+        j = a.index("--top"); top = int(a[j + 1]); del a[j:j + 2]
+    if "--chain" in a:
+        j = a.index("--chain"); chain_sym = a[j + 1]; del a[j:j + 2]
+    subtrees = 0
+    if "--subtrees" in a:
+        j = a.index("--subtrees"); subtrees = int(a[j + 1]); del a[j:j + 2]
+    if "--dump" in a:
+        j = a.index("--dump"); dump = a[j + 1]; del a[j:j + 2]
+    unit, mp = a
+    sh, syms, rels = elf(unit)
+    kept, cref = parse_map(mp)
+    secsize = {i: s["size"] for i, s in enumerate(sh)}
+    byname = {}
+    for i, s in enumerate(sh):
+        byname.setdefault(s["name"], []).append(i)
+    keptidx = set()
+    for n in kept:
+        for i in byname.get(n, []):
+            keptidx.add(i)
+    secsyms = collections.defaultdict(list)
+    defsym = {}
+    for s in syms:
+        if s["shn"] and s["shn"] < 0xff00 and s["name"] and s["type"] in (0, 1, 2):
+            secsyms[s["shn"]].append(s)
+            if s["bind"] != 0:
+                defsym[s["name"]] = s["shn"]
+
+    def label(i):
+        c = ([s for s in secsyms[i] if s["type"] in (1, 2) and s["bind"] != 0]
+             or [s for s in secsyms[i] if s["type"] in (1, 2)] or secsyms[i])
+        return c[0]["name"] if c else sh[i]["name"]
+
+    roots = {}
+    for name, files in cref.items():
+        if name not in defsym or not files or "unit.o" not in files[0]:
+            continue
+        ext = [f for f in files[1:] if "unit.o" not in f]
+        if ext:
+            roots[name] = (defsym[name], ext[0])
+
+    prev = {}
+    frontier = []
+    for name, (si, ext) in roots.items():
+        if si not in prev:
+            prev[si] = ("ROOT", name, ext)
+            frontier.append(si)
+
+    def sibling(i):
+        n = sh[i]["name"]
+        return byname.get(".literal." + n[6:], []) if n.startswith(".text.") else []
+
+    while frontier:
+        nxt = []
+        for si in frontier:
+            targets = []
+            for s2 in [si] + sibling(si):
+                if s2 != si and s2 not in prev:
+                    prev[s2] = ("LIT", si)
+                for sy in rels.get(s2, []):
+                    t = syms[sy]
+                    if t["shn"] and t["shn"] < 0xff00:
+                        targets.append((t["shn"], t["name"]))
+            for ti, tn in targets:
+                if ti not in prev:
+                    prev[ti] = ("REF", si, tn)
+                    nxt.append(ti)
+        frontier = nxt
+    reach = {i for i in prev if sh[i]["size"]}
+    kb = sum(secsize[i] for i in keptidx)
+    rb = sum(secsize[i] for i in reach)
+    print(f"kept unit.o sections: {len(keptidx)} / {kb} bytes; walked: {len(reach)} / {rb} bytes; "
+          f"roots: {len(roots)}; kept-not-walked: {sum(secsize[i] for i in keptidx - reach)}")
+
+    def root_of(i):
+        while prev[i][0] != "ROOT":
+            i = prev[i][1]
+        return i
+
+    def chain(i):
+        out = []
+        while True:
+            p = prev[i]
+            out.append(label(i))
+            if p[0] == "ROOT":
+                out.append(f"<{p[2]}> via {p[1]}")
+                break
+            i = p[1]
+        return out[::-1]
+
+    if chain_sym:
+        print(" -> ".join(chain(defsym[chain_sym])))
+        return
+    if subtrees:
+        # Bytes each section keeps alive through the shortest-path tree: a
+        # large subtree under a feature entry point is a cheap thing to cut.
+        size = collections.Counter()
+        for i in reach:
+            j = i
+            while True:
+                size[j] += secsize[i]
+                if prev[j][0] == "ROOT":
+                    break
+                j = prev[j][1]
+        for j, b in size.most_common(subtrees):
+            print(f"{b:8} {secsize[j]:6}  {label(j)}  <- {label(prev[j][1]) if prev[j][0] != 'ROOT' else prev[j][2]}")
+        return
+    groups = collections.defaultdict(lambda: [0, collections.Counter()])
+    rows = []
+    for i in reach:
+        nm = label(i)
+        g = "other"
+        for gname, rx in FEATURES:
+            if re.search(rx, nm, re.I):
+                g = gname
+                break
+        groups[g][0] += secsize[i]
+        groups[g][1][root_of(i)] += secsize[i]
+        rows.append((secsize[i], g, nm, label(root_of(i)), prev[root_of(i)][2]))
+    if dump:
+        with open(dump, "w") as f:
+            for r in sorted(rows, reverse=True):
+                f.write("\t".join(map(str, r)) + "\n")
+    print(f"{'group':26} {'bytes':>8}  dominant root (unit symbol <- first external referrer)")
+    for g, (b, c) in sorted(groups.items(), key=lambda kv: -kv[1][0])[:top]:
+        r, rb2 = c.most_common(1)[0]
+        print(f"{g:26} {b:8}  {label(r)} <- {prev[r][2]} ({rb2} B)")
+    print("\nlargest roots by dominated bytes:")
+    own = collections.Counter()
+    for i in reach:
+        own[root_of(i)] += secsize[i]
+    for r, b in own.most_common(top):
+        print(f"{b:8}  {label(r)}  <- {prev[r][2]}")
+
+
+if __name__ == "__main__":
+    main()
