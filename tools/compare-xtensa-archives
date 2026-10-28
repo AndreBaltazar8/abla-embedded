@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Classify functions shared by two chips' copies of an Espressif archive.
+
+Espressif builds the same Wi-Fi/radio sources for every Xtensa chip, so an
+ESP32-S3 member often matches its classic ESP32 counterpart function by
+function. This tool tells a new-chip recovery which already-recovered Abla can
+be reused: each function present in both archives is disassembled with
+relocations and normalized before comparison:
+
+- Code Density forms are widened (mov.n a,b == or a,b,b; x.n == x);
+- `memw` is dropped (the classic ESP32 compiler inserts it as an errata
+  workaround; it does not exist on later chips);
+- l32r operands become the literal they load (relocated symbol or constant),
+  calls become their callee, branch targets become instruction indexes.
+
+Classes: `identical` (same normalized sequence), `reordered` (same
+instructions, different schedule), `layout` (same once load/store offsets and
+branch indexes are ignored: the logic matches but structure layouts differ,
+e.g. ESP-IDF's wifi_osi_funcs_t table is 8 bytes shorter on the S3), and
+`different`, plus functions only on one side. Run per archive, e.g.
+
+  tools/compare-xtensa-archives esp_wifi/lib/esp32/libpp.a \\
+      esp_wifi/lib/esp32s3/libpp.a --objdump-a A --objdump-b B
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)(?:\s+(.*?))?\s*$")
+RELOC = re.compile(r"^\s*([0-9a-f]+):\s+(R_XTENSA_\w+)\s+(\S+)\s*$")
+FUNC = re.compile(r"^([0-9a-f]+) <([^>]+)>:\s*$")
+SECTION = re.compile(r"^Disassembly of section (\S+):\s*$")
+NARROW_KEEP = {"retw.n", "ret.n", "nop.n", "break.n", "beqz.n", "bnez.n"}
+BRANCHES = re.compile(r"^(b\w*|j|loop\w*)$")
+
+
+def run(command: list[str]) -> str:
+    return subprocess.run(command, capture_output=True, text=True, check=True).stdout
+
+
+def section_words(objdump: list[str], obj: pathlib.Path) -> dict[str, bytes]:
+    data: dict[str, bytearray] = {}
+    current = None
+    for line in run(objdump + ["-s", str(obj)]).splitlines():
+        if line.startswith("Contents of section "):
+            current = line[len("Contents of section "):].rstrip(":")
+            data[current] = bytearray()
+        elif current and re.match(r"^ [0-9a-f]+ ", line):
+            fields = line[1:].split("  ")[0].split()[1:]
+            data[current] += bytes.fromhex("".join(fields))
+    return {k: bytes(v) for k, v in data.items()}
+
+
+def section_relocations(objdump: list[str], obj: pathlib.Path) -> dict[str, dict[int, str]]:
+    relocations: dict[str, dict[int, str]] = collections.defaultdict(dict)
+    current = None
+    for line in run(objdump + ["-r", str(obj)]).splitlines():
+        m = re.match(r"^RELOCATION RECORDS FOR \[(.+)\]:", line)
+        if m:
+            current = m.group(1)
+            continue
+        parts = line.split()
+        if current and len(parts) == 3 and re.fullmatch(r"[0-9a-f]+", parts[0]) and parts[1] == "R_XTENSA_32":
+            relocations[current][int(parts[0], 16)] = parts[2]
+    return relocations
+
+
+def functions(objdump: list[str], obj: pathlib.Path) -> dict[str, list[str]]:
+    words = section_words(objdump, obj)
+    data_relocs = section_relocations(objdump, obj)
+    out: dict[str, list[str]] = {}
+    section = name = None
+    raw: list[tuple[int, str, str, list[tuple[str, str]]]] = []
+
+    def finish() -> None:
+        if not name:
+            return
+        index = {address: i for i, (address, _, _, _) in enumerate(raw)}
+        normalized = []
+        for address, op, args, relocs in raw:
+            expand = next((target for kind, target in relocs if kind == "R_XTENSA_ASM_EXPAND"), None)
+            slot = next((target for kind, target in relocs if kind == "R_XTENSA_SLOT0_OP"), None)
+            if op == "memw":
+                continue
+            if op == "mov.n":
+                a, b = [x.strip() for x in args.split(",")]
+                op, args = "or", f"{a}, {b}, {b}"
+            elif op.endswith(".n") and op not in NARROW_KEEP:
+                op = op[:-2]
+            if op == "l32r":
+                register = args.split(",")[0]
+                literal = expand
+                if not literal and slot:
+                    sec, _, offset = slot.partition("+")
+                    off = int(offset, 16) if offset else 0
+                    literal = data_relocs.get(sec, {}).get(off)
+                    if not literal and sec in words and off + 4 <= len(words[sec]):
+                        literal = hex(int.from_bytes(words[sec][off:off + 4], "little"))
+                normalized.append(f"l32r {register}, ={literal}")
+                continue
+            if op.startswith("call") and expand is None and slot:
+                normalized.append(f"{op} {slot}")
+                continue
+            if BRANCHES.match(op.rstrip(".n")):
+                m = re.search(r"\b([0-9a-f]+) <", args or "")
+                if m and int(m.group(1), 16) in index:
+                    args = re.sub(r"\b[0-9a-f]+ <[^>]*>", f"@{index[int(m.group(1), 16)]}", args)
+            normalized.append(f"{op} {re.sub(r'\s+', '', args or '')}")
+        out[name] = normalized
+
+    lines = run(objdump + ["-dr", "--no-show-raw-insn", str(obj)]).splitlines()
+    for line in lines:
+        if m := SECTION.match(line):
+            finish()
+            section, name, raw = m.group(1), None, []
+            continue
+        if m := FUNC.match(line):
+            finish()
+            name, raw = (m.group(2), []) if section and section.startswith(".text") and "+" not in m.group(2) and "-" not in m.group(2) else (None, [])
+            continue
+        if not name:
+            continue
+        if m := RELOC.match(line):
+            if raw:
+                raw[-1][3].append((m.group(2), m.group(3)))
+            continue
+        if m := INSN.match(line):
+            raw.append((int(m.group(1), 16), m.group(2), m.group(3) or "", []))
+    finish()
+    return out
+
+
+def coarse(sequence: list[str]) -> collections.Counter:
+    """Forget memory offsets and branch indexes (layout-only differences)."""
+    out = []
+    for line in sequence:
+        op, _, args = line.partition(" ")
+        if re.match(r"^(l|s)(8|16|32)\w*$", op) or op in ("addi", "addmi"):
+            args = re.sub(r",-?\d+$", ",#", args)
+        args = re.sub(r"@\d+", "@", args)
+        out.append(f"{op} {args}")
+    return collections.Counter(out)
+
+
+def members(archive: pathlib.Path, directory: pathlib.Path) -> list[pathlib.Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ar", "x", str(archive.resolve())], cwd=directory, check=True)
+    return sorted(directory.glob("*.o"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("archive_a", type=pathlib.Path)
+    parser.add_argument("archive_b", type=pathlib.Path)
+    parser.add_argument("--objdump-a", default="xtensa-esp32-elf-objdump")
+    parser.add_argument("--objdump-b", default="xtensa-esp32s3-elf-objdump")
+    parser.add_argument("--details", action="store_true", help="list every function and class")
+    args = parser.parse_args()
+    runner = ["steam-run"] if shutil.which("steam-run") and os.environ.get("ABLA_NO_STEAM_RUN") != "1" else []
+    totals = collections.Counter()
+    with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as scratch:
+        root = pathlib.Path(scratch)
+        a_members = {p.name: p for p in members(args.archive_a, root / "a")}
+        b_members = {p.name: p for p in members(args.archive_b, root / "b")}
+        for member in sorted(set(a_members) | set(b_members)):
+            if member not in a_members or member not in b_members:
+                totals["member-only-" + ("a" if member in a_members else "b")] += 1
+                continue
+            a = functions(runner + [args.objdump_a], a_members[member])
+            b = functions(runner + [args.objdump_b], b_members[member])
+            counts = collections.Counter()
+            for fn in sorted(set(a) | set(b)):
+                if fn not in a or fn not in b:
+                    kind = "only-a" if fn in a else "only-b"
+                elif a[fn] == b[fn]:
+                    kind = "identical"
+                elif collections.Counter(a[fn]) == collections.Counter(b[fn]):
+                    kind = "reordered"
+                elif coarse(a[fn]) == coarse(b[fn]):
+                    kind = "layout"
+                else:
+                    kind = "different"
+                counts[kind] += 1
+                if args.details:
+                    print(f"{member}\t{fn}\t{kind}")
+            totals.update(counts)
+            if not args.details:
+                print(f"{member:40} " + " ".join(f"{k}={counts[k]}" for k in ("identical", "reordered", "layout", "different", "only-a", "only-b") if counts[k]))
+    print("TOTAL " + " ".join(f"{k}={v}" for k, v in sorted(totals.items())))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
