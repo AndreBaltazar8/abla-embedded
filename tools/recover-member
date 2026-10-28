@@ -193,14 +193,25 @@ def volatile_after_memory_barriers(module: pathlib.Path) -> int:
     narrow or merge them (a masked 32-bit register read became a 16-bit
     `l16ui` that the S3 MAC does not support); volatile accesses keep the
     exact width, count and order.
+
+    LLVM's Xtensa back end itself puts a MEMW right before every volatile
+    access, so the barrier is dropped when only plain register arithmetic
+    separates it from the (sole) access of the line: the emitted code is then
+    GCC's `memw; access` instead of `memw; memw; access`.
     """
     access = re.compile(r"ablaUnsafe(Load|Store)U(8|16|32)\(nativePointerFromAddress\(")
+    arithmetic = re.compile(r"^\s*(?:var |val )?r\d+ = [^{}]*$")
     lines = module.read_text().splitlines()
     pending = False
+    barrier = -1
+    plain_since_barrier = False
+    drop: set[int] = set()
     changed = 0
     for index, line in enumerate(lines):
         if line.strip() == "xtensaMemoryBarrier()":
             pending = True
+            barrier = index
+            plain_since_barrier = True
             continue
         if line.strip().startswith(("trusted fun ", "}")) and not line.strip().startswith("} else"):
             pending = False
@@ -208,8 +219,13 @@ def volatile_after_memory_barriers(module: pathlib.Path) -> int:
             continue
         match = access.search(line)
         if not match:
+            if not (arithmetic.match(line) and "ablaUnsafe" not in line and "$xtensa" not in line
+                    and "(" not in line.split("=", 1)[1].replace("u32(", "").replace("u64(", "")):
+                plain_since_barrier = False
             continue
         pending = False
+        if plain_since_barrier and line.count("ablaUnsafe") == 1:
+            drop.add(barrier)
         kind, bits = match.group(1), match.group(2)
         call_open = match.end() - len("nativePointerFromAddress(") - 1
         call_end = _call_span(line, call_open)
@@ -220,6 +236,7 @@ def volatile_after_memory_barriers(module: pathlib.Path) -> int:
         lines[index] = (line[:match.start()] + f"ablaUnsafeVolatile{kind}U{bits}({address}{rest})"
                         + line[call_end:])
         changed += 1
+    lines = [line for index, line in enumerate(lines) if index not in drop]
     if changed:
         text = "\n".join(lines) + "\n"
         if 'import "abla/unsafe/mmio"' not in text:
