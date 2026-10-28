@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Assemble recovered archive members into one Abla unit and compile it.
+
+  tools/assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist
+
+Takes each member's lifted.ab and link.ab from tools/recover-member under
+build/recovery/<chip>/<archive>/<member>/, copies them into
+build/recovery/<chip>/unit/, and runs the cross-module passes that only make
+sense once the whole corpus is Abla:
+
+1. centralize-abla-owned-storage: data referenced from more than one module
+   moves into one cycle-free shared_storage.ab;
+2. lower-abla-owned-symbol-addresses: `$xtensa address {sym}` uses of
+   Abla-owned functions and data become ordinary Abla values;
+3. direct-recovered-xtensa-calls: symbolic calls to Abla-owned functions
+   become ordinary Abla calls (inlinable, tree-shakeable).
+
+Then it compiles the unit to one object with every link selector applied,
+which is what an application links instead of the Espressif archives.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TOOLS = ROOT / "tools"
+SELECTOR = re.compile(r"^compile fun (\w+)\(\): bool", re.MULTILINE)
+
+
+def load_driver():
+    loader = importlib.machinery.SourceFileLoader("recover_member", str(TOOLS / "recover-member"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+FUNCTION_TABLE = re.compile(
+    r"(?ms)^val (?P<value>esp32Data_\w+)Storage = nativeStaticAllocate\(\d+\)\n"
+    r"trusted fun (?P=value)Initialize\(\): int \{\n(?P<body>.*?)^\}\n"
+)
+
+
+def read_function_tables_through_storage(unit: pathlib.Path) -> int:
+    """Let functions reach a code-pointer table without waiting for it.
+
+    An ops table (for example a cipher descriptor) stores the addresses of
+    functions that read the table back. Abla orders initializers by what
+    their bodies name, so `table -> function -> table` is a cycle even though
+    taking an address runs nothing. Function bodies read the storage address
+    instead, which is the same value with no initialization dependency.
+    """
+    texts = {path: path.read_text() for path in unit.rglob("*.ab")}
+    tables = [m.group("value") for text in texts.values() for m in FUNCTION_TABLE.finditer(text)
+              if "nativeFunctionAddress(" in m.group("body")]
+    if not tables:
+        return 0
+    pattern = re.compile(r"\b(" + "|".join(map(re.escape, tables)) + r")\b(?!Storage|Initialized?)")
+    changed = 0
+    for path, text in texts.items():
+        parts = re.split(r"(?m)^(?=trusted fun |val |@)", text)
+        rewritten = "".join(
+            pattern.sub(lambda m: f"u32({m.group(1)}Storage)", part)
+            if part.startswith(("trusted fun ", "@")) and not re.match(r"trusted fun esp32Data_\w+Initialize\(", part)
+            else part
+            for part in parts
+        )
+        if rewritten != text:
+            path.write_text(rewritten)
+            changed += 1
+    return changed
+
+
+def run_pass(command: list[str], log) -> None:
+    log.write(f"== {' '.join(command)}\n")
+    log.flush()
+    result = subprocess.run([sys.executable, "-I", str(TOOLS / command[0]), *command[1:]],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    log.write(result.stdout)
+    print(f"{command[0]}: " + (result.stdout.strip().splitlines() or ["(no output)"])[-1]
+          + ("" if result.returncode == 0 else f" (exit {result.returncode})"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("chip")
+    parser.add_argument("archives", nargs="+")
+    parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--exclude", default="",
+                        help="comma-separated archive/member stems to leave to the Espressif "
+                        "archive (bisecting behavioural differences), e.g. libpp/pm")
+    args = parser.parse_args()
+
+    profile = load_driver().load_profile(args.chip)
+    base = ROOT / "build" / "recovery" / args.chip
+    unit = base / "unit"
+    if unit.exists():
+        shutil.rmtree(unit)
+    unit.mkdir(parents=True)
+    selectors: list[tuple[str, str]] = []
+    modules: list[str] = []
+    for archive in args.archives:
+        (unit / archive).mkdir()
+        excluded = {item for item in args.exclude.split(",") if item}
+        for member in sorted(p for p in (base / archive).iterdir() if (p / "lifted.ab").exists()):
+            if f"{archive}/{member.name}" in excluded:
+                continue
+            module = f"{archive}/{member.name}.ab"
+            # Same directory depth as the member work directory, so the
+            # relative src/ imports stay valid.
+            shutil.copyfile(member / "lifted.ab", unit / module)
+            modules.append(module)
+            if (member / "link.ab").exists():
+                link = f"{archive}/{member.name}_link.ab"
+                text = (member / "link.ab").read_text()
+                (unit / link).write_text(text)
+                selectors += [(link, name) for name in SELECTOR.findall(text)]
+    shared = unit / "shared_storage.ab"
+    shared.write_text('import "abla/unsafe/native"\n\n// Data owned by more than one recovered module.\n')
+    print(f"{len(modules)} modules, {len(selectors)} link selectors")
+
+    with (unit / "passes.log").open("w") as log:
+        run_pass(["centralize-abla-owned-storage", "--write", "--initialized-constants", str(unit), str(shared)], log)
+        run_pass(["lower-abla-owned-symbol-addresses", "--write", "--cross-module-data",
+                  "--cross-module-functions", str(unit)], log)
+        direct = ["direct-recovered-xtensa-calls", str(unit), "--write", "--library-root", str(ROOT / "src")]
+        for prefix in profile.get("standard_call_modules", []):
+            direct += ["--standard-module-prefix", prefix]
+        run_pass(direct, log)
+    print(f"function tables read through storage in {read_function_tables_through_storage(unit)} modules")
+
+    main_source = [f'import "{module}"' for module in modules]
+    main_source += [f'import "{link}"' for link in dict.fromkeys(link for link, _ in selectors)]
+    main_source += [""] + [f"#{name}()" for _, name in selectors]
+    (unit / "main.ab").write_text("\n".join(main_source) + "\n")
+    (unit / "build.ab").write_text(
+        'import "abla/compiler"\n\n'
+        'val target = #compilerDefineTarget("esp32-xtensa", "xtensa-esp-unknown-elf", "elf", "none", "none", false, false)\n'
+        f'val built = #compilerBuildProgram("{args.chip}-recovered-radio", "main.ab", "unit.o", "esp32-xtensa", "object", false, false)\n\n'
+        'fun main: int = if (target && built) 0 else 1\n')
+    if args.no_compile:
+        return 0
+
+    driver = load_driver()
+    ablac, environment = driver.ablac_environment(args.chip)
+    script = f'ulimit -s 131072; "{ablac}" build build.ab -o driver && ./driver'
+    result = subprocess.run(["bash", "-c", script], cwd=unit, env=environment,
+                            capture_output=True, text=True, errors="replace")
+    log = result.stdout + result.stderr
+    (unit / "compile.log").write_text(log[-4_000_000:])
+    if result.returncode == 0 and (unit / "unit.o").exists():
+        print(f"compiled {(unit / 'unit.o').relative_to(ROOT)} ({(unit / 'unit.o').stat().st_size} bytes)")
+        return 0
+    kinds: dict[str, int] = {}
+    for kind in re.findall(r"^error\[\w+\]: ([^\s@:]+(?::[^\s@]+)?)", log, re.MULTILINE):
+        kinds[kind] = kinds.get(kind, 0) + 1
+    print(f"compile failed: {sum(kinds.values())} error(s); see {(unit / 'compile.log').relative_to(ROOT)}")
+    for kind, count in sorted(kinds.items(), key=lambda item: -item[1])[:12]:
+        print(f"  {count:6} {kind}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -518,6 +518,9 @@ def normalize_symbolic_literal_addends(
     directives: list[str],
 ) -> tuple[str, list[str]]:
     """Keep Xtensa text-streamer literals to a single symbol expression."""
+    if SYMBOL_ADDEND_LITERALS:
+        # Upstream LLVM keeps `symbol+addend` in the literal's relocation.
+        return source, directives
     joined = source + "\n" + "\n".join(directives)
     literals: dict[str, tuple[str, int]] = {}
     pattern = re.compile(
@@ -787,6 +790,10 @@ def normalize_xtensa_assembler_immediate(text: str) -> str:
     return f"addmi\t{registers}, {value}"
 
 
+# Set by --symbol-addend-literals (see main).
+SYMBOL_ADDEND_LITERALS = False
+
+
 def symbolic_address_load(register: str, expression: str) -> str:
     """Load a symbol plus addend without a binary literal expression.
 
@@ -796,7 +803,10 @@ def symbolic_address_load(register: str, expression: str) -> str:
     """
     match = re.fullmatch(r"([.$A-Za-z_][.$A-Za-z0-9_]*)\+0x([0-9A-Fa-f]+)",
                          expression)
-    if not match:
+    if not match or SYMBOL_ADDEND_LITERALS:
+        # Upstream LLVM assembles `movi aN, symbol+addend` into a literal
+        # whose relocation keeps the addend: required for mergeable sections
+        # and for later section-alias rebasing of the addend.
         return f"movi {register}, {expression}"
     addend = int(match.group(2), 16)
     high = ((addend + 128) // 256) * 256
@@ -1208,7 +1218,26 @@ def main() -> int:
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--namespace", default="ioctl")
     parser.add_argument("--link-selector", default="linkRecoveredOpaqueCallers")
+    parser.add_argument(
+        "--data-anchor-synthetic", action="store_true",
+        help="assemble data sections with --synthetic-anchor instead of the "
+        "first selected function, so a function that stays raw assembly does "
+        "not keep the whole object's data in assembly",
+    )
+    parser.add_argument(
+        "--symbol-addend-literals", action="store_true",
+        help="load symbol+addend through one literal (upstream LLVM) instead "
+        "of movi+addi (an Espressif LLVM crash workaround)",
+    )
+    parser.add_argument(
+        "--no-compatibility-symbols", action="store_true",
+        help="do not apply the classic ESP32 ioctl local-symbol renames",
+    )
     arguments = parser.parse_args()
+    if arguments.no_compatibility_symbols:
+        COMPATIBILITY_SYMBOLS.clear()
+    global SYMBOL_ADDEND_LITERALS
+    SYMBOL_ADDEND_LITERALS = arguments.symbol_addend_literals
     aliases: list[tuple[str, str]] = []
     for value in arguments.alias_function:
         if "=" not in value:
@@ -1518,7 +1547,9 @@ def main() -> int:
             # function, avoiding a synthetic exported data anchor.
             recovered_prefix = "\n".join(prefix)
             if recovered_prefix:
-                anchor = next(
+                anchor = arguments.synthetic_anchor if (
+                    arguments.data_anchor_synthetic and arguments.synthetic_anchor
+                ) else next(
                     (name for name, _ in recovered_functions
                      if name not in unselected),
                     "",

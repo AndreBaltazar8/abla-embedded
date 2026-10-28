@@ -9,6 +9,7 @@ import importlib.util
 import importlib.machinery
 import pathlib
 import re
+import shlex
 import subprocess
 import struct
 import sys
@@ -167,6 +168,8 @@ def table_entries(source: str, table: str) -> tuple[re.Match[str], list[tuple[st
 
 
 def object_function_start(object_path: pathlib.Path, symbol: str) -> int:
+    if symbol.startswith(".text."):
+        return 0
     output = subprocess.check_output(
         ["nm", "--defined-only", str(object_path)], text=True
     )
@@ -326,13 +329,213 @@ def lower_dispatch(
     return "".join(output), replaced
 
 
+def lower_table_sites(
+    function: str, table: str
+) -> list[tuple[int, int, str, int]]:
+    """Find computed jumps through `table` in one dispatcher function.
+
+    Returns (jump line index, entry offset, selector register, shift line)
+    for each `rB = TABLE [; rB = rB + u32(K)] ; rT = (rS << u32(2)) + rB ;
+    rJ = load(rT) ; ... ; return u32(ablaUnsafeCall*(int(rJ), ...))`
+    sequence, allowing unrelated statements in between (GCC schedules
+    independent loads into the gap).
+    """
+    lines = function.splitlines(keepends=True)
+    sites = []
+    for index, line in enumerate(lines):
+        base = re.fullmatch(
+            rf"\s*(r[0-9]+) = (?:\({re.escape(table)} \+ u32\(([0-9]+)\)\)|{re.escape(table)})\n?",
+            line,
+        )
+        if base is None:
+            continue
+        register, offset, entry_register, selector, target = (
+            base.group(1), int(base.group(2) or 0), None, None, None
+        )
+        for look in range(index + 1, min(len(lines), index + 14)):
+            text = lines[look].strip()
+            add = re.fullmatch(rf"{register} = {register} \+ u32\(([0-9]+)\)", text)
+            if add and entry_register is None:
+                offset += int(add.group(1))
+                continue
+            shift = re.fullmatch(rf"(r[0-9]+) = \((r[0-9]+) << u32\(2\)\) \+ {register}", text)
+            if shift and entry_register is None:
+                entry_register, selector = shift.group(1), shift.group(2)
+                shift_line = look
+                continue
+            if entry_register and target is None:
+                load = re.fullmatch(rf"(r[0-9]+) = u32\(ablaUnsafeLoadU32\(.*\bint\({entry_register}\).*\)\)\)", text)
+                if load:
+                    target = load.group(1)
+                    continue
+            if target and text.startswith("return u32(ablaUnsafeCall") and f"(int({target})" in text:
+                sites.append((look, offset, selector, shift_line))
+                break
+    return sites
+
+
+def section_entry_offset(objdump: str, object_path: pathlib.Path, section: str) -> int:
+    """Offset of the first `entry` in a section (after its literal pool)."""
+    listing = subprocess.check_output(
+        shlex.split(objdump) + ["-d", "-j", section, str(object_path)], text=True, errors="replace"
+    )
+    match = re.search(r"(?m)^\s*([0-9a-f]+):\s+\S+\s+entry\b", listing)
+    return int(match.group(1), 16) if match else 0
+
+
+def lower_function_table(source, abla_function, abi_function, table, entries,
+                         source_path, object_path, objdump, tools, lifter, temporary):
+    """Lower one function's computed jumps through `table` (see discover)."""
+    dispatch = Dispatch(str(source_path), "", object_path.name,
+                        abi_function, abla_function, table)
+    begin, end = function_span(source, abla_function)
+    function_text = source[begin:end]
+    sites = lower_table_sites(function_text, table)
+    if not sites:
+        print(f"{abi_function}: table {table} has no recognized jump site")
+        return source, 0
+    try:
+        start, states = block_map(source_path.parent, tools, lifter, objdump,
+                                  object_path, dispatch, temporary)
+    except (ValueError, subprocess.CalledProcessError) as error:
+        print(f"{abi_function}: table {table} left as data ({error})")
+        return source, 0
+    lines = function_text.splitlines(keepends=True)
+    replacements = 0
+    for line_index, offset, selector, shift_line in sorted(sites, reverse=True):
+        mapping = []
+        # A table shared by several functions: this site's run starts
+        # at its byte offset and lasts while entries target this
+        # function.
+        for symbol, addend in entries[offset // 4:]:
+            # The reconstructed section-local helper starts at its `entry`;
+            # addends against its member-local label are relative to that.
+            if abi_function.startswith(".text.") and "_local_" + re.sub(r"[^A-Za-z0-9_]", "_", abi_function) in symbol:
+                addend += section_entry_offset(objdump, object_path, abi_function)
+            try:
+                target = target_offset(symbol, addend, abi_function, start)
+            except ValueError:
+                break
+            if target not in states:
+                mapping = []
+                break
+            mapping.append(states[target])
+        if not mapping:
+            print(f"{abi_function}: table {table}+{offset} has unmapped targets")
+            return source, 0
+        indent = re.match(r"\s*", lines[line_index]).group(0)
+        # The shift often overwrites the selector register (`r8 = (r8 << 2)
+        # + base`); keep the index in its own value.
+        index_name = f"jumpTableIndex{shift_line}"
+        arms = "".join(f"{indent}    {value} -> {state}\n" for value, state in enumerate(mapping))
+        lines[line_index] = (f"{indent}programCounter = when ({index_name}) {{\n{arms}"
+                             f"{indent}    else -> -1\n{indent}}}\n")
+        shift_indent = re.match(r"\s*", lines[shift_line]).group(0)
+        lines[shift_line] = f"{shift_indent}val {index_name} = {selector}\n" + lines[shift_line]
+        replacements += 1
+        print(f"{abi_function} -> {len(mapping)}-arm Abla when (offset {offset})")
+    if not replacements:
+        return source, 0
+    source = source[:begin] + "".join(lines) + source[end:]
+    return source, replacements
+
+
+def discover(
+    source_path: pathlib.Path,
+    object_path: pathlib.Path,
+    objdump: str,
+    tools: pathlib.Path,
+    write: bool,
+) -> int:
+    """Find and lower every computed jump table of one recovered member.
+
+    New chips have no hand-curated DISPATCHES list. A recovered rodata table
+    whose entries are all code addresses inside the one function that indexes
+    it is a switch table; its targets map to that function's lifted blocks
+    exactly as for the curated classic entries. Run before structurizing,
+    while functions are still program-counter dispatchers.
+    """
+    lifter = load_lifter(tools)
+    reconstruct_loader = importlib.machinery.SourceFileLoader(
+        "abla_jump_reconstruct", str(tools / "reconstruct-xtensa-object")
+    )
+    spec = importlib.util.spec_from_loader(reconstruct_loader.name, reconstruct_loader)
+    reconstruct = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = reconstruct
+    reconstruct_loader.exec_module(reconstruct)
+    symbols = re.findall(
+        r"(?m)^[0-9A-Fa-f]+\s+[Tt]\s+(\S+)$",
+        subprocess.check_output(["nm", "--defined-only", str(object_path)], text=True),
+    )
+    abi_by_abla = {reconstruct.abla_function_name(symbol): symbol for symbol in symbols}
+    # Section-local helpers without a symbol of their own (`.text.name`).
+    sections = re.findall(
+        r"(?m)^\s*\d+\s+(\.text\.\S+)\s",
+        subprocess.check_output(["objdump", "-h", str(object_path)], text=True, errors="replace"),
+    )
+    for section in sections:
+        abi_by_abla.setdefault(reconstruct.abla_function_name(section), section)
+    source = source_path.read_text()
+    lowered_count = 0
+    # Tables still defined in assembly (their entries are code relocations):
+    # `LABEL:` followed by `.long symbol+0xOFFSET` lines, indexed through
+    # `$xtensa address {LABEL}`.
+    assembly_tables = {
+        match.group(1): [
+            (entry.group(1), int(entry.group(2) or "0", 16))
+            for entry in re.finditer(r"\.long\s+([^\s+]+)(?:\+0x([0-9a-fA-F]+))?", match.group(2))
+        ]
+        for match in re.finditer(r"(?m)^(\.L[\w.$]+):\n((?:\.long\s+[^\n]+\n)+)", source)
+    }
+    with tempfile.TemporaryDirectory(prefix=".abla-jump-map.", dir=source_path.parent) as name:
+        temporary = pathlib.Path(name)
+        candidates = [(block.group("value"), None) for block in INITIALIZED.finditer(source)]
+        candidates += [(f"$xtensa address {{{label}}}", entries) for label, entries in assembly_tables.items()]
+        for table, assembly_entries in candidates:
+            if assembly_entries is None:
+                try:
+                    _, entries = table_entries(source, table)
+                except ValueError:
+                    continue
+            else:
+                entries = assembly_entries
+            if not entries:
+                continue
+            users = [m.group(1) for m in re.finditer(r"(?m)^trusted fun (\w+)\(", source)
+                     if re.search(rf"(?<![\w$]){re.escape(table)}(?![\w])",
+                                  source[slice(*function_span(source, m.group(1)))])]
+            for abla_function in users:
+                if abla_function not in abi_by_abla:
+                    continue
+                source, replacements = lower_function_table(
+                    source, abla_function, abi_by_abla[abla_function], table, entries,
+                    source_path, object_path, objdump, tools, lifter, temporary,
+                )
+                lowered_count += replacements
+    if write and lowered_count:
+        source_path.write_text(source)
+    print(f"{'lowered' if write else 'would lower'} {lowered_count} computed jumps")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write", action="store_true")
-    parser.add_argument("--archive-root", required=True, type=pathlib.Path)
+    parser.add_argument("--archive-root", type=pathlib.Path)
     parser.add_argument("--objdump", required=True)
+    parser.add_argument(
+        "--discover", type=pathlib.Path, metavar="OBJECT",
+        help="lower every table found in ROOT (one recovered .ab) against "
+        "its original OBJECT instead of the curated classic list",
+    )
     parser.add_argument("root", type=pathlib.Path)
     arguments = parser.parse_args()
+    if arguments.discover:
+        return discover(arguments.root.resolve(), arguments.discover.resolve(),
+                        arguments.objdump, pathlib.Path(__file__).resolve().parent,
+                        arguments.write)
+    if arguments.archive_root is None:
+        parser.error("--archive-root is required without --discover")
     root = arguments.root.resolve()
     tools = root / "tools"
     lifter = load_lifter(tools)

@@ -41,11 +41,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
 PASSES = (
     ["migrate-xtensa-recovered-blocks"],
-    ["lift-xtensa-leaves-to-abla", "--write"],
+    # ABI-named data stays assembler-defined: raw assembly in other members
+    # and the remaining Espressif objects still reference it by name.
+    ["lift-xtensa-leaves-to-abla", "--write", "--keep-global-data"],
     ["lower-xtensa-boundaries-to-abla", "--write"],
     ["structurize-acyclic-recovered-functions", "--write"],
 )
 REUSABLE = {"identical", "reordered"}
+CLASSES = ("rom", "identical", "reordered", "layout", "different", "new")
 PROVIDE = re.compile(r"PROVIDE\s*\(\s*([A-Za-z_]\w*)\s*=")
 SYMBOL = re.compile(r"^[0-9a-f]+ (.{7}) (\S+)\s+[0-9a-f]+ (\S+)$")
 SELECTOR = re.compile(r'(?:internal|export)Function\("(\w+)",\s*"([^"]+)"\)')
@@ -102,8 +105,320 @@ def object_functions(objdump: list[str], obj: pathlib.Path) -> dict[str, bool]:
     for line in text.splitlines():
         m = SYMBOL.match(line.replace("\t", " "))
         if m and "F" in m.group(1):
-            out[m.group(3)] = "g" in m.group(1)
+            out[m.group(3)] = "g" in m.group(1) or "w" in m.group(1)
     return out
+
+
+def weak_functions(objdump: list[str], obj: pathlib.Path) -> set[str]:
+    text = subprocess.run(objdump + ["-t", str(obj)], capture_output=True, text=True, check=True).stdout
+    return {m.group(3) for m in map(SYMBOL.match, (l.replace("\t", " ") for l in text.splitlines()))
+            if m and "F" in m.group(1) and "w" in m.group(1)}
+
+
+def label_code_offset_tables(module: pathlib.Path, objdump: list[str], obj: pathlib.Path) -> list[str]:
+    """Point `.long function+0xOFFSET` table entries at instruction labels.
+
+    Switch tables of functions that stay raw assembly hold absolute offsets
+    into the original code. Reassembly changes the layout (calls recovered as
+    `movi`+`callx8`, relaxed branches), so an offset would land mid-function;
+    the reconstruction's `.Labla_recovered_<function>_<offset>` labels keep
+    the target exact. Returns entries that had no label.
+    """
+    text = subprocess.run(objdump + ["-t", str(obj)], capture_output=True, text=True, check=True).stdout
+    starts = {}
+    for line in text.splitlines():
+        m = re.match(r"^([0-9a-f]+) (.{7}) \S+\s+[0-9a-f]+ (\S+)$", line.replace("\t", " "))
+        if m and "F" in m.group(2):
+            starts[m.group(3)] = int(m.group(1), 16)
+    source = module.read_text()
+    missing: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name, offset = match.group(1), int(match.group(2), 16)
+        if name not in starts:
+            return match.group(0)
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        label = f".Labla_recovered_{safe}_{starts[name] + offset:x}"
+        if f"\n{label}:" not in source:
+            # No labels at all: the function was lifted and its switch
+            # lowered to `when`, leaving this table unused.
+            if f"\n.Labla_recovered_{safe}_" in source:
+                missing.append(f"{name}+0x{offset:x}")
+            return match.group(0)
+        return f".long {label}"
+
+    rewritten = re.sub(r"\.long ([A-Za-z_][\w$.]*)\+0x([0-9a-f]+)\b", replace, source)
+    if rewritten != source:
+        module.write_text(rewritten)
+    return missing
+
+
+def unlowered_table_jumps(module: pathlib.Path) -> list[str]:
+    """Lifted functions that still jump through a loaded code-address table.
+
+    Such a jump treats an intra-function target as a call target and lands
+    mid-function at run time; lower-recovered-jump-tables must handle it.
+    """
+    found = []
+    text = module.read_text()
+    for function in re.finditer(r"(?ms)^trusted fun (\w+)\((?:(?!^trusted fun ).)*", text):
+        body = function.group(0)
+        if "$xtensa instructions" in body.split("\n", 1)[0]:
+            continue
+        if re.search(r"\(r[0-9]+ << u32\(2\)\) \+ r[0-9]+\n\s*(r[0-9]+) = u32\(ablaUnsafeLoadU32\([^\n]*\n"
+                     r"(?:[^\n]*\n){0,8}?\s*return u32\(ablaUnsafeCall\w*\(int\(\1\)", body):
+            found.append(function.group(1))
+    return found
+
+
+def _call_span(text: str, start: int) -> int:
+    """Index just past the parenthesized call starting at text[start] == '('."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise ValueError("unbalanced call")
+
+
+def volatile_after_memory_barriers(module: pathlib.Path) -> int:
+    """Make the memory access that follows each `memw` volatile.
+
+    GCC's Xtensa back end emits MEMW right before every volatile access, which
+    is how ESP-IDF reaches peripheral registers. Lifted plain loads let LLVM
+    narrow or merge them (a masked 32-bit register read became a 16-bit
+    `l16ui` that the S3 MAC does not support); volatile accesses keep the
+    exact width, count and order.
+    """
+    access = re.compile(r"ablaUnsafe(Load|Store)U(8|16|32)\(nativePointerFromAddress\(")
+    lines = module.read_text().splitlines()
+    pending = False
+    changed = 0
+    for index, line in enumerate(lines):
+        if line.strip() == "xtensaMemoryBarrier()":
+            pending = True
+            continue
+        if line.strip().startswith(("trusted fun ", "}")) and not line.strip().startswith("} else"):
+            pending = False
+        if not pending:
+            continue
+        match = access.search(line)
+        if not match:
+            continue
+        pending = False
+        kind, bits = match.group(1), match.group(2)
+        call_open = match.end() - len("nativePointerFromAddress(") - 1
+        call_end = _call_span(line, call_open)
+        inner = line[call_open + 1:call_end - 1]
+        pointer_end = _call_span(inner, len("nativePointerFromAddress"))
+        address = inner[len("nativePointerFromAddress") + 1:pointer_end - 1]
+        rest = inner[pointer_end:]
+        lines[index] = (line[:match.start()] + f"ablaUnsafeVolatile{kind}U{bits}({address}{rest})"
+                        + line[call_end:])
+        changed += 1
+    if changed:
+        text = "\n".join(lines) + "\n"
+        if 'import "abla/unsafe/mmio"' not in text:
+            text = 'import "abla/unsafe/mmio"\n' + text
+        module.write_text(text)
+    return changed
+
+
+def alias_symbol_addends(module: pathlib.Path, namespace: str) -> None:
+    """Route `symbol+addend` literals in raw assembly through `.set` aliases.
+
+    LLVM 23.1's Xtensa text streamer crashes emitting a literal whose value is
+    `symbol+addend` (`movi aN, sym+5`, `.literal L, sym+5`). A local alias
+    keeps the literal a single symbol while the object still carries the
+    relocation `sym+5`, so the addend survives linker section merging and
+    placement exactly as in the original object.
+    """
+    counter = 0
+    out = []
+    pattern = re.compile(r"^(movi\s+a\d+,\s*|\.literal\s+\S+,\s*)([.$A-Za-z_][\w.$]*[+-]0x[0-9A-Fa-f]+)\s*$")
+    for line in module.read_text().splitlines():
+        match = pattern.match(line)
+        if match:
+            alias = f".Labla_addend_{namespace}_{counter}"
+            counter += 1
+            out.append(f".set {alias}, {match.group(2)}")
+            line = match.group(1) + alias
+        out.append(line)
+    module.write_text("\n".join(out) + "\n")
+
+
+def keep_weak_functions_weak(module: pathlib.Path, link: pathlib.Path, weak: set[str], namespace: str) -> None:
+    """Publish weak functions as weak definitions, not strong exports.
+
+    ESP-IDF overrides some (adc2_wifi_acquire, ieee80211_ftm_attach, ...)
+    with strong C definitions. Each recovered body gets an internal name and
+    a `.weak name; .set name, internal` alias; calls keep using the ABI
+    symbol, so the linker still prefers a strong definition when one exists.
+    """
+    if not weak or not link.exists():
+        return
+    text = link.read_text()
+    aliases = []
+    for name in sorted(weak):
+        internal = f"abla_weak_{name}"
+        exported = re.compile(rf'exportFunction\("(\w+)", "{re.escape(name)}"\)')
+        if not exported.search(text):
+            continue
+        text = exported.sub(lambda m: f'requiredInternalFunction("{m.group(1)}", "{internal}")', text)
+        aliases += [f".weak {name}", f".set {name}, {internal}"]
+    if not aliases:
+        return
+    holder = f"esp32Recovered{namespace}WeakAliases"
+    text = text.replace("    true\n}", f'    if (!requiredInternalFunction("{holder}", "abla_weak_aliases_{namespace}")) return false\n    true\n}}', 1)
+    link.write_text(text)
+    with module.open("a") as out:
+        out.write("\n// Weak ABI definitions; strong ESP-IDF definitions take precedence.\n"
+                  f"@naked\ntrusted fun {holder}(): void = $xtensa instructions {{\n"
+                  + "\n".join(aliases) + "\nret.n\n}\n")
+
+
+def object_data(objdump: list[str], obj: pathlib.Path) -> dict[str, str]:
+    """Global and weak data objects the member defines -> reconstruct option."""
+    out: dict[str, str] = {}
+    text = subprocess.run(objdump + ["-t", str(obj)], capture_output=True, text=True, check=True).stdout
+    for line in text.splitlines():
+        m = SYMBOL.match(line.replace("\t", " "))
+        if m and "O" in m.group(1) and m.group(2) != "*UND*":
+            if "w" in m.group(1):
+                out[m.group(3)] = "--weak-data"
+            elif "g" in m.group(1):
+                out[m.group(3)] = "--global-data"
+    return out
+
+
+def symbolless_code_sections(objdump: list[str], obj: pathlib.Path) -> list[str]:
+    """Code sections holding a static function that has no symbol of its own.
+
+    GCC keeps only the section symbol for some static helpers (and
+    `$constprop`/`$isra` clones); their entry follows the in-section literal
+    pool. reconstruct-xtensa-object recovers them as standalone locals.
+    """
+    headers = subprocess.run(objdump + ["-h", str(obj)], capture_output=True, text=True, check=True).stdout
+    lines = headers.splitlines()
+    code = []
+    for number, line in enumerate(lines):
+        fields = line.split()
+        if len(fields) >= 7 and fields[0].isdigit() and number + 1 < len(lines) and "CODE" in lines[number + 1]:
+            if int(fields[2], 16):
+                code.append(fields[1])
+    table = subprocess.run(objdump + ["-t", str(obj)], capture_output=True, text=True, check=True).stdout
+    owned = {m.group(2) for m in map(SYMBOL.match, (l.replace("\t", " ") for l in table.splitlines()))
+             if m and "F" in m.group(1)}
+    return [section for section in code if section not in owned]
+
+
+def unique_call_results(module: pathlib.Path) -> None:
+    """Rename each `val callResultN` declaration uniquely within its function.
+
+    The lifter numbers call results per basic block; structurizing can merge
+    two blocks into one scope. Each result is read right after its call, so
+    uses bind to the most recent declaration.
+    """
+    out, current, counter = [], {}, 0
+    for line in module.read_text().splitlines():
+        if ABLA_FUNCTION.match(line.strip()):
+            current, counter = {}, 0
+        declared = re.match(r"(\s*)val (callResult\d+)\b", line)
+        if declared:
+            counter += 1
+            current[declared.group(2)] = f"callResult{counter}"
+            line = line.replace(f"val {declared.group(2)}", f"val callResult{counter}", 1)
+        else:
+            line = re.sub(r"\bcallResult\d+\b", lambda m: current.get(m.group(0), m.group(0)), line)
+        out.append(line)
+    module.write_text("\n".join(out) + "\n")
+
+
+def terminate_fallthrough(module: pathlib.Path) -> None:
+    """End u32 functions whose structured body can reach the closing brace.
+
+    Structurizing keeps only the dispatcher states the original reaches; the
+    leftover fall-through is unreachable. Make that explicit the same way the
+    lifter does for noreturn functions.
+    """
+    lines = module.read_text().splitlines()
+    out: list[str] = []
+    returns_u32 = False
+    for line in lines:
+        if line.startswith("trusted fun "):
+            returns_u32 = False
+        if re.match(r"^\)?(?:.*\))?: u32 \{$", line) or re.match(r"^trusted fun \w+\(.*\): u32 \{$", line):
+            returns_u32 = True
+        if line == "}" and returns_u32:
+            previous = next((l for l in reversed(out) if l.strip()), "")
+            if not re.match(r"^    (return\b|ablaRuntimeTrap\(\))", previous):
+                out += ["    ablaRuntimeTrap()", "    return r2"]
+            returns_u32 = False
+        out.append(line)
+    module.write_text("\n".join(out) + "\n")
+
+
+def namespace_local_functions(module: pathlib.Path, link: pathlib.Path, namespace: str) -> None:
+    """Give member-local helpers member-specific Abla names.
+
+    GCC copies some static helpers into several objects; their linker labels
+    are namespaced already, so name the Abla functions the same way to keep
+    one assembled unit free of duplicate declarations.
+    """
+    if not link.exists():
+        return
+    selections = re.findall(r'Function\("(\w+)",\s*"\.Labla_recovered_[^"]*_local_[^"]*"\)', link.read_text())
+    renames = {name: name.replace("esp32Recovered", f"esp32Recovered{namespace}", 1)
+               for name in selections if name.startswith("esp32Recovered")}
+    if not renames:
+        return
+    pattern = re.compile(r"\b(" + "|".join(map(re.escape, renames)) + r")\b")
+    for path in (module, link):
+        path.write_text(pattern.sub(lambda m: renames[m.group(1)], path.read_text()))
+
+
+def add_imports(module: pathlib.Path) -> None:
+    """Import the `$xtensa` subparser and memory helpers the passes emit."""
+    src = os.path.relpath(ROOT / "src", module.parent)
+    header = [f'import "{src}/xtensa/assembly.ab"', f'import "{src}/runtime/freestanding_memory.ab"',
+              'import "abla/unsafe/native"', 'import "abla/unsafe/memory"']
+    text = module.read_text()
+    missing = [line for line in header if line not in text]
+    module.write_text("\n".join(missing + [text]) if missing else text)
+
+
+def ablac_environment(chip: str) -> tuple[pathlib.Path, dict[str, str]]:
+    """The installed ablac payload with abla-embedded's llc wrapper first."""
+    launcher = pathlib.Path(shutil.which("ablac") or sys.exit("recover-member: ablac not on PATH")).resolve()
+    root = launcher.parent.parent
+    tools = list(dict.fromkeys(re.findall(r"/nix/store/[^:'\"\s]*/bin", launcher.read_text(errors="replace"))))
+    environment = dict(os.environ, ABLA_ESP_CPU=chip, ABLA_SYSROOT=str(root / "share" / "abla"),
+                       PATH=":".join([str(TOOLS / "esp-llvm-bin"), *tools, os.environ.get("PATH", "")]))
+    return root / "libexec" / "ablac.bin", environment
+
+
+def compile_check(chip: str, work: pathlib.Path, selector: str) -> int:
+    """Compile the lifted member and its link selectors to an Xtensa object."""
+    directory = work / "compile"
+    directory.mkdir(exist_ok=True)
+    (directory / "main.ab").write_text(f'import "../lifted.ab"\nimport "../link.ab"\n\n#{selector}()\n')
+    (directory / "build.ab").write_text(
+        'import "abla/compiler"\n\n'
+        'val target = #compilerDefineTarget("esp32-xtensa", "xtensa-esp-unknown-elf", "elf", "none", "none", false, false)\n'
+        'val built = #compilerBuildProgram("recovery-check", "main.ab", "member.o", "esp32-xtensa", "object", false, false)\n\n'
+        'fun main: int = if (target && built) 0 else 1\n')
+    ablac, environment = ablac_environment(chip)
+    script = f'ulimit -s 131072; "{ablac}" build build.ab -o driver && ./driver'
+    result = subprocess.run(["bash", "-c", script], cwd=directory, env=environment,
+                            capture_output=True, text=True, errors="replace")
+    log = result.stdout + result.stderr
+    (work / "compile.log").write_text(log[-2_000_000:])
+    if result.returncode == 0 and (directory / "member.o").exists():
+        return 0
+    return max(1, len(re.findall(r"^error\[", log, re.MULTILINE)))
 
 
 def recovered_abla_index() -> dict[str, str]:
@@ -143,11 +458,16 @@ def digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def lift(source: pathlib.Path, rounds: int, log: pathlib.Path) -> int:
+def lift(source: pathlib.Path, rounds: int, log: pathlib.Path, obj: pathlib.Path, objdump: list[str]) -> int:
+    passes = list(PASSES)
+    # Switch tables must become `when` flow while functions are still
+    # program-counter dispatchers, i.e. before structurizing.
+    passes.insert(2, ["lower-recovered-jump-tables", "--write", "--objdump", " ".join(objdump),
+                      "--discover", str(obj)])
     with log.open("w") as out:
         for number in range(1, rounds + 1):
             before = digest(source)
-            for command in PASSES:
+            for command in passes:
                 out.write(f"== round {number}: {' '.join(command)}\n")
                 out.flush()
                 result = subprocess.run([sys.executable, "-I", str(TOOLS / command[0]), *command[1:], str(source)],
@@ -169,29 +489,16 @@ def lifted_status(source: pathlib.Path) -> dict[str, str]:
     return status
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("chip")
-    parser.add_argument("archive", help="archive key from the profile, e.g. libnet80211")
-    parser.add_argument("member", help="object file inside the archive, e.g. wl_chm.o")
-    parser.add_argument("--work", type=pathlib.Path, help="work directory (default build/recovery/...)")
-    parser.add_argument("--namespace", help="assembler-local namespace (default from the member name)")
-    parser.add_argument("--rounds", type=int, default=6, help="maximum lifting rounds")
-    parser.add_argument("--classify-only", action="store_true", help="stop after reuse.tsv")
-    args = parser.parse_args()
-
-    profile = load_profile(args.chip)
-    if args.archive not in profile["archives"]:
-        sys.exit(f"recover-member: {args.chip} has no archive {args.archive}; "
-                 f"known: {', '.join(sorted(profile['archives']))}")
-    stem = args.member.removesuffix(".o")
+def recover(profile: dict, args: argparse.Namespace, member: str, index: dict[str, str] | None) -> dict:
+    """Recover one member; returns a summary row for the archive table."""
+    stem = member.removesuffix(".o")
     work = args.work or ROOT / "build" / "recovery" / args.chip / args.archive / stem
     if work.exists():
         shutil.rmtree(work)
     objdump = objdump_command(profile)
-    obj = extract(profile["archives"][args.archive], args.member, work / "object")
+    obj = extract(profile["archives"][args.archive], member, work / "object")
     if obj is None:
-        sys.exit(f"recover-member: {args.member} is not in {profile['archives'][args.archive]}")
+        sys.exit(f"recover-member: {member} is not in {profile['archives'][args.archive]}")
 
     compare = load_tool("compare-xtensa-archives")
     ours = compare.functions(objdump, obj)
@@ -200,12 +507,13 @@ def main() -> int:
     if "reference" in profile:
         reference_profile = load_profile(profile["reference"])
         reference_archive = reference_profile["archives"].get(args.archive)
-        reference_obj = reference_archive and extract(reference_archive, args.member, work / "reference")
+        reference_obj = reference_archive and extract(reference_archive, member, work / "reference")
         if reference_obj:
             reference = compare.functions(objdump_command(reference_profile), reference_obj)
     rom = rom_symbols(profile)
     reconstruct = load_tool("reconstruct-xtensa-object")
-    index = recovered_abla_index() if reference is not None else {}
+    if reference is None:
+        index = {}
 
     rows = []
     for name in sorted(symbols):
@@ -219,29 +527,71 @@ def main() -> int:
             out.write("\t".join(row) + "\n")
     counts = collections.Counter(kind for _, _, kind, _, _ in rows)
     reusable = [row for row in rows if row[2] in REUSABLE and row[4]]
-    print(f"{args.chip} {args.archive}/{args.member}: {len(rows)} functions, "
+    summary = {"member": member, "functions": len(rows), "reusable": len(reusable),
+               **{k: counts[k] for k in CLASSES}, "lifted": "", "emitted": "", "rounds": "", "compile": "", "error": ""}
+    print(f"{args.chip} {args.archive}/{member}: {len(rows)} functions, "
           + ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
           + f"; reusable with existing Abla: {len(reusable)}")
     if args.classify_only:
-        print(f"wrote {(work / 'reuse.tsv').relative_to(ROOT)}")
-        return 0
+        return summary
 
     namespace = args.namespace or re.sub(r"[^A-Za-z0-9]", "", stem.title()) + args.chip.capitalize()
     recovered = work / "recovered.ab"
+    sections = symbolless_code_sections(objdump, obj)
+    selector = f"{namespace[:1].lower()}{namespace[1:]}Link"
     command = [sys.executable, "-I", str(TOOLS / "reconstruct-xtensa-object"), str(obj),
                *(name for name, binding, kind, _, _ in rows if binding == "global" and kind != "rom"),
-               "--objdump", " ".join(objdump), "--namespace", namespace, "--output", str(recovered)]
+               *sections,
+               "--objdump", " ".join(objdump), "--namespace", namespace, "--output", str(recovered),
+               "--link-output", str(work / "link.ab"), "--link-selector", selector]
+    if not profile.get("classic_compatibility_symbols", False):
+        command += ["--no-compatibility-symbols"]
+    command += ["--symbol-addend-literals"]
+    # Until every caller is Abla, the member's global ABI stays linker-visible.
+    for name, option in object_data(objdump, obj).items():
+        command += [option, name]
+    for name, binding, kind, _, _ in rows:
+        if binding == "global" and kind != "rom":
+            command += ["--export-function", name]
     for name, binding, kind, _, _ in rows:
         if binding == "local":
-            command += ["--local-function", name]
+            # Standalone: an own (liftable, prunable) Abla function rather
+            # than directives inside an unrelated anchor.
+            command[4:4] = [name]
+            command += ["--standalone-local-function", name]
+    for section in sections:
+        command += ["--standalone-local-function", section]
+    # Data sections get their own anchor function: lifting moves them to Abla
+    # unless code that stays raw assembly still names them.
+    command += ["--synthetic-anchor", f"abla_recovered_{namespace}_anchor", "--data-anchor-synthetic"]
     result = subprocess.run(command, capture_output=True, text=True)
     (work / "reconstruct.log").write_text(result.stdout + result.stderr)
     if result.returncode != 0:
-        print(f"reconstruct-xtensa-object failed; see {(work / 'reconstruct.log').relative_to(ROOT)}")
-        return 1
+        last = (result.stderr.strip().splitlines() or ["?"])[-1]
+        print(f"reconstruct-xtensa-object failed: {last}")
+        summary["error"] = "reconstruct: " + last
+        return summary
+    # Recovered code reaches data as `label + offset` computed at run time
+    # (`movi`+`addi`, or Abla address arithmetic). The linker may reorder or
+    # deduplicate the contents of mergeable (SHF_MERGE) sections, which would
+    # break that arithmetic, so recovered data sections are never mergeable.
+    recovered.write_text(re.sub(r'(\.pushsection [^,\n]+),"aMS?",@progbits,\d+', r'\1,"a",@progbits',
+                                recovered.read_text()))
     lifted = work / "lifted.ab"
     shutil.copyfile(recovered, lifted)
-    used = lift(lifted, args.rounds, work / "lift.log")
+    used = lift(lifted, args.rounds, work / "lift.log", obj, objdump)
+    unique_call_results(lifted)
+    volatile_after_memory_barriers(lifted)
+    for name in unlowered_table_jumps(lifted):
+        print(f"WARNING: {name} still jumps through a code-address table")
+    alias_symbol_addends(lifted, namespace)
+    unlabeled = label_code_offset_tables(lifted, objdump, obj)
+    if unlabeled:
+        print("code-offset table entries without a label: " + ", ".join(unlabeled))
+    keep_weak_functions_weak(lifted, work / "link.ab", weak_functions(objdump, obj), namespace)
+    terminate_fallthrough(lifted)
+    namespace_local_functions(lifted, work / "link.ab", namespace)
+    add_imports(lifted)
 
     status = lifted_status(lifted)
     by_abla = {row[3]: row for row in rows}
@@ -251,11 +601,58 @@ def main() -> int:
             row = by_abla.get(abla)
             out.write(f"{abla}\t{row[0] if row else ''}\t{row[2] if row else ''}\t{state}\n")
     done = sum(state == "lifted" for state in status.values())
+    summary.update(lifted=done, emitted=len(status), rounds=used)
+    if args.compile:
+        errors = compile_check(args.chip, work, selector)
+        summary["compile"] = errors
+        print("compiles" if errors == 0 else f"compile: {errors} error(s); see {(work / 'compile.log').relative_to(ROOT)}")
     print(f"lifted {done} of {len(status)} functions in {used} round(s); "
           f"output {lifted.relative_to(ROOT)}")
-    naked = [abla for abla, state in sorted(status.items()) if state == "naked"]
-    if naked:
-        print("still raw Xtensa: " + ", ".join(naked))
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("chip")
+    parser.add_argument("archive", help="archive key from the profile, e.g. libnet80211")
+    parser.add_argument("member", help="object file inside the archive, e.g. wl_chm.o, or `all`")
+    parser.add_argument("--work", type=pathlib.Path, help="work directory for one member (default build/recovery/...)")
+    parser.add_argument("--namespace", help="assembler-local namespace (default from the member name)")
+    parser.add_argument("--rounds", type=int, default=6, help="maximum lifting rounds")
+    parser.add_argument("--classify-only", action="store_true", help="stop after reuse.tsv")
+    parser.add_argument("--compile", action="store_true", help="compile the lifted member with ablac")
+    args = parser.parse_args()
+
+    profile = load_profile(args.chip)
+    if args.archive not in profile["archives"]:
+        sys.exit(f"recover-member: {args.chip} has no archive {args.archive}; "
+                 f"known: {', '.join(sorted(profile['archives']))}")
+    index = recovered_abla_index() if "reference" in profile else {}
+    if args.member != "all":
+        summary = recover(profile, args, args.member, index)
+        return 1 if summary["error"] else 0
+
+    if args.work or args.namespace:
+        sys.exit("recover-member: --work and --namespace apply to one member")
+    archive = profile["archives"][args.archive]
+    members = sorted(set(subprocess.run(["ar", "t", str(archive)], capture_output=True, text=True,
+                                        check=True).stdout.split()))
+    table = ROOT / "build" / "recovery" / args.chip / args.archive / "summary.tsv"
+    table.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["member", "functions", "reusable", *CLASSES, "lifted", "emitted", "rounds", "compile", "error"]
+    totals = collections.Counter()
+    with table.open("w") as out:
+        out.write("\t".join(columns) + "\n")
+        for member in members:
+            summary = recover(profile, args, member, index)
+            out.write("\t".join(str(summary[c]) for c in columns) + "\n")
+            out.flush()
+            for column in ["functions", "reusable", *CLASSES, "lifted", "emitted"]:
+                if isinstance(summary[column], int):
+                    totals[column] += summary[column]
+            totals["failed"] += bool(summary["error"])
+    print("TOTAL " + " ".join(f"{k}={totals[k]}" for k in ["functions", "reusable", *CLASSES, "lifted", "emitted", "failed"]))
+    print(f"wrote {table.relative_to(ROOT)}")
     return 0
 
 

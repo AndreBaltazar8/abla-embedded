@@ -33,6 +33,32 @@ targets as instruction indexes). Functions present in both builds:
   (`phy_chip_v7*`, `rtc_esp32.ab`, `mac_hal_esp32.ab`) and the hand-written
   `phy_rom_*` primitives.
 
+## Status (2026-10-28): recovered libnet80211 + libpp + libcoexist run on hardware
+
+`tools/recover-member esp32s3 <archive> all` lifts every member;
+`tools/assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist` builds one
+Abla unit (about 85% of functions typed Abla, the rest raw Xtensa inside Abla).
+Linked into mono-life (`idf.py -B build-radio -D ABLA_RADIO_OBJECT=.../unit.o`)
+the link map takes no member from the three archives, and the Paper Mono
+associates (WPA2), gets DHCP, completes TLS and plays the echo reply, with
+beacon-timeout counts matching the stock build. Image: 997,632 bytes vs
+917,024 stock (exports and raw bodies still block dead-code elimination).
+
+Bugs found on the way, all fixed generically in the tools:
+
+- raw-assembly callees were rewritten into zero-argument direct Abla calls
+  (direct-recovered-xtensa-calls now skips them);
+- switch tables: lowered automatically (discovery mode of
+  lower-recovered-jump-tables, including assembler-defined, shared and
+  section-local tables); tables of raw functions point at labels;
+- `symbol+addend` split into `movi`+`addi` broke mergeable string sections and
+  section-entry rebasing (one literal per symbol+addend via `.set` aliases;
+  recovered data sections are not mergeable);
+- weak functions stay weak (ESP-IDF overrides some with strong C);
+- ABI-named data stays assembler-defined while raw code references it;
+- memory access after `memw` is volatile (GCC's marker for MMIO); LLVM had
+  narrowed a 32-bit MAC register read to `l16ui`.
+
 ## The S3 uses ROM much more
 
 On the classic ESP32 these archives call ROM only for libc-level helpers. On

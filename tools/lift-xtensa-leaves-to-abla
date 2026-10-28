@@ -21,6 +21,7 @@ import argparse
 import ast
 import hashlib
 import pathlib
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -327,6 +328,14 @@ def parse_data_section(
     return section_name, labels, bytes_at, symbolic, offset
 
 
+# Debugging aid for bisecting behavioural differences: Abla function names
+# (or `*`) that stay raw assembly.
+KEEP_RAW = {name for name in os.environ.get("ABLA_LIFT_KEEP_RAW", "").split(",") if name}
+
+# Set by --keep-global-data (see main).
+KEEP_GLOBAL_DATA = False
+
+
 def extract_liftable_data_sections(
     body: str, raw_bodies: list[str], allowed_cross: set[str] | None = None
 ) -> ExtractedData:
@@ -352,6 +361,11 @@ def extract_liftable_data_sections(
                 header, match.group("body")
             )
         except Unsupported:
+            return match.group("whole")
+        if KEEP_GLOBAL_DATA and any(
+            re.search(rf"(?m)^\.(?:global|weak)\s+{re.escape(symbol)}\s*$", body)
+            for symbol in labels
+        ):
             return match.group("whole")
         # A raw body cannot consume a dynamic Abla address. Only move this
         # section once every remaining raw reference is in the owning body,
@@ -610,7 +624,7 @@ def symbol_value(text: str) -> str:
     if not match:
         raise Unsupported(f"unsupported literal expression: {text}")
     symbol = match.group("symbol")
-    result = f"$xtensa address {{{{{symbol}}}}}"
+    result = f"$xtensa address {{{symbol}}}"
     if match.group("offset"):
         offset = int(match.group("offset"), 0)
         operator = match.group("operator")
@@ -2238,6 +2252,9 @@ def transform(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]:
 
     def replace(match: re.Match[str]) -> str:
         nonlocal lifted_count, uses_memory, uses_internal_function
+        if match.group("name") in KEEP_RAW or "*" in KEEP_RAW:
+            reasons["kept raw (ABLA_LIFT_KEEP_RAW)"] = reasons.get("kept raw (ABLA_LIFT_KEEP_RAW)", 0) + 1
+            return match.group(0)
         head = match.group("head")
         if "@naked\n" not in head:
             extracted_data = extract_liftable_data_sections(
@@ -2289,6 +2306,11 @@ def transform(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]:
         except Unsupported as error:
             reason = str(error)
             reasons[reason] = reasons.get(reason, 0) + 1
+            # The body stays raw assembly: data it still names by label must
+            # stay assembler-defined (raw code cannot take an Abla address).
+            if any(symbol in extracted_data.body
+                   for symbol in extracted_data.addresses):
+                extracted_data = ExtractedData(recovered_body, [], {}, 0)
             if extracted_data.declarations:
                 prefix = (
                     "\n\n".join(extracted_data.declarations) + "\n\n" +
@@ -2318,7 +2340,7 @@ def transform(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]:
     transformed = BLOCK.sub(replace, source)
     for symbol, address in data_addresses.items():
         transformed = transformed.replace(
-            f"$xtensa address {{{{{symbol}}}}}", address
+            f"$xtensa address {{{symbol}}}", address
         )
     if lifted_count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
         transformed = 'import "abla/unsafe/memory"\n' + transformed
@@ -2443,6 +2465,9 @@ def transform_u32(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]
 
     def replace(match: re.Match[str]) -> str:
         nonlocal lifted_count, uses_memory, uses_internal_function
+        if match.group("name") in KEEP_RAW or "*" in KEEP_RAW:
+            reasons["kept raw (ABLA_LIFT_KEEP_RAW)"] = reasons.get("kept raw (ABLA_LIFT_KEEP_RAW)", 0) + 1
+            return match.group(0)
         alias_body, aliases = extract_function_aliases(match.group("body"))
         helpers = extract_liftable_text_helpers(match.group("name"), alias_body)
         for reason in helpers.reasons:
@@ -2498,7 +2523,7 @@ def transform_u32(path: pathlib.Path, write: bool) -> tuple[int, dict[str, int]]
     transformed = U32_BLOCK.sub(replace, source)
     for symbol, address in data_addresses.items():
         transformed = transformed.replace(
-            f"$xtensa address {{{{{symbol}}}}}", address
+            f"$xtensa address {{{symbol}}}", address
         )
     if lifted_count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
         transformed = 'import "abla/unsafe/memory"\n' + transformed
@@ -2585,7 +2610,7 @@ def transform_typed_void(
     transformed = TYPED_VOID_BLOCK.sub(replace, source)
     for symbol, address in data_addresses.items():
         transformed = transformed.replace(
-            f"$xtensa address {{{{{symbol}}}}}", address
+            f"$xtensa address {{{symbol}}}", address
         )
     if count and uses_memory and 'import "abla/unsafe/memory"' not in transformed:
         transformed = 'import "abla/unsafe/memory"\n' + transformed
@@ -2605,10 +2630,14 @@ def transform_inline_data(
     addresses: dict[str, str] = {}
     count = 0
 
+    # Every raw body in the file can still name a label (as `movi aN, L`);
+    # data may move to Abla only when its owning block is the sole user.
+    all_raw_bodies = [match.group("body") for match in INLINE_BLOCK.finditer(source)]
+
     def replace(match: re.Match[str]) -> str:
         nonlocal count
         extracted = extract_liftable_data_sections(
-            match.group("body"), [match.group("body")]
+            match.group("body"), all_raw_bodies
         )
         if not extracted.declarations or extracted.body.strip() != "":
             return match.group(0)
@@ -2621,9 +2650,6 @@ def transform_inline_data(
     if not count:
         return 0, {}
     for symbol, address in addresses.items():
-        transformed = transformed.replace(
-            f"$xtensa address {{{{{symbol}}}}}", address
-        )
         transformed = transformed.replace(
             f"$xtensa address {{{symbol}}}", address
         )
@@ -2727,7 +2753,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("paths", nargs="+", type=pathlib.Path)
     parser.add_argument("--write", action="store_true")
+    parser.add_argument(
+        "--keep-global-data", action="store_true",
+        help="leave .global/.weak data assembler-defined: while other "
+        "objects still reference it by name it must keep its linker symbol",
+    )
     arguments = parser.parse_args()
+    global KEEP_GLOBAL_DATA
+    KEEP_GLOBAL_DATA = arguments.keep_global_data
     files: list[pathlib.Path] = []
     for path in arguments.paths:
         if path.is_dir():
