@@ -174,6 +174,43 @@ def apply_feature_rewrites(text: str, rewrites: list[dict], applied: dict[str, i
     return text
 
 
+INTERNAL_SELECTOR = re.compile(
+    r'^\s*if \(!internalFunction\("(\w+)", "([^"]+)"\)\) return false\n', re.MULTILINE
+)
+
+
+def prune_internal_selectors(unit: pathlib.Path) -> int:
+    """Drop internalFunction selectors whose link name nothing names.
+
+    internalFunction keeps a linker name for raw assembly and `$xtensa`
+    symbol forms, but it also puts the function in llvm.used, which LLVM
+    emits as a retained (SHF_GNU_RETAIN) section: neither LLVM nor
+    --gc-sections may then drop it. Once direct-recovered-xtensa-calls has
+    turned symbolic calls into Abla calls, most of those names have no user
+    left, so the selector only pins dead code.
+    """
+    links = sorted(unit.rglob("*_link.ab"))
+    # Comments (`// Original ABI symbol: name`) are not users.
+    sources = "\n".join(re.sub(r"//[^\n]*", "", path.read_text()) for path in unit.rglob("*.ab")
+                        if not path.name.endswith("_link.ab") and path.name != "main.ab")
+    names = {name for path in links for _, name in INTERNAL_SELECTOR.findall(path.read_text())}
+    used = {name for name in names
+            if re.search(rf"(?<![\w.$]){re.escape(name)}(?![\w$])", sources)}
+    dropped = 0
+    for path in links:
+        text = path.read_text()
+
+        def keep(match: re.Match[str]) -> str:
+            nonlocal dropped
+            if match.group(2) in used:
+                return match.group(0)
+            dropped += 1
+            return ""
+
+        path.write_text(INTERNAL_SELECTOR.sub(keep, text))
+    return dropped
+
+
 def run_pass(command: list[str], log) -> None:
     log.write(f"== {' '.join(command)}\n")
     log.flush()
@@ -275,6 +312,7 @@ def main() -> int:
             run_pass(["mark-recovered-noinline", str(unit), "--write",
                       "--inline-lines", os.environ.get("ABLA_RECOVERED_INLINE_LINES", "0")], log)
     print(f"function tables read through storage in {read_function_tables_through_storage(unit)} modules")
+    print(f"internal link names dropped (no assembler user): {prune_internal_selectors(unit)}")
 
     main_source = [f'import "{module}"' for module in modules]
     main_source += [f'import "{link}"' for link in dict.fromkeys(link for link, _ in selectors)]
@@ -290,7 +328,7 @@ def main() -> int:
 
     driver = load_driver()
     ablac, environment = driver.ablac_environment(args.chip)
-    script = f'ulimit -s 131072; "{ablac}" build build.ab -o driver && ./driver'
+    script = f'ulimit -s 131072; "{ablac}" build build.ab -o driver --no-cache && ./driver'
     result = subprocess.run(["bash", "-c", script], cwd=unit, env=environment,
                             capture_output=True, text=True, errors="replace")
     log = result.stdout + result.stderr
