@@ -174,6 +174,86 @@ def apply_feature_rewrites(text: str, rewrites: list[dict], applied: dict[str, i
     return text
 
 
+COVERAGE_SOURCE = """\
+import "../../../../src/xtensa/assembly.ab"
+import "abla/unsafe/native"
+import "abla/unsafe/memory"
+
+// ABLA_COVERAGE=1 builds only: the first call of recovered function N prints
+// `ABLACOV N` once (names in coverage.tsv). IRAM and DRAM only, so callers
+// that run with the flash cache disabled can reach it.
+@section(".iram1.abla_coverage")
+@noinline
+trusted fun ablaRecoveredCoverage(index: u32): void {{
+    val hits = nativeStaticAllocate({count})
+    val flag = nativePointerFromAddress(hits + int(index))
+    if (ablaUnsafeLoadU8(flag) != 0) return
+    ablaUnsafeStoreU8(flag, 1)
+    val text = nativeStaticAllocate(16)
+    val prefix = "ABLACOV "
+    var at = 0
+    while (at < 8) {{
+        ablaUnsafeStoreU8(nativePointerFromAddress(text + at), prefix[at])
+        at = at + 1
+    }}
+    var value = int(index)
+    var digits = 1
+    var scale = 1
+    while (value / scale >= 10) {{
+        scale = scale * 10
+        digits = digits + 1
+    }}
+    while (scale > 0) {{
+        ablaUnsafeStoreU8(nativePointerFromAddress(text + at), 48 + (value / scale) % 10)
+        at = at + 1
+        scale = scale / 10
+    }}
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + at), 10)
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + at + 1), 0)
+    val printed = $xtensa call {{esp_rom_printf}}(u32(text))
+}}
+"""
+FUNCTION_START = re.compile(r"^(?:trusted )?fun (esp32Recovered\w+)\(", re.MULTILINE)
+
+
+def instrument_coverage(unit: pathlib.Path, modules: list[str]) -> int:
+    """Make each lifted function report its first call (ABLA_COVERAGE=1).
+
+    Finds which recovered code a real session executes, as opposed to what
+    the linker must keep because a table or a runtime mode check reaches it.
+    Raw-assembly bodies are not instrumented.
+    """
+    rows = []
+    for module in modules:
+        path = unit / module
+        lines = path.read_text().split("\n")
+        out = []
+        pending = None
+        symbol = ""
+        for line in lines:
+            if line.startswith("// Original ABI symbol: "):
+                symbol = line.split(": ", 1)[1].strip()
+            match = FUNCTION_START.match(line)
+            if match and "$xtensa instructions" not in line:
+                pending = match.group(1)
+            out.append(line)
+            if pending and line.rstrip().endswith("{") and ("): " in line or line.startswith("trusted fun") or line.startswith("fun ")):
+                if "$xtensa instructions" in line:
+                    pending = None
+                    continue
+                out.append(f"    ablaRecoveredCoverage(u32({len(rows)}))")
+                rows.append((len(rows), module, pending, symbol))
+                pending = None
+                symbol = ""
+        text = "\n".join(out)
+        if f"{len(rows)}" and 'import "../coverage.ab"' not in text:
+            text = 'import "../coverage.ab"\n' + text
+        path.write_text(text)
+    (unit / "coverage.ab").write_text(COVERAGE_SOURCE.format(count=max(len(rows), 1)))
+    (unit / "coverage.tsv").write_text("".join(f"{i}\t{m}\t{f}\t{s}\n" for i, m, f, s in rows))
+    return len(rows)
+
+
 PUSHSECTION = re.compile(r'(\.pushsection\s+)("?)([^,\s"]+)')
 
 
@@ -389,6 +469,8 @@ def main() -> int:
     print(f"internal link names dropped (no assembler user): {dropped}; "
           f"kept as global names (gc-able): {made_global} ({renamed} assembler-local names renamed)")
 
+    if os.environ.get("ABLA_COVERAGE") == "1":
+        print(f"coverage: instrumented {instrument_coverage(unit, modules)} function(s); map in coverage.tsv")
     main_source = [f'import "{module}"' for module in modules]
     main_source += [f'import "{link}"' for link in dict.fromkeys(link for link, _ in selectors)]
     main_source += [""] + [f"#{name}()" for _, name in selectors]
