@@ -100,6 +100,31 @@ llvm-mc gives literal pools alignment 1, which GNU ld misplaces after odd-sized
 narrow-encoded sections ("dangerous relocation: l32r: misaligned literal
 target"); the llc wrapper now aligns them to 4 for esp32s3.
 
+### Tree-shaking the unit: retained roots (measured 2026-10-28, `sta` profile, eight archives)
+
+With only the 108 C-referenced symbols global the image was *larger* than with
+everything exported (1,083,648 vs 989,248 bytes). Cause: ablac puts two kinds of
+function in `llvm.used`, which LLVM emits as retained (`SHF_GNU_RETAIN`) sections that
+`--gc-sections` can never drop, and a retained section is also a linker root for
+everything it calls: (1) every `internalFunction` target and (2) every raw-assembly
+function without an export request (an "assembly owner"). Fixes, all in `tools/`:
+
+- `lower-abla-owned-symbol-addresses --calls` (run by `assemble-recovered-unit` after
+  `direct-recovered-xtensa-calls`): `$xtensa call/callWide {sym}(args)` of an
+  `internalFunction` target becomes `$xtensa callAddress[Wide](u32(nativeFunctionAddress(fn)), args)`,
+  the same indirect call with an address LLVM can see (1,274 sites). Opt out with
+  `ABLA_SIZE_SKIP=calladdress`.
+- `prune_internal_selectors`: names that something still mentions (raw assembly) become
+  `exportFunction` (global, gc-able) instead of `internalFunction`; raw-assembly functions
+  and the weak-override functions (`requiredInternalFunction`) always keep an
+  `exportFunction` selector; assembler-local `.L` names are renamed to global ones in
+  every source that names them. `ABLA_RAW_NAMES=internal` restores the old behaviour.
+
+Result: 0 retained text sections (was 878 with the list, 224 with everything exported);
+list image 955,088 bytes, everything exported 960,928 (was 1,083,648 and 989,248).
+Lowering the calls alone, without exporting the raw functions, made things worse
+(1,114,784): each address-taken raw function became an assembly owner and a retained root.
+
 ## The S3 uses ROM much more
 
 On the classic ESP32 these archives call ROM only for libc-level helpers. On

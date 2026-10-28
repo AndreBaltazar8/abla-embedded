@@ -33,6 +33,15 @@ SECTION_FUNCTION = re.compile(
     r"\s*(?:trusted\s+)?fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.MULTILINE,
 )
+# `$xtensa call {sym}(args)` and `callWide`: the same symbolic call the target
+# package lowers to `movi $0, sym` inline assembly, which LLVM cannot see.
+CALL = re.compile(
+    r"\$xtensa\s+(call|callWide)\s+\{\{?\s*([^{}\s]+)\s*\}\}?\s*\(\s*(\)?)"
+)
+INTERNAL_ONLY = re.compile(
+    r'#?internalFunction\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"([^"]+)"\s*\)',
+    re.DOTALL,
+)
 INTERNAL = re.compile(
     r'#?(?:internal|export)Function\(\s*'
     r'"([A-Za-z_][A-Za-z0-9_]*)"\s*,\s*"([^"]+)"\s*\)',
@@ -179,8 +188,22 @@ def reaches(
     return False
 
 
+def call_form(match: re.Match[str], function: str) -> str:
+    """`callAddress[Wide](u32(nativeFunctionAddress(fn)), args` for a symbolic call.
+
+    The target package lowers both spellings to the same indirect call; only
+    the address operand differs: an Abla function value instead of an opaque
+    `movi` of a link name, so LLVM sees the reference and the function no
+    longer needs a link name (or a retained section) to survive.
+    """
+    mode = "callAddressWide" if match.group(1) == "callWide" else "callAddress"
+    separator = "" if match.group(3) else ", "
+    return (f"$xtensa {mode}(u32(nativeFunctionAddress({function})){separator}"
+            + match.group(3))
+
+
 def lower_cross_module_functions(
-    paths: list[pathlib.Path], write: bool
+    paths: list[pathlib.Path], write: bool, calls: bool = False
 ) -> tuple[int, int, int]:
     definitions: dict[str, pathlib.Path] = {}
     ambiguous_names: set[str] = set()
@@ -229,8 +252,14 @@ def lower_cross_module_functions(
             owner = definitions.get(name)
             if owner is not None:
                 all_bindings.append((bound.strip(), name, owner))
+    internal_functions = {name for source in sources.values()
+                          for name, _ in INTERNAL_ONLY.findall(source)}
     for source in sources.values():
-        for symbol in ADDRESS.findall(source):
+        wanted = list(ADDRESS.findall(source))
+        if calls:
+            wanted += [symbol for _, symbol in
+                       ((m.group(1), m.group(2)) for m in CALL.finditer(source))]
+        for symbol in wanted:
             if symbol in symbols:
                 continue
             key = recovered_local_key(symbol)
@@ -252,15 +281,23 @@ def lower_cross_module_functions(
 
         def replace(match: re.Match[str]) -> str:
             nonlocal lowered_count, cycle_count, link_owner_count, needs_native
-            symbol = match.group(1)
+            is_call = match.re is CALL
+            symbol = match.group(2 if is_call else 1)
             mapped = symbols.get(symbol)
             if mapped is None:
                 return match.group(0)
             function, owner = mapped
+            # Calls are lowered only for functions that keep a link name just
+            # for assembly (internalFunction): a global one is followed by the
+            # linker through its real relocation already.
+            if is_call and function not in internal_functions:
+                return match.group(0)
+            spelling = (lambda: call_form(match, function)) if is_call else (
+                lambda: f"u32(nativeFunctionAddress({function}))")
             if owner == path:
                 lowered_count += 1
                 needs_native = True
-                return f"u32(nativeFunctionAddress({function}))"
+                return spelling()
             # Importing a compatibility link-selector would retain precisely
             # the public ABI root this conversion is intended to eliminate.
             if "_link" in owner.stem:
@@ -273,9 +310,11 @@ def lower_cross_module_functions(
             imports.add(relative_import(path, owner))
             lowered_count += 1
             needs_native = True
-            return f"u32(nativeFunctionAddress({function}))"
+            return spelling()
 
         lowered = ADDRESS.sub(replace, source)
+        if calls:
+            lowered = CALL.sub(replace, lowered)
         if needs_native:
             imports.add("abla/unsafe/native")
             lowered = ensure_imports(lowered, imports)
@@ -359,6 +398,10 @@ def main() -> int:
     parser.add_argument("--write", action="store_true")
     parser.add_argument("--cross-module-functions", action="store_true")
     parser.add_argument("--cross-module-data", action="store_true")
+    parser.add_argument("--calls", action="store_true",
+                        help="with --cross-module-functions: also lower symbolic `$xtensa call`/"
+                        "`callWide` of internalFunction targets to `callAddress` on "
+                        "nativeFunctionAddress, so LLVM sees the reference")
     parser.add_argument("paths", nargs="+", type=pathlib.Path)
     arguments = parser.parse_args()
     functions = data = changed = 0
@@ -379,7 +422,7 @@ def main() -> int:
     )
     if arguments.cross_module_functions:
         cross, cycles, link_owners = lower_cross_module_functions(
-            source_paths(arguments.paths), arguments.write
+            source_paths(arguments.paths), arguments.write, arguments.calls
         )
         print(
             f"{action} {cross} cross-module function addresses; "

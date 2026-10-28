@@ -175,40 +175,78 @@ def apply_feature_rewrites(text: str, rewrites: list[dict], applied: dict[str, i
 
 
 INTERNAL_SELECTOR = re.compile(
-    r'^\s*if \(!internalFunction\("(\w+)", "([^"]+)"\)\) return false\n', re.MULTILINE
+    r'^\s*if \(!(internalFunction|requiredInternalFunction)\("(\w+)", "([^"]+)"\)\) return false\n',
+    re.MULTILINE,
 )
+RAW_FUNCTION = re.compile(r"\bfun\s+(\w+)\s*\([^)]*\)\s*:\s*\w+\s*=\s*\$xtensa instructions")
 
 
-def prune_internal_selectors(unit: pathlib.Path) -> int:
-    """Drop internalFunction selectors whose link name nothing names.
+def prune_internal_selectors(unit: pathlib.Path, global_names: bool = True) -> tuple[int, int, int]:
+    """Drop internalFunction selectors whose link name nothing names; export the rest.
 
     internalFunction keeps a linker name for raw assembly and `$xtensa`
     symbol forms, but it also puts the function in llvm.used, which LLVM
     emits as a retained (SHF_GNU_RETAIN) section: neither LLVM nor
-    --gc-sections may then drop it. Once direct-recovered-xtensa-calls has
-    turned symbolic calls into Abla calls, most of those names have no user
-    left, so the selector only pins dead code.
+    --gc-sections may then drop it. Once direct-recovered-xtensa-calls (and
+    the callAddress lowering) have turned symbolic calls into calls LLVM sees,
+    most of those names have no user left, so the selector only pins dead code.
+
+    A name that is still mentioned (raw assembly such as `movi a8, foo` or
+    `.long foo`, or a `$xtensa address` the Abla passes could not lower) must
+    stay a link name. It becomes a global symbol (exportFunction) instead of an
+    internal one: the assembler resolves the reference with a real relocation
+    that --gc-sections follows, so the function is dropped when the code that
+    names it is. The same holds for raw-assembly functions themselves: a raw
+    function without an export request is an "assembly owner", which ablac
+    keeps in llvm.used (a retained root that pins everything it calls), so a
+    raw function keeps an exportFunction selector even when no source names it.
+    Assembler-local `.L` names cannot be global; they are renamed (the `.L`
+    dropped) in every source that names them. `global_names=False`
+    (ABLA_RAW_NAMES=internal) keeps the old retained form for comparison.
+    Returns (dropped, made global, renamed).
     """
     links = sorted(unit.rglob("*_link.ab"))
+    paths = [path for path in unit.rglob("*.ab") if not path.name.endswith("_link.ab") and path.name != "main.ab"]
+    texts = {path: path.read_text() for path in paths}
     # Comments (`// Original ABI symbol: name`) are not users.
-    sources = "\n".join(re.sub(r"//[^\n]*", "", path.read_text()) for path in unit.rglob("*.ab")
-                        if not path.name.endswith("_link.ab") and path.name != "main.ab")
-    names = {name for path in links for _, name in INTERNAL_SELECTOR.findall(path.read_text())}
+    sources = "\n".join(re.sub(r"//[^\n]*", "", text) for text in texts.values())
+    raw = {name for text in texts.values() for name in RAW_FUNCTION.findall(text)}
+    names = {name for path in links for _, _, name in INTERNAL_SELECTOR.findall(path.read_text())}
     used = {name for name in names
             if re.search(rf"(?<![\w.$]){re.escape(name)}(?![\w$])", sources)}
-    dropped = 0
+    dropped = exported = 0
+    renames: dict[str, str] = {}
+    taken = set(re.findall(r"[A-Za-z_][\w$]*", sources + "\n".join(path.read_text() for path in links)))
     for path in links:
         text = path.read_text()
 
         def keep(match: re.Match[str]) -> str:
-            nonlocal dropped
-            if match.group(2) in used:
+            nonlocal dropped, exported
+            kind, function, name = match.groups()
+            if kind == "internalFunction" and name not in used and function not in raw:
+                dropped += 1
+                return ""
+            if not global_names:
                 return match.group(0)
-            dropped += 1
-            return ""
+            exported += 1
+            if name.startswith("."):
+                renamed = name[2:] if name.startswith(".L") else name[1:]
+                if renamed in taken and renames.get(name) != renamed:
+                    renamed = "abla_local_" + renamed
+                renames[name] = renamed
+                taken.add(renamed)
+                name = renamed
+            return f'    if (!exportFunction("{function}", "{name}")) return false\n'
 
         path.write_text(INTERNAL_SELECTOR.sub(keep, text))
-    return dropped
+    if renames:
+        pattern = re.compile(r"(?<![\w.$])(" + "|".join(map(re.escape, sorted(renames, key=len, reverse=True)))
+                             + r")(?![\w$])")
+        for path, text in texts.items():
+            renamed = pattern.sub(lambda m: renames[m.group(1)], text)
+            if renamed != text:
+                path.write_text(renamed)
+    return dropped, exported, len(renames)
 
 
 def run_pass(command: list[str], log) -> None:
@@ -294,6 +332,7 @@ def main() -> int:
     print(f"{len(modules)} modules, {len(selectors)} link selectors"
           + (f" ({exported} exported, {dropped} made internal)" if keep is not None else ""))
 
+    skip_passes = set(os.environ.get("ABLA_SIZE_SKIP", "").split(","))
     with (unit / "passes.log").open("w") as log:
         run_pass(["centralize-abla-owned-storage", "--write", "--initialized-constants", str(unit), str(shared)], log)
         run_pass(["lower-abla-owned-symbol-addresses", "--write", "--cross-module-data",
@@ -304,6 +343,13 @@ def main() -> int:
         for symbol in profile.get("standard_call_exclude", []):
             direct += ["--standard-exclude", symbol]
         run_pass(direct, log)
+        # What direct calls could not take (variadic or stack-reading raw
+        # callees, ...) still names an Abla-owned function through an opaque
+        # `movi sym`. Calling the function's address instead lets LLVM see
+        # the edge, so the link name (and its retained section) can go.
+        if "calladdress" not in skip_passes:
+            run_pass(["lower-abla-owned-symbol-addresses", "--write", "--cross-module-functions",
+                      "--calls", str(unit)], log)
         # ABLA_SIZE_SKIP=merge,noinline disables these size passes (bisecting).
         skip = set(os.environ.get("ABLA_SIZE_SKIP", "").split(","))
         if "merge" not in skip:
@@ -312,7 +358,10 @@ def main() -> int:
             run_pass(["mark-recovered-noinline", str(unit), "--write",
                       "--inline-lines", os.environ.get("ABLA_RECOVERED_INLINE_LINES", "0")], log)
     print(f"function tables read through storage in {read_function_tables_through_storage(unit)} modules")
-    print(f"internal link names dropped (no assembler user): {prune_internal_selectors(unit)}")
+    dropped, made_global, renamed = prune_internal_selectors(
+        unit, os.environ.get("ABLA_RAW_NAMES", "export") != "internal")
+    print(f"internal link names dropped (no assembler user): {dropped}; "
+          f"kept as global names (gc-able): {made_global} ({renamed} assembler-local names renamed)")
 
     main_source = [f'import "{module}"' for module in modules]
     main_source += [f'import "{link}"' for link in dict.fromkeys(link for link, _ in selectors)]
