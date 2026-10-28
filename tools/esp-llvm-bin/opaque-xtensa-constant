@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Work around LLVM 23.1's Xtensa `Cannot select: Constant<N>` failure.
+
+Upstream Xtensa selects `(add (shl x, 1|2|3), C)` as ADDX2/4/8 with C as a
+register operand but never materializes a C that does not fit MOVI, so
+instruction selection aborts. Usage (textual IR on stdin/stdout):
+
+  opaque-xtensa-constant FUNCTION N < in.ll > out.ll
+
+When N itself does not occur (the DAG folded it from other constants, e.g.
+`(x | 0x1FFFFD80) << 3` becomes `+ -5120`), every i32 constant of FUNCTION
+outside MOVI's -2048..2047 range is treated the same way. Each such constant
+needs MOVI/L32R materialization anyway.
+
+Inside FUNCTION only, ordinary `i32 N` operands become one value produced by
+an empty inline-asm identity at the entry block. The value is the same; the
+DAG can no longer fold it into the ADDX pattern and materializes it with
+MOVI/L32R like any other large constant. Switch case values and GEP indices
+must stay constants and are left alone.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    function, constant = sys.argv[1], sys.argv[2]
+    text = sys.stdin.read()
+    header = re.search(rf"(?m)^define [^\n]*@{re.escape(function)}\(", text)
+    if header is None:
+        print(f"opaque-xtensa-constant: no function {function}", file=sys.stderr)
+        return 1
+    body_start = text.index("{\n", header.end()) + 2
+    body_end = text.index("\n}\n", body_start)
+    body = text[body_start:body_end]
+    lines = body.split("\n")
+
+    def eligible(line: str) -> bool:
+        return ("i32" in line and "getelementptr" not in line and "switch" not in line
+                and not re.match(r"\s*i32 -?\d+, label", line))
+
+    def operand(value: str) -> re.Pattern[str]:
+        # `i32 N` (typed operand), `, N` (second operand of an i32 instruction)
+        # and `[ N, %bb ]` (i32 phi incoming value).
+        return re.compile(rf"(?:(?<=\bi32 )|(?<=, )|(?<=\[ )){re.escape(value)}\b(?!\s*,\s*label)")
+
+    constants = [constant]
+    if not any(operand(constant).search(line) for line in lines if eligible(line)):
+        found = re.findall(r"(?:(?<=\bi32 )|(?<=, )|(?<=\[ ))(-?\d+)\b(?!\s*,\s*label)",
+                           "\n".join(line for line in lines if eligible(line)))
+        constants = sorted({value for value in found if not -2048 <= int(value) <= 2047}, key=int)
+    definitions = []
+    for value in constants:
+        name = f"%abla.opaque.{value.lstrip('-')}{'n' if value.startswith('-') else ''}"
+        pattern = operand(value)
+        count = 0
+        for index, line in enumerate(lines):
+            if eligible(line) and not line.lstrip().startswith(name):
+                lines[index], replaced = pattern.subn(name, line)
+                count += replaced
+        if count:
+            definitions.append(f'  {name} = call i32 asm "", "=r,0"(i32 {value})')
+    if not definitions:
+        print(f"opaque-xtensa-constant: no large constant in {function}", file=sys.stderr)
+        return 1
+    # The first line of the body is the entry label (or the first instruction).
+    first = 1 if re.match(r"^[\w.$-]+:", lines[0]) else 0
+    lines[first:first] = definitions
+    sys.stdout.write(text[:body_start] + "\n".join(lines) + text[body_end:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

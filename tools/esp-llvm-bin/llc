@@ -129,10 +129,52 @@ elif [[ $filetype == obj && -n $output && ${#inputs[@]} -gt 0 && $cpu == esp32* 
             assembly_arguments+=("$argument")
         fi
     done
-    "$llc" "${common[@]}" "${assembly_arguments[@]}" -o - |
-        python3 -I "$script_root/narrow-xtensa-assembly" > "$temporary_assembly"
-    "$tool_root/llvm-mc" -triple=xtensa-esp-unknown-elf "${target[@]}" -filetype=obj \
-        "$temporary_assembly" -o "$output"
+    # LLVM 23.1 cannot select a large constant folded into ADDX2/4/8; hide
+    # the constant in the failing function behind an inline-asm identity and
+    # retry (see opaque-xtensa-constant).
+    if [[ ${ABLA_KEEP_XTENSA_INPUT:-0} == 1 ]]; then
+        for input in "${inputs[@]}"; do cp -- "$input" "$output.abla-input.${input##*.}"; done
+    fi
+    temporary_errors="$temporary_assembly.err"
+    temporary_inputs=()
+    trap 'rm -f -- "$temporary_assembly" "$temporary_errors" "${temporary_inputs[@]}"' EXIT
+    for attempt in $(seq 1 64); do
+        if "$llc" "${common[@]}" "${assembly_arguments[@]}" -o "$temporary_assembly" 2> "$temporary_errors"; then
+            break
+        fi
+        constant=$(grep -o 'Cannot select: [^ ]* i32 = Constant<-\?[0-9]*>' "$temporary_errors" | head -1 | grep -o '<-\?[0-9]*>' | tr -d '<>' || true)
+        function=$(grep -o 'In function: .*' "$temporary_errors" | head -1 | cut -d' ' -f3- || true)
+        if [[ -z $constant || -z $function || ${#inputs[@]} -ne 1 || $attempt -eq 64 ]]; then
+            cat "$temporary_errors" >&2
+            exit 1
+        fi
+        rewritten="$output_directory/.abla-xtensa-opaque.$attempt.$$.bc"
+        temporary_inputs+=("$rewritten")
+        "$tool_root/llvm-dis" "${inputs[0]}" -o - |
+            python3 -I "$script_root/opaque-xtensa-constant" "$function" "$constant" |
+            "$tool_root/llvm-as" -o "$rewritten"
+        for index in "${!assembly_arguments[@]}"; do
+            [[ ${assembly_arguments[$index]} == "${inputs[0]}" ]] && assembly_arguments[$index]="$rewritten"
+        done
+        inputs[0]="$rewritten"
+    done
+    python3 -I "$script_root/narrow-xtensa-assembly" < "$temporary_assembly" > "$temporary_assembly.narrow"
+    mv -f "$temporary_assembly.narrow" "$temporary_assembly"
+    # Relax conditional branches the assembler reports out of range (GNU as
+    # does this implicitly; LLVM 23.1's Xtensa assembler does not).
+    for attempt in $(seq 1 16); do
+        if "$tool_root/llvm-mc" -triple=xtensa-esp-unknown-elf "${target[@]}" -filetype=obj \
+            "$temporary_assembly" -o "$output" 2> "$temporary_errors"; then
+            break
+        fi
+        mapfile -t far < <(grep -o "^$temporary_assembly:[0-9]*:[0-9]*: error: fixup value out of range" "$temporary_errors" |
+            cut -d: -f2 | sort -un)
+        if [[ ${#far[@]} -eq 0 || $attempt -eq 16 ]] ||
+            ! python3 -I "$script_root/relax-xtensa-branches" "$temporary_assembly" "${far[@]}" 2>> "$temporary_errors"; then
+            cat "$temporary_errors" >&2
+            exit 1
+        fi
+    done
 else
     "$llc" "${common[@]}" "${arguments[@]}"
 fi
