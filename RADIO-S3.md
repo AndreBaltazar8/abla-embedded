@@ -59,6 +59,22 @@ Bugs found on the way, all fixed generically in the tools:
 - memory access after `memw` is volatile (GCC's marker for MMIO); LLVM had
   narrowed a 32-bit MAC register read to `l16ui`.
 
+### Remaining Wi-Fi archives (libcore, libespnow, libmesh, libsmartconfig, libwapi)
+
+All five are in the profiles and recover with `recover-member` (libcore 4
+functions, libespnow 43, libmesh 548, libsmartconfig 98, libwapi 21; none
+failed). The main "not lifted" reason is a dynamic `CALLX8` that may consume
+untyped outgoing stack arguments (390 of 548 functions in libmesh), plus
+assembler-owned nested definitions; those stay raw Xtensa inside Abla.
+Linked with `libnet80211 libpp libcoexist libcore libespnow libmesh` the link
+takes no member from any of them (image 1,007,936 bytes, +9.9 kB over the
+libnet80211/libpp/libcoexist-only 998,064). libsmartconfig and libwapi are not
+linked by the app at all; recovering them anyway keeps them alive through
+exports (+51 kB), so leave them out of the app unit. Fix found on the way:
+llvm-mc gives literal pools alignment 1, which GNU ld misplaces after odd-sized
+narrow-encoded sections ("dangerous relocation: l32r: misaligned literal
+target"); the llc wrapper now aligns them to 4 for esp32s3.
+
 ## The S3 uses ROM much more
 
 On the classic ESP32 these archives call ROM only for libc-level helpers. On
