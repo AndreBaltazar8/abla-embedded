@@ -254,6 +254,50 @@ def instrument_coverage(unit: pathlib.Path, modules: list[str]) -> int:
     return len(rows)
 
 
+ROM_PROVIDE = re.compile(r"PROVIDE\s*\(\s*([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+)")
+ROM_ASSIGNMENT = re.compile(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+)\s*;")
+
+
+def write_rom_entries(unit: pathlib.Path, base: pathlib.Path, archives: list[str], profile: dict) -> int:
+    """Define the ROM functions recover-member left out as absolute symbols.
+
+    Functions the chip's ROM provides (class `rom` in reuse.tsv) are not
+    recovered; recovered code calls them by name. ESP-IDF's ROM script
+    assigns those names, but GNU ld evaluates script assignments only after
+    it has chosen archive members, so to the archive scan the names look
+    undefined and Espressif's own members would be pulled in again. Defining
+    them in the unit at the script's address keeps the scan satisfied; the
+    script assignment then sets the same value.
+    """
+    addresses: dict[str, str] = {}
+    for script in profile.get("rom_linker_scripts", []):
+        text = re.sub(r"/\*.*?\*/", "", pathlib.Path(script).read_text(), flags=re.DOTALL)
+        for name, value in ROM_PROVIDE.findall(text) + ROM_ASSIGNMENT.findall(text):
+            addresses.setdefault(name, value)
+    names: set[str] = set()
+    for archive in archives:
+        for reuse in sorted((base / archive).glob("*/reuse.tsv")):
+            for line in reuse.read_text().splitlines()[1:]:
+                fields = line.split("\t")
+                if len(fields) > 2 and fields[2] == "rom" and fields[0] in addresses:
+                    names.add(fields[0])
+    if not names:
+        return 0
+    body = "".join(f".global {name}\n.set {name}, {addresses[name]}\n" for name in sorted(names))
+    (unit / "rom_entries.ab").write_text(
+        'import "../../../../src/xtensa/assembly.ab"\n\n'
+        "// ROM entry points recovered code calls by name (see write_rom_entries).\n"
+        "@naked\n"
+        "trusted fun esp32RecoveredRomEntries(): void = $xtensa instructions {\n"
+        + body + "}\n")
+    (unit / "rom_entries_link.ab").write_text(
+        'import "abla/build"\n\n'
+        "compile fun recoveredRomEntriesLink(): bool {\n"
+        '    if (!exportFunction("esp32RecoveredRomEntries", "abla_recovered_rom_entries")) return false\n'
+        "    true\n}\n")
+    return len(names)
+
+
 PUSHSECTION = re.compile(r'(\.pushsection\s+)("?)([^,\s"]+)')
 
 
@@ -471,6 +515,11 @@ def main() -> int:
 
     if os.environ.get("ABLA_COVERAGE") == "1":
         print(f"coverage: instrumented {instrument_coverage(unit, modules)} function(s); map in coverage.tsv")
+    rom_entries = write_rom_entries(unit, base, args.archives, profile)
+    if rom_entries:
+        modules.append("rom_entries.ab")
+        selectors.append(("rom_entries_link.ab", "recoveredRomEntriesLink"))
+        print(f"ROM entry points defined in the unit: {rom_entries}")
     main_source = [f'import "{module}"' for module in modules]
     main_source += [f'import "{link}"' for link in dict.fromkeys(link for link, _ in selectors)]
     main_source += [""] + [f"#{name}()" for _, name in selectors]
