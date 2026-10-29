@@ -1321,7 +1321,89 @@ def emit_stackified(blocks: dict[int, Block], nodes: set[int]) -> str | None:
     return None if lines is None else "\n".join(lines) + "\n"
 
 
+CANCEL = re.compile(
+    r"^            if \((?:\((?P<condition>.*)\) && )?loopEnd == (?P<end>[0-9]+)\) loopActive = false\n",
+    re.MULTILINE,
+)
+
+
+def stackify_hardware_loops(arms: str) -> tuple[dict[int, Block], int] | None:
+    """Rewrite a dispatcher's Xtensa hardware loops as ordinary graph edges.
+
+    LOOP sets LCOUNT/LBEG/LEND; reaching LEND by falling through decrements
+    LCOUNT and returns to LBEG until it reaches zero, while a taken branch or
+    jump to LEND leaves the loop (the lifter marks those edges with
+    `loopActive = false`). Here each loop instruction sets `loopCounter` and
+    enters (or, for LOOPNEZ/LOOPGTZ, skips) the body; every fall-through edge
+    into LEND goes to a new latch block that counts down and returns to LBEG
+    or continues at LEND, and marked exits go to LEND directly. Bodies must be
+    the block range [LBEG, LEND) with no other entry and no other exit than
+    LEND or a returning block. Returns the blocks and the first free number.
+    """
+    bodies: dict[int, str] = {}
+    exits: set[tuple[int, int]] = set()
+    for arm in ARM.finditer(arms):
+        number = int(arm.group("number"))
+        body = arm.group("body")
+        for cancel in CANCEL.finditer(body):
+            exits.add((number, int(cancel.group("end"))))
+        bodies[number] = CANCEL.sub("", body)
+    blocks: dict[int, Block] = {}
+    for number, body in bodies.items():
+        block = parse_block(body)
+        if block is None or number in blocks:
+            return None
+        blocks[number] = block
+    loops = {number: block for number, block in blocks.items() if block.kind == "hardware_loop"}
+    if not loops:
+        return blocks, max(blocks) + 1
+    spare = max(blocks) + 1
+    for header, loop in loops.items():
+        if any(loop.loop_start <= other < loop.loop_end for other in loops):
+            return None  # nested hardware loops
+    for header, loop in loops.items():
+        start, end = loop.loop_start, loop.loop_end
+        body = set(range(start, end))
+        if not body <= set(blocks) or end not in blocks:
+            return None
+        for number, block in blocks.items():
+            if number in body or number == header:
+                continue
+            if any(target in body and target != start for target in block.targets):
+                return None
+        latch = spare
+        spare += 1
+        for number in body:
+            block = blocks[number]
+            targets = []
+            for target in block.targets:
+                if target == end and (number, end) not in exits:
+                    targets.append(latch)
+                elif target == EXIT or target in body or target == end or blocks.get(target, block).kind == "exit":
+                    targets.append(target)
+                else:
+                    return None
+            blocks[number] = replace(block, targets=tuple(targets))
+        blocks[latch] = Block(("            loopCounter = loopCounter - u32(1)",), "branch",
+                              "loopCounter != u32(0)", (start, end))
+        entry = loop.statements + (f"            loopCounter = {loop.count}",)
+        if loop.condition == "true":
+            blocks[header] = Block(entry, "jump", targets=(start,))
+        else:
+            blocks[header] = Block(entry, "branch", loop.condition, (start, end))
+    return blocks, spare
+
+
 def lower_dispatcher(match: re.Match[str]) -> str | None:
+    if match.group("loopvars") and os.environ.get("ABLA_STRUCTURE", "stackify") == "stackify":
+        converted = stackify_hardware_loops(match.group("arms"))
+        if converted is not None:
+            loop_blocks, _ = converted
+            nodes = reachable(loop_blocks)
+            if nodes is not None:
+                stackified = emit_stackified(loop_blocks, nodes)
+                if stackified is not None:
+                    return "    var loopCounter = u32(0)\n" + stackified
     blocks: dict[int, Block] = {}
     for arm in ARM.finditer(match.group("arms")):
         number = int(arm.group("number"))
