@@ -1,8 +1,9 @@
 // Taps and swipes on the PaperMono's touch panel. A finger going down starts
 // a gesture; its lift ends it as a tap, or as a swipe when it moved more
-// than paperMonoSwipePixels. The gesture stays pending until the app takes
-// it (paperMonoGestureTake). paperMonoGestureSample reads the controller
-// once: call it often, also while the app waits (on the network, a render),
+// than paperMonoSwipePixels. Finished gestures wait in order, a few of them,
+// until the app takes each (paperMonoGestureTake). paperMonoGestureSample reads
+// the controller once: call it often, also while the app waits (on the network,
+// a render); paperMonoGesturesOpen has refreshes sample while the panel is busy,
 // so a short tap is not lost. State is static: one panel, no heap.
 import "./papermono_board.ab"
 import "./papermono_touch_tracker_esp32s3.ab"
@@ -10,7 +11,7 @@ import "./papermono_touch_tracker_esp32s3.ab"
 val paperMonoSwipePixels = 24
 
 val paperMonoGestureSnapshot = nativeStaticAllocate(29 + 4)
-val paperMonoGestureState = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0,0,0,0])
+val paperMonoGestureState = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
 val paperMonoGestureControl = 0
 val paperMonoGestureTouch = 1   // TouchControllerOpen (0: none)
 val paperMonoGestureDown = 2
@@ -18,14 +19,19 @@ val paperMonoGestureStartX = 3
 val paperMonoGestureStartY = 4
 val paperMonoGestureLastX = 5
 val paperMonoGestureLastY = 6
-val paperMonoGesturePending = 7 // 0 none, 1 tap, 2 swipe
-val paperMonoGestureX = 8       // where it started (portrait pixels)
+val paperMonoGestureX = 8       // the one taken last: where it started (portrait pixels)
 val paperMonoGestureY = 9
 val paperMonoGestureDy = 10     // start y - end y: positive when dragged up
 // The handles' high words: both are 64-bit values (TouchControllerOpen keeps
 // its status and kind above the address).
 val paperMonoGestureControlHigh = 11
 val paperMonoGestureTouchHigh = 12
+// Finished gestures: a ring of paperMonoGestureSlots, four cells each (kind, x,
+// y, dy), with the counts of those written and taken.
+val paperMonoGestureWritten = 13
+val paperMonoGestureRead = 14
+val paperMonoGestureRing = 15
+val paperMonoGestureSlots = 8
 
 val paperMonoGestureNone = 0
 val paperMonoGestureTap = 1
@@ -51,7 +57,26 @@ trusted fun paperMonoGesturesOpen(control: M5Pm1Control): bool {
     paperMonoGestureSet(paperMonoGestureControlHigh, (control|0) >>> 32)
     paperMonoGestureSet(paperMonoGestureTouch, if (touch.ready()) (touch|0) & 4294967295 else 0)
     paperMonoGestureSet(paperMonoGestureTouchHigh, if (touch.ready()) (touch|0) >>> 32 else 0)
+    if (touch.ready()) ssd1677SetWhileBusy(int(u32(nativeFunctionAddress(paperMonoGestureWhileBusy))))
     touch.ready()
+}
+
+// Keeps a finished gesture; when the ring is full the newest is dropped.
+trusted fun paperMonoGestureRecord(kind: int, x: int, y: int, dy: int): void {
+    val written = paperMonoGestureCell(paperMonoGestureWritten)
+    if (written - paperMonoGestureCell(paperMonoGestureRead) >= paperMonoGestureSlots) return
+    val slot = paperMonoGestureRing + (written % paperMonoGestureSlots) * 4
+    paperMonoGestureSet(slot, kind)
+    paperMonoGestureSet(slot + 1, x)
+    paperMonoGestureSet(slot + 2, y)
+    paperMonoGestureSet(slot + 3, dy)
+    paperMonoGestureSet(paperMonoGestureWritten, written + 1)
+    return
+}
+
+trusted fun paperMonoGestureWhileBusy(ignored: int): void {
+    paperMonoGestureSample()
+    return
 }
 
 trusted fun paperMonoGestureSample(): void {
@@ -74,24 +99,27 @@ trusted fun paperMonoGestureSample(): void {
     }
     if (paperMonoGestureCell(paperMonoGestureDown) == 0) return
     paperMonoGestureSet(paperMonoGestureDown, 0)
-    if (paperMonoGestureCell(paperMonoGesturePending) != paperMonoGestureNone) return
     val dy = paperMonoGestureCell(paperMonoGestureStartY) - paperMonoGestureCell(paperMonoGestureLastY)
     val dx = paperMonoGestureCell(paperMonoGestureStartX) - paperMonoGestureCell(paperMonoGestureLastX)
-    paperMonoGestureSet(paperMonoGestureX, paperMonoGestureCell(paperMonoGestureStartX))
-    paperMonoGestureSet(paperMonoGestureY, paperMonoGestureCell(paperMonoGestureStartY))
-    paperMonoGestureSet(paperMonoGestureDy, dy)
     val moved = (if (dy < 0) 0 - dy else dy) > paperMonoSwipePixels ||
         (if (dx < 0) 0 - dx else dx) > paperMonoSwipePixels
-    paperMonoGestureSet(paperMonoGesturePending, if (moved) paperMonoGestureSwipe else paperMonoGestureTap)
+    paperMonoGestureRecord(if (moved) paperMonoGestureSwipe else paperMonoGestureTap,
+        paperMonoGestureCell(paperMonoGestureStartX), paperMonoGestureCell(paperMonoGestureStartY), dy)
     return
 }
 
-// The pending gesture (paperMonoGestureTap/Swipe, or None), cleared; its
-// position and vertical travel stay readable until the next one.
+// The oldest finished gesture (paperMonoGestureTap/Swipe, or None if there is
+// none); its position and vertical travel stay readable until the next one.
 trusted fun paperMonoGestureTake(): int {
-    val pending = paperMonoGestureCell(paperMonoGesturePending)
-    paperMonoGestureSet(paperMonoGesturePending, paperMonoGestureNone)
-    pending
+    val read = paperMonoGestureCell(paperMonoGestureRead)
+    if (read == paperMonoGestureCell(paperMonoGestureWritten)) return paperMonoGestureNone
+    val slot = paperMonoGestureRing + (read % paperMonoGestureSlots) * 4
+    paperMonoGestureSet(paperMonoGestureX, paperMonoGestureCell(slot + 1))
+    paperMonoGestureSet(paperMonoGestureY, paperMonoGestureCell(slot + 2))
+    paperMonoGestureSet(paperMonoGestureDy, paperMonoGestureCell(slot + 3))
+    val kind = paperMonoGestureCell(slot)
+    paperMonoGestureSet(paperMonoGestureRead, read + 1)
+    kind
 }
 
 trusted fun paperMonoGestureAtX(): int = paperMonoGestureCell(paperMonoGestureX)
