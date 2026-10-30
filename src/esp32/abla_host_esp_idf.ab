@@ -1,0 +1,115 @@
+// The Abla runtime on ESP-IDF. ablac gives 32-bit microcontroller targets the
+// runtime Wasm uses (abla/runtime/platform/wasm.ab), which needs no C
+// library: it allocates and collects inside one memory region and reaches
+// the platform through a few calls, answered here by the IDF:
+//   write, exit, clock and random (the standard library's I/O, process,
+//   time and random APIs end there), and
+//   the region (abla_host_memory_base/size/grow, in Wasm's units: an
+//   address, 64 KiB pages counted from address 0, -1 when it is full).
+// The region is reserved once, from PSRAM when the chip has it (8 MB on the
+// PaperMono's ESP32-S3), else from internal RAM.
+import "abla/unsafe/native"
+import "./sdk/raw_buffer.ab"
+import "abla/build"
+
+trusted noescape extern:"c" fun heap_caps_malloc(size: u32, caps: u32): i64*
+trusted noescape extern:"c" fun heap_caps_get_largest_free_block(caps: u32): u32
+trusted noescape extern:"c" fun write(descriptor: i32, data: i64*, length: u32): i32
+trusted noescape extern:"c" fun esp_timer_get_time(): i64
+trusted noescape extern:"c" fun esp_fill_random(buffer: i64*, length: u32): void
+trusted noescape extern:"c" fun abort(): void
+trusted noescape extern:"c" fun memset(destination: i64*, value: i32, size: u32): i64*
+
+// Plain C symbols, not exports, and runtime functions by name
+// (__ablaRuntime…): the runtime calls them from inside its allocator and
+// collector, where neither an export's entry nor a safe point (which could
+// start a collection inside one) may run.
+#requiredInternalFunction("__ablaRuntimeEspIdfMemoryBase", "abla_host_memory_base")
+#requiredInternalFunction("__ablaRuntimeEspIdfMemorySize", "abla_host_memory_size")
+#requiredInternalFunction("__ablaRuntimeEspIdfMemoryGrow", "abla_host_memory_grow")
+#requiredInternalFunction("__ablaRuntimeEspIdfWrite", "__ablaHostWrite")
+#requiredInternalFunction("__ablaRuntimeEspIdfExit", "__ablaHostExit")
+#requiredInternalFunction("__ablaRuntimeEspIdfClockNs", "__ablaHostClockNs")
+#requiredInternalFunction("__ablaRuntimeEspIdfRandom", "__ablaHostRandom")
+
+val ablaHostPage = 65536
+// MALLOC_CAP_SPIRAM (1 << 10), MALLOC_CAP_8BIT (1 << 2)
+val ablaHostSpiram = 1024
+val ablaHostByteAddressable = 4
+
+// Region state: base address (64 KiB aligned), capacity, bytes in use.
+val ablaHostRegion = nativeStaticMutableU32s([0, 0, 0])
+
+// Reserves the region on first use: up to `ablaHostRegionLimit` bytes, all
+// but 1 MB of the largest PSRAM block (or half the internal one).
+val ablaHostRegionLimit = 6291456
+
+trusted fun __ablaRuntimeEspIdfRegionReserve(): void {
+    if (nativeAddressLoadU32(ablaHostRegion, 0) != 0) return
+    var caps = ablaHostSpiram | ablaHostByteAddressable
+    var largest = int(heap_caps_get_largest_free_block(u32(caps)))
+    var spare = 1048576
+    if (largest < 2 * ablaHostPage) {
+        caps = ablaHostByteAddressable
+        largest = int(heap_caps_get_largest_free_block(u32(caps)))
+        spare = largest / 2
+    }
+    var capacity = largest - spare - ablaHostPage
+    if (capacity > ablaHostRegionLimit) capacity = ablaHostRegionLimit
+    capacity = capacity / ablaHostPage * ablaHostPage
+    if (capacity < ablaHostPage) return
+    val block = nativePointerAddress(heap_caps_malloc(u32(capacity + ablaHostPage), u32(caps)))
+    if (block == 0) return
+    nativeAddressStoreU32(ablaHostRegion, 0, (block + ablaHostPage - 1) / ablaHostPage * ablaHostPage)
+    nativeAddressStoreU32(ablaHostRegion, 4, capacity)
+    nativeAddressStoreU32(ablaHostRegion, 8, 0)
+    // (ROM printf: no allocation, and the boot log says where the heap is.)
+    callNativeVoidI32I32I32(0x400005d0, nativeStaticBytes("abla: heap of %d bytes at 0x%08x\n\x00"),
+        capacity, nativeAddressLoadU32(ablaHostRegion, 0))
+    return
+}
+
+trusted fun __ablaRuntimeEspIdfMemoryBase(): i32 {
+    __ablaRuntimeEspIdfRegionReserve()
+    i32(nativeAddressLoadU32(ablaHostRegion, 0))
+}
+
+// The end of the region in use, in pages from address 0.
+trusted fun __ablaRuntimeEspIdfMemorySize(): i32 {
+    __ablaRuntimeEspIdfRegionReserve()
+    i32((nativeAddressLoadU32(ablaHostRegion, 0) + nativeAddressLoadU32(ablaHostRegion, 8)) / ablaHostPage)
+}
+
+// Grows the part in use by `pages`; the previous size, or -1 past the region.
+// The new pages read as zero, as memory.grow's do (the runtime relies on it).
+trusted fun __ablaRuntimeEspIdfMemoryGrow(pages: i32): i32 {
+    __ablaRuntimeEspIdfRegionReserve()
+    val used = nativeAddressLoadU32(ablaHostRegion, 8)
+    val wanted = used + int(pages) * ablaHostPage
+    if (int(pages) < 0 || wanted > nativeAddressLoadU32(ablaHostRegion, 4)) return i32(-1)
+    val previous = (nativeAddressLoadU32(ablaHostRegion, 0) + used) / ablaHostPage
+    memset(nativePointerFromAddress(nativeAddressLoadU32(ablaHostRegion, 0) + used), i32(0), u32(wanted - used))
+    nativeAddressStoreU32(ablaHostRegion, 8, wanted)
+    i32(previous)
+}
+
+trusted fun __ablaRuntimeEspIdfWrite(descriptor: i32, data: i32, length: i32): i32 {
+    if (int(length) == 0) return i32(0)
+    val written = write(descriptor, nativePointerFromAddress(int(data) & 4294967295), u32(length))
+    if (int(written) < 0) i32(-5) else written
+}
+
+trusted fun __ablaRuntimeEspIdfExit(code: i32): void {
+    // (The IDF's abort: its panic handler restarts the chip.)
+    abort()
+    return
+}
+
+// 0: the wall clock (ns since 1970, as far as the IDF knows it), else the
+// monotonic one (ns since boot).
+trusted fun __ablaRuntimeEspIdfClockNs(clock: i32): i64 = i64(int(esp_timer_get_time()) * 1000)
+
+trusted fun __ablaRuntimeEspIdfRandom(data: i32, length: i32): i32 {
+    esp_fill_random(nativePointerFromAddress(int(data) & 4294967295), u32(length))
+    length
+}
