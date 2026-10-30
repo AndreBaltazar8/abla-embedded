@@ -1,0 +1,125 @@
+// The M5Stack PaperMono, ready for an application: the internal I2C bus, the
+// PM1 power controller and IO expander, the SSD1677 e-paper session with its
+// two 96000-byte buffers (static storage, internal RAM), refreshes and the
+// frontlight. Panel coordinates are portrait 480x800 (rotation 0).
+import "../esp32/i2c_esp32s3.ab"
+import "../esp32/gpio_esp32s3.ab"
+import "../esp32/peripheral_delay_esp32s3.ab"
+import "./pm1_control_esp32s3.ab"
+import "./papermono_display_esp32s3.ab"
+import "./papermono_display_startup_esp32s3.ab"
+import "./papermono_session_canvas.ab"
+import "../runtime/memory32.ab"
+import "abla/unsafe/native"
+import "abla/runtime/scalar"
+import "abla/build"
+
+val paperMonoControlStorage = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+val paperMonoSessionStorage = nativeStaticMutableU32s([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+val paperMonoGateStorage = nativeStaticMutableU32s([0])
+val paperMonoCanvasStorage = nativeStaticAllocate(96000)
+val paperMonoHistoryStorage = nativeStaticAllocate(96000)
+
+val paperMonoWidth = 480
+val paperMonoHeight = 800
+val paperMonoOwner = u32(7)
+val paperMonoBusyPolls = 10000
+// SSD1677 refresh modes (ssd1677Lut): 1 quality, 2 text, 3 fast, 4 fastest.
+val paperMonoQuality = 1
+val paperMonoFastest = 4
+
+// ROM ets_printf: the console (UART0 and USB-Serial/JTAG) without the heap.
+// Formats are NUL-terminated nativeStaticBytes literals.
+trusted fun paperMonoLog(text: int): void {
+    callNativeVoidI32(0x400005d0, text)
+    return
+}
+trusted fun paperMonoLogValue(format: int, value: int): void {
+    callNativeVoidI32I32(0x400005d0, format, value)
+    return
+}
+
+// The canvas, for drawing before the session exists (the first frame).
+trusted fun paperMonoCanvas(): NativeBuffer = nativeBufferAt(paperMonoCanvasStorage, 96000)
+
+// A slave can still hold SDA low after an ESP-only reset (the PM1/IOE1 keep
+// power): if setup sees a busy bus, clock it free once and retry.
+trusted fun paperMonoOpenI2c(): I2cBus {
+    val first = i2cMaster(0, 47, 48, u32(40000000), u32(160000000))
+    if (first.valid()) return first
+    paperMonoLog(nativeStaticBytes("papermono: I2C busy, clearing bus\n\x00"))
+    val budget = esp32S3I2cTimeoutCycles(20, 160000000)
+    if (!esp32S3I2cClearStuckBusOwned(0, 47, 48, budget)) paperMonoLog(nativeStaticBytes("papermono: bus clear failed\n\x00"))
+    i2cMaster(0, 47, 48, u32(40000000), u32(160000000))
+}
+
+// The M5PM1 (0x6E) and M5IOE1 (0x4F) idle in an I2C sleep mode and NACK the
+// transfer that wakes them: poke each once, clear the NACK, give them time.
+trusted fun paperMonoWakeI2cDevices(bus: I2cBus): void {
+    if (!bus.probe(110)) bus.recover()
+    peripheralDelayMilliseconds(5)
+    if (!bus.probe(79)) bus.recover()
+    peripheralDelayMilliseconds(5)
+    return
+}
+
+// Brings up the bus and the PM1/IO-expander control, with the factory power
+// key behaviour (single press: on/reset, double press: off). 0 (invalid) on
+// failure, after logging why.
+trusted fun paperMonoOpen(): M5Pm1Control {
+    // After a cold power-on the PM1/IOE1 need a moment before they answer.
+    peripheralDelayMilliseconds(150)
+    val bus = paperMonoOpenI2c()
+    if (!bus.valid()) {
+        paperMonoLog(nativeStaticBytes("papermono: I2C setup failed\n\x00"))
+        return M5Pm1Control(0)
+    }
+    paperMonoWakeI2cDevices(bus)
+    val control = m5Pm1ControlAt(nativeBufferAt(paperMonoControlStorage, 72))
+    if (!control.initialize()) return M5Pm1Control(0)
+    var opened = control.openOwned(bus, m5BoardPaperMono, true, true)
+    var attempt = 1
+    while (opened != 1 && attempt < 6) {
+        control.closeOwned(true)
+        bus.recover()
+        peripheralDelayMilliseconds(200)
+        paperMonoWakeI2cDevices(bus)
+        control.initialize()
+        opened = control.openOwned(bus, m5BoardPaperMono, true, true)
+        attempt = attempt + 1
+    }
+    if (opened != 1) {
+        paperMonoLogValue(nativeStaticBytes("papermono: PM1 open failed %d\n\x00"), opened)
+        return M5Pm1Control(0)
+    }
+    val power = M5Pm1(control.pmic().deviceHandle())
+    if (!power.setI2cSleepSeconds(0)) power.setI2cSleepSeconds(0)
+    power.setSingleResetDisabled(false)
+    power.setDoubleOffDisabled(false)
+    control
+}
+
+// Shows what was drawn into paperMonoCanvas() with a full refresh and
+// returns the session; 0 on failure.
+trusted fun paperMonoDisplayStart(control: M5Pm1Control): Ssd1677Session {
+    val record = nativeBufferAt(paperMonoSessionStorage, 64)
+    val started = control.initializePaperMonoDisplayOwned(record, paperMonoCanvas(),
+        nativeBufferAt(paperMonoHistoryStorage, 96000), peripheralGateAt(paperMonoGateStorage),
+        paperMonoOwner, paperMonoQuality, 0, paperMonoBusyPolls, true)
+    if (started != 1) {
+        paperMonoLogValue(nativeStaticBytes("papermono: display startup failed %d\n\x00"), started & 4294967295)
+        return Ssd1677Session(0)
+    }
+    Ssd1677Session(record|0)
+}
+
+// Refreshes the session's dirty area in `mode`; false (logged) on failure.
+trusted fun paperMonoRefresh(session: Ssd1677Session, mode: int): bool {
+    val result = paperMonoDisplayRefresh(session, peripheralGateAt(paperMonoGateStorage), paperMonoOwner, mode, paperMonoBusyPolls)
+    if (!result.valid()) paperMonoLogValue(nativeStaticBytes("papermono: refresh failed %d\n\x00"), (result|0) & 4294967295)
+    result.valid()
+}
+
+// Frontlight 0 (off) to 255.
+trusted fun paperMonoFrontlight(control: M5Pm1Control, level: int): bool =
+    control.paperMonoFrontlightOwned(level, true) == 1
