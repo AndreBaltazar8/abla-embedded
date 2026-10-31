@@ -11,6 +11,15 @@
 #error Define ABLA_TEST_ENTRY to the exported Abla test entry
 #endif
 extern int32_t ABLA_TEST_ENTRY(void);
+/* The compiler's indirect-call checks end here, as on a device: the host's runtime
+ * panic prints and exits 101, and firmware links its own. */
+void abla_platform_panic(const char *message, int64_t size);
+void abla_platform_panic(const char *message, int64_t size) {
+    (void)!write(2, "panic: ", 7);
+    (void)!write(2, message, (size_t)size);
+    (void)!write(2, "\n", 1);
+    _exit(101);
+}
 static ucontext_t caller, test;
 static int result = 125;
 static void invoke(void) { result = ABLA_TEST_ENTRY(); }
