@@ -3,6 +3,7 @@
 import "abla_host_esp_idf.ab"
 import "abla/unsafe/memory"
 import "abla/unsafe/native"
+import "../wifi/join_policy.ab"
 
 trusted noescape extern:"c" fun nvs_flash_init(): i32
 trusted noescape extern:"c" fun nvs_flash_erase(): i32
@@ -18,6 +19,7 @@ trusted noescape extern:"c" fun esp_wifi_start(): i32
 trusted noescape extern:"c" fun esp_wifi_set_country_code(country: i64*, ieee80211dEnabled: bool): i32
 trusted noescape extern:"c" fun esp_wifi_connect(): i32
 trusted noescape extern:"c" fun esp_wifi_disconnect(): i32
+trusted noescape extern:"c" fun esp_wifi_sta_get_ap_info(info: i64*): i32
 trusted noescape extern:"c" fun esp_wifi_set_ps(mode: i32): i32
 trusted noescape extern:"c" fun esp_tls_init(): i64*
 trusted noescape extern:"c" fun esp_tls_conn_new_sync(host: i64*, hostLength: i32, port: i32, config: i64*, tls: i64*): i32
@@ -51,11 +53,14 @@ val wifiInitStorage = nativeStaticAllocate(152)
 val wifiConfigStorage = nativeStaticAllocate(184)
 val tlsConfigStorage = nativeStaticAllocate(96)
 val ipInfoStorage = nativeStaticAllocate(12)
+// wifi_ap_record_t, which ESP-IDF fills whole: under 128 bytes in every 6.0 configuration.
+val apInfoStorage = nativeStaticAllocate(128)
 val socketTimeoutStorage = nativeStaticAllocate(16)
 val socketStorage = nativeStaticAllocate(4)
 // Module state lives in static cells: top-level vars would pull in the hosted
 // Abla runtime initializer (GC/env/panic) that this ESP-IDF app does not link.
-val netState = nativeStaticMutableU32s([0])
+// The station's netif, then when it last asked to join and how many times.
+val netState = nativeStaticMutableU32s([0, 0, 0])
 trusted fun stationNetif(): int = nativeAddressLoadU32(netState, 0)
 
 trusted fun pointer(address: int): i64* = nativePointerFromAddress(address)
@@ -78,6 +83,11 @@ trusted fun wifiStart(): int {
         nvs = nvs_flash_init()
     }
     if (nvs != i32(0)) return 1
+    wifiStartDriver()
+}
+
+// The same, for an application that has brought up NVS itself (encrypted, say).
+trusted fun wifiStartDriver(): int {
     if (esp_netif_init() != i32(0)) return 2
     if (esp_event_loop_create_default() != i32(0)) return 3
     nativeAddressStoreU32(netState, 0, nativePointerAddress(esp_netif_create_default_wifi_sta()))
@@ -120,8 +130,9 @@ trusted fun wifiHasAddress(): bool {
 
 trusted fun wifiAddress(): int = nativeBufferAt(ipInfoStorage, 12).loadU32(0)
 
-// ssid/password are NUL-terminated C strings with their lengths (no NUL).
-trusted fun wifiJoin(ssid: int, ssidLength: int, password: int, passwordLength: int, timeoutMilliseconds: int): bool {
+// Starts joining; wifiJoinTick carries it on. ssid/password are NUL-terminated C strings
+// with their lengths (no NUL).
+trusted fun wifiJoinBegin(ssid: int, ssidLength: int, password: int, passwordLength: int): bool {
     if (ssidLength > 32 || passwordLength > 64) return false
     esp_wifi_disconnect()
     val config = nativeBufferAt(wifiConfigStorage, wifiConfigBytes)
@@ -134,13 +145,37 @@ trusted fun wifiJoin(ssid: int, ssidLength: int, password: int, passwordLength: 
     index = 0
     while (index < passwordLength) { config.store(32 + index, passwordBytes.load(index)); index = index + 1 }
     if (esp_wifi_set_config(i32(wifiInterfaceStation), pointer(wifiConfigStorage)) != i32(0)) return false
-    if (esp_wifi_connect() != i32(0)) return false
+    nativeAddressStoreU32(netState, 4, uptimeMilliseconds())
+    nativeAddressStoreU32(netState, 8, 1)
+    esp_wifi_set_ps(i32(wifiPowerSaveMinimum))
+    esp_wifi_connect()
+    true
+}
+
+// Whether there's an address; if not, and there's no link either, asks to join again when
+// it's time (join_policy.ab). Doesn't block. A lost link comes back the same way.
+trusted fun wifiJoinTick(): bool {
+    if (wifiHasAddress()) {
+        nativeAddressStoreU32(netState, 8, 1)
+        return true
+    }
+    val now = uptimeMilliseconds()
+    val tries = nativeAddressLoadU32(netState, 8)
+    if (!wifiJoinTryDue(now, nativeAddressLoadU32(netState, 4), tries)) return false
+    if (esp_wifi_sta_get_ap_info(pointer(apInfoStorage)) == i32(0)) return false
+    nativeAddressStoreU32(netState, 4, now)
+    nativeAddressStoreU32(netState, 8, tries + 1)
+    esp_wifi_connect()
+    false
+}
+
+trusted fun wifiJoin(ssid: int, ssidLength: int, password: int, passwordLength: int, timeoutMilliseconds: int): bool {
+    if (!wifiJoinBegin(ssid, ssidLength, password, passwordLength)) return false
     val started = uptimeMilliseconds()
-    while (!wifiHasAddress()) {
+    while (!wifiJoinTick()) {
         if (uptimeMilliseconds() - started > timeoutMilliseconds) return false
         delayMilliseconds(100)
     }
-    esp_wifi_set_ps(i32(wifiPowerSaveMinimum))
     true
 }
 
