@@ -1,0 +1,234 @@
+// Wi-Fi station and TCP/TLS sockets through ESP-IDF, for an application on the SDK
+// (abla_host_esp_idf.ab). The default country joins only channels 1-11, so it sets PT.
+import "abla_host_esp_idf.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+trusted noescape extern:"c" fun nvs_flash_init(): i32
+trusted noescape extern:"c" fun nvs_flash_erase(): i32
+trusted noescape extern:"c" fun esp_netif_init(): i32
+trusted noescape extern:"c" fun esp_event_loop_create_default(): i32
+trusted noescape extern:"c" fun esp_netif_create_default_wifi_sta(): i64*
+trusted noescape extern:"c" fun esp_netif_get_ip_info(netif: i64*, info: i64*): i32
+trusted noescape extern:"c" fun esp_wifi_init(config: i64*): i32
+trusted noescape extern:"c" fun esp_wifi_set_storage(storage: i32): i32
+trusted noescape extern:"c" fun esp_wifi_set_mode(mode: i32): i32
+trusted noescape extern:"c" fun esp_wifi_set_config(wifiInterface: i32, config: i64*): i32
+trusted noescape extern:"c" fun esp_wifi_start(): i32
+trusted noescape extern:"c" fun esp_wifi_set_country_code(country: i64*, ieee80211dEnabled: bool): i32
+trusted noescape extern:"c" fun esp_wifi_connect(): i32
+trusted noescape extern:"c" fun esp_wifi_disconnect(): i32
+trusted noescape extern:"c" fun esp_wifi_set_ps(mode: i32): i32
+trusted noescape extern:"c" fun esp_tls_init(): i64*
+trusted noescape extern:"c" fun esp_tls_conn_new_sync(host: i64*, hostLength: i32, port: i32, config: i64*, tls: i64*): i32
+trusted noescape extern:"c" fun esp_tls_conn_write(tls: i64*, data: i64*, length: u32): i32
+trusted noescape extern:"c" fun esp_tls_conn_read(tls: i64*, data: i64*, length: u32): i32
+trusted noescape extern:"c" fun esp_tls_conn_destroy(tls: i64*): i32
+trusted noescape extern:"c" fun esp_tls_get_conn_sockfd(tls: i64*, socket: i64*): i32
+trusted noescape extern:"c" fun lwip_setsockopt(socket: i32, level: i32, option: i32, value: i64*, length: u32): i32
+
+// wifi_init_config_t (152 bytes): osi_funcs pointer at 0, a 44-byte copy of
+// g_wifi_default_wpa_crypto_funcs at 4, then WIFI_INIT_CONFIG_DEFAULT()'s
+// scalar fields as measured for this sdkconfig (magic at 144).
+val wifiInitConfigBytes = 152
+val wifiInitDefaults = nativeStaticU32s([
+    48, 10, 52, 32, 56, 1, 64, 32, 72, 5, 84, 1, 88, 1, 96, 1, 104, 6,
+    112, 752, 116, 32, 120, 161, 132, 7, 136, 1, 144, 523190095])
+// wifi_config_t is 184 bytes; station ssid[32] at 0, password[64] at 32.
+val wifiConfigBytes = 184
+val wifiModeStation = 1
+val wifiInterfaceStation = 0
+val wifiStorageRam = 1
+val wifiPowerSaveMinimum = 1
+// esp_tls_cfg_t is 96 bytes: cacert_buf at 4, cacert_bytes at 8,
+// timeout_ms at 48.
+val tlsConfigBytes = 96
+val solSocket = 4095
+val soReceiveTimeout = 4102
+val soSendTimeout = 4101
+
+val wifiInitStorage = nativeStaticAllocate(152)
+val wifiConfigStorage = nativeStaticAllocate(184)
+val tlsConfigStorage = nativeStaticAllocate(96)
+val ipInfoStorage = nativeStaticAllocate(12)
+val socketTimeoutStorage = nativeStaticAllocate(16)
+val socketStorage = nativeStaticAllocate(4)
+// Module state lives in static cells: top-level vars would pull in the hosted
+// Abla runtime initializer (GC/env/panic) that this ESP-IDF app does not link.
+val netState = nativeStaticMutableU32s([0])
+trusted fun stationNetif(): int = nativeAddressLoadU32(netState, 0)
+
+trusted fun pointer(address: int): i64* = nativePointerFromAddress(address)
+
+trusted fun delayMilliseconds(milliseconds: int): void {
+    vTaskDelay(u32(if (milliseconds > 0) milliseconds else 1))
+    return
+}
+
+trusted fun uptimeMilliseconds(): int = int(esp_timer_get_time()) / 1000
+
+// Brings up NVS, netif, the default event loop and the Wi-Fi driver in
+// station mode. Returns 0 on success or the failing step.
+trusted fun wifiStart(): int {
+    var nvs = nvs_flash_init()
+    if (nvs != i32(0)) {
+        // A partition from another firmware (e.g. the factory app) may need a
+        // reformat before the Wi-Fi driver can keep its calibration data.
+        nvs_flash_erase()
+        nvs = nvs_flash_init()
+    }
+    if (nvs != i32(0)) return 1
+    if (esp_netif_init() != i32(0)) return 2
+    if (esp_event_loop_create_default() != i32(0)) return 3
+    nativeAddressStoreU32(netState, 0, nativePointerAddress(esp_netif_create_default_wifi_sta()))
+    if (stationNetif() == 0) return 4
+    val config = nativeBufferAt(wifiInitStorage, wifiInitConfigBytes)
+    var offset = 0
+    while (offset < wifiInitConfigBytes) { config.storeU32(offset, 0); offset = offset + 4 }
+    config.storeU32(0, nativeLinkerSymbolAddress("g_wifi_osi_funcs"))
+    val crypto = nativeLinkerSymbolAddress("g_wifi_default_wpa_crypto_funcs")
+    offset = 0
+    while (offset < 44) { config.storeU32(4 + offset, nativeAddressLoadU32(crypto, offset)); offset = offset + 4 }
+    val defaults = nativeBufferAt(wifiInitDefaults, 120)
+    var index = 0
+    while (index < 30) {
+        config.storeU32(defaults.loadU32(index*4), defaults.loadU32(index*4 + 4))
+        index = index + 2
+    }
+    if (esp_wifi_init(pointer(wifiInitStorage)) != i32(0)) return 5
+    if (esp_wifi_set_storage(i32(wifiStorageRam)) != i32(0)) return 6
+    if (esp_wifi_set_mode(i32(wifiModeStation)) != i32(0)) return 7
+    if (esp_wifi_start() != i32(0)) return 8
+    // The default country ("01") joins only channels 1-11; Portugal's allows
+    // 1-13 (home APs often sit on 12 or 13).
+    if (esp_wifi_set_country_code(pointer(nativeStaticBytes("PT\x00")), false) != i32(0)) return 9
+    0
+}
+
+// Modem sleep adds latency; disable it while audio streams.
+trusted fun wifiPowerSave(enabled: bool): void {
+    esp_wifi_set_ps(i32(if (enabled) wifiPowerSaveMinimum else 0))
+    return
+}
+
+trusted fun wifiHasAddress(): bool {
+    if (stationNetif() == 0) return false
+    val info = nativeBufferAt(ipInfoStorage, 12)
+    info.storeU32(0, 0)
+    esp_netif_get_ip_info(pointer(stationNetif()), pointer(ipInfoStorage)) == i32(0) && info.loadU32(0) != 0
+}
+
+trusted fun wifiAddress(): int = nativeBufferAt(ipInfoStorage, 12).loadU32(0)
+
+// ssid/password are NUL-terminated C strings with their lengths (no NUL).
+trusted fun wifiJoin(ssid: int, ssidLength: int, password: int, passwordLength: int, timeoutMilliseconds: int): bool {
+    if (ssidLength > 32 || passwordLength > 64) return false
+    esp_wifi_disconnect()
+    val config = nativeBufferAt(wifiConfigStorage, wifiConfigBytes)
+    var offset = 0
+    while (offset < wifiConfigBytes) { config.storeU32(offset, 0); offset = offset + 4 }
+    val ssidBytes = nativeBufferAt(ssid, ssidLength)
+    val passwordBytes = nativeBufferAt(password, passwordLength)
+    var index = 0
+    while (index < ssidLength) { config.store(index, ssidBytes.load(index)); index = index + 1 }
+    index = 0
+    while (index < passwordLength) { config.store(32 + index, passwordBytes.load(index)); index = index + 1 }
+    if (esp_wifi_set_config(i32(wifiInterfaceStation), pointer(wifiConfigStorage)) != i32(0)) return false
+    if (esp_wifi_connect() != i32(0)) return false
+    val started = uptimeMilliseconds()
+    while (!wifiHasAddress()) {
+        if (uptimeMilliseconds() - started > timeoutMilliseconds) return false
+        delayMilliseconds(100)
+    }
+    esp_wifi_set_ps(i32(wifiPowerSaveMinimum))
+    true
+}
+
+type TlsConnection = int
+
+// Verifies the server against the PEM root (NUL-terminated, length without
+// the NUL). Returns 0 on failure.
+trusted fun tlsConnect(host: int, hostLength: int, port: int, rootPem: int, rootPemLength: int): TlsConnection {
+    val tls = nativePointerAddress(esp_tls_init())
+    if (tls == 0) return TlsConnection(0)
+    val config = nativeBufferAt(tlsConfigStorage, tlsConfigBytes)
+    var offset = 0
+    while (offset < tlsConfigBytes) { config.storeU32(offset, 0); offset = offset + 4 }
+    config.storeU32(4, rootPem)
+    config.storeU32(8, rootPemLength + 1)
+    config.storeU32(48, 10000)
+    if (esp_tls_conn_new_sync(pointer(host), i32(hostLength), i32(port), pointer(tlsConfigStorage), pointer(tls)) != i32(1)) {
+        esp_tls_conn_destroy(pointer(tls))
+        return TlsConnection(0)
+    }
+    TlsConnection(tls)
+}
+
+// Verifies the server against ESP-IDF's root certificate bundle
+// (esp_tls_cfg_t.crt_bundle_attach at 68). Returns 0 on failure.
+trusted fun tlsConnectBundle(host: int, hostLength: int, port: int, readTimeoutMilliseconds: int): TlsConnection {
+    val tls = nativePointerAddress(esp_tls_init())
+    if (tls == 0) return TlsConnection(0)
+    val config = nativeBufferAt(tlsConfigStorage, tlsConfigBytes)
+    var offset = 0
+    while (offset < tlsConfigBytes) { config.storeU32(offset, 0); offset = offset + 4 }
+    config.storeU32(48, 10000)
+    config.storeU32(68, nativeLinkerSymbolAddress("esp_crt_bundle_attach"))
+    if (esp_tls_conn_new_sync(pointer(host), i32(hostLength), i32(port), pointer(tlsConfigStorage), pointer(tls)) != i32(1)) {
+        esp_tls_conn_destroy(pointer(tls))
+        return TlsConnection(0)
+    }
+    TlsConnection(tls).setReadTimeout(readTimeoutMilliseconds)
+    TlsConnection(tls)
+}
+
+fun TlsConnection.valid(): bool = (this|0) != 0
+
+// Bounds every subsequent read; a timed-out read returns a negative result
+// and the caller polls again.
+// Bounds every socket read (and sends, at 2 s) so a stalled link cannot hang
+// the app; a timed-out read returns a negative result and the caller polls.
+trusted fun TlsConnection.setReadTimeout(milliseconds: int): bool {
+    val socket = nativeBufferAt(socketStorage, 4)
+    socket.storeU32(0, 0)
+    if (esp_tls_get_conn_sockfd(pointer(this|0), pointer(socketStorage)) != i32(0)) return false
+    val timeout = nativeBufferAt(socketTimeoutStorage, 16)
+    timeout.storeU32(0, milliseconds / 1000)
+    timeout.storeU32(4, 0)
+    timeout.storeU32(8, (milliseconds - (milliseconds / 1000)*1000)*1000)
+    timeout.storeU32(12, 0)
+    val receive = lwip_setsockopt(i32(socket.loadU32(0)), i32(solSocket), i32(soReceiveTimeout), pointer(socketTimeoutStorage), u32(16)) == i32(0)
+    timeout.storeU32(0, 2)
+    timeout.storeU32(8, 0)
+    receive && lwip_setsockopt(i32(socket.loadU32(0)), i32(solSocket), i32(soSendTimeout), pointer(socketTimeoutStorage), u32(16)) == i32(0)
+}
+
+// mbedTLS WANT_READ/WANT_WRITE (-0x6900/-0x6880): retry, not failure.
+fun tlsWouldBlock(result: int): bool = result == -26880 || result == -26752
+
+// Writes everything within 3 s; false if the link is gone or stalled.
+trusted fun TlsConnection.writeAll(data: int, length: int): bool {
+    val deadline = uptimeMilliseconds() + 3000
+    var sent = 0
+    while (sent < length) {
+        val written = int(esp_tls_conn_write(pointer(this|0), pointer(data + sent), u32(length - sent)))
+        if (written > 0) sent = sent + written
+        else {
+            if (!tlsWouldBlock(written) || uptimeMilliseconds() > deadline) {
+                callNativeVoidI32I32(0x400005d0, nativeStaticBytes("net: TLS write failed %d\n\x00"), written)
+                return false
+            }
+            delayMilliseconds(5)
+        }
+    }
+    true
+}
+
+// Returns bytes read (>0), 0 when the peer closed, or <0 on timeout/error.
+trusted fun TlsConnection.readSome(buffer: int, capacity: int): int =
+    int(esp_tls_conn_read(pointer(this|0), pointer(buffer), u32(capacity)))
+
+trusted fun TlsConnection.close(): void {
+    if ((this|0) != 0) esp_tls_conn_destroy(pointer(this|0))
+    return
+}
