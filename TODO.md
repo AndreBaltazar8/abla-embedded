@@ -1,5 +1,9 @@
 # TODO
 
+- Recovered radio unit: `llc` aborts once on each run of `tools/build-recovered-radio`
+  (`tools/esp-llvm-bin/llc` line 164), and the object still comes out. Moved from NovaKind
+  on 2026-11-03; the build scripts belong here. Recheck against the current wrapper.
+
 - `make imu-offsets` aborts in the Xtensa `llc` ("Cannot scavenge register without an emergency spill slot", on
   nvs `Storage::writeItem`). It's an LLVM bug: ablac's TODO.md has it, with the fix on its branch
   `llvm-xtensa-lea-scavenging`, waiting for a new prebuilt LLVM. With that `llc` it builds and links.
