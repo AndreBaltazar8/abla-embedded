@@ -5,10 +5,10 @@ from pathlib import Path
 validate = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/check-cache-internal-relocations'))['validate']
 
 
-def fixture(target_name, target_index=3, relocations=True, root='.iram1.code'):
+def fixture(target_name, target_index=3, relocations=True, root='.iram1.code', source=None):
     data = bytearray(52)
     data[:6] = b'\x7fELF\x01\x01'
-    names = b'\0.names\0' + root.encode() + b'\0' + target_name.encode() + b'\0.symtab\0.rela.iram1.code\0'
+    names = b'\0.names\0' + root.encode() + b'\0' + target_name.encode() + b'\0.symtab\0.rela.iram1.code\0' + (source.encode() + b'\0' if source else b'')
     sections = [(0,)*10]
     def add(name, kind, flags, payload, link=0, info=0, stride=0):
         start = len(data)
@@ -18,8 +18,11 @@ def fixture(target_name, target_index=3, relocations=True, root='.iram1.code'):
     add(root, 1, 6, b'\0'*4)
     add(target_name, 1, 2, b'\0'*4)
     add('.symtab', 2, 0, b'\0'*16 + struct.pack('<IIIBBH', 0, 0, 4, 3, 0, target_index), stride=16)
+    if source:
+        add(source, 1, 6, b'\0'*4)
     if relocations:
-        add('.rela.iram1.code', 4, 0, struct.pack('<IIi', 0, 257, 0), link=4, info=2, stride=12)
+        # info: the section the relocations apply to (2: the internal root, 5: the flash source)
+        add('.rela.iram1.code', 4, 0, struct.pack('<IIi', 0, 257, 0), link=4, info=5 if source else 2, stride=12)
     table = len(data)
     for section in sections:
         data.extend(struct.pack('<10I', *section))
@@ -45,4 +48,7 @@ except ValueError:
     pass
 else:
     raise AssertionError('a check with no internal section was accepted')
+# Only a relocation whose source section is internal counts: one that applies to flash code is
+# skipped, so with an internal root present and nothing else to check the closure is accepted.
+assert validate(fixture('.text.helper', source='.text.caller')) == 0
 print('PASS: internal data, flash table/helper, undefined relocation and relocation-free closure cases')
