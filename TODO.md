@@ -15,12 +15,16 @@
 - `make charger-aw32001` fails with `cannot lower ... nativeXtensaCoreId`: it builds for the C6 but imports the classic
   ESP32's `i2c_idf6.ab` and `serial.ab`, through `src/power/aw32001.ab` and `bq27220.ab`. The C6 has no `I2cBus`
   backend behind `i2cMaster` yet, only the software session in `i2c_session_esp32c6.ab`.
-- `tools/build-callable-example` fails on 14 of 808 examples, the same on origin/master before these fixes (seen
-  2026-11-01). Undefined 64-bit helpers on RV32: `__lshrdi3` (`esp32c5-spi-master`, `esp32c5-spi-pins`,
-  `esp32c5-wake-pad`, `esp32c5-wake-session`, `esp32c61-spi-master`, `esp32c61-spi-pins`), `__ashldi3` (`imu-clock-c5`,
-  `imu-clock-lp-c5`, `toughc5-rtc-interrupt`), `__udivdi3` (`corematrix-tone-controls`, `pmic-battery-level`).
-  `esp32s3-sleep-quiesce` and `esp32s3-sleep-scheduler` stop after `place-internal-closure` reports "placed 0 sections".
-  `paper-s3-sleep-cycle` fails with `call8: call target out of range` into `.iram1.abla.closure.text.*`.
+- `tools/build-callable-example` fails on `paper-s3-sleep-cycle` only (swept 2026-11-08 over all 854 examples
+  with a master ablac and an `origin/master` of this repo; 14 of 808 failed on 2026-11-01). The flash entry
+  `abla_paper_s3_sleep_cycle_example` calls helpers that LLVM does not inline under minsize
+  (`NativeBuffer.storeU32`, 13 callers; `S3I2cSleepLease.owned`, and more once those are `@inline`), and
+  `place-internal-closure` moves a helper the IRAM closure reaches into `.iram1.abla.closure.text.*`, so the flash
+  caller's `call8` is out of range (`tools/check-paper-s3-sleep-link`). It fails the same with the v0.2.49 compiler.
+  Marking helpers `@inline` one at a time exposes the next; the placement tool giving the IRAM closure its own copy
+  of a helper that flash code also calls would fix the class. The RV32 libcalls and the "placed 0 sections" cases
+  are fixed (the callable build generates an object again without minsize when only 64-bit libcalls are missing;
+  a closure without relocations is whole), and `pmic-battery-level` divides in 32 bits.
 - Abla's recovered code keeps its own `errno` (section `.tdata.abla_errno`), apart from the IDF libc's: an error an
   Abla-replaced libc call sets isn't seen by C code reading `errno`. The classic ESP32 images linked this way have not
   run on hardware. `src/esp32/platform_full_esp32.ab`, which replaces the libc, has to fill `.tdata.errno` again if
