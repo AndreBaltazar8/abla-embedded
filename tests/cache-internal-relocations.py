@@ -5,20 +5,21 @@ from pathlib import Path
 validate = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'tools/check-cache-internal-relocations'))['validate']
 
 
-def fixture(target_name, target_index=3):
+def fixture(target_name, target_index=3, relocations=True, root='.iram1.code'):
     data = bytearray(52)
     data[:6] = b'\x7fELF\x01\x01'
-    names = b'\0.names\0.iram1.code\0' + target_name.encode() + b'\0.symtab\0.rela.iram1.code\0'
+    names = b'\0.names\0' + root.encode() + b'\0' + target_name.encode() + b'\0.symtab\0.rela.iram1.code\0'
     sections = [(0,)*10]
     def add(name, kind, flags, payload, link=0, info=0, stride=0):
         start = len(data)
         data.extend(payload)
         sections.append((names.index(name.encode()+b'\0'), kind, flags, 0, start, len(payload), link, info, 4, stride))
     add('.names', 3, 0, names)
-    add('.iram1.code', 1, 6, b'\0'*4)
+    add(root, 1, 6, b'\0'*4)
     add(target_name, 1, 2, b'\0'*4)
     add('.symtab', 2, 0, b'\0'*16 + struct.pack('<IIIBBH', 0, 0, 4, 3, 0, target_index), stride=16)
-    add('.rela.iram1.code', 4, 0, struct.pack('<IIi', 0, 257, 0), link=4, info=2, stride=12)
+    if relocations:
+        add('.rela.iram1.code', 4, 0, struct.pack('<IIi', 0, 257, 0), link=4, info=2, stride=12)
     table = len(data)
     for section in sections:
         data.extend(struct.pack('<10I', *section))
@@ -35,4 +36,13 @@ for data in (fixture('.rodata.table'), fixture('.text.helper'), fixture('.dram1.
         pass
     else:
         raise AssertionError('unsafe relocation accepted')
-print('PASS: internal data, flash table/helper and undefined relocation cases')
+# A closure with no relocation at all is whole in internal memory: nothing to check. Without any
+# allocated internal section the check would be vacuous and must fail.
+assert validate(fixture('.dram1.table', relocations=False)) == 0
+try:
+    validate(fixture('.text.helper', relocations=False, root='.text.code'))
+except ValueError:
+    pass
+else:
+    raise AssertionError('a check with no internal section was accepted')
+print('PASS: internal data, flash table/helper, undefined relocation and relocation-free closure cases')
