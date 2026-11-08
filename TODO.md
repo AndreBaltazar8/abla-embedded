@@ -21,8 +21,15 @@
   (`NativeBuffer.storeU32`, 13 callers; `S3I2cSleepLease.owned`, and more once those are `@inline`), and
   `place-internal-closure` moves a helper the IRAM closure reaches into `.iram1.abla.closure.text.*`, so the flash
   caller's `call8` is out of range (`tools/check-paper-s3-sleep-link`). It fails the same with the v0.2.49 compiler.
-  Marking helpers `@inline` one at a time exposes the next; the placement tool giving the IRAM closure its own copy
-  of a helper that flash code also calls would fix the class. The RV32 libcalls and the "placed 0 sections" cases
+  Marking helpers `@inline` one at a time exposes the next. Giving the IRAM closure its own copy of each helper
+  flash code also calls (a pass over the optimized IR: clone every function reachable from a `.iram1` root that
+  flash code reaches too, as `NAME.iram` in a `.iram1.abla.clone.NAME` section, and redirect the closure's direct
+  calls; 33 clones here, none in the other 39 `place_internal_closure` examples) removes the `call8` errors and the
+  link then passes. It is not enough: `tools/check-paper-s3-sleep-layout` then needs `.xt.prop` in the linked ELF,
+  which only the external Espressif assembler writes (`ABLA_XTENSA_ASSEMBLER=external`; LLVM's own assembler, used
+  by default for this example, writes none), and with the external assembler the clones' literals are out of `l32r`
+  range (`literal target out of range` from `.iram1.abla.clone.*` to `.dram1.abla.rodata.*`), which needs their
+  literal pools kept with the clones (`-xtensa-text-section-literals`). The RV32 libcalls and the "placed 0 sections" cases
   are fixed (the callable build generates an object again without minsize when only 64-bit libcalls are missing;
   a closure without relocations is whole), and `pmic-battery-level` divides in 32 bits.
 - Abla's recovered code keeps its own `errno` (section `.tdata.abla_errno`), apart from the IDF libc's: an error an
