@@ -1,0 +1,244 @@
+// Check emitted IRQ shell ABI/order. Not nested hardware execution proof.
+//
+//     tools/abla-tool check-s3-irq-entries OBJECT.o
+//
+// Disassembles .iram1.abla.s3IrqEntries with the S3 GNU objdump (see check-s3-fatal-vectors).
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+// A block of disassembled instructions as parallel mnemonic / operand-text lists.
+class Pairs(val pcs: array<int>, val ops: array<string>, val args: array<string>, var missing: string) {
+    fun size(): int = this.ops.size
+    fun at(op: string, arg: string): int {
+        var i = 0
+        while (i < this.ops.size) {
+            if (this.ops[i] == op && this.args[i] == arg) return i
+            i = i + 1
+        }
+        this.missing = "missing instruction $op $arg"
+        -1
+    }
+    fun has(op: string, arg: string): bool {
+        var i = 0
+        while (i < this.ops.size) {
+            if (this.ops[i] == op && this.args[i] == arg) return true
+            i = i + 1
+        }
+        false
+    }
+    fun opAt(i: int): string = if (i < 0 || i >= this.ops.size) "" else this.ops[i]
+    fun argAt(i: int): string = if (i < 0 || i >= this.ops.size) "" else this.args[i]
+    fun is(i: int, op: string, arg: string): bool = i >= 0 && i < this.ops.size && this.ops[i] == op && this.args[i] == arg
+    fun count(op: string, arg: string): int {
+        var total = 0
+        var i = 0
+        while (i < this.ops.size) {
+            if (this.ops[i] == op && this.args[i] == arg) total = total + 1
+            i = i + 1
+        }
+        total
+    }
+    // The block's last eight instructions equal `ops`/`args`.
+    fun endsWith(ops: array<string>, args: array<string>): bool {
+        if (this.ops.size < ops.size) return false
+        val start = this.ops.size - ops.size
+        var i = 0
+        while (i < ops.size) {
+            if (this.ops[start + i] != ops[i] || this.args[start + i] != args[i]) return false
+            i = i + 1
+        }
+        true
+    }
+}
+
+// The instructions with lo <= pc < hi, up to and including the first of `ends`.
+fun irqBlock(all: Pairs, lo: int, hi: int, ends: array<string>): Pairs {
+    val block = Pairs([], [], [], "")
+    var i = 0
+    var done = false
+    while (i < all.ops.size && !done) {
+        if (all.pcs[i] >= lo && all.pcs[i] < hi) {
+            block.pcs.append(all.pcs[i])
+            block.ops.append(all.ops[i])
+            block.args.append(all.args[i])
+            for (end in ends) {
+                if (all.ops[i] == end) done = true
+            }
+        }
+        i = i + 1
+    }
+    if (!done) block.missing = "block has no return instruction"
+    block
+}
+
+fun irqLiteralCall(block: Pairs, i: int, code: string, sectionAddress: int): int {
+    val previous = block.argAt(i - 1)
+    val comma = previous.indexOf(",")
+    if (block.argAt(i) != "a0" || block.opAt(i - 1) != "l32r" || !previous.startsWith("a0,") || comma < 0) return -1
+    val literal = parseHex(previous.slice(comma + 1, previous.size)) - sectionAddress
+    elfU32(code, literal)
+}
+
+fun checkIrqEntries(path: string, data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return elf.error
+    val entries = elfLastSection(elf, ".iram1.abla.s3IrqEntries")
+    val configIndex = elfLastSection(elf, ".dram1.abla.s3IrqConfig")
+    if (entries < 0 || configIndex < 0) return "missing IRQ entry or config section"
+    val section = elf.sections[entries]
+    val code = elf.sectionBytes(section)
+    val config = elf.sections[configIndex]
+    if (config.size != 64 || !isZero(elfSlice(data, config.offset, config.offset + 64))) {
+        return "IRQ config must be 64 zero bytes"
+    }
+    val listing = runS3Objdump(["-d", "-j", ".iram1.abla.s3IrqEntries", path])
+    if (listing.status != 0) return "objdump failed"
+    val all = Pairs([], [], [], "")
+    for (line in listing.output.split("\n")) {
+        val parsed = parseDisasmInsn(line)
+        if (parsed != null) {
+            all.pcs.append(parsed.address)
+            all.ops.append(parsed.op)
+            all.args.append(parsed.args.join(","))
+        }
+    }
+    var base = -1
+    var first = 0
+    while (first < all.ops.size && base < 0) {
+        if (all.ops[first] == "wsr.excsave1") base = all.pcs[first]
+        first = first + 1
+    }
+    if (base < 0) return "no wsr.excsave1 entry"
+    val returns = ["rfe", "rfi"]
+    for (level in [1, 2, 3]) {
+        val block = irqBlock(all, base + (level - 1) * 512, base + level * 512, returns)
+        if (block.missing != "") return "level $level: ${block.missing}"
+        if (block.opAt(0) != "wsr.excsave$level" || block.argAt(0) != "a0") {
+            return "level $level shell must start with wsr.excsave$level a0"
+        }
+        val calls: array<int> = []
+        val callIndices: array<int> = []
+        var i = 0
+        while (i < block.size()) {
+            val op = block.opAt(i)
+            if (op == "callx0" || op == "call0") callIndices.append(i)
+            i = i + 1
+        }
+        if (callIndices.size != 2 || block.count("callx4", "a4") != 1) {
+            return "level $level shell must make exactly two CALL0 and one CALLX4"
+        }
+        val callx4 = block.at("callx4", "a4")
+        val saveA12 = block.at("s32i", "a12,a1,60")
+        val saveA13 = block.at("s32i", "a13,a1,64")
+        val saveCpenable = block.at("s32i", "a0,a1,148")
+        val writeCpenable = block.at("wsr.cpenable", "a0")
+        val saveA13Base = block.at("s32i", "a13,a1,0")
+        val saveA12Base = block.at("s32i", "a12,a1,4")
+        val rsil = block.at("rsil", "a0,15")
+        val storeZero = block.at("s32i", "a0,a1,156")
+        val storeLevel = block.at("s32i", "a0,a1,152")
+        val decrement = block.at("addi", "a0,a0,-1")
+        if (block.missing != "") return "level $level: ${block.missing}"
+        if (saveA12 >= callIndices[0] || saveA13 >= callIndices[0]) {
+            return "level $level shell saves a12/a13 after its first call"
+        }
+        var j = 0
+        while (j < block.size()) {
+            val op = block.opAt(j)
+            if (op == "entry" || op == "callx8" || op == "callx12" || op == "retw") {
+                return "level $level shell uses windowed instruction $op"
+            }
+            j = j + 1
+        }
+        for (index in callIndices) {
+            val op = block.opAt(index)
+            if (op == "call0") {
+                calls.append(parseHex(block.argAt(index)))
+            } else {
+                val target = irqLiteralCall(block, index, code, section.address)
+                if (target < 0 && (block.argAt(index) != "a0" || block.opAt(index - 1) != "l32r")) {
+                    return "level $level CALLX0 is not a literal-pool call through a0"
+                }
+                calls.append(target)
+            }
+        }
+        if (calls.size != 2 || calls[0] != base + 1536 || calls[1] != base + 1792) {
+            return "level $level shell calls the wrong context leaves"
+        }
+        if (!block.has("slli", "a0,a8,5")) return "level $level shell lacks the 32-byte per-core config scale"
+        if (!(saveCpenable < writeCpenable && writeCpenable < callx4)) {
+            return "level $level shell must save CPENABLE, then clear it, before CALLX4"
+        }
+        if (!(saveA13Base < callx4 && saveA12Base < callx4)) return "level $level shell must save a12/a13 before CALLX4"
+        if (!block.has("movi", "a7,$level") || !block.has("extui", "a8,a8,13,1")) {
+            return "level $level shell lacks level or core-id setup"
+        }
+        if (!(rsil > callx4)) return "level $level shell must raise PS.INTLEVEL after CALLX4"
+        if (!block.is(storeZero - 1, "movi", "a0,0")) return "level $level frame selector slot 156 is not cleared"
+        if (!block.is(storeLevel - 1, "movi", "a0,$level")) return "level $level frame selector slot 152 is not the level"
+        if (!(block.is(decrement + 1, "s32i", "a0,a12,4") && block.opAt(decrement + 2) == "bnez" &&
+            block.argAt(decrement + 2).startsWith("a0,") && block.is(decrement + 3, "l32i", "a0,a13,156") &&
+            block.opAt(decrement + 4) == "beqz" && block.argAt(decrement + 4) == block.argAt(decrement + 2) &&
+            block.is(decrement + 5, "mov", "a1,a0") && block.is(decrement + 6, "j", hexText(base + 1408)) &&
+            block.is(decrement + 7, "mov", "a1,a13"))) {
+            return "level $level nested-frame selection differs"
+        }
+        val psOp = if (level == 1) "wsr.ps" else "wsr.eps$level"
+        val lastOp = if (level == 1) "rfe" else "rfi"
+        val lastArg = if (level == 1) "" else "$level"
+        if (!block.endsWith(
+            ["l32i", psOp, "l32i", "wsr.epc$level", "l32i", "l32i", "rsync", lastOp],
+            ["a0,a1,8", "a0", "a0,a1,4", "a0", "a0,a1,12", "a1,a1,16", "", lastArg])) {
+            return "level $level restore/return tail differs"
+        }
+    }
+    val shared = irqBlock(all, base + 1408, base + 1536, ["rfe"])
+    if (shared.missing != "") return "shared restore: ${shared.missing}"
+    if (!shared.is(0, "l32i", "a0,a1,148") || !shared.is(1, "wsr.cpenable", "a0")) {
+        return "shared restore must reload CPENABLE first"
+    }
+    var call = -1
+    var k = 0
+    while (k < shared.size() && call < 0) {
+        if (shared.opAt(k) == "callx0" || shared.opAt(k) == "call0") call = k
+        k = k + 1
+    }
+    if (call < 0) return "shared restore has no call"
+    if (shared.opAt(call) == "call0") {
+        if (parseHex(shared.argAt(call)) != base + 1792) return "shared restore calls the wrong leaf"
+    } else {
+        if (shared.argAt(call) != "a0" || shared.opAt(call - 1) != "l32r") return "shared restore call is not through a0"
+        val target = irqLiteralCall(shared, call, code, section.address)
+        if (target != base + 1792) return "shared restore calls the wrong leaf"
+    }
+    if (!shared.endsWith(
+        ["l32i", "wsr.ps", "l32i", "wsr.epc1", "l32i", "l32i", "rsync", "rfe"],
+        ["a0,a1,8", "a0", "a0,a1,4", "a0", "a0,a1,12", "a1,a1,16", "", ""])) {
+        return "shared restore/RFE tail differs"
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-irq-entries OBJECT.o")
+        return 2
+    }
+    val path = processArgument(0)
+    val file = readBinaryFile(path)
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkIrqEntries(path, file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: three IRQ shells, nested-safe selected-frame routing, shared restore/RFE and original RFIn paths; not hardware proof")
+    0
+}

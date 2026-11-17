@@ -1,0 +1,361 @@
+// Helpers shared by the S3/P4 object checks: reading a file, ELF lookups by section or
+// symbol name, 24-bit Xtensa instruction words and GNU objdump disassembly parsing.
+//
+// Binary data is a `string` of bytes. Readers never panic on a truncated file.
+
+import "abla/bytes"
+import "abla/fs"
+import "abla/integer"
+import "abla/text"
+import "abla/process/command"
+import "abla/process/environment"
+import "elf.ab"
+
+class FileBytes(val data: string, val error: string)
+
+fun readBinaryFile(path: string): FileBytes {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded) FileBytes("", "cannot read $path") else FileBytes(result.text, "")
+}
+
+// ---- integers ----
+
+fun signExtend(value: int, bits: int): int =
+    if ((value & (1 << (bits - 1))) != 0) value - (1 << bits) else value
+
+// The 24-bit little-endian Xtensa instruction word at `offset`.
+fun xtensaWord(data: string, offset: int): int =
+    elfU16(data, offset) | (elfU8(data, offset + 2) << 16)
+
+// CALL0/J style 18-bit signed displacement of a 24-bit word.
+fun xtensaDisplacement18(word: int): int = signExtend(word >> 6, 18)
+
+fun hexDigit(ch: int): int =
+    if (ch >= 48 && ch <= 57) ch - 48 else if (ch >= 97 && ch <= 102) ch - 87
+    else if (ch >= 65 && ch <= 70) ch - 55 else -1
+
+// Parses hexadecimal digits (no prefix); -1 for empty or invalid text.
+fun parseHex(text: string): int {
+    if (text.size == 0 || text.size > 15) return -1
+    var value = 0
+    for (ch in text) {
+        val digit = hexDigit(ch)
+        if (digit < 0) return -1
+        value = value * 16 + digit
+    }
+    value
+}
+
+// Python's int(text, 0): optional sign, then 0x hex or decimal. null when invalid.
+fun parseNumber(text: string): int? {
+    var body = text
+    var negative = false
+    if (body.startsWith("-")) {
+        negative = true
+        body = body.slice(1, body.size)
+    } else if (body.startsWith("+")) {
+        body = body.slice(1, body.size)
+    }
+    var value = -1
+    if (body.startsWith("0x") || body.startsWith("0X")) {
+        value = parseHex(body.slice(2, body.size))
+    } else {
+        val parsed = body.parseInt()
+        if (parsed != null && body.size > 0 && body[0] != 45 && body[0] != 43) value = parsed
+    }
+    if (value < 0) return null
+    if (negative) -value else value
+}
+
+// ---- ELF lookups ----
+
+// Index of the last section called `name` (a name dictionary keeps the last), or -1.
+fun elfLastSection(elf: Elf32, name: string): int {
+    var found = -1
+    var index = 0
+    while (index < elf.sections.size) {
+        if (elf.sections[index].name == name) found = index
+        index = index + 1
+    }
+    found
+}
+
+fun elfSectionCount(elf: Elf32, name: string): int {
+    var count = 0
+    for (section in elf.sections) {
+        if (section.name == name) count = count + 1
+    }
+    count
+}
+
+// One 16-byte symbol table entry as the checks read it: straight from the file bytes, with no
+// dependence on the table's string-table link.
+class RawSymbol(
+    val nameOffset: int,
+    val value: int,
+    val size: int,
+    val info: int,
+    val sectionIndex: int,
+    val link: int
+) {
+    fun kind(): int = this.info & 15
+    fun binding(): int = this.info >> 4
+}
+
+class SymbolScan(val symbols: array<RawSymbol>, val error: string)
+
+// Every symbol of every SHT_SYMTAB section, in file order. An entry that does not lie wholly in
+// the file is an error (a damaged section table), as is an entry size other than 16 when
+// `strideCheck` asks for it.
+fun elfScanSymbols(elf: Elf32, strideCheck: bool): SymbolScan = elfScanSymbolsStepped(elf, strideCheck, false)
+
+// As elfScanSymbols; with `useEntrySize` the entries are `entsize` bytes apart (a zero entsize is
+// an error) instead of 16.
+fun elfScanSymbolsStepped(elf: Elf32, strideCheck: bool, useEntrySize: bool): SymbolScan {
+    val result: array<RawSymbol> = []
+    for (section in elf.sections) {
+        if (section.kind != ELF_SHT_SYMTAB) continue
+        if (strideCheck && section.entrySize != 16) return SymbolScan(result, "invalid symbol stride")
+        val step = if (useEntrySize) section.entrySize else 16
+        if (step <= 0) return SymbolScan(result, "invalid symbol stride")
+        var at = section.offset
+        while (at < section.offset + section.size) {
+            if (!elfInRange(elf.data, at, 16)) return SymbolScan(result, "symbol table outside the file")
+            result.append(RawSymbol(elfU32(elf.data, at), elfU32(elf.data, at + 4), elfU32(elf.data, at + 8),
+                elfU8(elf.data, at + 12), elfU16(elf.data, at + 14), section.link))
+            at = at + step
+        }
+    }
+    SymbolScan(result, "")
+}
+
+// FUNC symbols defined in section `index`: addresses and sizes (parallel arrays).
+class FunctionList(val addresses: array<int>, val sizes: array<int>, val error: string)
+
+fun elfFunctionsIn(elf: Elf32, index: int, strideCheck: bool): FunctionList {
+    val addresses: array<int> = []
+    val sizes: array<int> = []
+    val scan = elfScanSymbols(elf, strideCheck)
+    if (scan.error != "") return FunctionList(addresses, sizes, scan.error)
+    for (symbol in scan.symbols) {
+        if (symbol.sectionIndex == index && symbol.kind() == 2) {
+            addresses.append(symbol.value)
+            sizes.append(symbol.size)
+        }
+    }
+    FunctionList(addresses, sizes, "")
+}
+
+// Symbols by name (the name read from the table's linked string section; a later definition
+// replaces an earlier one, nameless symbols are left out). `error` for a link outside the
+// section table.
+class NamedSymbols(val symbols: Map<string, RawSymbol>, val error: string)
+
+fun elfNamedSymbols(elf: Elf32): NamedSymbols = elfNamedSymbolsStepped(elf, false)
+
+fun elfNamedSymbolsStepped(elf: Elf32, useEntrySize: bool): NamedSymbols {
+    val result: Map<string, RawSymbol> = Map()
+    val scan = elfScanSymbolsStepped(elf, false, useEntrySize)
+    if (scan.error != "") return NamedSymbols(result, scan.error)
+    for (symbol in scan.symbols) {
+        if (symbol.link < 0 || symbol.link >= elf.sections.size) return NamedSymbols(result, "symbol string table missing")
+        val name = elfCString(elf.sectionBytes(elf.sections[symbol.link]), symbol.nameOffset)
+        if (name != "") result.set(name, symbol)
+    }
+    NamedSymbols(result, "")
+}
+
+// `size` bytes at virtual `address` inside one PROGBITS section; ok is false outside them.
+class LoadedBytes(val bytes: string, val ok: bool)
+
+fun elfReadLoaded(elf: Elf32, address: int, size: int): LoadedBytes {
+    for (section in elf.sections) {
+        if (section.kind == ELF_SHT_PROGBITS && section.address <= address &&
+            address + size <= section.address + section.size) {
+            val start = section.offset + address - section.address
+            return LoadedBytes(elfSlice(elf.data, start, start + size), true)
+        }
+    }
+    LoadedBytes("", false)
+}
+
+fun isZero(bytes: string): bool {
+    for (value in bytes) {
+        if (value != 0) return false
+    }
+    true
+}
+
+// ---- objdump ----
+
+fun onPath(name: string): string {
+    val path = processEnvironmentOr("PATH", "")
+    for (directory in path.split(":")) {
+        if (directory != "" && Path(directory + "/" + name).exists()) return directory + "/" + name
+    }
+    ""
+}
+
+// The Xtensa S3 objdump: $ABLA_ESP_S3_OBJDUMP, else xtensa-esp32s3-elf-objdump on PATH, else the
+// PlatformIO copy.
+fun s3ObjdumpPath(): string {
+    val configured = processEnvironmentOr("ABLA_ESP_S3_OBJDUMP", "")
+    if (configured != "") return configured
+    val found = onPath("xtensa-esp32s3-elf-objdump")
+    if (found != "") return found
+    processEnvironmentOr("HOME", "") + "/.platformio/packages/toolchain-xtensa-esp32s3/xtensa-esp32s3-elf/bin/objdump"
+}
+
+class ObjdumpResult(val output: string, val status: int)
+
+// Runs `objdump ARGS...` (under steam-run when it is installed) and captures its output.
+fun runS3Objdump(args: array<string>): ObjdumpResult {
+    val steam = onPath("steam-run")
+    val objdump = s3ObjdumpPath()
+    val run = if (steam != "") command(steam).argument(objdump) else command(objdump)
+    for (arg in args) run.argument(arg)
+    val result = run.capture()
+    ObjdumpResult(result.output, result.status)
+}
+
+// One disassembled instruction: operands without the `<symbol>` suffix and spaces, split at commas.
+class Insn(val address: int, val width: int, val op: string, val args: array<string>)
+
+fun isSpace(ch: int): bool = ch == 32 || ch == 9 || ch == 10 || ch == 13
+
+fun isHexLower(ch: int): bool = (ch >= 48 && ch <= 57) || (ch >= 97 && ch <= 102)
+
+fun isMnemonicStart(ch: int): bool = ch >= 97 && ch <= 122
+
+fun isMnemonicChar(ch: int): bool = (ch >= 97 && ch <= 122) || (ch >= 48 && ch <= 57) || ch == 46
+
+// Splits operand text at '<' (symbol annotation), strips and removes blanks, splits at commas.
+fun operandList(rest: string): array<string> {
+    var text = rest
+    val cut = text.indexOf("<")
+    if (cut >= 0) text = text.slice(0, cut)
+    text = text.trim().replace(" ", "")
+    val empty: array<string> = []
+    if (text == "") empty else text.split(",")
+}
+
+// An objdump line `  ADDRESS:\tBYTES\tMNEMONIC OPERANDS`; null for any other line. The mnemonic's
+// `.n` suffix is kept: callers that ignore the density use `insnPlain`.
+fun parseDisasmLine(line: string): Insn? {
+    var i = 0
+    while (i < line.size && isSpace(line[i])) i = i + 1
+    val addressStart = i
+    while (i < line.size && isHexLower(line[i])) i = i + 1
+    if (i == addressStart || i >= line.size || line[i] != 58) return null
+    val address = parseHex(line.slice(addressStart, i))
+    if (address < 0) return null
+    i = i + 1
+    val spaceStart = i
+    while (i < line.size && isSpace(line[i])) i = i + 1
+    if (i == spaceStart) return null
+    val bytesStart = i
+    while (i < line.size && isHexLower(line[i])) i = i + 1
+    val digits = i - bytesStart
+    if (digits < 4 || digits > 6 || i >= line.size || !isSpace(line[i])) return null
+    while (i < line.size && isSpace(line[i])) i = i + 1
+    if (i >= line.size || !isMnemonicStart(line[i])) return null
+    val opStart = i
+    while (i < line.size && isMnemonicChar(line[i])) i = i + 1
+    val op = line.slice(opStart, i)
+    Insn(address, digits / 2, op, operandList(line.slice(i, line.size)))
+}
+
+fun insnPlain(op: string): string = if (op.endsWith(".n")) op.slice(0, op.size - 2) else op
+
+// One parsed instruction line with `.n` stripped from the mnemonic.
+fun parseDisasmInsn(line: string): Insn? {
+    val parsed = parseDisasmLine(line)
+    if (parsed == null) return null
+    Insn(parsed.address, parsed.width, insnPlain(parsed.op), parsed.args)
+}
+
+// The text of `Disassembly of section NAME:` for a line, or "".
+fun disassemblySection(line: string): string {
+    val prefix = "Disassembly of section "
+    if (!line.startsWith(prefix) || !line.endsWith(":")) return ""
+    line.slice(prefix.size, line.size - 1)
+}
+
+fun insnText(insn: Insn): string = insn.op + " " + insn.args.join(",")
+
+fun byteCodes3(first: int, second: int, third: int): string =
+    elfByte(first) + elfByte(second) + elfByte(third)
+
+// Lowercase hexadecimal of a non-negative value, without prefix.
+fun hexText(value: int): string {
+    if (value == 0) return "0"
+    var rest = value
+    var text = ""
+    while (rest > 0) {
+        val digit = rest & 15
+        text = byteEncode(if (digit < 10) 48 + digit else 87 + digit) + text
+        rest = rest >> 4
+    }
+    text
+}
+
+// Instruction words written most-significant byte first ("004136 f00c") as little-endian
+// instruction bytes (36 41 00 0c f0): each word's bytes reversed.
+fun xtensaInsns(words: string): string {
+    var result = ""
+    for (word in words.split(" ")) {
+        if (word == "") continue
+        val bytes = elfHex(word)
+        var index = bytes.size - 1
+        while (index >= 0) {
+            result = result + elfByte(bytes[index])
+            index = index - 1
+        }
+    }
+    result
+}
+
+// (address, bytes) of the one FUNC symbol defined in the section called `name`. `error` is
+// non-empty when there is no such section or not exactly one function.
+class SectionFunction(val address: int, val code: string, val error: string)
+
+fun elfSectionFunction(elf: Elf32, name: string): SectionFunction {
+    val index = elfLastSection(elf, name)
+    if (index < 0) return SectionFunction(0, "", "missing section $name")
+    val functions = elfFunctionsIn(elf, index, false)
+    if (functions.error != "") return SectionFunction(0, "", functions.error)
+    if (functions.addresses.size != 1) return SectionFunction(0, "", "section $name must define exactly one function")
+    val section = elf.sections[index]
+    val start = section.offset + functions.addresses[0] - section.address
+    SectionFunction(functions.addresses[0], elfSlice(elf.data, start, start + functions.sizes[0]), "")
+}
+
+// Like elf32Parse, but needing only the magic, 40-byte section headers and a section table that
+// lies in the file: a section-name string table that is missing or damaged leaves the names
+// empty instead of being an error (the RISC-V checks never use section names).
+fun elf32ParseLoose(data: string): Elf32 {
+    val none: array<Elf32Section> = []
+    if (data.size < 52 || elfU8(data, 0) != 0x7f || elfU8(data, 1) != 0x45 ||
+        elfU8(data, 2) != 0x4c || elfU8(data, 3) != 0x46 ||
+        elfU8(data, 4) != 1 || elfU8(data, 5) != 1) {
+        return Elf32(data, none, 0, 0, "expected little-endian ELF32")
+    }
+    val table = elfU32(data, 32)
+    val stride = elfU16(data, 46)
+    val count = elfU16(data, 48)
+    if (stride != 40 || !elfInRange(data, table, count * 40)) {
+        return Elf32(data, none, elfU32(data, 24), elfU16(data, 16), "unsupported ELF32 section table")
+    }
+    val sections: array<Elf32Section> = []
+    var index = 0
+    while (index < count) {
+        val at = table + index * 40
+        sections.append(Elf32Section(
+            "", elfU32(data, at), elfU32(data, at + 4),
+            elfU32(data, at + 8), elfU32(data, at + 12), elfU32(data, at + 16),
+            elfU32(data, at + 20), elfU32(data, at + 24), elfU32(data, at + 28),
+            elfU32(data, at + 32), elfU32(data, at + 36)))
+        index = index + 1
+    }
+    Elf32(data, sections, elfU32(data, 24), elfU16(data, 16), "")
+}
