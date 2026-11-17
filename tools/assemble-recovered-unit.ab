@@ -1,0 +1,1709 @@
+// Assemble recovered archive members into one Abla unit and compile it.
+//
+//   tools/abla-tool assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist
+//
+// Takes each member's lifted.ab and link.ab from tools/recover-member under
+// build/recovery/<chip>/<archive>/<member>/, copies them into
+// build/recovery/<chip>/unit/, and runs the cross-module passes that only make
+// sense once the whole corpus is Abla:
+//
+// 1. centralize-abla-owned-storage: data referenced from more than one module
+//    moves into one cycle-free shared_storage.ab;
+// 2. lower-abla-owned-symbol-addresses: `$xtensa address {sym}` uses of
+//    Abla-owned functions and data become ordinary Abla values;
+// 3. direct-recovered-xtensa-calls: symbolic calls to Abla-owned functions
+//    become ordinary Abla calls (inlinable, tree-shakeable);
+// 4. merge-recovered-join-tails: tails the structurizer copied into every
+//    branch arm are hoisted after the branch.
+//
+// Then it compiles the unit to one object with every link selector applied,
+// which is what an application links instead of the Espressif archives.
+//
+// With --exports FILE only the listed symbols stay global; every other
+// `exportFunction` selector becomes `internalFunction`, which keeps the exact
+// link name for raw assembly in the same object but lets LLVM inline and drop
+// the function. --exports-from-map regenerates FILE from an application link
+// map (see asmLinkMapReferences).
+//
+// This file replaces the Python tool of the same name. Its text rewrites were
+// regular expressions with multi-line, lookahead and back-reference forms that the
+// Abla regex library does not have, so each one is a scanner that follows the
+// same matching rules; the Python pattern is quoted above each scanner. The
+// stage tools run as `tools/abla-tool NAME ARGS`.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "abla/process/exit"
+import "lib/recovery.ab"
+
+// ---------------------------------------------------------------- scanning helpers
+
+private fun asmAt(text: string, i: int, literal: string): bool {
+    if (i < 0 || i + literal.size > text.size) return false
+    var j = 0
+    while (j < literal.size) {
+        if (text[i + j] != literal[j]) return false
+        j = j + 1
+    }
+    true
+}
+
+private fun asmWordEnd(text: string, from: int): int {
+    var e = from
+    while (e < text.size && recoveryIsWord(text[e])) e = e + 1
+    e
+}
+
+private fun asmSpaceEnd(text: string, from: int): int {
+    var e = from
+    while (e < text.size && recoveryIsSpace(text[e])) e = e + 1
+    e
+}
+
+private fun asmDigitsEnd(text: string, from: int): int {
+    var e = from
+    while (e < text.size && recoveryIsDigit(text[e])) e = e + 1
+    e
+}
+
+// A character of Python's `[\w.$]` and of `[\w$]`.
+private fun asmIsRef1(c: int): bool = recoveryIsWord(c) || c == 46 || c == 36
+
+private fun asmIsRef2(c: int): bool = recoveryIsWord(c) || c == 36
+
+// The first position at or after `pos` where `(?m)^` matches, or -1.
+private fun asmLineStartFrom(text: string, pos: int): int {
+    if (pos > text.size) return -1
+    if (pos == 0 || text[pos - 1] == 10) return pos
+    val nl = text.indexOf("\n", pos)
+    if (nl < 0) return -1
+    nl + 1
+}
+
+private fun asmIsLineStart(text: string, p: int): bool = p == 0 || text[p - 1] == 10
+
+// The end of `\s*$` (multi-line) from `from`: the largest position inside the whitespace run
+// that is at the end of the text or before a newline; -1 when there is none.
+private fun asmLineEndAfterSpace(text: string, from: int): int {
+    val limit = asmSpaceEnd(text, from)
+    var q = limit
+    while (q >= from) {
+        if (q == text.size || text[q] == 10) return q
+        q = q - 1
+    }
+    -1
+}
+
+// `(?<![\w.$])NAME(?![\w$])` found anywhere in `text`.
+private fun asmHasReference(text: string, name: string): bool {
+    var at = text.indexOf(name)
+    while (at >= 0) {
+        val before = at == 0 || !asmIsRef1(text[at - 1])
+        val afterAt = at + name.size
+        val after = afterAt >= text.size || !asmIsRef2(text[afterAt])
+        if (before && after) return true
+        at = text.indexOf(name, at + 1)
+    }
+    false
+}
+
+private fun asmRepr(values: array<string>): string {
+    val parts: array<string> = []
+    for (value in values) parts.append("'" + value + "'")
+    "[" + parts.join(", ") + "]"
+}
+
+private fun asmFail(message: string): int {
+    eprintln(message)
+    exit(1)
+}
+
+private fun asmRead(path: string): string {
+    val read = Path(path).readTextResult()
+    if (!read.succeeded) asmFail("assemble-recovered-unit: cannot read $path")
+    recoveryTranslateNewlines(read.text)
+}
+
+private fun asmWrite(path: string, text: string): void {
+    if (!Path(path).writeText(text)) asmFail("assemble-recovered-unit: cannot write $path")
+}
+
+// ---------------------------------------------------------------- read_function_tables_through_storage
+
+// FUNCTION_TABLE = (?ms)^val (?P<value>esp32Data_\w+)Storage = nativeStaticAllocate\(\d+\)\n
+//                  trusted fun (?P=value)Initialize\(\): int \{\n(?P<body>.*?)^\}\n
+// The values of the tables whose initializer body names nativeFunctionAddress(.
+private fun asmFunctionTables(text: string): array<string> {
+    val found: array<string> = []
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        if (asmAt(text, p, "val esp32Data_")) {
+            val e = asmWordEnd(text, p + 4)
+            val run = text.slice(p + 4, e)
+            if (run.size >= 18 && run.endsWith("Storage") && asmAt(text, e, " = nativeStaticAllocate(")) {
+                val value = run.slice(0, run.size - 7)
+                val d = asmDigitsEnd(text, e + 24)
+                if (d > e + 24 && asmAt(text, d, ")\n")) {
+                    val header = "trusted fun " + value + "Initialize(): int {\n"
+                    if (asmAt(text, d + 2, header)) {
+                        val bodyStart = d + 2 + header.size
+                        var q = bodyStart
+                        var closed = -1
+                        while (q >= 0 && q < text.size) {
+                            if (text[q] == 125 && q + 1 < text.size && text[q + 1] == 10) {
+                                closed = q
+                                break
+                            }
+                            val nl = text.indexOf("\n", q)
+                            q = if (nl < 0) -1 else nl + 1
+                        }
+                        if (closed >= 0) {
+                            if (text.slice(bodyStart, closed).indexOf("nativeFunctionAddress(") >= 0) found.append(value)
+                            end = closed + 2
+                        }
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    found
+}
+
+private fun asmReplaceStorageWords(text: string, tables: Map<string, bool>): string {
+    val out: array<string> = []
+    var i = 0
+    var copied = 0
+    while (i < text.size) {
+        if (recoveryIsWord(text[i])) {
+            val e = asmWordEnd(text, i)
+            val word = text.slice(i, e)
+            if (tables.has(word)) {
+                out.append(text.slice(copied, i))
+                out.append("u32(" + word + "Storage)")
+                copied = e
+            }
+            i = e
+        } else {
+            i = i + 1
+        }
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+// re.split(r"(?m)^(?=trusted fun |val |@)", text), the parts starting with `trusted fun ` or `@`
+// (and not esp32Data_...Initialize( functions) rewritten.
+private fun asmRewriteStorageReads(text: string, tables: Map<string, bool>): string {
+    val starts: array<int> = []
+    var p = 0
+    while (p >= 0 && p < text.size) {
+        if (asmAt(text, p, "trusted fun ") || asmAt(text, p, "val ") || asmAt(text, p, "@")) starts.append(p)
+        val nl = text.indexOf("\n", p)
+        p = if (nl < 0) -1 else nl + 1
+    }
+    val out: array<string> = []
+    if (starts.size == 0 || starts[0] > 0) out.append(text.slice(0, if (starts.size == 0) text.size else starts[0]))
+    var i = 0
+    while (i < starts.size) {
+        val start = starts[i]
+        val end = if (i + 1 < starts.size) starts[i + 1] else text.size
+        var rewrite = asmAt(text, start, "trusted fun ") || asmAt(text, start, "@")
+        if (rewrite && asmAt(text, start, "trusted fun esp32Data_")) {
+            val e = asmWordEnd(text, start + 12)
+            val run = text.slice(start + 12, e)
+            if (run.size >= 21 && run.endsWith("Initialize") && e < text.size && text[e] == 40) rewrite = false
+        }
+        val part = text.slice(start, end)
+        out.append(if (rewrite) asmReplaceStorageWords(part, tables) else part)
+        i = i + 1
+    }
+    out.join("")
+}
+
+private fun asmReadFunctionTablesThroughStorage(unit: string): int {
+    val paths = recoveryRglob(unit, ".ab")
+    val texts: array<string> = []
+    val tables: Map<string, bool> = Map()
+    for (path in paths) {
+        val text = asmRead(path)
+        texts.append(text)
+        for (value in asmFunctionTables(text)) tables.set(value, true)
+    }
+    if (tables.size == 0) return 0
+    var changed = 0
+    var i = 0
+    while (i < paths.size) {
+        val rewritten = asmRewriteStorageReads(texts[i], tables)
+        if (rewritten != texts[i]) {
+            asmWrite(paths[i], rewritten)
+            changed = changed + 1
+        }
+        i = i + 1
+    }
+    changed
+}
+
+// ---------------------------------------------------------------- link map, exports
+
+private val asmExport = regexCompile("""exportFunction\("(\w+)",\s*"([^"]+)"\)""").regex
+
+// Symbols the unit defines that some other input file references (the `-Wl,--cref` table: a symbol
+// line names its defining file, the indented lines after it the referencing files).
+private fun asmLinkMapReferences(mapPath: string): array<string> {
+    val lines = asmRead(mapPath).split("\n")
+    var start = -1
+    var i = 0
+    while (i < lines.size) {
+        if (lines[i] == "Cross Reference Table") {
+            start = i + 3
+            break
+        }
+        i = i + 1
+    }
+    if (start < 0) asmFail("assemble-recovered-unit: no `Cross Reference Table` in $mapPath")
+    val unitObject = "unit/unit.o"
+    val needed: Map<string, bool> = Map()
+    var current = ""
+    var definedHere = false
+    i = start
+    while (i < lines.size) {
+        val line = lines[i]
+        i = i + 1
+        if (recoveryStrip(line) == "") continue
+        if (!line.startsWith(" ")) {
+            val space = line.indexOf(" ")
+            current = if (space < 0) line else line.slice(0, space)
+            val where = if (space < 0) "" else line.slice(space + 1, line.size)
+            definedHere = where.indexOf(unitObject) >= 0
+            if (definedHere) needed.set(current, false)
+        } else if (definedHere && line.indexOf(unitObject) < 0) {
+            needed.set(current, true)
+        }
+    }
+    val names: array<string> = []
+    for (name in needed.keys()) {
+        val used = needed.get(name)
+        if (used != null && used) names.append(name)
+    }
+    sortedStrings(names)
+}
+
+class AsmRestricted(val text: string, val dropped: int)
+
+// Turns exportFunction selectors for symbols outside `keep` into internal ones.
+private fun asmRestrictExports(link: string, keep: Map<string, bool>): AsmRestricted {
+    val out: array<string> = []
+    var copied = 0
+    var dropped = 0
+    for (m in asmExport.findAll(link)) {
+        val name = m.group(2) ?? ""
+        if (keep.has(name)) continue
+        dropped = dropped + 1
+        out.append(link.slice(copied, m.start()))
+        out.append("internalFunction(\"" + (m.group(1) ?? "") + "\", \"" + name + "\")")
+        copied = m.end()
+    }
+    out.append(link.slice(copied, link.size))
+    AsmRestricted(out.join(""), dropped)
+}
+
+// ---------------------------------------------------------------- feature rewrites
+
+class AsmRewrite(val function: string, val nullAddresses: array<string>, val skipCalls: array<string>)
+
+class AsmCount(val text: string, val count: int)
+
+// CALL_LINE = ^(?P<ind>\s*)(?P<lhs>r\d+|val callResult\d+) = (?:\$xtensa call(?:Wide)? \{SYM\}\([^)]*\))\n  (multi-line)
+// Replaces each such call line by `lhs = u32(0)` (`u64(0)` for `val callResultN`).
+private fun asmDropCalls(body: string, symbol: string): AsmCount {
+    val out: array<string> = []
+    var pos = 0
+    var copied = 0
+    var count = 0
+    val target = " {" + symbol + "}("
+    while (true) {
+        val p = asmLineStartFrom(body, pos)
+        if (p < 0 || p >= body.size) break
+        val q = asmSpaceEnd(body, p)
+        var lhsEnd = -1
+        var wide = false
+        if (asmAt(body, q, "val callResult")) {
+            val d = asmDigitsEnd(body, q + 14)
+            if (d > q + 14) {
+                lhsEnd = d
+                wide = true
+            }
+        } else if (q < body.size && body[q] == 114) {
+            val d = asmDigitsEnd(body, q + 1)
+            if (d > q + 1) lhsEnd = d
+        }
+        var end = -1
+        if (lhsEnd >= 0 && asmAt(body, lhsEnd, " = \$xtensa call")) {
+            var r = lhsEnd + 15
+            if (asmAt(body, r, "Wide")) r = r + 4
+            if (asmAt(body, r, target)) {
+                val close = body.indexOf(")", r + target.size)
+                if (close >= 0 && close + 1 < body.size && body[close + 1] == 10) end = close + 2
+            }
+        }
+        if (end > 0) {
+            out.append(body.slice(copied, p))
+            out.append(body.slice(p, q))
+            out.append(body.slice(q, lhsEnd))
+            out.append(if (wide) " = u64(0)\n" else " = u32(0)\n")
+            copied = end
+            count = count + 1
+            pos = end
+        } else {
+            pos = p + 1
+        }
+    }
+    out.append(body.slice(copied, body.size))
+    AsmCount(out.join(""), count)
+}
+
+// The end of `^\)[^\n]*\{\n` (multi-line) in `body`, or -1.
+private fun asmFeatureHeaderEnd(body: string): int {
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(body, pos)
+        if (p < 0 || p >= body.size) return -1
+        if (body[p] == 41) {
+            val nl = body.indexOf("\n", p)
+            if (nl >= 0 && nl - 1 > p && body[nl - 1] == 123) return nl + 1
+        }
+        pos = p + 1
+    }
+    -1
+}
+
+// Nulls address-of and skips direct calls to feature symbols in the named functions (the function is
+// found by the `// Original ABI symbol: NAME` comment above its Abla body).
+private fun asmApplyFeatureRewrites(text0: string, rewrites: array<AsmRewrite>, var applied: Map<string, int>): string {
+    var text = text0
+    for (item in rewrites) {
+        val marker = "// Original ABI symbol: " + item.function + "\n"
+        val start = text.indexOf(marker)
+        if (start < 0) continue
+        val found = text.indexOf("\n}\n", start)
+        // Python slices with end -1 when the terminator is missing: all but the last character.
+        val end = if (found < 0) text.size - 1 else found
+        var body = text.slice(start, end)
+        for (symbol in item.nullAddresses) {
+            val needle = "\$xtensa address {" + symbol + "}"
+            val count = recoveryCount(body, needle)
+            body = body.replace(needle, "u32(0)")
+            applied.set(item.function + ":addr:" + symbol, count)
+        }
+        for (symbol in item.skipCalls) {
+            val dropped = asmDropCalls(body, symbol)
+            body = dropped.text
+            applied.set(item.function + ":call:" + symbol, dropped.count)
+        }
+        val refs: array<string> = []
+        for (symbol in item.nullAddresses) refs.append(symbol)
+        for (symbol in item.skipCalls) refs.append(symbol)
+        var droppedCalls = 0
+        for (symbol in item.skipCalls) droppedCalls = droppedCalls + (applied.get(item.function + ":call:" + symbol) ?? 0)
+        val headerEnd = asmFeatureHeaderEnd(body)
+        if (headerEnd < 0) asmFail("assemble-recovered-unit: no function header in the body of ${item.function}")
+        body = body.slice(0, headerEnd) + "    // abla-feature-rewrite: calls=$droppedCalls refs=${refs.join(",")}\n" +
+            body.slice(headerEnd, body.size)
+        text = text.slice(0, start) + body + text.slice(end, text.size)
+    }
+    text
+}
+
+// ---------------------------------------------------------------- coverage
+
+private val asmCoverageSource = """
+import "../../../../src/xtensa/assembly.ab"
+import "abla/unsafe/native"
+import "abla/unsafe/memory"
+
+// ABLA_COVERAGE=1 builds only: the first call of recovered function N prints
+// `ABLACOV N` once (names in coverage.tsv). IRAM and DRAM only, so callers
+// that run with the flash cache disabled can reach it.
+@section(".iram1.abla_coverage")
+@noinline
+trusted fun ablaRecoveredCoverage(index: u32): void {
+    val hits = nativeStaticAllocate(@COUNT@)
+    val flag = nativePointerFromAddress(hits + int(index))
+    if (ablaUnsafeLoadU8(flag) != 0) return
+    ablaUnsafeStoreU8(flag, 1)
+    val text = nativeStaticAllocate(16)
+    val prefix = "ABLACOV "
+    var at = 0
+    while (at < 8) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(text + at), prefix[at])
+        at = at + 1
+    }
+    var value = int(index)
+    var digits = 1
+    var scale = 1
+    while (value / scale >= 10) {
+        scale = scale * 10
+        digits = digits + 1
+    }
+    while (scale > 0) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(text + at), 48 + (value / scale) % 10)
+        at = at + 1
+        scale = scale / 10
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + at), 10)
+    ablaUnsafeStoreU8(nativePointerFromAddress(text + at + 1), 0)
+    val printed = $xtensa call {esp_rom_printf}(u32(text))
+}
+"""
+
+// Makes each lifted function report its first call (ABLA_COVERAGE=1). Raw-assembly bodies are not instrumented.
+private fun asmInstrumentCoverage(unit: string, modules: array<string>): int {
+    val tsv: array<string> = []
+    var rows = 0
+    for (module in modules) {
+        val path = unit + "/" + module
+        val lines = asmRead(path).split("\n")
+        val out: array<string> = []
+        var pending = ""
+        var hasPending = false
+        var symbol = ""
+        for (line in lines) {
+            if (line.startsWith("// Original ABI symbol: ")) {
+                val at = line.indexOf(": ")
+                symbol = recoveryStrip(line.slice(at + 2, line.size))
+            }
+            val raw = line.indexOf("\$xtensa instructions") >= 0
+            var nameStart = -1
+            if (line.startsWith("trusted fun esp32Recovered")) nameStart = 12
+            else if (line.startsWith("fun esp32Recovered")) nameStart = 4
+            if (nameStart >= 0) {
+                val e = asmWordEnd(line, nameStart)
+                if (e > nameStart + 14 && e < line.size && line[e] == 40 && !raw) {
+                    pending = line.slice(nameStart, e)
+                    hasPending = true
+                }
+            }
+            out.append(line)
+            if (hasPending) {
+                var end = line.size
+                while (end > 0 && recoveryIsSpace(line[end - 1])) end = end - 1
+                val opens = end > 0 && line[end - 1] == 123
+                if (opens && (line.indexOf("): ") >= 0 || line.startsWith("trusted fun") || line.startsWith("fun "))) {
+                    if (raw) {
+                        hasPending = false
+                        continue
+                    }
+                    out.append("    ablaRecoveredCoverage(u32($rows))")
+                    tsv.append("$rows\t$module\t$pending\t$symbol\n")
+                    rows = rows + 1
+                    hasPending = false
+                    symbol = ""
+                }
+            }
+        }
+        var text = out.join("\n")
+        if (text.indexOf("import \"../coverage.ab\"") < 0) text = "import \"../coverage.ab\"\n" + text
+        asmWrite(path, text)
+    }
+    asmWrite(unit + "/coverage.ab", asmCoverageSource.replace("@COUNT@", "${if (rows > 1) rows else 1}") + "\n")
+    asmWrite(unit + "/coverage.tsv", tsv.join(""))
+    rows
+}
+
+// ---------------------------------------------------------------- ROM entries
+
+private val asmRomProvide = regexCompile("""PROVIDE\s*\(\s*([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+)""").regex
+
+// Text without `/* ... */` comments (re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)).
+private fun asmStripBlockComments(text: string): string {
+    val out: array<string> = []
+    var copied = 0
+    var from = 0
+    while (true) {
+        val open = text.indexOf("/*", from)
+        if (open < 0) break
+        val close = text.indexOf("*/", open + 2)
+        if (close < 0) break
+        out.append(text.slice(copied, open))
+        copied = close + 2
+        from = copied
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+class AsmAssignments(val names: array<string>, val values: array<string>)
+
+// ROM_ASSIGNMENT = (?m)^\s*([A-Za-z_]\w*)\s*=\s*(0x[0-9A-Fa-f]+)\s*;
+private fun asmRomAssignments(text: string): AsmAssignments {
+    val names: array<string> = []
+    val values: array<string> = []
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        val q = asmSpaceEnd(text, p)
+        if (q < text.size && (text[q] == 95 || (text[q] >= 65 && text[q] <= 90) || (text[q] >= 97 && text[q] <= 122))) {
+            val e = asmWordEnd(text, q)
+            val a = asmSpaceEnd(text, e)
+            if (a < text.size && text[a] == 61) {
+                val b = asmSpaceEnd(text, a + 1)
+                if (asmAt(text, b, "0x")) {
+                    var h = b + 2
+                    while (h < text.size && recoveryIsHex(text[h])) h = h + 1
+                    if (h > b + 2) {
+                        val s = asmSpaceEnd(text, h)
+                        if (s < text.size && text[s] == 59) {
+                            names.append(text.slice(q, e))
+                            values.append(text.slice(b, h))
+                            end = s + 1
+                        }
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    AsmAssignments(names, values)
+}
+
+// Defines the ROM functions recover-member left out (class `rom` in reuse.tsv) as absolute symbols
+// at the ROM linker script's address, so the archive scan finds them defined.
+private fun asmWriteRomEntries(unit: string, base: string, archives: array<string>, profile: RecoveryProfile): int {
+    val addressNames: array<string> = []
+    val addressValues: array<string> = []
+    val known: Map<string, string> = Map()
+    for (script in profile.romLinkerScripts) {
+        val text = asmStripBlockComments(asmRead(script))
+        for (m in asmRomProvide.findAll(text)) {
+            val name = m.group(1) ?? ""
+            if (!known.has(name)) known.set(name, m.group(2) ?? "")
+        }
+        val assigned = asmRomAssignments(text)
+        var i = 0
+        while (i < assigned.names.size) {
+            if (!known.has(assigned.names[i])) known.set(assigned.names[i], assigned.values[i])
+            i = i + 1
+        }
+    }
+    val names: Map<string, bool> = Map()
+    for (archive in archives) {
+        val members: array<string> = []
+        for (entry in Path(base + "/" + archive).entries()) {
+            if (Path(entry.text + "/reuse.tsv").info().isFile()) members.append(entry.name())
+        }
+        for (member in sortedStrings(members)) {
+            val lines = recoverySplitLines(asmRead(base + "/" + archive + "/" + member + "/reuse.tsv"))
+            var i = 1
+            while (i < lines.size) {
+                val fields = lines[i].split("\t")
+                if (fields.size > 2 && fields[2] == "rom" && known.has(fields[0])) names.set(fields[0], true)
+                i = i + 1
+            }
+        }
+    }
+    if (names.size == 0) return 0
+    val body: array<string> = []
+    for (name in sortedStrings(names.keys())) body.append(".global " + name + "\n.set " + name + ", " + (known.get(name) ?? "") + "\n")
+    asmWrite(unit + "/rom_entries.ab", "import \"../../../../src/xtensa/assembly.ab\"\n\n" +
+        "// ROM entry points recovered code calls by name (see write_rom_entries).\n" +
+        "@naked\n" +
+        "trusted fun esp32RecoveredRomEntries(): void = \$xtensa instructions {\n" + body.join("") + "}\n")
+    asmWrite(unit + "/rom_entries_link.ab", "import \"abla/build\"\n\n" +
+        "compile fun recoveredRomEntriesLink(): bool {\n" +
+        "    if (!exportFunction(\"esp32RecoveredRomEntries\", \"abla_recovered_rom_entries\")) return false\n" +
+        "    true\n}\n")
+    names.size
+}
+
+// ---------------------------------------------------------------- section names
+
+// PUSHSECTION = (\.pushsection\s+)("?)([^,\s"]+); each section name gets `.abla_<module>` appended
+// unless it already has `.abla.` in it.
+private fun asmModuleUniqueSections(text: string, module: string): string {
+    val tag = recoverySanitize(module)
+    val out: array<string> = []
+    var copied = 0
+    var pos = 0
+    while (true) {
+        val at = text.indexOf(".pushsection", pos)
+        if (at < 0) break
+        var s = asmSpaceEnd(text, at + 12)
+        var matched = false
+        if (s > at + 12) {
+            var nameStart = s
+            if (nameStart < text.size && text[nameStart] == 34) nameStart = nameStart + 1
+            var e = nameStart
+            while (e < text.size && text[e] != 44 && text[e] != 34 && !recoveryIsSpace(text[e])) e = e + 1
+            if (e > nameStart) {
+                matched = true
+                val name = text.slice(nameStart, e)
+                if (name.indexOf(".abla.") < 0) {
+                    out.append(text.slice(copied, e))
+                    out.append(".abla_" + tag)
+                    copied = e
+                }
+                pos = e
+            }
+        }
+        if (!matched) pos = at + 1
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+// OPTIONAL_IRAM_SECTION = @section\("(\.(?:wifi0iram|wifirxiram|wifislpiram|wifislprxiram|wifiextrairam|wifiorslpiram|coexiram|coexsleepiram)\.[^"]*)"\)
+// becomes @section(".text<name>"), so the optional-IRAM functions join the unit's flash text statement.
+private fun asmFlashOptionalIramSections(text: string): string {
+    val prefixes = [".wifi0iram.", ".wifirxiram.", ".wifislpiram.", ".wifislprxiram.", ".wifiextrairam.",
+        ".wifiorslpiram.", ".coexiram.", ".coexsleepiram."]
+    val out: array<string> = []
+    var copied = 0
+    var pos = 0
+    while (true) {
+        val at = text.indexOf("@section(\"", pos)
+        if (at < 0) break
+        val nameStart = at + 10
+        val close = text.indexOf("\"", nameStart)
+        pos = at + 1
+        if (close < 0) break
+        if (close + 1 < text.size && text[close + 1] == 41) {
+            var ok = false
+            for (prefix in prefixes) if (asmAt(text, nameStart, prefix)) ok = true
+            if (ok) {
+                out.append(text.slice(copied, nameStart))
+                out.append(".text")
+                copied = nameStart
+                pos = close + 2
+            }
+        }
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+// ---------------------------------------------------------------- prune_internal_selectors
+
+
+class AsmSelector(val start: int, val end: int, val kind: string, val function: string, val name: string)
+
+// INTERNAL_SELECTOR = (?m)^\s*if \(!(internalFunction|requiredInternalFunction)\("(\w+)", "([^"]+)"\)\) return false\n
+private fun asmSelectors(text: string): array<AsmSelector> {
+    val found: array<AsmSelector> = []
+    var pos = 0
+    val tail = "\")) return false\n"
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        val q = asmSpaceEnd(text, p)
+        if (asmAt(text, q, "if (!")) {
+            val r = q + 5
+            var kind = ""
+            if (asmAt(text, r, "internalFunction")) kind = "internalFunction"
+            else if (asmAt(text, r, "requiredInternalFunction")) kind = "requiredInternalFunction"
+            if (kind != "" && asmAt(text, r + kind.size, "(\"")) {
+                val f = r + kind.size + 2
+                val fe = asmWordEnd(text, f)
+                if (fe > f && asmAt(text, fe, "\", \"")) {
+                    val n = fe + 4
+                    val close = text.indexOf("\"", n)
+                    if (close > n && asmAt(text, close, tail)) {
+                        end = close + tail.size
+                        found.append(AsmSelector(p, end, kind, text.slice(f, fe), text.slice(n, close)))
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    found
+}
+
+// re.sub(r"//[^\n]*", "", text)
+private fun asmStripLineComments(text: string): string {
+    val out: array<string> = []
+    var copied = 0
+    var pos = 0
+    while (true) {
+        val at = text.indexOf("//", pos)
+        if (at < 0) break
+        val nl = text.indexOf("\n", at)
+        val end = if (nl < 0) text.size else nl
+        out.append(text.slice(copied, at))
+        copied = end
+        pos = end
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+// RAW_FUNCTION = \bfun\s+(\w+)\s*\([^)]*\)\s*:\s*\w+\s*=\s*\$xtensa instructions
+private fun asmRawFunctions(text: string): array<string> {
+    val found: array<string> = []
+    var pos = 0
+    while (true) {
+        val at = text.indexOf("fun", pos)
+        if (at < 0) break
+        pos = at + 1
+        if (at > 0 && recoveryIsWord(text[at - 1])) continue
+        val j = asmSpaceEnd(text, at + 3)
+        if (j == at + 3) continue
+        val e = asmWordEnd(text, j)
+        if (e == j) continue
+        val k = asmSpaceEnd(text, e)
+        if (k >= text.size || text[k] != 40) continue
+        val m = text.indexOf(")", k + 1)
+        if (m < 0) continue
+        val n = asmSpaceEnd(text, m + 1)
+        if (n >= text.size || text[n] != 58) continue
+        val n2 = asmSpaceEnd(text, n + 1)
+        val w = asmWordEnd(text, n2)
+        if (w == n2) continue
+        val n3 = asmSpaceEnd(text, w)
+        if (n3 >= text.size || text[n3] != 61) continue
+        val n4 = asmSpaceEnd(text, n3 + 1)
+        if (!asmAt(text, n4, "\$xtensa instructions")) continue
+        found.append(text.slice(j, e))
+        pos = n4 + 20
+    }
+    found
+}
+
+// Names of `taken` that matter: the tokens `[A-Za-z_][\w$]*` of the sources (one per run of `[\w$]`:
+// from its first letter or underscore) that are in `interest`.
+private fun asmTokensIn(text: string, interest: Map<string, bool>): Map<string, bool> {
+    val seen: Map<string, bool> = Map()
+    if (interest.size == 0) return seen
+    var i = 0
+    while (i < text.size) {
+        if (asmIsRef2(text[i])) {
+            var e = i + 1
+            while (e < text.size && asmIsRef2(text[e])) e = e + 1
+            var f = i
+            while (f < e && !((text[f] >= 65 && text[f] <= 90) || (text[f] >= 97 && text[f] <= 122) || text[f] == 95)) f = f + 1
+            if (f < e) {
+                val token = text.slice(f, e)
+                if (interest.has(token)) seen.set(token, true)
+            }
+            i = e
+        } else {
+            i = i + 1
+        }
+    }
+    seen
+}
+
+// The names (`(?<![\w.$])NAME(?![\w$])`) that occur in `sources`. A name made of `[\w.$]` can only start a
+// run of those characters and end before a `.` or at the run's end.
+private fun asmUsedNames(sources: string, names: Map<string, bool>): Map<string, bool> {
+    val used: Map<string, bool> = Map()
+    var i = 0
+    while (i < sources.size) {
+        if (asmIsRef1(sources[i])) {
+            var e = i + 1
+            while (e < sources.size && asmIsRef1(sources[e])) e = e + 1
+            var k = i + 1
+            while (k <= e) {
+                if (k == e || sources[k] == 46) {
+                    val sub = sources.slice(i, k)
+                    if (names.has(sub)) used.set(sub, true)
+                }
+                k = k + 1
+            }
+            i = e
+        } else {
+            i = i + 1
+        }
+    }
+    for (name in names.keys()) {
+        var plain = true
+        for (c in name) if (!asmIsRef1(c)) plain = false
+        if (!plain && asmHasReference(sources, name)) used.set(name, true)
+    }
+    used
+}
+
+// re.sub(r"(?<![\w.$])(NAME|...)(?![\w$])", rename, text) with the names longest first.
+private fun asmApplyRenames(text: string, renames: Map<string, string>): string {
+    val exotic: array<string> = []
+    for (name in renames.keys()) {
+        var plain = true
+        for (c in name) if (!asmIsRef1(c)) plain = false
+        if (!plain) exotic.append(name)
+    }
+    val out: array<string> = []
+    var copied = 0
+    var i = 0
+    while (i < text.size) {
+        if (text[i] == 46 && (i == 0 || !asmIsRef1(text[i - 1]))) {
+            var e = i + 1
+            while (e < text.size && asmIsRef1(text[e])) e = e + 1
+            var best = ""
+            var k = e
+            while (k > i) {
+                if (k == e || text[k] == 46) {
+                    val sub = text.slice(i, k)
+                    if (renames.has(sub)) {
+                        best = sub
+                        break
+                    }
+                }
+                k = k - 1
+            }
+            for (name in exotic) {
+                if (name.size > best.size && asmAt(text, i, name) &&
+                    (i + name.size >= text.size || !asmIsRef2(text[i + name.size]))) best = name
+            }
+            if (best != "") {
+                out.append(text.slice(copied, i))
+                out.append(renames.get(best) ?? best)
+                copied = i + best.size
+                i = copied
+                continue
+            }
+        }
+        i = i + 1
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+class AsmPruned(val dropped: int, val exported: int, val renamed: int)
+
+private fun asmIsUnitSource(path: string): bool {
+    val name = Path(path).name()
+    !name.endsWith("_link.ab") && name != "main.ab"
+}
+
+// Drops internalFunction selectors whose link name nothing names and exports the rest (see the Python
+// tool's docstring, kept in the notes below): a name still mentioned by raw assembly or a `$xtensa address`
+// becomes a global symbol (exportFunction) so --gc-sections can follow the relocation; raw-assembly
+// functions keep an exportFunction selector; assembler-local `.L` names are renamed in every source.
+private fun asmPruneInternalSelectors(unit: string, globalNames: bool): AsmPruned {
+    val links = recoveryRglob(unit, "_link.ab")
+    val paths: array<string> = []
+    for (path in recoveryRglob(unit, ".ab")) if (asmIsUnitSource(path)) paths.append(path)
+    val texts: array<string> = []
+    val stripped: array<string> = []
+    val raw: Map<string, bool> = Map()
+    for (path in paths) {
+        val text = asmRead(path)
+        texts.append(text)
+        stripped.append(asmStripLineComments(text))
+        for (name in asmRawFunctions(text)) raw.set(name, true)
+    }
+    val sources = stripped.join("\n")
+    val linkTexts: array<string> = []
+    val names: Map<string, bool> = Map()
+    val interest: Map<string, bool> = Map()
+    for (path in links) {
+        val text = asmRead(path)
+        linkTexts.append(text)
+        for (selector in asmSelectors(text)) {
+            names.set(selector.name, true)
+            if (selector.name.startsWith(".")) {
+                interest.set(if (selector.name.startsWith(".L")) selector.name.slice(2, selector.name.size) else selector.name.slice(1, selector.name.size), true)
+            }
+        }
+    }
+    val used = asmUsedNames(sources, names)
+    val tokenSeen = asmTokensIn(sources + linkTexts.join("\n"), interest)
+    val added: Map<string, bool> = Map()
+    val renames: Map<string, string> = Map()
+    var dropped = 0
+    var exported = 0
+    var li = 0
+    while (li < links.size) {
+        val text = linkTexts[li]
+        val out: array<string> = []
+        var copied = 0
+        for (selector in asmSelectors(text)) {
+            out.append(text.slice(copied, selector.start))
+            copied = selector.end
+            if (selector.kind == "internalFunction" && !used.has(selector.name) && !raw.has(selector.function)) {
+                dropped = dropped + 1
+                continue
+            }
+            if (!globalNames) {
+                out.append(text.slice(selector.start, selector.end))
+                continue
+            }
+            exported = exported + 1
+            var name = selector.name
+            if (name.startsWith(".")) {
+                var renamed = if (name.startsWith(".L")) name.slice(2, name.size) else name.slice(1, name.size)
+                if ((tokenSeen.has(renamed) || added.has(renamed)) && (renames.get(name) ?? "\u0001") != renamed) {
+                    renamed = "abla_local_" + renamed
+                }
+                renames.set(name, renamed)
+                added.set(renamed, true)
+                name = renamed
+            }
+            out.append("    if (!exportFunction(\"" + selector.function + "\", \"" + name + "\")) return false\n")
+        }
+        out.append(text.slice(copied, text.size))
+        asmWrite(links[li], out.join(""))
+        li = li + 1
+    }
+    if (renames.size > 0) {
+        var i = 0
+        while (i < paths.size) {
+            val renamed = asmApplyRenames(texts[i], renames)
+            if (renamed != texts[i]) asmWrite(paths[i], renamed)
+            i = i + 1
+        }
+    }
+    AsmPruned(dropped, exported, renames.size)
+}
+
+// ---------------------------------------------------------------- direct_raw_long_calls
+
+class AsmHeader(val annotations: string, val function: string, val end: int)
+
+// The `(?:@[^\n]*\n)*` annotations at line start `p`: the position after them.
+private fun asmAnnotationsEnd(text: string, p: int): int {
+    var q = p
+    while (q < text.size && text[q] == 64) {
+        val nl = text.indexOf("\n", q)
+        if (nl < 0) break
+        q = nl + 1
+    }
+    q
+}
+
+// The position after `(?:trusted\s+)?fun\s+` at `q` (-1 when absent), with `fun` at the returned position - 3 - spaces.
+private fun asmFunKeywordEnd(text: string, q: int): int {
+    var r = q
+    if (asmAt(text, r, "trusted") && r + 7 < text.size && recoveryIsSpace(text[r + 7])) r = asmSpaceEnd(text, r + 7)
+    if (!asmAt(text, r, "fun")) return -1
+    val s = asmSpaceEnd(text, r + 3)
+    if (s == r + 3) return -1
+    s
+}
+
+// FUNCTION_HEADER = (?m)^((?:@[^\n]*\n)*)(?:trusted\s+)?fun\s+(\w+)\s*\(
+private fun asmFunctionHeaders(text: string): array<AsmHeader> {
+    val found: array<AsmHeader> = []
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        val q = asmAnnotationsEnd(text, p)
+        val s = asmFunKeywordEnd(text, q)
+        if (s >= 0) {
+            val e = asmWordEnd(text, s)
+            if (e > s) {
+                val k = asmSpaceEnd(text, e)
+                if (k < text.size && text[k] == 40) {
+                    end = k + 1
+                    found.append(AsmHeader(text.slice(p, q), text.slice(s, e), end))
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    found
+}
+
+// SECTION_ANNOTATION = @section\("([^"]+)"\) (first match), or "".
+private fun asmSectionOf(annotations: string): string {
+    var pos = 0
+    while (true) {
+        val at = annotations.indexOf("@section(\"", pos)
+        if (at < 0) return ""
+        val n = at + 10
+        val close = annotations.indexOf("\"", n)
+        if (close > n && close + 1 < annotations.size && annotations[close + 1] == 41) return annotations.slice(n, close)
+        pos = at + 1
+    }
+    ""
+}
+
+class AsmRawBody(val function: string, val bodyStart: int, val bodyEnd: int, val end: int)
+
+// RAW_BODY = (?ms)^((?:@[^\n]*\n)*)(?:trusted\s+)?fun\s+(\w+)\s*\(\)\s*:\s*void\s*=\s*\$xtensa instructions \{\n(.*?)\n\}$
+private fun asmRawBodies(text: string): array<AsmRawBody> {
+    val found: array<AsmRawBody> = []
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        val q = asmAnnotationsEnd(text, p)
+        val s = asmFunKeywordEnd(text, q)
+        if (s >= 0) {
+            val e = asmWordEnd(text, s)
+            val t = asmSpaceEnd(text, e)
+            if (e > s && asmAt(text, t, "()")) {
+                val u = asmSpaceEnd(text, t + 2)
+                if (u < text.size && text[u] == 58) {
+                    val v = asmSpaceEnd(text, u + 1)
+                    if (asmAt(text, v, "void")) {
+                        val w = asmSpaceEnd(text, v + 4)
+                        if (w < text.size && text[w] == 61) {
+                            val x = asmSpaceEnd(text, w + 1)
+                            val head = "\$xtensa instructions {\n"
+                            if (asmAt(text, x, head)) {
+                                val bodyStart = x + head.size
+                                var k = text.indexOf("\n}", bodyStart)
+                                while (k >= 0 && !(k + 2 == text.size || text[k + 2] == 10)) k = text.indexOf("\n}", k + 1)
+                                if (k >= 0) {
+                                    end = k + 2
+                                    found.append(AsmRawBody(text.slice(s, e), bodyStart, k, end))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    found
+}
+
+// The end of `a(?:[89]|1[0-5])` at `i`, or -1.
+private fun asmRegisterEnd(text: string, i: int): int {
+    if (i + 1 >= text.size || text[i] != 97) return -1
+    val c = text[i + 1]
+    if (c == 56 || c == 57) return i + 2
+    if (c == 49 && i + 2 < text.size && text[i + 2] >= 48 && text[i + 2] <= 53) return i + 3
+    -1
+}
+
+class AsmLongCall(val start: int, val end: int, val register: string, val symbolOrLabel: string,
+    val isLabel: bool, val callRegister: string)
+
+// LONG_CALL = (?m)^(?:l32r\s+(a(?:[89]|1[0-5])),\s*(\.L\w+)|movi\s+(a(?:[89]|1[0-5])),\s*([A-Za-z_.][\w.$]*))\s*\n
+//             callx8\s+(a(?:[89]|1[0-5]))\s*$
+private fun asmLongCalls(text: string): array<AsmLongCall> {
+    val found: array<AsmLongCall> = []
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        var isLabel = false
+        var keyword = 0
+        if (asmAt(text, p, "l32r")) {
+            keyword = 4
+            isLabel = true
+        } else if (asmAt(text, p, "movi")) {
+            keyword = 4
+        }
+        if (keyword > 0) {
+            val s = asmSpaceEnd(text, p + 4)
+            val regEnd = if (s > p + 4) asmRegisterEnd(text, s) else -1
+            if (regEnd >= 0 && regEnd < text.size && text[regEnd] == 44) {
+                val t = asmSpaceEnd(text, regEnd + 1)
+                var symEnd = -1
+                if (isLabel) {
+                    if (asmAt(text, t, ".L")) {
+                        val w = asmWordEnd(text, t + 2)
+                        if (w > t + 2) symEnd = w
+                    }
+                } else if (t < text.size && (text[t] == 46 || text[t] == 95 || (text[t] >= 65 && text[t] <= 90) ||
+                    (text[t] >= 97 && text[t] <= 122))) {
+                    var w = t + 1
+                    while (w < text.size && asmIsRef1(text[w])) w = w + 1
+                    symEnd = w
+                }
+                if (symEnd >= 0) {
+                    val z = asmSpaceEnd(text, symEnd)
+                    if (z > symEnd && text[z - 1] == 10 && asmAt(text, z, "callx8")) {
+                        val s2 = asmSpaceEnd(text, z + 6)
+                        val reg2End = if (s2 > z + 6) asmRegisterEnd(text, s2) else -1
+                        if (reg2End >= 0) {
+                            val q = asmLineEndAfterSpace(text, reg2End)
+                            if (q >= 0) {
+                                end = q
+                                found.append(AsmLongCall(p, q, text.slice(s, regEnd), text.slice(t, symEnd), isLabel,
+                                    text.slice(s2, reg2End)))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    found
+}
+
+class AsmLiterals(val labels: array<string>, val symbols: Map<string, string>)
+
+// re.findall(r"(?m)^\.literal\s+(\.L\w+),\s*([A-Za-z_.][\w.$]*)\s*$", body) as an ordered dict.
+private fun asmLiterals(body: string): AsmLiterals {
+    val labels: array<string> = []
+    val symbols: Map<string, string> = Map()
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(body, pos)
+        if (p < 0 || p >= body.size) break
+        var end = -1
+        if (asmAt(body, p, ".literal")) {
+            val s = asmSpaceEnd(body, p + 8)
+            if (s > p + 8 && asmAt(body, s, ".L")) {
+                val e = asmWordEnd(body, s + 2)
+                if (e > s + 2 && e < body.size && body[e] == 44) {
+                    val t = asmSpaceEnd(body, e + 1)
+                    if (t < body.size && (body[t] == 46 || body[t] == 95 || (body[t] >= 65 && body[t] <= 90) ||
+                        (body[t] >= 97 && body[t] <= 122))) {
+                        var y = t + 1
+                        while (y < body.size && asmIsRef1(body[y])) y = y + 1
+                        val q = asmLineEndAfterSpace(body, y)
+                        if (q >= 0) {
+                            val label = body.slice(s, e)
+                            if (!symbols.has(label)) labels.append(label)
+                            symbols.set(label, body.slice(t, y))
+                            end = q
+                        }
+                    }
+                }
+            }
+        }
+        pos = if (end > p) end else p + 1
+    }
+    AsmLiterals(labels, symbols)
+}
+
+// (?m)^\.literal\s+LABEL,.*$ (`.*\n` with `withNewline`) removed.
+private fun asmRemoveLiteralLines(text: string, label: string, withNewline: bool): string {
+    val out: array<string> = []
+    var copied = 0
+    var pos = 0
+    while (true) {
+        val p = asmLineStartFrom(text, pos)
+        if (p < 0 || p >= text.size) break
+        var end = -1
+        if (asmAt(text, p, ".literal")) {
+            val s = asmSpaceEnd(text, p + 8)
+            if (s > p + 8 && asmAt(text, s, label) && s + label.size < text.size && text[s + label.size] == 44) {
+                val nl = text.indexOf("\n", s + label.size)
+                if (withNewline) {
+                    if (nl >= 0) end = nl + 1
+                } else {
+                    end = if (nl < 0) text.size else nl
+                }
+            }
+        }
+        if (end > p) {
+            out.append(text.slice(copied, p))
+            copied = end
+            pos = end
+        } else {
+            pos = p + 1
+        }
+    }
+    out.append(text.slice(copied, text.size))
+    out.join("")
+}
+
+class AsmCounter(var calls: int, var removed: int)
+
+private fun asmRewriteRawBody(body: string, region: string, targets: Map<string, string>, var counter: AsmCounter): string {
+    val literals = asmLiterals(body)
+    val out: array<string> = []
+    var copied = 0
+    for (call in asmLongCalls(body)) {
+        val symbol = if (call.isLabel) (literals.symbols.get(call.symbolOrLabel) ?? "") else call.symbolOrLabel
+        if (call.register != call.callRegister || (targets.get(symbol) ?? "") != region || !targets.has(symbol)) continue
+        counter.calls = counter.calls + 1
+        out.append(body.slice(copied, call.start))
+        out.append("call8 " + symbol)
+        copied = call.end
+    }
+    out.append(body.slice(copied, body.size))
+    var result = out.join("")
+    for (label in literals.labels) {
+        if (!asmHasReference(asmRemoveLiteralLines(result, label, false), label)) {
+            result = asmRemoveLiteralLines(result, label, true)
+            counter.removed = counter.removed + 1
+        }
+    }
+    result
+}
+
+// Turns raw assembly's long calls within one memory region into CALL8 (see the notes in the Python tool:
+// GCC's -mlongcalls form `l32r aN, .Lx; callx8 aN` becomes `call8 sym` when caller and callee are both
+// flash-text or both .iram1 functions of the unit). Returns (calls, literals removed).
+private fun asmDirectRawLongCalls(unit: string): AsmCounter {
+    val links = recoveryRglob(unit, "_link.ab")
+    val paths: array<string> = []
+    for (path in recoveryRglob(unit, ".ab")) if (asmIsUnitSource(path)) paths.append(path)
+    val texts: array<string> = []
+    val region: Map<string, string> = Map()
+    for (path in paths) {
+        val text = asmRead(path)
+        texts.append(text)
+        for (header in asmFunctionHeaders(text)) {
+            val section = asmSectionOf(header.annotations)
+            if (section == "" || section.startsWith(".text")) region.set(header.function, "flash")
+            else if (section.startsWith(".iram1.")) region.set(header.function, "iram")
+        }
+    }
+    val linkName = regexCompile("""(?:internal|requiredInternal|export)Function\("(\w+)", "([^"]+)"\)""").regex
+    val targets: Map<string, string> = Map()
+    for (path in links) {
+        for (m in linkName.findAll(asmRead(path))) {
+            val function = m.group(1) ?? ""
+            if (region.has(function)) targets.set(m.group(2) ?? "", region.get(function) ?? "")
+        }
+    }
+    val counter = AsmCounter(0, 0)
+    var i = 0
+    while (i < paths.size) {
+        val text = texts[i]
+        val out: array<string> = []
+        var copied = 0
+        for (match in asmRawBodies(text)) {
+            if (!region.has(match.function)) continue
+            out.append(text.slice(copied, match.bodyStart))
+            out.append(asmRewriteRawBody(text.slice(match.bodyStart, match.bodyEnd), region.get(match.function) ?? "",
+                targets, counter))
+            copied = match.bodyEnd
+        }
+        out.append(text.slice(copied, text.size))
+        val rewritten = out.join("")
+        if (rewritten != text) asmWrite(paths[i], rewritten)
+        i = i + 1
+    }
+    counter
+}
+
+// ---------------------------------------------------------------- passes
+
+private fun asmRunPass(root: string, command: array<string>, var log: array<string>): void {
+    log.append("== " + command.join(" ") + "\n")
+    val words: array<string> = [root + "/tools/abla-tool"]
+    for (word in command) words.append(word)
+    val result = recoveryCaptureMerged(words, "")
+    val output = recoveryTranslateNewlines(result.output)
+    log.append(output)
+    val lines = recoverySplitLines(recoveryStrip(output))
+    val last = if (lines.size == 0) "(no output)" else lines[lines.size - 1]
+    println(command[0] + ": " + last + (if (result.status == 0) "" else " (exit ${result.status})"))
+}
+
+// ---------------------------------------------------------------- command line
+
+class AsmArguments(
+    val chip: string,
+    val archives: array<string>,
+    val noCompile: bool,
+    val exclude: string,
+    val exports: string,
+    val hasExports: bool,
+    val exportsFromMap: string,
+    val hasExportsFromMap: bool,
+    val features: string
+)
+
+private fun asmUsage(): string =
+    "usage: assemble-recovered-unit [-h] [--no-compile] [--exclude EXCLUDE] [--exports EXPORTS]\n" +
+    "                               [--exports-from-map MAP] [--features FEATURES]\n" +
+    "                               chip [archives ...]"
+
+private fun asmUsageError(message: string): int {
+    eprintln(asmUsage())
+    eprintln("assemble-recovered-unit: error: " + message)
+    exit(2)
+}
+
+private fun asmParseArguments(): AsmArguments {
+    val optionNames = ["--help", "--no-compile", "--exclude", "--exports", "--exports-from-map", "--features"]
+    val positional: array<string> = []
+    var noCompile = false
+    var exclude = ""
+    var exports = ""
+    var hasExports = false
+    var map = ""
+    var hasMap = false
+    var features = processEnvironmentOr("ABLA_FEATURES", "")
+    val unknown: array<string> = []
+    val count = processArgumentCount()
+    var i = 0
+    var onlyPositional = false
+    while (i < count) {
+        var arg = processArgument(i)
+        i = i + 1
+        if (onlyPositional || arg == "-" || !arg.startsWith("-")) {
+            positional.append(arg)
+            continue
+        }
+        if (arg == "--") {
+            onlyPositional = true
+            continue
+        }
+        if (arg == "-h") arg = "--help"
+        if (!arg.startsWith("--")) {
+            unknown.append(arg)
+            continue
+        }
+        var name = arg
+        var inline = ""
+        var hasInline = false
+        val eq = arg.indexOf("=")
+        if (eq >= 0) {
+            name = arg.slice(0, eq)
+            inline = arg.slice(eq + 1, arg.size)
+            hasInline = true
+        }
+        var chosen = ""
+        val matches: array<string> = []
+        for (option in optionNames) {
+            if (option == name) chosen = option
+            if (option.startsWith(name)) matches.append(option)
+        }
+        if (chosen == "") {
+            if (matches.size == 1) {
+                chosen = matches[0]
+            } else if (matches.size > 1) {
+                asmUsageError("ambiguous option: $name could match ${matches.join(", ")}")
+            } else {
+                unknown.append(arg)
+                continue
+            }
+        }
+        if (chosen == "--help") {
+            println(asmUsage())
+            println("\nAssemble recovered archive members into one Abla unit and compile it.")
+            exit(0)
+        }
+        if (chosen == "--no-compile") {
+            if (hasInline) asmUsageError("argument --no-compile: ignored explicit argument '$inline'")
+            noCompile = true
+            continue
+        }
+        var value = inline
+        if (!hasInline) {
+            if (i >= count) asmUsageError("argument $chosen: expected one argument")
+            value = processArgument(i)
+            if (value.startsWith("-") && value.size > 1) asmUsageError("argument $chosen: expected one argument")
+            i = i + 1
+        }
+        if (chosen == "--exclude") exclude = value
+        else if (chosen == "--exports") {
+            exports = value
+            hasExports = true
+        } else if (chosen == "--exports-from-map") {
+            map = value
+            hasMap = true
+        } else if (chosen == "--features") features = value
+    }
+    if (positional.size == 0) asmUsageError("the following arguments are required: chip")
+    if (unknown.size > 0) asmUsageError("unrecognized arguments: " + unknown.join(" "))
+    val archives: array<string> = []
+    var k = 1
+    while (k < positional.size) {
+        archives.append(positional[k])
+        k = k + 1
+    }
+    AsmArguments(positional[0], archives, noCompile, exclude, exports, hasExports, map, hasMap, features)
+}
+
+// ---------------------------------------------------------------- compile
+
+// ^error\[\w+\]: ([^\s@:]+(?::[^\s@]+)?) per line of the compiler's log.
+private fun asmErrorKind(line: string): string {
+    if (!line.startsWith("error[")) return ""
+    val w = asmWordEnd(line, 6)
+    if (w == 6 || !asmAt(line, w, "]: ")) return ""
+    val s = w + 3
+    var e = s
+    while (e < line.size && !recoveryIsSpace(line[e]) && line[e] != 64 && line[e] != 58) e = e + 1
+    if (e == s) return ""
+    if (e < line.size && line[e] == 58) {
+        var f = e + 1
+        while (f < line.size && !recoveryIsSpace(line[f]) && line[f] != 64) f = f + 1
+        if (f > e + 1) e = f
+    }
+    line.slice(s, e)
+}
+
+private fun asmCompile(root: string, chip: string, unit: string): int {
+    val compiler = recoveryAblacEnvironment(root, chip)
+    if (compiler.error != "") {
+        eprintln("recover-member: " + compiler.error)
+        return 1
+    }
+    val script = "ulimit -s 131072; \"" + compiler.binary + "\" build build.ab -o driver --no-cache && ./driver"
+    val result = recoveryCapture(["bash", "-c", script], unit, compiler.names, compiler.values)
+    val whole = recoveryTranslateNewlines(result.output + result.errors)
+    val tail = if (whole.size > 4000000) whole.slice(whole.size - 4000000, whole.size) else whole
+    asmWrite(unit + "/compile.log", tail)
+    val object = Path(unit + "/unit.o")
+    if (result.status == 0 && object.exists()) {
+        println("compiled build/recovery/$chip/unit/unit.o (${object.info().size} bytes)")
+        return 0
+    }
+    val kinds: array<string> = []
+    val counts: array<int> = []
+    for (line in whole.split("\n")) {
+        val kind = asmErrorKind(line)
+        if (kind == "") continue
+        var found = -1
+        var j = 0
+        while (j < kinds.size) {
+            if (kinds[j] == kind) found = j
+            j = j + 1
+        }
+        if (found >= 0) {
+            counts[found] = counts[found] + 1
+        } else {
+            kinds.append(kind)
+            counts.append(1)
+        }
+    }
+    var total = 0
+    for (n in counts) total = total + n
+    println("compile failed: $total error(s); see build/recovery/$chip/unit/compile.log")
+    // stable sort by descending count
+    val order: array<int> = []
+    var a = 0
+    while (a < kinds.size) {
+        var at = order.size
+        while (at > 0 && counts[order[at - 1]] < counts[a]) at = at - 1
+        order.append(a)
+        var m = order.size - 1
+        while (m > at) {
+            order[m] = order[m - 1]
+            m = m - 1
+        }
+        order[at] = a
+        a = a + 1
+    }
+    var shown = 0
+    for (index in order) {
+        if (shown >= 12) break
+        println("  " + "${counts[index]}".padStart(6) + " " + kinds[index])
+        shown = shown + 1
+    }
+    1
+}
+
+// ---------------------------------------------------------------- main
+
+fun main: int {
+    val root = recoveryRoot()
+    val args = asmParseArguments()
+    if (args.hasExportsFromMap) {
+        val names = asmLinkMapReferences(args.exportsFromMap)
+        if (!args.hasExports) return asmFail("assemble-recovered-unit: --exports-from-map needs --exports FILE")
+        val lines: array<string> = []
+        for (name in names) lines.append(name + "\n")
+        asmWrite(args.exports, lines.join(""))
+        println("${names.size} symbols referenced from outside the unit -> ${args.exports}")
+        return 0
+    }
+    var keep: Map<string, bool> = Map()
+    if (args.hasExports) {
+        for (line in recoverySplitLines(asmRead(args.exports))) {
+            val name = recoveryStrip(line)
+            if (name != "") keep.set(name, true)
+        }
+    }
+    var exported = 0
+    var dropped = 0
+
+    val loaded = recoveryLoadProfile(root, args.chip)
+    if (loaded.error != "") {
+        eprintln("recover-member: " + loaded.error)
+        return 1
+    }
+    val profile = loaded.profile
+    val rewrites: array<AsmRewrite> = []
+    for (name in args.features.split(",")) {
+        if (name == "") continue
+        val prefix = "features." + name
+        var present = profile.doc.tableCount(prefix) > 0
+        for (key in profile.doc.keys) if (key.startsWith(prefix + ".") || key.startsWith(prefix + "[")) present = true
+        if (!present) {
+            eprintln("assemble-recovered-unit: no [features.$name] in the ${args.chip} profile")
+            return 1
+        }
+        val count = profile.doc.tableCount(prefix + ".rewrite")
+        var r = 0
+        while (r < count) {
+            val key = prefix + ".rewrite[" + "$r" + "]"
+            rewrites.append(AsmRewrite(profile.doc.string(key + ".function"), profile.doc.strings(key + ".null_addresses"),
+                profile.doc.strings(key + ".skip_calls")))
+            r = r + 1
+        }
+    }
+    val applied: Map<string, int> = Map()
+    val base = root + "/build/recovery/" + args.chip
+    val unit = base + "/unit"
+    if (Path(unit).exists()) Path(unit).removeTree()
+    Path(unit).createDirectories()
+    val selectors: array<string> = []
+    val selectorLinks: array<string> = []
+    val modules: array<string> = []
+    val excluded: Map<string, bool> = Map()
+    for (item in args.exclude.split(",")) if (item != "") excluded.set(item, true)
+    for (archive in args.archives) {
+        if (Path(unit + "/" + archive).exists()) {
+            eprintln("assemble-recovered-unit: $unit/$archive exists")
+            return 1
+        }
+        Path(unit + "/" + archive).createDirectories()
+        if (!Path(base + "/" + archive).info().isDirectory()) {
+            eprintln("assemble-recovered-unit: no such directory $base/$archive")
+            return 1
+        }
+        val members: array<string> = []
+        for (entry in Path(base + "/" + archive).entries()) {
+            if (Path(entry.text + "/lifted.ab").exists()) members.append(entry.name())
+        }
+        for (member in sortedStrings(members)) {
+            if (excluded.has(archive + "/" + member)) continue
+            val module = archive + "/" + member + ".ab"
+            val memberDir = base + "/" + archive + "/" + member
+            // Same directory depth as the member work directory, so the relative src/ imports stay valid.
+            var text = asmRead(memberDir + "/lifted.ab")
+            if (rewrites.size > 0) text = asmApplyFeatureRewrites(text, rewrites, applied)
+            text = asmFlashOptionalIramSections(text)
+            asmWrite(unit + "/" + module, asmModuleUniqueSections(text, archive + "_" + member))
+            modules.append(module)
+            if (Path(memberDir + "/link.ab").exists()) {
+                val link = archive + "/" + member + "_link.ab"
+                var linkText = asmRead(memberDir + "/link.ab")
+                if (args.hasExports) {
+                    val restricted = asmRestrictExports(linkText, keep)
+                    linkText = restricted.text
+                    dropped = dropped + restricted.dropped
+                }
+                exported = exported + asmExport.findAll(linkText).size
+                asmWrite(unit + "/" + link, linkText)
+                // SELECTOR = ^compile fun (\w+)\(\): bool   (multi-line)
+                var p = 0
+                while (p >= 0 && p < linkText.size) {
+                    if (asmAt(linkText, p, "compile fun ")) {
+                        val e = asmWordEnd(linkText, p + 12)
+                        if (e > p + 12 && asmAt(linkText, e, "(): bool")) {
+                            selectorLinks.append(link)
+                            selectors.append(linkText.slice(p + 12, e))
+                        }
+                    }
+                    val nl = linkText.indexOf("\n", p)
+                    p = if (nl < 0) -1 else nl + 1
+                }
+            }
+        }
+    }
+    if (rewrites.size > 0) {
+        val missing: array<string> = []
+        val seen: Map<string, bool> = Map()
+        for (r in rewrites) {
+            for (symbol in r.nullAddresses) {
+                val key = r.function + ":addr:" + symbol
+                if (!seen.has(key)) {
+                    seen.set(key, true)
+                    if ((applied.get(key) ?? 0) == 0) missing.append(key)
+                }
+            }
+            for (symbol in r.skipCalls) {
+                val key = r.function + ":call:" + symbol
+                if (!seen.has(key)) {
+                    seen.set(key, true)
+                    if ((applied.get(key) ?? 0) == 0) missing.append(key)
+                }
+            }
+        }
+        var edits = 0
+        for (key in applied.keys()) edits = edits + (applied.get(key) ?? 0)
+        println("features ${args.features}: $edits edits in ${rewrites.size} functions" +
+            (if (missing.size > 0) "; NOT APPLIED: " + asmRepr(sortedStrings(missing)) else ""))
+    }
+    asmWrite(unit + "/shared_storage.ab", "import \"abla/unsafe/native\"\n\n// Data owned by more than one recovered module.\n")
+    println("${modules.size} modules, ${selectors.size} link selectors" +
+        (if (args.hasExports) " ($exported exported, $dropped made internal)" else ""))
+
+    val skipPasses = processEnvironmentOr("ABLA_SIZE_SKIP", "").split(",")
+    val log: array<string> = []
+    var skipCallAddress = false
+    var skipMerge = false
+    var skipNoinline = false
+    var skipRawCalls = false
+    for (item in skipPasses) {
+        if (item == "calladdress") skipCallAddress = true
+        if (item == "merge") skipMerge = true
+        if (item == "noinline") skipNoinline = true
+        if (item == "rawcalls") skipRawCalls = true
+    }
+    asmRunPass(root, ["centralize-abla-owned-storage", "--write", "--initialized-constants", unit,
+        unit + "/shared_storage.ab"], log)
+    asmRunPass(root, ["lower-abla-owned-symbol-addresses", "--write", "--cross-module-data",
+        "--cross-module-functions", unit], log)
+    val direct: array<string> = ["direct-recovered-xtensa-calls", unit, "--write", "--library-root", root + "/src"]
+    for (prefix in profile.standardCallModules) {
+        direct.append("--standard-module-prefix")
+        direct.append(prefix)
+    }
+    for (symbol in profile.standardCallExclude) {
+        direct.append("--standard-exclude")
+        direct.append(symbol)
+    }
+    asmRunPass(root, direct, log)
+    // What direct calls could not take (variadic or stack-reading raw callees, ...) still names an
+    // Abla-owned function through an opaque `movi sym`. Calling the function's address instead lets
+    // LLVM see the edge, so the link name (and its retained section) can go.
+    if (!skipCallAddress) {
+        asmRunPass(root, ["lower-abla-owned-symbol-addresses", "--write", "--cross-module-functions", "--calls", unit], log)
+    }
+    // ABLA_SIZE_SKIP=merge,noinline disables these size passes (bisecting).
+    if (!skipMerge) asmRunPass(root, ["merge-recovered-join-tails", unit, "--write"], log)
+    if (!skipNoinline) {
+        asmRunPass(root, ["mark-recovered-noinline", unit, "--write", "--inline-lines",
+            processEnvironmentOr("ABLA_RECOVERED_INLINE_LINES", "0")], log)
+    }
+    asmWrite(unit + "/passes.log", log.join(""))
+    println("function tables read through storage in ${asmReadFunctionTablesThroughStorage(unit)} modules")
+    if (!skipRawCalls) {
+        val counter = asmDirectRawLongCalls(unit)
+        println("raw long calls made direct: ${counter.calls} (${counter.removed} literals removed)")
+    }
+    val pruned = asmPruneInternalSelectors(unit, processEnvironmentOr("ABLA_RAW_NAMES", "export") != "internal")
+    println("internal link names dropped (no assembler user): ${pruned.dropped}; " +
+        "kept as global names (gc-able): ${pruned.exported} (${pruned.renamed} assembler-local names renamed)")
+
+    if (processEnvironmentOr("ABLA_COVERAGE", "") == "1") {
+        println("coverage: instrumented ${asmInstrumentCoverage(unit, modules)} function(s); map in coverage.tsv")
+    }
+    val romEntries = asmWriteRomEntries(unit, base, args.archives, profile)
+    if (romEntries > 0) {
+        modules.append("rom_entries.ab")
+        selectorLinks.append("rom_entries_link.ab")
+        selectors.append("recoveredRomEntriesLink")
+        println("ROM entry points defined in the unit: $romEntries")
+    }
+    val mainSource: array<string> = []
+    for (module in modules) mainSource.append("import \"" + module + "\"\n")
+    val importedLinks: Map<string, bool> = Map()
+    for (link in selectorLinks) {
+        if (!importedLinks.has(link)) {
+            importedLinks.set(link, true)
+            mainSource.append("import \"" + link + "\"\n")
+        }
+    }
+    mainSource.append("\n")
+    for (name in selectors) mainSource.append("#" + name + "()\n")
+    asmWrite(unit + "/main.ab", mainSource.join(""))
+    asmWrite(unit + "/build.ab", "import \"abla/compiler\"\n\n" +
+        "val target = #compilerDefineTarget(\"esp32-xtensa\", \"xtensa-esp-unknown-elf\", \"elf\", \"none\", \"none\", false, false)\n" +
+        "val built = #compilerBuildProgram(\"" + args.chip + "-recovered-radio\", \"main.ab\", \"unit.o\", \"esp32-xtensa\", \"object\", false, false)\n\n" +
+        "fun main: int = if (target && built) 0 else 1\n")
+    if (args.noCompile) return 0
+    asmCompile(root, args.chip, unit)
+}
