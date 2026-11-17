@@ -1,0 +1,581 @@
+// Report actual windowed frames from linked ELF + matching objdump stdin.
+//
+// Use target GNU objdump -d --no-show-raw-insn with retained .xt.prop metadata,
+// or Espressif llvm-objdump -d --mcpu=esp32s3 --no-show-raw-insn for entry frames.
+// This inventories symbol-entry frames ONLY, not instruction streams/call graphs.
+// Linear disassembly can lose alignment in embedded padding/literal pools after
+// Xtensa property sections have been stripped. Never infer calls from that.
+// ROM calls, nesting, recursion and dynamic stack operations need separate work.
+//
+//     tools/abla-tool report-xtensa-stack LINKED.elf [OPTIMIZED.ll ENTRY] < CPU-SPECIFIC-OBJDUMP.txt
+//
+// Prints the report as JSON (the same layout as the former Python tool's
+// json.dumps(indent=2)); a failure prints its reason on standard error and
+// exits 1.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/crypto"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/process/exit"
+import "lib/elf.ab"
+
+fun stackRegex(pattern: string): Regex {
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) panic("bad regular expression $pattern: ${compiled.error.message}")
+    compiled.regex
+}
+
+val STACK_LINE = stackRegex("""^\s*([0-9a-fA-F]+):\s+(.+?)\s*$""")
+val STACK_ENTRY_OPERANDS = stackRegex("""a1,\s*(0x[0-9a-fA-F]+|[0-9]+)""")
+val STACK_DEFINE = stackRegex("""^define\b.*@([A-Za-z0-9_.$]+)\(.*$""")
+val STACK_SELECT = stackRegex("""\s*(%[A-Za-z0-9_.$]+) = select i1 [^,]+, ptr inttoptr \(i(?:32|64) ([0-9]+) to ptr\), ptr inttoptr \(i(?:32|64) ([0-9]+) to ptr\)\s*""")
+val STACK_CALL_KEYWORD = stackRegex("""\s(?:call|invoke|callbr)\s""")
+val STACK_DIRECT = stackRegex("""@([A-Za-z0-9_.$]+)\(""")
+val STACK_FIXED = stackRegex("""inttoptr \(i(?:32|64) ([0-9]+) to ptr\)\(""")
+val STACK_INDIRECT = stackRegex("""(%[A-Za-z0-9_.$]+)\(""")
+
+// A function symbol: every name at one address and the shared size.
+class StackSymbol(val names: array<string>, val size: int)
+
+class StackFunction(
+    val address: int,
+    val names: array<string>,
+    var frameBytes: int,
+    var hasFrame: bool,
+    var entryInstruction: string,
+    var hasEntry: bool
+)
+
+class StackIr(
+    val sha256: string,
+    val entry: string,
+    val frameSum: int,
+    val path: array<string>,
+    val reachable: int,
+    val fixedAddresses: array<string>,
+    val unresolvedLines: array<int>,
+    val intrinsics: array<string>,
+    val scope: string
+)
+
+class StackReport(
+    val functions: array<StackFunction>,
+    val largestFrameBytes: int,
+    val functionsWithoutEntry: int,
+    var callGraph: string,
+    var ir: StackIr?
+)
+
+class StackSymbols(val symbols: Map<int, StackSymbol>, val error: string)
+
+class StackResult(val report: StackReport, val error: string)
+
+fun stackEmptyReport(): StackReport {
+    val none: array<StackFunction> = []
+    StackReport(none, 0, 0, "", null)
+}
+
+fun stackHex(value: int): string {
+    if (value == 0) return "0"
+    val digits = "0123456789abcdef"
+    var out = ""
+    var rest = value
+    while (rest > 0) {
+        out = digits.slice(rest & 15, (rest & 15) + 1) + out
+        rest = rest >> 4
+    }
+    out
+}
+
+fun stackIsHexDigit(c: int): bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+
+fun stackHexValue(c: int): int = if (c >= 97) c - 87 else if (c >= 65) c - 55 else c - 48
+
+fun stackParseHex(text: string): int {
+    var value = 0
+    for (c in text) {
+        if (stackIsHexDigit(c)) value = value * 16 + stackHexValue(c)
+    }
+    value
+}
+
+// The symbol sizes by address of a linked little-endian Xtensa executable.
+fun stackFunctions(data: string): StackSymbols {
+    val symbols: Map<int, StackSymbol> = Map()
+    if (data.size < 52 || elfU8(data, 0) != 0x7f || elfU8(data, 1) != 0x45 || elfU8(data, 2) != 0x4c ||
+        elfU8(data, 3) != 0x46 || elfU8(data, 4) != 1 || elfU8(data, 5) != 1 || elfU16(data, 18) != 94) {
+        return StackSymbols(symbols, "expected little-endian ELF32 Xtensa")
+    }
+    if (elfU16(data, 16) != 2) {
+        return StackSymbols(symbols, "expected linked executable, not relocatable object")
+    }
+    val table = elfU32(data, 32)
+    val stride = elfU16(data, 46)
+    val count = elfU16(data, 48)
+    if (stride != 40) return StackSymbols(symbols, "unsupported section table")
+    if (!elfInRange(data, table, count * 40)) {
+        return StackSymbols(symbols, "truncated ELF section table")
+    }
+    var number = 0
+    while (number < count) {
+        val at = table + number * 40
+        number = number + 1
+        if (elfU32(data, at + 4) != 2) continue // SYMTAB
+        val offset = elfU32(data, at + 16)
+        val size = elfU32(data, at + 20)
+        val link = elfU32(data, at + 24)
+        val entrySize = elfU32(data, at + 36)
+        if (entrySize != 16 || link >= count) return StackSymbols(symbols, "invalid symbol table")
+        val stringsAt = table + link * 40
+        val stringsOffset = elfU32(data, stringsAt + 16)
+        val stringsSize = elfU32(data, stringsAt + 20)
+        val names = elfSlice(data, stringsOffset, stringsOffset + stringsSize)
+        var position = offset
+        while (position < offset + size) {
+            if (!elfInRange(data, position, 16)) return StackSymbols(symbols, "truncated symbol table")
+            val nameOffset = elfU32(data, position)
+            val address = elfU32(data, position + 4)
+            val symbolSize = elfU32(data, position + 8)
+            val info = elfU8(data, position + 12)
+            val shndx = elfU16(data, position + 14)
+            position = position + 16
+            if ((info & 15) != 2 || symbolSize == 0 || shndx == 0) continue
+            val label = elfCString(names, nameOffset)
+            if (!label.isValidUtf8()) {
+                return StackSymbols(symbols, "'utf-8' codec can't decode bytes in symbol name")
+            }
+            val existing = symbols.get(address)
+            if (existing != null && existing.size != symbolSize) {
+                return StackSymbols(symbols, "function aliases disagree on size")
+            }
+            if (existing == null) {
+                val fresh: array<string> = [label]
+                symbols.set(address, StackSymbol(fresh, symbolSize))
+            } else {
+                existing.names.append(label)
+            }
+        }
+    }
+    if (symbols.size == 0) return StackSymbols(symbols, "no sized function symbols")
+    StackSymbols(symbols, "")
+}
+
+// `int(text, 0)` for the entry operand: 0x hex or decimal without leading zeros.
+fun stackParseFrame(text: string): int {
+    if (text.startsWith("0x") || text.startsWith("0X")) return stackParseHex(text.slice(2, text.size))
+    var value = 0
+    for (c in text) value = value * 10 + (c - 48)
+    value
+}
+
+fun stackFrameLiteralValid(text: string): bool {
+    if (text.startsWith("0x") || text.startsWith("0X")) return true
+    text == "0" || !text.startsWith("0")
+}
+
+// A report of each function entry's frame (ENTRY a1, N) found in `lines`.
+fun stackInspect(symbols: Map<int, StackSymbol>, lines: array<string>): StackResult {
+    val starts = stackSortedAddresses(symbols.keys())
+    val records: Map<int, StackFunction> = Map()
+    for (address in starts) {
+        records.set(address, StackFunction(address, (symbols.get(address) ?? StackSymbol([], 0)).names, 0, false, "", false))
+    }
+    for (line in lines) {
+        val match = STACK_LINE.matchFull(line)
+        if (match == null) continue
+        val address = stackParseHex(match.group(1) ?? "")
+        val record = records.get(address)
+        // Only exact ELF function entries are reliable here.
+        if (record == null) continue
+        val instruction = match.group(2) ?? ""
+        record.entryInstruction = instruction
+        record.hasEntry = true
+        var split = 0
+        while (split < instruction.size && !stackIsSpace(instruction[split])) split = split + 1
+        val opcode = instruction.slice(0, split)
+        while (split < instruction.size && stackIsSpace(instruction[split])) split = split + 1
+        val operands = instruction.slice(split, instruction.size)
+        val entry = STACK_ENTRY_OPERANDS.matchFull(operands)
+        if (opcode == "entry" && entry != null) {
+            val literal = entry.group(1) ?? ""
+            if (!stackFrameLiteralValid(literal)) {
+                return StackResult(stackEmptyReport(), "invalid literal for int() with base 0: '$literal'")
+            }
+            record.frameBytes = stackParseFrame(literal)
+            record.hasFrame = true
+        }
+    }
+    val ordered: array<StackFunction> = []
+    for (address in starts) {
+        val record = records.get(address)
+        if (record != null) {
+            if (!record.hasEntry) {
+                return StackResult(stackEmptyReport(), "disassembly does not cover every ELF function")
+            }
+            ordered.append(record)
+        }
+    }
+    // sorted(key=-frame): larger frames first, ties keep address order
+    val sorted: array<StackFunction> = []
+    for (record in ordered) {
+        sorted.append(record)
+        var position = sorted.size - 1
+        while (position > 0 && sorted[position - 1].frameBytes < record.frameBytes) {
+            sorted[position] = sorted[position - 1]
+            position = position - 1
+        }
+        sorted[position] = record
+    }
+    var largest = 0
+    var without = 0
+    for (record in sorted) {
+        if (record.frameBytes > largest) largest = record.frameBytes
+        if (!record.hasFrame) without = without + 1
+    }
+    StackResult(StackReport(sorted, largest, without, "", null), "")
+}
+
+fun stackIsSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+fun stackSortedAddresses(addresses: array<int>): array<int> {
+    val sorted: array<int> = []
+    for (address in addresses) {
+        sorted.append(address)
+        var position = sorted.size - 1
+        while (position > 0 && sorted[position - 1] > address) {
+            sorted[position] = sorted[position - 1]
+            position = position - 1
+        }
+        sorted[position] = address
+    }
+    sorted
+}
+
+class StackNode(
+    val calls: array<string>,
+    val fixedAddresses: array<int>,
+    val unresolved: array<int>,
+    val intrinsics: array<string>,
+    val fixedValues: Map<string, array<int>>
+)
+
+class StackPath(val total: int, val names: array<string>)
+
+class StackVisit(val path: StackPath, val error: string)
+
+// The sorted values of `values` without duplicates.
+fun stackSortedUnique(values: array<string>): array<string> {
+    val seen: Map<string, bool> = Map()
+    val unique: array<string> = []
+    for (value in values) {
+        if (!seen.has(value)) {
+            seen.set(value, true)
+            unique.append(value)
+        }
+    }
+    sortedStrings(unique)
+}
+
+fun stackAppendUnique(var values: array<string>, value: string): void {
+    for (existing in values) {
+        if (existing == value) return
+    }
+    values.append(value)
+}
+
+fun stackAppendUniqueInt(var values: array<int>, value: int): void {
+    for (existing in values) {
+        if (existing == value) return
+    }
+    values.append(value)
+}
+
+class StackVisitor(
+    val graph: Map<string, StackNode>,
+    val frames: Map<string, int>,
+    val hasFrame: Map<string, bool>,
+    val memo: Map<string, StackPath>,
+    val active: Map<string, bool>
+)
+
+fun stackVisit(var visitor: StackVisitor, name: string): StackVisit {
+    val none = StackPath(0, [])
+    if (visitor.active.has(name)) return StackVisit(none, "recursive named call path: $name")
+    val known = visitor.memo.get(name)
+    if (known != null) return StackVisit(known, "")
+    val node = visitor.graph.get(name)
+    if (node == null || !visitor.hasFrame.has(name)) {
+        return StackVisit(none, "missing IR definition/measured ENTRY frame: $name")
+    }
+    visitor.active.set(name, true)
+    var best = StackPath(0, [])
+    var first = true
+    for (child in sortedStrings(node.calls)) {
+        val visit = stackVisit(visitor, child)
+        if (visit.error != "") return visit
+        // max(children, key=total): the first maximal one
+        if (first || visit.path.total > best.total) best = visit.path
+        first = false
+    }
+    val names: array<string> = [name]
+    for (item in best.names) names.append(item)
+    val result = StackPath((visitor.frames.get(name) ?? 0) + best.total, names)
+    visitor.active.remove(name)
+    visitor.memo.set(name, result)
+    StackVisit(result, "")
+}
+
+fun stackLineNumbers(values: array<int>): array<int> {
+    val sorted: array<int> = []
+    for (value in stackSortedAddresses(values)) {
+        if (sorted.size == 0 || sorted[sorted.size - 1] != value) sorted.append(value)
+    }
+    sorted
+}
+
+// Correlate optimized IR calls with measured frames, without ROM bounds.
+//
+// This is a conservative sum of named ENTRY frames, counting tail calls too.
+// It is not a machine-level stack proof or a ROM/interrupt stack allowance.
+fun stackCallPaths(var report: StackReport, ir: string, entry: string): StackResult {
+    val graph: Map<string, StackNode> = Map()
+    var current = ""
+    var inFunction = false
+    var number = 0
+    for (line in ir.split("\n")) {
+        number = number + 1
+        val define = STACK_DEFINE.matchFull(line)
+        if (define != null) {
+            current = define.group(1) ?? ""
+            inFunction = true
+            val calls: array<string> = []
+            val fixed: array<int> = []
+            val unresolved: array<int> = []
+            val intrinsics: array<string> = []
+            val values: Map<string, array<int>> = Map()
+            graph.set(current, StackNode(calls, fixed, unresolved, intrinsics, values))
+        }
+        if (line == "}") inFunction = false
+        if (!inFunction) continue
+        val node = graph.get(current)
+        if (node == null) continue
+        // Only exact constant pointer SELECTs; no guesses about loaded pointers
+        // or phi nodes. Both outcomes contribute to the fixed-call inventory.
+        val selected = STACK_SELECT.matchFull(line)
+        if (selected != null) {
+            val pair: array<int> = []
+            stackAppendUniqueInt(pair, stackParseDecimal(selected.group(2) ?? ""))
+            stackAppendUniqueInt(pair, stackParseDecimal(selected.group(3) ?? ""))
+            node.fixedValues.set(selected.group(1) ?? "", pair)
+        }
+        if (STACK_CALL_KEYWORD.find(line) == null) continue
+        val direct = STACK_DIRECT.find(line)
+        val fixedCall = STACK_FIXED.find(line)
+        val indirect = STACK_INDIRECT.find(line)
+        if (direct != null) {
+            val name = direct.group(1) ?? ""
+            if (name.startsWith("llvm.")) stackAppendUnique(node.intrinsics, name) else stackAppendUnique(node.calls, name)
+        } else if (fixedCall != null) {
+            stackAppendUniqueInt(node.fixedAddresses, stackParseDecimal(fixedCall.group(1) ?? ""))
+        } else if (indirect != null && node.fixedValues.has(indirect.group(1) ?? "")) {
+            for (address in node.fixedValues.get(indirect.group(1) ?? "") ?? []) {
+                stackAppendUniqueInt(node.fixedAddresses, address)
+            }
+        } else {
+            node.unresolved.append(number)
+        }
+    }
+    val frames: Map<string, int> = Map()
+    val hasFrame: Map<string, bool> = Map()
+    for (record in report.functions) {
+        for (name in record.names) {
+            if (record.hasFrame) {
+                frames.set(name, record.frameBytes)
+                hasFrame.set(name, true)
+            } else if (hasFrame.has(name)) {
+                hasFrame.remove(name)
+            }
+        }
+    }
+    val memo: Map<string, StackPath> = Map()
+    val active: Map<string, bool> = Map()
+    val visitor = StackVisitor(graph, frames, hasFrame, memo, active)
+    val visit = stackVisit(visitor, entry)
+    if (visit.error != "") return StackResult(report, visit.error)
+    val fixedHex: array<string> = []
+    val unresolvedLines: array<int> = []
+    val intrinsics: array<string> = []
+    for (name in visitor.memo.keys()) {
+        val node = graph.get(name)
+        if (node == null) continue
+        for (address in node.fixedAddresses) fixedHex.append("0x" + stackHex(address))
+        for (line in node.unresolved) unresolvedLines.append(line)
+        for (item in node.intrinsics) intrinsics.append(item)
+    }
+    val summary = StackIr(hexEncode(sha256(ir)), entry, visit.path.total, visit.path.names, visitor.memo.size,
+        stackSortedUnique(fixedHex), stackLineNumbers(unresolvedLines), stackSortedUnique(intrinsics),
+        "optimized IR named calls only; fixed calls, intrinsics, dynamic stack and interrupts excluded")
+    report.ir = summary
+    // Deliberately leave worst_case_stack_proven false, even with no recursion.
+    report.callGraph = "optimized IR named calls only"
+    StackResult(report, "")
+}
+
+fun stackParseDecimal(text: string): int {
+    var value = 0
+    for (c in text) value = value * 10 + (c - 48)
+    value
+}
+
+// ---- JSON (json.dumps(indent=2), ensure_ascii) ----
+
+fun stackJsonString(text: string): string {
+    val parts: array<string> = ["\""]
+    var index = 0
+    while (index < text.size) {
+        val c = text[index]
+        if (c == 34) {
+            parts.append("\\\"")
+        } else if (c == 92) {
+            parts.append("\\\\")
+        } else if (c == 10) {
+            parts.append("\\n")
+        } else if (c == 13) {
+            parts.append("\\r")
+        } else if (c == 9) {
+            parts.append("\\t")
+        } else if (c == 8) {
+            parts.append("\\b")
+        } else if (c == 12) {
+            parts.append("\\f")
+        } else if (c < 32) {
+            parts.append("\\u" + stackHex4(c))
+        } else if (c < 128) {
+            parts.append(text.slice(index, index + 1))
+        } else {
+            val length = utf8SequenceLength(c)
+            val scalar = utf8DecodeAt(text, index)
+            if (scalar >= 0x10000) {
+                val rest = scalar - 0x10000
+                parts.append("\\u" + stackHex4(0xd800 + (rest >> 10)) + "\\u" + stackHex4(0xdc00 + (rest & 0x3ff)))
+            } else {
+                parts.append("\\u" + stackHex4(scalar))
+            }
+            index = index + (if (length > 1) length - 1 else 0)
+        }
+        index = index + 1
+    }
+    parts.append("\"")
+    parts.join("")
+}
+
+fun stackHex4(value: int): string {
+    val text = stackHex(value)
+    text.padStart(4, "0")
+}
+
+fun stackIndent(level: int): string = " ".repeat(level * 2)
+
+fun stackJsonStringList(values: array<string>, level: int): string {
+    if (values.size == 0) return "[]"
+    val items: array<string> = []
+    for (value in values) items.append(stackIndent(level + 1) + stackJsonString(value))
+    "[\n" + items.join(",\n") + "\n" + stackIndent(level) + "]"
+}
+
+fun stackJsonIntList(values: array<int>, level: int): string {
+    if (values.size == 0) return "[]"
+    val items: array<string> = []
+    for (value in values) items.append(stackIndent(level + 1) + "$value")
+    "[\n" + items.join(",\n") + "\n" + stackIndent(level) + "]"
+}
+
+fun stackJsonFunction(record: StackFunction, level: int): string {
+    val inner = stackIndent(level + 1)
+    val fields: array<string> = [
+        inner + "\"address\": " + stackJsonString("0x" + stackHex(record.address)),
+        inner + "\"names\": " + stackJsonStringList(record.names, level + 1),
+        inner + "\"frame_bytes\": " + (if (record.hasFrame) "${record.frameBytes}" else "null"),
+        inner + "\"entry_instruction\": " + (if (record.hasEntry) stackJsonString(record.entryInstruction) else "null")
+    ]
+    stackIndent(level) + "{\n" + fields.join(",\n") + "\n" + stackIndent(level) + "}"
+}
+
+fun stackJsonIr(ir: StackIr, level: int): string {
+    val inner = stackIndent(level + 1)
+    val fields: array<string> = [
+        inner + "\"sha256\": " + stackJsonString(ir.sha256),
+        inner + "\"entry\": " + stackJsonString(ir.entry),
+        inner + "\"named_entry_frame_sum_bytes\": ${ir.frameSum}",
+        inner + "\"largest_named_path\": " + stackJsonStringList(ir.path, level + 1),
+        inner + "\"reachable_functions\": ${ir.reachable}",
+        inner + "\"fixed_call_addresses\": " + stackJsonStringList(ir.fixedAddresses, level + 1),
+        inner + "\"unresolved_call_lines\": " + stackJsonIntList(ir.unresolvedLines, level + 1),
+        inner + "\"intrinsics\": " + stackJsonStringList(ir.intrinsics, level + 1),
+        inner + "\"scope\": " + stackJsonString(ir.scope)
+    ]
+    "{\n" + fields.join(",\n") + "\n" + stackIndent(level) + "}"
+}
+
+// The report as `json.dumps(report, indent=2)`.
+fun stackReportJson(report: StackReport): string {
+    val functions: array<string> = []
+    for (record in report.functions) functions.append(stackJsonFunction(record, 2))
+    val fields: array<string> = [
+        "  \"worst_case_stack_proven\": false",
+        "  \"scope\": " + stackJsonString("individual function-entry frames only; no call graph or dynamic/interrupt stack proof"),
+        "  \"call_graph_analyzed\": " + (if (report.callGraph == "") "false" else stackJsonString(report.callGraph)),
+        "  \"largest_frame_bytes\": ${report.largestFrameBytes}",
+        "  \"functions_without_entry\": ${report.functionsWithoutEntry}",
+        "  \"functions\": " + (if (functions.size == 0) "[]" else "[\n" + functions.join(",\n") + "\n  ]")
+    ]
+    val ir = report.ir
+    if (ir != null) fields.append("  \"optimized_ir\": " + stackJsonIr(ir, 1))
+    "{\n" + fields.join(",\n") + "\n}"
+}
+
+fun stackReadStandardInput(): string {
+    val chunks: array<string> = []
+    val input = LinuxFileDescriptor(0)
+    var more = true
+    while (more) {
+        val chunk = input.read(1048576)
+        if (chunk.size == 0) more = false else chunks.append(chunk)
+    }
+    chunks.join("")
+}
+
+fun stackFail(message: string): int {
+    eprintln(message)
+    1
+}
+
+fun main: int {
+    val count = processArgumentCount()
+    if (count != 1 && count != 3) {
+        return stackFail("usage: report-xtensa-stack LINKED.elf [OPTIMIZED.ll ENTRY] < CPU-SPECIFIC-OBJDUMP.txt")
+    }
+    val elf = Path(processArgument(0)).readTextResult()
+    if (!elf.succeeded) return stackFail("[Errno 2] No such file or directory: '${processArgument(0)}'")
+    val symbols = stackFunctions(elf.text)
+    if (symbols.error != "") return stackFail(symbols.error)
+    // file iteration yields lines with their terminator; the pattern's trailing \s* ignores it
+    val lines: array<string> = []
+    for (line in stackReadStandardInput().split("\n")) lines.append(line)
+    val inspected = stackInspect(symbols.symbols, lines)
+    if (inspected.error != "") return stackFail(inspected.error)
+    if (count == 3) {
+        val ir = Path(processArgument(1)).readTextResult()
+        if (!ir.succeeded) return stackFail("[Errno 2] No such file or directory: '${processArgument(1)}'")
+        val paths = stackCallPaths(inspected.report, ir.text, processArgument(2))
+        if (paths.error != "") return stackFail(paths.error)
+        println(stackReportJson(paths.report))
+        return 0
+    }
+    println(stackReportJson(inspected.report))
+    0
+}

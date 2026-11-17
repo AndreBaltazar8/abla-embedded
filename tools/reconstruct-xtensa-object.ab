@@ -1,0 +1,578 @@
+// Recover relocatable Xtensa functions as Abla-owned naked assembly.
+//
+// This is intentionally a source reconstruction aid, not a binary embedder. It
+// turns literal-pool loads back into symbolic assembler expressions and local
+// branches back into labels. The emitted block is assembled from the Abla LLVM
+// unit, so the original archive member is no longer an input to the firmware.
+//
+//     tools/abla-tool reconstruct-xtensa-object OBJECT.o [SYMBOL...]
+//         [--objdump CMD] [--output FILE] [--link-output FILE] [--namespace NAME] ...
+//
+// The helpers are also imported by the tests and by the recovery pipeline (the
+// former Python tool was loaded with runpy for the same functions). A Python
+// ValueError is returned as the `error` of a result value instead.
+
+import "abla/io"
+import "abla/bytes"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/exit"
+
+import "lib/reconstruct-xtensa.ab"
+
+// ---- command line ----
+
+class ReconArguments(
+    var objectPath: string,
+    val symbols: array<string>,
+    var objdump: string,
+    val globalData: array<string>,
+    var commonData: bool,
+    val internalData: array<string>,
+    val weakData: array<string>,
+    val localData: array<string>,
+    val localFunction: array<string>,
+    val standaloneLocalFunction: array<string>,
+    var reuseRecoveredData: bool,
+    val reuseDataFrom: array<string>,
+    var linkOutput: string,
+    val exportFunction: array<string>,
+    val aliasFunction: array<string>,
+    val weakSymbolAlias: array<string>,
+    val globalSymbolAlias: array<string>,
+    var syntheticAnchor: string,
+    val unselectedFunction: array<string>,
+    var output: string,
+    val header: array<string>,
+    var namespace: string,
+    var linkSelector: string,
+    var dataAnchorSynthetic: bool,
+    var symbolAddendLiterals: bool,
+    var noCompatibilitySymbols: bool
+)
+
+fun reconDefaultArguments(): ReconArguments = ReconArguments(
+    "", [], "xtensa-esp32-elf-objdump", [], false, [], [], [], [], [], false, [], "", [], [], [], [], "", [],
+    "", [], "ioctl", "linkRecoveredOpaqueCallers", false, false, false)
+
+class ReconParsedArguments(val arguments: ReconArguments, val error: string)
+
+fun reconUsage(): string =
+    "usage: reconstruct-xtensa-object [-h] [--objdump OBJDUMP] [--global-data GLOBAL_DATA] [--common-data]\n" +
+        "       [--internal-data INTERNAL_DATA] [--weak-data WEAK_DATA] [--local-data LOCAL_DATA]\n" +
+        "       [--local-function LOCAL_FUNCTION] [--standalone-local-function STANDALONE_LOCAL_FUNCTION]\n" +
+        "       [--reuse-recovered-data] [--reuse-data-from SOURCE.ab] [--link-output LINK_OUTPUT]\n" +
+        "       [--export-function EXPORT_FUNCTION] [--alias-function ALIAS=TARGET]\n" +
+        "       [--weak-symbol-alias ALIAS=TARGET] [--global-symbol-alias ALIAS=TARGET]\n" +
+        "       [--synthetic-anchor NAME] [--unselected-function UNSELECTED_FUNCTION] [--output OUTPUT]\n" +
+        "       [--header HEADER] [--namespace NAMESPACE] [--link-selector LINK_SELECTOR]\n" +
+        "       [--data-anchor-synthetic] [--symbol-addend-literals] [--no-compatibility-symbols]\n" +
+        "       object [symbols ...]"
+
+// The option takes a value and appends it to (or sets) its field.
+fun reconSetOption(var arguments: ReconArguments, name: string, value: string): bool {
+    if (name == "--objdump") { arguments.objdump = value; return true }
+    if (name == "--global-data") { arguments.globalData.append(value); return true }
+    if (name == "--internal-data") { arguments.internalData.append(value); return true }
+    if (name == "--weak-data") { arguments.weakData.append(value); return true }
+    if (name == "--local-data") { arguments.localData.append(value); return true }
+    if (name == "--local-function") { arguments.localFunction.append(value); return true }
+    if (name == "--standalone-local-function") { arguments.standaloneLocalFunction.append(value); return true }
+    if (name == "--reuse-data-from") { arguments.reuseDataFrom.append(value); return true }
+    if (name == "--link-output") { arguments.linkOutput = value; return true }
+    if (name == "--export-function") { arguments.exportFunction.append(value); return true }
+    if (name == "--alias-function") { arguments.aliasFunction.append(value); return true }
+    if (name == "--weak-symbol-alias") { arguments.weakSymbolAlias.append(value); return true }
+    if (name == "--global-symbol-alias") { arguments.globalSymbolAlias.append(value); return true }
+    if (name == "--synthetic-anchor") { arguments.syntheticAnchor = value; return true }
+    if (name == "--unselected-function") { arguments.unselectedFunction.append(value); return true }
+    if (name == "--output") { arguments.output = value; return true }
+    if (name == "--header") { arguments.header.append(value); return true }
+    if (name == "--namespace") { arguments.namespace = value; return true }
+    if (name == "--link-selector") { arguments.linkSelector = value; return true }
+    false
+}
+
+fun reconSetFlag(var arguments: ReconArguments, name: string): bool {
+    if (name == "--common-data") { arguments.commonData = true; return true }
+    if (name == "--reuse-recovered-data") { arguments.reuseRecoveredData = true; return true }
+    if (name == "--data-anchor-synthetic") { arguments.dataAnchorSynthetic = true; return true }
+    if (name == "--symbol-addend-literals") { arguments.symbolAddendLiterals = true; return true }
+    if (name == "--no-compatibility-symbols") { arguments.noCompatibilitySymbols = true; return true }
+    false
+}
+
+fun reconParseArguments(): ReconParsedArguments {
+    val arguments = reconDefaultArguments()
+    var index = 0
+    var positionals = 0
+    val count = processArgumentCount()
+    var onlyPositionals = false
+    while (index < count) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (!onlyPositionals && argument == "--") {
+            onlyPositionals = true
+            continue
+        }
+        if (!onlyPositionals && argument.startsWith("--")) {
+            val equals = argument.indexOf("=")
+            val name = if (equals < 0) argument else argument.slice(0, equals)
+            if (reconSetFlag(arguments, name)) {
+                if (equals >= 0) return ReconParsedArguments(arguments, "argument " + name + ": ignored explicit argument")
+                continue
+            }
+            var value = ""
+            if (equals >= 0) {
+                value = argument.slice(equals + 1, argument.size)
+            } else {
+                if (index >= count) return ReconParsedArguments(arguments, "argument " + name + ": expected one argument")
+                value = processArgument(index)
+                index = index + 1
+            }
+            if (!reconSetOption(arguments, name, value)) {
+                return ReconParsedArguments(arguments, "unrecognized arguments: " + argument)
+            }
+            continue
+        }
+        if (!onlyPositionals && argument == "-h") {
+            return ReconParsedArguments(arguments, "-h")
+        }
+        if (positionals == 0) arguments.objectPath = argument else arguments.symbols.append(argument)
+        positionals = positionals + 1
+    }
+    if (positionals == 0) {
+        return ReconParsedArguments(arguments, "the following arguments are required: object")
+    }
+    ReconParsedArguments(arguments, "")
+}
+
+// "ALIAS=TARGET" values; `error` names the option when one is malformed.
+class ReconAliases(val aliases: array<ReconPair>, val error: string)
+
+fun reconParseAliases(values: array<string>, option: string): ReconAliases {
+    val aliases: array<ReconPair> = []
+    for (value in values) {
+        val equals = value.indexOf("=")
+        if (equals < 0) return ReconAliases(aliases, option + " requires ALIAS=TARGET")
+        val alias = value.slice(0, equals)
+        val target = value.slice(equals + 1, value.size)
+        if (alias == "" || target == "") {
+            return ReconAliases(aliases, option + " requires non-empty ALIAS and TARGET")
+        }
+        aliases.append(ReconPair(alias, target))
+    }
+    ReconAliases(aliases, "")
+}
+
+fun reconReadFile(path: string): ReconText {
+    val read = Path(path).readTextResult()
+    if (!read.succeeded) return ReconText("", "cannot read " + path)
+    ReconText(read.text, "")
+}
+
+fun reconWriteFile(path: string, text: string): bool = Path(path).writeText(text)
+
+fun reconEntryStart(function: ReconFunction): int {
+    val entry = reconEntryIndex(function.instructions)
+    if (entry >= 0) function.instructions[entry].offset else function.start
+}
+
+fun main: int {
+    val parsed = reconParseArguments()
+    if (parsed.error == "-h") {
+        println(reconUsage())
+        return 0
+    }
+    if (parsed.error != "") {
+        eprintln(reconUsage())
+        eprintln("reconstruct-xtensa-object: error: " + parsed.error)
+        return 2
+    }
+    val arguments = parsed.arguments
+    if (arguments.noCompatibilitySymbols) COMPATIBILITY_SYMBOLS.clear()
+    SYMBOL_ADDEND_LITERALS = arguments.symbolAddendLiterals
+    val aliasParse = reconParseAliases(arguments.aliasFunction, "--alias-function")
+    val weakParse = reconParseAliases(arguments.weakSymbolAlias, "--weak-symbol-alias")
+    val globalParse = reconParseAliases(arguments.globalSymbolAlias, "--global-symbol-alias")
+    for (check in [aliasParse, weakParse, globalParse]) {
+        if (check.error != "") {
+            eprintln(reconUsage())
+            eprintln("reconstruct-xtensa-object: error: " + check.error)
+            return 2
+        }
+    }
+    val aliases: array<ReconPair> = []
+    for (alias in aliasParse.aliases) aliases.append(alias)
+    val weakSymbolAliases = weakParse.aliases
+    val globalSymbolAliases = globalParse.aliases
+    if (arguments.symbols.size == 0 && arguments.syntheticAnchor == "") {
+        eprintln(reconUsage())
+        eprintln("reconstruct-xtensa-object: error: select at least one function or provide --synthetic-anchor")
+        return 2
+    }
+    val namespace = reconSanitize(arguments.namespace)
+    val reusedDataLabels: Map<string, string> = Map()
+    for (reusedPath in arguments.reuseDataFrom) {
+        val reused = reconReadFile(reusedPath)
+        if (reused.error != "") {
+            eprintln(reused.error)
+            return 1
+        }
+        val problem = reconReusedLabels(reused.text, reusedDataLabels)
+        if (problem != "") {
+            eprintln(problem)
+            return 1
+        }
+    }
+    val nameList: array<string> = []
+    for (name in arguments.symbols) nameList.append(name)
+    for (alias in aliases) nameList.append(alias.first)
+    if (arguments.syntheticAnchor != "") nameList.append(arguments.syntheticAnchor)
+    val emittedNames = uniqueAblaFunctionNames(nameList)
+    val unselected = reconSetOf(arguments.unselectedFunction)
+    val standaloneLocalFunctions = reconSetOf(arguments.standaloneLocalFunction)
+    val localFunctions = reconSetOf(arguments.localFunction)
+    val localSymbols: Map<string, string> = Map()
+    for (name in arguments.localFunction) {
+        localSymbols.set(name, ".Labla_recovered_" + namespace + "_local_" + reconSanitize(name))
+    }
+    for (name in arguments.standaloneLocalFunction) {
+        localSymbols.set(name, ".Labla_recovered_" + namespace + "_local_" + reconSanitize(name))
+    }
+    val dump = reconRunObjdump(arguments.objdump, arguments.objectPath)
+    if (dump.error != "") {
+        eprintln(dump.error)
+        return 1
+    }
+    val output = dump.output
+    val data = sectionBytes(output)
+    val metadata = sectionMetadata(output)
+    val parse = reconParse(output)
+    val functions = parse.functions
+    val relocations = parse.relocations
+    val symbolRun = reconRunSymbolTable(arguments.objdump, arguments.objectPath)
+    if (symbolRun.error != "") {
+        eprintln(symbolRun.error)
+        return 1
+    }
+    val symbolTableOutput = symbolRun.output
+    val functionSymbols = objectFunctionSymbols(symbolTableOutput)
+    val explicitAliasNames: Map<string, bool> = Map()
+    for (alias in aliases) explicitAliasNames.set(alias.first, true)
+    val localAliases: array<ReconPair> = []
+    for (name in arguments.symbols) {
+        if (functions.has(name) || explicitAliasNames.has(name)) continue
+        val location = functionSymbols.get(name)
+        if (location == null) continue
+        val candidates: array<string> = []
+        for (target in arguments.symbols) {
+            val targetLocation = functionSymbols.get(target)
+            if (target != name && functions.has(target) && targetLocation != null &&
+                targetLocation.section == location.section && targetLocation.size == location.size) {
+                candidates.append(target)
+            }
+        }
+        if (candidates.size == 1) {
+            val target = candidates[0]
+            if (localSymbols.has(target)) {
+                localAliases.append(ReconPair(name, target))
+            } else {
+                aliases.append(ReconPair(name, target))
+            }
+        }
+    }
+    val aliasNames: Map<string, bool> = Map()
+    for (alias in aliases) aliasNames.set(alias.first, true)
+    for (alias in localAliases) aliasNames.set(alias.first, true)
+    for (alias in aliasNames.keys()) localSymbols.remove(alias)
+    val sectionFunctions: Map<string, array<ReconAlias>> = Map()
+    for (name in arguments.symbols) {
+        val recovered = functions.get(name)
+        if (recovered == null || localSymbols.has(name)) continue
+        if (!sectionFunctions.has(recovered.section)) {
+            val fresh: array<ReconAlias> = []
+            sectionFunctions.set(recovered.section, fresh)
+        }
+        val entries = sectionFunctions.get(recovered.section) ?? []
+        entries.append(ReconAlias(name, recovered.start))
+    }
+    // Compiler-generated section symbols do not always repeat the ABI name.
+    // For example, a function `foo` may live in `.text.optimizedFoo`, and REL
+    // relocations then refer to the section plus the function-entry addend.
+    // Derive that relationship from the symbol table so reconstruction stays
+    // generic and every reference is rebased to the selected Abla function.
+    val sectionAliases: Map<string, ReconAlias> = Map()
+    for (section in sectionFunctions.keys()) {
+        val entries = sectionFunctions.get(section)
+        if (entries != null && section.startsWith(".") && entries.size == 1) sectionAliases.set(section, entries[0])
+    }
+    val localSectionAliases: Map<string, ReconAlias> = Map()
+    for (name in localSymbols.keys()) {
+        val emittedName = localSymbols.get(name) ?? ""
+        val recovered = functions.get(name)
+        if (recovered == null || !recovered.section.startsWith(".")) continue
+        // Section-local compiler helpers commonly have a literal pool before
+        // their first `entry`. Their reconstructed Abla function starts at
+        // the entry instruction, so section-symbol relocations must be rebased
+        // for every object just like named function-symbol relocations are.
+        var start = recovered.start
+        if (name.startsWith(".text.")) start = reconEntryStart(recovered)
+        localSectionAliases.set(recovered.section, ReconAlias(emittedName, start))
+    }
+    val symbolTable = objectDataSymbols(symbolTableOutput)
+    if (arguments.commonData) {
+        val common = objectCommonSymbols(symbolTableOutput)
+        for (name in common.keys()) {
+            val entry = common.get(name)
+            if (entry == null) continue
+            val section = ".bss." + name
+            symbolTable.set(name, ReconSymbol(section, entry.size))
+            metadata.set(section, ReconMeta(entry.size, entry.alignment))
+        }
+    }
+    val localDataLabels = objectLocalDataLabels(symbolTableOutput)
+    val recoveredFunctions: array<ReconEmitted> = []
+    val localDirectives: array<string> = []
+    var failures = 0
+    for (name in arguments.symbols) {
+        if (aliasNames.has(name)) continue
+        val recovered = functions.get(name)
+        if (recovered == null) {
+            eprintln("missing function: " + name)
+            failures = failures + 1
+            continue
+        }
+        if (localFunctions.has(name)) {
+            val emitted = localFunctionDirectives(name, recovered.section, recovered.start,
+                recovered.instructions, data, relocations,
+                (metadata.get(recovered.section) ?? ReconMeta(0, 2)).alignment, localSymbols.get(name) ?? "")
+            if (emitted.error != "") {
+                eprintln(name + ": " + emitted.error)
+                failures = failures + 1
+            } else {
+                for (line in emitted.lines) localDirectives.append(line)
+            }
+        } else if (standaloneLocalFunctions.has(name)) {
+            val emitted = emitStandaloneLocalFunction(name, recovered.section, recovered.start,
+                recovered.instructions, data, relocations, emittedNames.get(name) ?? "",
+                localSymbols.get(name) ?? "")
+            if (emitted.error != "") {
+                eprintln(name + ": " + emitted.error)
+                failures = failures + 1
+            } else {
+                recoveredFunctions.append(ReconEmitted(name, emitted.text))
+            }
+        } else {
+            val symbolAliasPrefix: array<string> = []
+            for (alias in weakSymbolAliases) {
+                if (alias.second == name) {
+                    symbolAliasPrefix.append(".weak " + alias.first)
+                    symbolAliasPrefix.append(".set " + alias.first + ", " + compatibilitySymbol(alias.second))
+                }
+            }
+            for (alias in globalSymbolAliases) {
+                if (alias.second == name) {
+                    symbolAliasPrefix.append(".global " + alias.first)
+                    symbolAliasPrefix.append(".set " + alias.first + ", " + compatibilitySymbol(alias.second))
+                }
+            }
+            val emitted = emitFunction(name, recovered.section, recovered.start, recovered.instructions,
+                data, relocations, symbolAliasPrefix, emittedNames.get(name) ?? "")
+            if (emitted.error != "") {
+                eprintln(name + ": " + emitted.error)
+                failures = failures + 1
+            } else {
+                recoveredFunctions.append(ReconEmitted(name, emitted.text))
+            }
+        }
+    }
+    for (alias in localAliases) {
+        localDirectives.append(".local " + alias.first)
+        localDirectives.append(".set " + alias.first + ", " + (localSymbols.get(alias.second) ?? ""))
+    }
+    if (failures == 0 && arguments.syntheticAnchor != "") {
+        recoveredFunctions.append(ReconEmitted(arguments.syntheticAnchor,
+            emitSyntheticAnchor(arguments.syntheticAnchor, emittedNames.get(arguments.syntheticAnchor) ?? "")))
+    }
+    if (failures == 0) {
+        val selectedNames: Map<string, bool> = Map()
+        for (entry in recoveredFunctions) selectedNames.set(entry.name, true)
+        for (alias in weakSymbolAliases) {
+            if (selectedNames.has(alias.first)) {
+                eprintln("duplicate weak symbol alias: " + alias.first)
+                failures = failures + 1
+            }
+        }
+        for (alias in globalSymbolAliases) {
+            if (selectedNames.has(alias.first)) {
+                eprintln("duplicate global symbol alias: " + alias.first)
+                failures = failures + 1
+            } else if (!selectedNames.has(alias.second)) {
+                eprintln("global symbol alias target is not selected: " + alias.first + "=" + alias.second)
+                failures = failures + 1
+            }
+        }
+        for (alias in aliases) {
+            if (selectedNames.has(alias.first)) {
+                eprintln("duplicate alias function: " + alias.first)
+                failures = failures + 1
+            } else if (!selectedNames.has(alias.second)) {
+                eprintln("alias target is not selected: " + alias.first + "=" + alias.second)
+                failures = failures + 1
+            } else {
+                recoveredFunctions.append(ReconEmitted(alias.first,
+                    emitAliasFunction(alias.first, alias.second, emittedNames.get(alias.first) ?? "")))
+                selectedNames.set(alias.first, true)
+            }
+        }
+    }
+    if (failures == 0) {
+        val problem = reconFinish(arguments, namespace, recoveredFunctions, localDirectives, functions, relocations, data,
+            metadata, symbolTable, localDataLabels, localSymbols, sectionAliases, localSectionAliases,
+            reusedDataLabels, unselected, standaloneLocalFunctions, emittedNames)
+        if (problem != "") {
+            eprintln(problem)
+            failures = failures + 1
+        }
+    }
+    if (failures != 0) 1 else 0
+}
+
+fun reconApplyAlias(unit: ReconUnit, old: string, replacement: string, start: int): ReconUnit {
+    val lines: array<string> = []
+    for (line in unit.directives) lines.append(replaceCompatibilityReference(line, old, replacement, start))
+    ReconUnit(replaceCompatibilityReference(unit.source, old, replacement, start), lines)
+}
+
+// Everything after the functions were recovered: data, renames, the anchor and
+// the output files. Returns an error message ("" when all went well).
+fun reconFinish(
+    arguments: ReconArguments,
+    namespace: string,
+    recoveredFunctions: array<ReconEmitted>,
+    localDirectives: array<string>,
+    functions: Map<string, ReconFunction>,
+    relocations: Map<string, Map<int, ReconReloc>>,
+    data: Map<string, string>,
+    metadata: Map<string, ReconMeta>,
+    symbolTable: Map<string, ReconSymbol>,
+    localDataLabels: Map<string, ReconSymbol>,
+    localSymbols: Map<string, string>,
+    sectionAliases: Map<string, ReconAlias>,
+    localSectionAliases: Map<string, ReconAlias>,
+    reusedDataLabels: Map<string, string>,
+    unselected: Map<string, bool>,
+    standaloneLocalFunctions: Map<string, bool>,
+    emittedNames: Map<string, string>
+): string {
+    val sources: array<string> = []
+    for (entry in recoveredFunctions) sources.append(entry.source)
+    val combinedStart = sources.join("\n")
+    val selected: array<string> = []
+    for (name in arguments.globalData) selected.append(name)
+    for (name in arguments.internalData) selected.append(name)
+    for (name in arguments.weakData) selected.append(name)
+    for (name in arguments.localData) selected.append(name)
+    val labelled = resolveLocalDataLabels(combinedStart, localDirectives, localDataLabels, reconSetOf(selected))
+    val compatibilityStarts: Map<string, int> = Map()
+    for (name in functions.keys()) {
+        if (COMPATIBILITY_SYMBOLS.has(name)) compatibilityStarts.set(name, (functions.get(name) ?? ReconFunction("", 0, [])).start)
+    }
+    val dataPrefix = recoveredDataPrefix(labelled.source, arguments.globalData, arguments.internalData,
+        arguments.weakData, arguments.localData, data, relocations, metadata, symbolTable,
+        compatibilityStarts, labelled.directives, arguments.reuseRecoveredData, reusedDataLabels)
+    if (dataPrefix.error != "") return dataPrefix.error
+    val namespaced = namespaceAssemblerLocals(dataPrefix.source, dataPrefix.directives, namespace)
+    val literals = normalizeSymbolicLiteralAddends(namespaced.source, namespaced.directives)
+    if (literals.error != "") return literals.error
+    var unit = ReconUnit(normalizeCrossSectionBranches(literals.source, namespace), literals.directives)
+    // Rename after data recovery as well: data tables can contain
+    // relocations to section-local functions, not only code calls.
+    for (old in localSymbols.keys()) {
+        val replacement = localSymbols.get(old) ?? ""
+        val recovered = functions.get(old)
+        if (recovered == null) return "KeyError: '" + old + "'"
+        var start = recovered.start
+        if (old.startsWith(".text.")) start = reconEntryStart(recovered)
+        unit = reconApplyAlias(unit, old, replacement, start)
+    }
+    for (old in reconSortByLengthDescending(sectionAliases.keys())) {
+        val alias = sectionAliases.get(old)
+        if (alias != null) unit = reconApplyAlias(unit, old, alias.name, alias.start)
+    }
+    for (old in reconSortByLengthDescending(localSectionAliases.keys())) {
+        val alias = localSectionAliases.get(old)
+        if (alias != null) unit = reconApplyAlias(unit, old, alias.name, alias.start)
+    }
+    var combined = unit.source
+    // All section definitions are assembled with the first selected
+    // function, avoiding a synthetic exported data anchor.
+    val recoveredPrefix = unit.directives.join("\n")
+    if (recoveredPrefix != "") {
+        var anchor = ""
+        if (arguments.dataAnchorSynthetic && arguments.syntheticAnchor != "") {
+            anchor = arguments.syntheticAnchor
+        } else {
+            for (entry in recoveredFunctions) {
+                if (anchor == "" && !unselected.has(entry.name)) anchor = entry.name
+            }
+        }
+        if (anchor == "") return "recovered data and local functions need a selected function anchor"
+        val marker = "trusted fun " + ablaFunctionName(anchor) + "(): void = \$xtensa instructions {\n"
+        val at = combined.indexOf(marker)
+        if (at < 0) return "cannot find selected function anchor: " + anchor
+        combined = combined.slice(0, at) + marker + recoveredPrefix + "\n" +
+            combined.slice(at + marker.size, combined.size)
+    }
+    if (namespace != "ioctl") {
+        combined = combined.replace(".Labla_recovered_ioctl_data_", ".Labla_recovered_" + namespace + "_data_")
+            .replace(".abla_ioctl_", ".abla_" + namespace + "_")
+    }
+    if (arguments.header.size > 0) {
+        val headerParts: array<string> = []
+        for (value in arguments.header) {
+            val headerLines: array<string> = []
+            for (line in reconSplitLines(value)) {
+                headerLines.append(if (line.startsWith("//")) line else "// " + line)
+            }
+            headerParts.append(headerLines.join("\n"))
+        }
+        combined = headerParts.join("\n") + "\n\n" + combined
+    }
+    if (arguments.output != "") {
+        val text = if (combined != "" && !combined.endsWith("\n")) combined + "\n" else combined
+        if (!reconWriteFile(arguments.output, text)) return "cannot write " + arguments.output
+    } else {
+        println(combined)
+    }
+    if (arguments.linkOutput != "") {
+        val selections: array<string> = [
+            "import \"abla/build\"",
+            "",
+            "// Exact names used by recovered assembly and mixed callers.",
+            "// Internal linkage is the default; list only proven foreign roots",
+            "// with --export-function while opaque callers remain.",
+            "compile fun " + arguments.linkSelector + "(): bool {"
+        ]
+        val exported = reconSetOf(arguments.exportFunction)
+        for (entry in recoveredFunctions) {
+            val name = entry.name
+            if (unselected.has(name)) continue
+            if (standaloneLocalFunctions.has(name)) {
+                selections.append("    // Original section-local symbol: " + name)
+            }
+            val selector = if (exported.has(name)) "exportFunction" else "internalFunction"
+            selections.append("    if (!" + selector + "(\"" + (emittedNames.get(name) ?? ablaFunctionName(name)) +
+                "\", \"" + (localSymbols.get(name) ?? compatibilitySymbol(name)) + "\")) return false")
+        }
+        selections.append("    true")
+        selections.append("}")
+        selections.append("")
+        if (!reconWriteFile(arguments.linkOutput, selections.join("\n"))) return "cannot write " + arguments.linkOutput
+    }
+    ""
+}

@@ -1,0 +1,94 @@
+// Frames and conservative call sums of tools/report-xtensa-stack.
+
+import "abla/io"
+import "abla/text"
+import "../tools/report-xtensa-stack.ab"
+
+var failures = 0
+
+fun expect(condition: bool, label: string): void {
+    if (!condition) {
+        println("FAIL $label")
+        failures = failures + 1
+    }
+}
+
+fun names(first: string): array<string> = [first]
+
+fun hasLine(lines: array<int>, wanted: int): bool {
+    for (line in lines) {
+        if (line == wanted) return true
+    }
+    false
+}
+
+fun sameStrings(left: array<string>, right: array<string>): bool {
+    if (left.size != right.size) return false
+    var index = 0
+    while (index < left.size) {
+        if (left[index] != right[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+// `text` with its first `old` replaced (Python's replace(old, new, 1)).
+fun replaceFirst(text: string, old: string, replacement: string): string {
+    val at = text.indexOf(old)
+    if (at < 0) text else text.slice(0, at) + replacement + text.slice(at + old.size, text.size)
+}
+
+fun main: int {
+    val symbols: Map<int, StackSymbol> = Map()
+    symbols.set(0x1000, StackSymbol(names("first"), 64))
+    symbols.set(0x1040, StackSymbol(names("second"), 32))
+    val first = stackInspect(symbols, ["1000: entry a1, 640", "1003: call8 0x1234", "1006: <unknown>", "1040: entry a1, 0x20"])
+    expect(first.error == "", "inspect error ${first.error}")
+    val result = first.report
+    expect(result.largestFrameBytes == 640, "largest frame")
+    expect(result.functionsWithoutEntry == 0, "functions without entry")
+    expect(result.callGraph == "" && result.ir == null, "no call graph or worst-case proof")
+    expect(result.functions.size == 2, "two functions")
+    expect(result.functions[1].frameBytes == 32 && result.functions[1].hasFrame, "second frame")
+    val branch = stackInspect(symbols, ["1000: j 0x1010", "1010: entry a1, 512", "1040: entry a1, 32"])
+    expect(branch.error == "" && branch.report.functionsWithoutEntry == 1, "never infer entry after jump")
+    val missing = stackInspect(symbols, ["1003: entry a1, 640", "1040: entry a1, 32"])
+    expect(missing.error != "", "missing exact entry accepted")
+    if (failures != 0) return 1
+    println("PASS: exact-entry frames, missing/branch entries, no false call-graph proof")
+
+    val reportResult = stackInspect(symbols, ["1000: entry a1, 640", "1040: entry a1, 32"])
+    val ir = "define void @first() {\n  tail call void @second()\n  call void inttoptr (i32 1073741824 to ptr)()\n" +
+        "  call void %dynamic()\n  ret void\n}\ndefine void @second() {\n  ret void\n}\n"
+    val paths = stackCallPaths(reportResult.report, ir, "first")
+    expect(paths.error == "", "call paths error ${paths.error}")
+    val summary = paths.report.ir
+    if (summary == null) {
+        println("FAIL no optimized_ir")
+        return 1
+    }
+    expect(summary.frameSum == 672, "named entry frame sum ${summary.frameSum}")
+    expect(sameStrings(summary.fixedAddresses, ["0x40000000"]), "fixed call addresses")
+    expect(summary.unresolvedLines.size == 1 && hasLine(summary.unresolvedLines, 4), "unresolved call lines")
+    expect(paths.report.callGraph != "", "call graph scope")
+    val selectedIr = ir.replace("  call void %dynamic()",
+        "  %target = select i1 %choice, ptr inttoptr (i32 1073748088 to ptr), ptr inttoptr (i32 1073748112 to ptr)\n  call void %target()")
+    val reportAgain = stackInspect(symbols, ["1000: entry a1, 640", "1040: entry a1, 32"])
+    val selected = stackCallPaths(reportAgain.report, selectedIr, "first")
+    val selectedSummary = selected.report.ir
+    if (selectedSummary == null) {
+        println("FAIL no optimized_ir for the select")
+        return 1
+    }
+    expect(sameStrings(selectedSummary.fixedAddresses, ["0x40000000", "0x40001878", "0x40001890"]), "select addresses")
+    expect(selectedSummary.unresolvedLines.size == 0, "select leaves nothing unresolved")
+    val recursive = stackInspect(symbols, ["1000: entry a1, 640", "1040: entry a1, 32"])
+    expect(stackCallPaths(recursive.report, replaceFirst(ir, "  ret void", "  call void @first()"), "first").error != "",
+        "recursion accepted")
+    val absent = stackInspect(symbols, ["1000: entry a1, 640", "1040: entry a1, 32"])
+    expect(stackCallPaths(absent.report, replaceFirst(ir, "@second()", "@missing()"), "first").error != "",
+        "missing frame accepted")
+    if (failures != 0) return 1
+    println("PASS: conservative tail-call sum, ROM/dynamic exclusions, recursion/missing-frame rejection")
+    0
+}
