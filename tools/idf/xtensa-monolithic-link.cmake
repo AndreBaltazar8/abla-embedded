@@ -11,7 +11,8 @@ function(abla_enable_xtensa_monolithic_link component)
     endif()
     execute_process(
         COMMAND
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/prepare-esp32-vector-literals"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../abla-tool"
+            idf/prepare-esp32-vector-literals
             "$ENV{IDF_PATH}"
         RESULT_VARIABLE status
     )
