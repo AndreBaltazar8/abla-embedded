@@ -1,0 +1,758 @@
+// Attribute the bytes of a recovered unit.o that survive --gc-sections.
+//
+//     tools/abla-tool report-recovered-retention UNIT.O MAP [--top N] [--chain SYMBOL] [--subtrees N] [--dump FILE]
+//
+// MAP is the -Wl,-Map output of a link with -Wl,--cref. Kept sections are the unit.o input sections
+// placed at a non-zero address. Roots are the unit symbols the cross-reference table shows as referenced
+// from other files. The relocation graph of UNIT.O is walked breadth-first from the roots so every kept
+// section gets a shortest chain back to an external reference (an ESP-IDF or app object). Sections are
+// grouped by feature with the regex table below.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/regex"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+import "lib/elf.ab"
+
+class Feature(val name: string, val pattern: string)
+
+fun features(): array<Feature> {
+    val table: array<Feature> = []
+    table.append(Feature("mesh (libmesh)", """^(esp_mesh|mesh_|mwifi|mesh)"""))
+    table.append(Feature("esp-now", """espnow|esp_now"""))
+    table.append(Feature("FTM", """ftm"""))
+    table.append(Feature("NAN", """nan_|_nan|ieee80211_nan"""))
+    table.append(Feature("WPS/WAPI/smartconfig", """wps|wapi|sms4|smartconfig"""))
+    table.append(Feature("WEP/TKIP", """wep|tkip|michael|\barc4\b|rc4"""))
+    table.append(Feature("softAP / hostap", """softap|hostap|(^|_)ap_|_ap($|_)|ieee80211_.*_ap|ieee80211_beacon|ieee80211_proberesp"""))
+    table.append(Feature("GCMP/CCMP/crypto", """gcmp|ccmp|cmac|aes|crypto"""))
+    table.append(Feature("BT coexist / btbb", """^(coex|btdm|bt_|btbb|lc_|ble|bb_)|coexist|btbb"""))
+    table.append(Feature("11ax/HE/TWT", """(^|_)he_|_he($|_)|twt|11ax|heop|mu_edca|bss_color"""))
+    table.append(Feature("CSI/sniffer/promisc", """csi|promisc|sniff"""))
+    table.append(Feature("regulatory/country", """country|regulatory|regdomain"""))
+    table.append(Feature("A-MPDU/BA", """ampdu|(^|_)ba_|addba|delba"""))
+    table.append(Feature("power save / TIM / pm", """(^|_)pm_|tim_|(^|_)ps_|powersave|dtim"""))
+    table.append(Feature("phy cal / rf", """phy_|(^|_)rf_|^pll|cal_|txpwr|tx_pwctrl"""))
+    table.append(Feature("rate / rssi / scan", """rate|rssi|scan|roam|rc_"""))
+    table.append(Feature("ioctl/config/log", """ioctl|printf|log|config"""))
+    table
+}
+
+// ---- Python's set iteration order for small integers ----
+
+// The order in which CPython 3 iterates a set of non-negative ints added in the given order: open
+// addressing with the hash as the int itself, nine linear probes, perturbed jumps, growth to four times
+// the number of elements once the table is three fifths full.
+class SetTable(var mask: int, var fill: int, var keys: array<int>, var used: array<bool>)
+
+fun setInsertClean(var table: SetTable, key: int): void {
+    var i = key & table.mask
+    var perturb = key
+    while (true) {
+        val probes = if (i + 9 <= table.mask) 9 else 0
+        var entry = i
+        var left = probes
+        while (true) {
+            if (!table.used[entry]) {
+                table.used[entry] = true
+                table.keys[entry] = key
+                return
+            }
+            entry = entry + 1
+            if (left == 0) break
+            left = left - 1
+        }
+        perturb = perturb >> 5
+        i = (i * 5 + 1 + perturb) & table.mask
+    }
+}
+
+fun newSetTable(size: int): SetTable {
+    val keys: array<int> = []
+    val used: array<bool> = []
+    var index = 0
+    while (index < size) {
+        keys.append(0)
+        used.append(false)
+        index = index + 1
+    }
+    SetTable(size - 1, 0, keys, used)
+}
+
+fun setAdd(var table: SetTable, key: int): void {
+    setInsertClean(table, key)
+    table.fill = table.fill + 1
+    if (table.fill * 5 >= table.mask * 3) {
+        val wanted = if (table.fill > 50000) table.fill * 2 else table.fill * 4
+        var size = 8
+        while (size <= wanted) size = size * 2
+        val grown = newSetTable(size)
+        var index = 0
+        while (index <= table.mask) {
+            if (table.used[index]) setInsertClean(grown, table.keys[index])
+            index = index + 1
+        }
+        grown.fill = table.fill
+        table.mask = grown.mask
+        table.keys = grown.keys
+        table.used = grown.used
+    }
+}
+
+fun pySetOrder(values: array<int>): array<int> {
+    val table = newSetTable(8)
+    for (value in values) setAdd(table, value)
+    val order: array<int> = []
+    var index = 0
+    while (index <= table.mask) {
+        if (table.used[index]) order.append(table.keys[index])
+        index = index + 1
+    }
+    order
+}
+
+// ---- the map file ----
+
+class MapData(val keptNames: array<string>, val keptBytes: array<int>, val crefNames: array<string>,
+    val crefFiles: array<array<string>>, val error: string)
+
+val sectionLine = regexCompile("""^ (\.\S+)\s*$""")
+val unitContinuation = regexCompile("""^\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(\S.*unit\.o)\s*$""")
+val inlineSection = regexCompile("""^ (\.\S+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(\S.*unit\.o)\s*$""")
+
+fun hexValue(text: string): int = hexNumber(text.slice(2, text.size))
+
+fun indexOfName(names: array<string>, name: string): int {
+    var index = 0
+    while (index < names.size) {
+        if (names[index] == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+fun parseMap(path: string): MapData {
+    val keptNames: array<string> = []
+    val keptBytes: array<int> = []
+    val crefNames: array<string> = []
+    val crefFiles: array<array<string>> = []
+    val read = recoveredRead(path)
+    if (read.error != "") return MapData(keptNames, keptBytes, crefNames, crefFiles, read.error)
+    val lines = read.text.split("\n")
+    var cr = -1
+    var start = -1
+    var index = 0
+    while (index < lines.size) {
+        if (cr < 0 && lines[index].startsWith("Cross Reference Table")) cr = index
+        if (start < 0 && lines[index].startsWith("Linker script and memory map")) start = index
+        index = index + 1
+    }
+    if (cr < 0 || start < 0) return MapData(keptNames, keptBytes, crefNames, crefFiles, "StopIteration")
+    var k = start
+    while (k < cr) {
+        val line = lines[k]
+        val header = sectionLine.regex.find(line)
+        if (header != null && k + 1 < cr) {
+            val next = unitContinuation.regex.find(lines[k + 1])
+            if (next != null && hexValue(next.group(1) ?? "") != 0) {
+                addKept(keptNames, keptBytes, header.group(1) ?? "", hexValue(next.group(2) ?? ""))
+                k = k + 1
+                continue
+            }
+        }
+        val whole = inlineSection.regex.find(line)
+        if (whole != null && hexValue(whole.group(2) ?? "") != 0) {
+            addKept(keptNames, keptBytes, whole.group(1) ?? "", hexValue(whole.group(3) ?? ""))
+        }
+        k = k + 1
+    }
+    var current = -1
+    index = cr + 3
+    while (index < lines.size) {
+        val line = lines[index]
+        index = index + 1
+        if (pyStripLine(line) == "") continue
+        if (line[0] != 32) {
+            val split = splitOnce(line)
+            var at = indexOfName(crefNames, split[0])
+            val files: array<string> = []
+            if (split.size > 1) files.append(pyStripLine(split[1]))
+            if (at >= 0) {
+                crefFiles[at] = files
+            } else {
+                crefNames.append(split[0])
+                crefFiles.append(files)
+                at = crefNames.size - 1
+            }
+            current = at
+        } else if (current >= 0) {
+            crefFiles[current].append(pyStripLine(line))
+        }
+    }
+    MapData(keptNames, keptBytes, crefNames, crefFiles, "")
+}
+
+fun addKept(var names: array<string>, var bytes: array<int>, name: string, size: int): void {
+    val at = indexOfName(names, name)
+    if (at >= 0) {
+        bytes[at] = bytes[at] + size
+    } else {
+        names.append(name)
+        bytes.append(size)
+    }
+}
+
+fun pySpaceByte(c: int): bool = c == 32 || (c >= 9 && c <= 13) || (c >= 28 && c <= 31)
+
+fun pyStripLine(text: string): string {
+    var begin = 0
+    var end = text.size
+    while (begin < end && pySpaceByte(text[begin])) begin = begin + 1
+    while (end > begin && pySpaceByte(text[end - 1])) end = end - 1
+    text.slice(begin, end)
+}
+
+// line.split(None, 1): the first word and the stripped rest (when there is one).
+fun splitOnce(line: string): array<string> {
+    var begin = 0
+    while (begin < line.size && pySpaceByte(line[begin])) begin = begin + 1
+    var end = begin
+    while (end < line.size && !pySpaceByte(line[end])) end = end + 1
+    val parts: array<string> = [line.slice(begin, end)]
+    var rest = end
+    while (rest < line.size && pySpaceByte(line[rest])) rest = rest + 1
+    if (rest < line.size) parts.append(line.slice(rest, line.size))
+    parts
+}
+
+// ---- the object ----
+
+class Section(val name: string, val kind: int, val offset: int, val size: int, val link: int,
+    val info: int, val entrySize: int)
+
+class Sym(val name: string, val value: int, val size: int, val bind: int, val kind: int, val shn: int)
+
+class ObjectGraph(val sections: array<Section>, val syms: array<Sym>, val relocationSymbols: Map<int, array<int>>,
+    val error: string)
+
+fun loadObject(path: string): ObjectGraph {
+    val none: array<Section> = []
+    val noSyms: array<Sym> = []
+    val noRels: Map<int, array<int>> = Map()
+    val read = Path(path).readTextResult()
+    if (!read.succeeded) return ObjectGraph(none, noSyms, noRels, "cannot read ${path}")
+    val elf = elf32Parse(read.text)
+    if (elf.error != "") return ObjectGraph(none, noSyms, noRels, elf.error)
+    val sections: array<Section> = []
+    for (s in elf.sections) sections.append(Section(s.name, s.kind, s.offset, s.size, s.link, s.info, s.entrySize))
+    var table = -1
+    var index = 0
+    while (index < sections.size) {
+        if (table < 0 && sections[index].kind == 2) table = index
+        index = index + 1
+    }
+    if (table < 0) return ObjectGraph(none, noSyms, noRels, "StopIteration")
+    val syms: array<Sym> = []
+    for (symbol in elf.symbols(table)) {
+        syms.append(Sym(symbol.name, symbol.value, symbol.size, symbol.binding(), symbol.kind(), symbol.sectionIndex))
+    }
+    val rels: Map<int, array<int>> = Map()
+    index = 0
+    while (index < sections.size) {
+        val s = sections[index]
+        index = index + 1
+        if (s.kind != 4 && s.kind != 9) continue
+        if (s.entrySize == 0) return ObjectGraph(none, noSyms, noRels, "ZeroDivisionError")
+        if (!rels.has(s.info)) {
+            val fresh: array<int> = []
+            rels.set(s.info, fresh)
+        }
+        val list = rels.get(s.info)
+        var entry = 0
+        while (entry < s.size / s.entrySize) {
+            val at = s.offset + entry * s.entrySize
+            if (list != null) list.append(elfU32(read.text, at + 4) >> 8)
+            entry = entry + 1
+        }
+    }
+    ObjectGraph(sections, syms, rels, "")
+}
+
+// ---- the report ----
+
+class Prev(val kind: string, val from: int, val name: string, val external: string)
+
+class Report(val graph: ObjectGraph, val prevKind: Map<int, Prev>, val order: array<int>,
+    val secSyms: Map<int, array<int>>, val defSym: Map<string, int>)
+
+// label(i): the section's best symbol name, else its section name.
+fun sectionLabel(report: Report, index: int): string {
+    val found = report.secSyms.get(index)
+    val ids: array<int> = []
+    if (found != null) {
+        for (id in found) ids.append(id)
+    }
+    var chosen = -1
+    for (id in ids) {
+        val s = report.graph.syms[id]
+        if (chosen < 0 && (s.kind == 1 || s.kind == 2) && s.bind != 0) chosen = id
+    }
+    if (chosen < 0) {
+        for (id in ids) {
+            val s = report.graph.syms[id]
+            if (chosen < 0 && (s.kind == 1 || s.kind == 2)) chosen = id
+        }
+    }
+    if (chosen < 0 && ids.size > 0) chosen = ids[0]
+    if (chosen >= 0) report.graph.syms[chosen].name else report.graph.sections[index].name
+}
+
+fun rootOf(report: Report, start: int): int {
+    var i = start
+    while (true) {
+        val p = report.prevKind.get(i)
+        if (p == null || p.kind == "ROOT") return i
+        i = p.from
+    }
+    i
+}
+
+// The chain of labels back to the root, outermost first, ending with the external referrer.
+fun chainOf(report: Report, start: int): array<string> {
+    val out: array<string> = []
+    var i = start
+    while (true) {
+        val p = report.prevKind.get(i)
+        if (p == null) break
+        out.append(sectionLabel(report, i))
+        if (p.kind == "ROOT") {
+            out.append("<${p.external}> via ${p.name}")
+            break
+        }
+        i = p.from
+    }
+    val reversed: array<string> = []
+    var at = out.size - 1
+    while (at >= 0) {
+        reversed.append(out[at])
+        at = at - 1
+    }
+    reversed
+}
+
+fun padLeft(text: string, width: int): string = text.padStart(width, " ")
+
+fun padRight(text: string, width: int): string = text.padEnd(width, " ")
+
+// Counter.most_common(n): counts descending, ties in first-seen order.
+fun mostCommon(keys: array<int>, counts: array<int>, n: int): array<int> {
+    val order: array<int> = []
+    var index = 0
+    while (index < keys.size) {
+        var place = order.size
+        while (place > 0 && counts[order[place - 1]] < counts[index]) place = place - 1
+        order.append(index)
+        var shift = order.size - 1
+        while (shift > place) {
+            order[shift] = order[shift - 1]
+            shift = shift - 1
+        }
+        order[place] = index
+        index = index + 1
+    }
+    val limited: array<int> = []
+    var count = 0
+    for (item in order) {
+        if (count < n) limited.append(item)
+        count = count + 1
+    }
+    limited
+}
+
+fun counterAdd(var keys: array<int>, var counts: array<int>, key: int, amount: int): void {
+    var index = 0
+    while (index < keys.size) {
+        if (keys[index] == key) {
+            counts[index] = counts[index] + amount
+            return
+        }
+        index = index + 1
+    }
+    keys.append(key)
+    counts.append(amount)
+}
+
+fun parseNumber(text: string, var failure: Failure): int {
+    if (text.size == 0) {
+        failure.message = "invalid literal for int() with base 10: ''"
+        return 0
+    }
+    var value = 0
+    var index = 0
+    var negative = false
+    if (text[0] == 45) {
+        negative = true
+        index = 1
+    }
+    if (index >= text.size) {
+        failure.message = "invalid literal for int() with base 10: '${text}'"
+        return 0
+    }
+    while (index < text.size) {
+        val c = text[index]
+        if (c < 48 || c > 57) {
+            failure.message = "invalid literal for int() with base 10: '${text}'"
+            return 0
+        }
+        value = value * 10 + (c - 48)
+        index = index + 1
+    }
+    if (negative) -value else value
+}
+
+class Failure(var message: string)
+
+fun main: int {
+    val arguments: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        arguments.append(processArgument(index))
+        index = index + 1
+    }
+    val failure = Failure("")
+    var top = 15
+    var chainSymbol = ""
+    var haveChain = false
+    var dump = ""
+    var haveDump = false
+    var subtrees = 0
+    // Each option is taken once, in this order, with the word after it.
+    for (name in ["--top", "--chain", "--subtrees", "--dump"]) {
+        val at = indexOfName(arguments, name)
+        if (at < 0) continue
+        if (at + 1 >= arguments.size) {
+            eprintln("IndexError: list index out of range")
+            return 1
+        }
+        val value = arguments[at + 1]
+        arguments.removeAt(at)
+        arguments.removeAt(at)
+        if (name == "--top") top = parseNumber(value, failure)
+        else if (name == "--chain") { chainSymbol = value; haveChain = true }
+        else if (name == "--subtrees") subtrees = parseNumber(value, failure)
+        else { dump = value; haveDump = true }
+        if (failure.message != "") {
+            eprintln("ValueError: ${failure.message}")
+            return 1
+        }
+    }
+    if (arguments.size != 2) {
+        eprintln("ValueError: ${if (arguments.size > 2) "too many values to unpack (expected 2)" else "not enough values to unpack (expected 2, got ${arguments.size})"}")
+        return 1
+    }
+    val graph = loadObject(arguments[0])
+    if (graph.error != "") {
+        eprintln(graph.error)
+        return 1
+    }
+    val map = parseMap(arguments[1])
+    if (map.error != "") {
+        eprintln(map.error)
+        return 1
+    }
+    val sections = graph.sections
+    // sections by name, and the kept section indexes (each once)
+    val keptSet: array<int> = []
+    for (name in map.keptNames) {
+        var at = 0
+        while (at < sections.size) {
+            if (sections[at].name == name && !containsInt(keptSet, at)) keptSet.append(at)
+            at = at + 1
+        }
+    }
+    val secSyms: Map<int, array<int>> = Map()
+    val defSym: Map<string, int> = Map()
+    var id = 0
+    while (id < graph.syms.size) {
+        val s = graph.syms[id]
+        if (s.shn != 0 && s.shn < 0xff00 && s.name != "" && (s.kind == 0 || s.kind == 1 || s.kind == 2)) {
+            if (!secSyms.has(s.shn)) {
+                val fresh: array<int> = []
+                secSyms.set(s.shn, fresh)
+            }
+            val list = secSyms.get(s.shn)
+            if (list != null) list.append(id)
+            if (s.bind != 0) defSym.set(s.name, s.shn)
+        }
+        id = id + 1
+    }
+    val prev: Map<int, Prev> = Map()
+    val order: array<int> = []
+    val report = Report(graph, prev, order, secSyms, defSym)
+
+    // roots
+    val rootNames: array<string> = []
+    val rootExternal: array<string> = []
+    var ci = 0
+    while (ci < map.crefNames.size) {
+        val name = map.crefNames[ci]
+        val files = map.crefFiles[ci]
+        ci = ci + 1
+        if (!defSym.has(name) || files.size == 0 || !files[0].contains("unit.o")) continue
+        var external = ""
+        var haveExternal = false
+        var f = 1
+        while (f < files.size) {
+            if (!haveExternal && !files[f].contains("unit.o")) {
+                external = files[f]
+                haveExternal = true
+            }
+            f = f + 1
+        }
+        if (haveExternal) {
+            rootNames.append(name)
+            rootExternal.append(external)
+        }
+    }
+    var frontier: array<int> = []
+    var r = 0
+    while (r < rootNames.size) {
+        val section = defSym.get(rootNames[r]) ?? 0
+        if (!prev.has(section)) {
+            prev.set(section, Prev("ROOT", 0, rootNames[r], rootExternal[r]))
+            order.append(section)
+            frontier.append(section)
+        }
+        r = r + 1
+    }
+    while (frontier.size > 0) {
+        val next: array<int> = []
+        for (si in frontier) {
+            val targets: array<int> = []
+            val targetNames: array<string> = []
+            val group: array<int> = [si]
+            val sibling = siblingSections(sections, si)
+            for (extra in sibling) group.append(extra)
+            for (s2 in group) {
+                if (s2 != si && !prev.has(s2)) {
+                    prev.set(s2, Prev("LIT", si, "", ""))
+                    order.append(s2)
+                }
+                val rels = graph.relocationSymbols.get(s2)
+                if (rels != null) {
+                    for (sy in rels) {
+                        if (sy < 0 || sy >= graph.syms.size) {
+                            eprintln("IndexError: list index out of range")
+                            return 1
+                        }
+                        val t = graph.syms[sy]
+                        if (t.shn != 0 && t.shn < 0xff00) {
+                            targets.append(t.shn)
+                            targetNames.append(t.name)
+                        }
+                    }
+                }
+            }
+            var ti = 0
+            while (ti < targets.size) {
+                if (!prev.has(targets[ti])) {
+                    prev.set(targets[ti], Prev("REF", si, targetNames[ti], ""))
+                    order.append(targets[ti])
+                    next.append(targets[ti])
+                }
+                ti = ti + 1
+            }
+        }
+        frontier = next
+    }
+    val reachInput: array<int> = []
+    for (i in order) {
+        if (i >= 0 && i < sections.size && sections[i].size != 0) reachInput.append(i)
+    }
+    val reach = pySetOrder(reachInput)
+    var keptBytesTotal = 0
+    for (i in keptSet) keptBytesTotal = keptBytesTotal + sections[i].size
+    var reachBytes = 0
+    for (i in reach) reachBytes = reachBytes + sections[i].size
+    var keptNotWalked = 0
+    for (i in keptSet) {
+        if (!containsInt(reach, i)) keptNotWalked = keptNotWalked + sections[i].size
+    }
+    println("kept unit.o sections: ${keptSet.size} / ${keptBytesTotal} bytes; walked: ${reach.size} / ${reachBytes} bytes; roots: ${rootNames.size}; kept-not-walked: ${keptNotWalked}")
+
+    if (haveChain) {
+        val section = defSym.get(chainSymbol)
+        if (section == null) {
+            eprintln("KeyError: '${chainSymbol}'")
+            return 1
+        }
+        if (!prev.has(section)) {
+            eprintln("KeyError: ${section}")
+            return 1
+        }
+        println(chainOf(report, section).join(" -> "))
+        return 0
+    }
+    if (subtrees != 0) {
+        // Bytes each section keeps alive through the shortest-path tree.
+        val keys: array<int> = []
+        val counts: array<int> = []
+        for (i in reach) {
+            var j = i
+            while (true) {
+                counterAdd(keys, counts, j, sections[i].size)
+                val p = prev.get(j)
+                if (p == null || p.kind == "ROOT") break
+                j = p.from
+            }
+        }
+        for (at in mostCommon(keys, counts, subtrees)) {
+            val j = keys[at]
+            val p = prev.get(j)
+            val origin = if (p != null && p.kind != "ROOT") sectionLabel(report, p.from) else (p?.external ?? "")
+            println("${padLeft("${counts[at]}", 8)} ${padLeft("${sections[j].size}", 6)}  ${sectionLabel(report, j)}  <- ${origin}")
+        }
+        return 0
+    }
+    val featureTable = features()
+    val compiled: array<Regex> = []
+    for (feature in featureTable) {
+        val result = regexCompile(feature.pattern)
+        if (!result.succeeded) {
+            eprintln("bad pattern ${feature.pattern}: ${result.error.message}")
+            return 1
+        }
+        compiled.append(result.regex)
+    }
+    val groupNames: array<string> = []
+    val groupBytes: array<int> = []
+    val groupRootKeys: array<array<int>> = []
+    val groupRootCounts: array<array<int>> = []
+    val rowSizes: array<int> = []
+    val rowGroups: array<string> = []
+    val rowNames: array<string> = []
+    val rowRoots: array<string> = []
+    val rowExternals: array<string> = []
+    for (i in reach) {
+        val name = sectionLabel(report, i)
+        var group = "other"
+        val lowered = name.lowercase()
+        var f = 0
+        var chosen = false
+        while (f < featureTable.size && !chosen) {
+            if (compiled[f].find(lowered) != null) {
+                group = featureTable[f].name
+                chosen = true
+            }
+            f = f + 1
+        }
+        var at = indexOfName(groupNames, group)
+        if (at < 0) {
+            groupNames.append(group)
+            groupBytes.append(0)
+            val keys: array<int> = []
+            val counts: array<int> = []
+            groupRootKeys.append(keys)
+            groupRootCounts.append(counts)
+            at = groupNames.size - 1
+        }
+        val root = rootOf(report, i)
+        groupBytes[at] = groupBytes[at] + sections[i].size
+        counterAdd(groupRootKeys[at], groupRootCounts[at], root, sections[i].size)
+        val rootPrev = prev.get(root)
+        rowSizes.append(sections[i].size)
+        rowGroups.append(group)
+        rowNames.append(name)
+        rowRoots.append(sectionLabel(report, root))
+        rowExternals.append(rootPrev?.external ?? "")
+    }
+    if (haveDump) {
+        val parts: array<string> = []
+        for (row in rowsDescending(rowSizes, rowGroups, rowNames, rowRoots, rowExternals)) {
+            parts.append("${rowSizes[row]}\t${rowGroups[row]}\t${rowNames[row]}\t${rowRoots[row]}\t${rowExternals[row]}\n")
+        }
+        Path(dump).writeText(parts.join(""))
+    }
+    println("${padRight("group", 26)} ${padLeft("bytes", 8)}  dominant root (unit symbol <- first external referrer)")
+    val groupOrder = mostCommon(indexRange(groupNames.size), groupBytes, top)
+    for (g in groupOrder) {
+        val best = mostCommon(groupRootKeys[g], groupRootCounts[g], 1)
+        val root = groupRootKeys[g][best[0]]
+        val rootPrev = prev.get(root)
+        println("${padRight(groupNames[g], 26)} ${padLeft("${groupBytes[g]}", 8)}  ${sectionLabel(report, root)} <- ${rootPrev?.external ?? ""} (${groupRootCounts[g][best[0]]} B)")
+    }
+    println("\nlargest roots by dominated bytes:")
+    val ownKeys: array<int> = []
+    val ownCounts: array<int> = []
+    for (i in reach) counterAdd(ownKeys, ownCounts, rootOf(report, i), sections[i].size)
+    for (at in mostCommon(ownKeys, ownCounts, top)) {
+        val root = ownKeys[at]
+        val rootPrev = prev.get(root)
+        println("${padLeft("${ownCounts[at]}", 8)}  ${sectionLabel(report, root)}  <- ${rootPrev?.external ?? ""}")
+    }
+    0
+}
+
+fun containsInt(values: array<int>, wanted: int): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}
+
+// `.literal.NAME` sections next to a `.text.NAME` section.
+fun siblingSections(sections: array<Section>, index: int): array<int> {
+    val found: array<int> = []
+    val name = sections[index].name
+    if (!name.startsWith(".text.")) return found
+    val wanted = ".literal." + name.slice(6, name.size)
+    var at = 0
+    while (at < sections.size) {
+        if (sections[at].name == wanted) found.append(at)
+        at = at + 1
+    }
+    found
+}
+
+fun indexRange(count: int): array<int> {
+    val values: array<int> = []
+    var index = 0
+    while (index < count) {
+        values.append(index)
+        index = index + 1
+    }
+    values
+}
+
+// Row indexes ordered as `sorted(rows, reverse=True)` orders the tuples
+// (size, group, name, root label, external referrer).
+fun rowsDescending(sizes: array<int>, groups: array<string>, names: array<string>, roots: array<string>,
+    externals: array<string>): array<int> {
+    val order: array<int> = []
+    var index = 0
+    while (index < sizes.size) {
+        var place = order.size
+        while (place > 0 && rowLess(order[place - 1], index, sizes, groups, names, roots, externals)) place = place - 1
+        order.append(index)
+        var shift = order.size - 1
+        while (shift > place) {
+            order[shift] = order[shift - 1]
+            shift = shift - 1
+        }
+        order[place] = index
+        index = index + 1
+    }
+    order
+}
+
+fun rowLess(a: int, b: int, sizes: array<int>, groups: array<string>, names: array<string>,
+    roots: array<string>, externals: array<string>): bool {
+    if (sizes[a] != sizes[b]) return sizes[a] < sizes[b]
+    if (groups[a] != groups[b]) return groups[a] < groups[b]
+    if (names[a] != names[b]) return names[a] < names[b]
+    if (roots[a] != roots[b]) return roots[a] < roots[b]
+    externals[a] < externals[b]
+}

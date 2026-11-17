@@ -1,0 +1,449 @@
+// Replace object-local executable-section relocations with function symbols.
+//
+// Xtensa GCC often relocates a call or data pointer against a local section such as `.iram1.16`
+// instead of against the function which starts that section. That is safe while every C input
+// remains a separate object. Recovered Abla is one LLVM unit, so identical section spellings from
+// unrelated inputs would otherwise coalesce and point at whichever function happened to be emitted
+// first.
+//
+// This source-recovery pass identifies the archive member represented by each Abla module, reads
+// that member's function table, and replaces every executable section reference with the stable ABI
+// symbol or recovered local-helper label. Section-placement annotations and definitions are
+// intentionally left intact.
+//
+//     tools/abla-tool resolve-recovered-executable-section-targets --archives DIR --objdump CMD [--write] SOURCE.ab [...]
+//
+// `--objdump` is accepted for compatibility with the former Python tool and not needed: the member's
+// symbol table is read directly.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+// One `.iram...`/`.text...` reference with an optional `+0x`/`-0x` addend inside a line.
+class SectionReference(val begin: int, val end: int, val section: string, val addend: string)
+
+private fun referenceByte(c: int): bool = isByteIn(c, ".$")
+
+// EXECUTABLE_REFERENCE over one line: `(?<![A-Za-z0-9_.$])(\.(?:iram|text)[A-Za-z0-9_.$-]*)([+-]0x[0-9A-Fa-f]+)?(?![A-Za-z0-9_.$])`.
+fun sectionReferences(line: string): array<SectionReference> {
+    val found: array<SectionReference> = []
+    var from = 0
+    while (from < line.size) {
+        var at = -1
+        var scan = from
+        while (scan < line.size) {
+            if (line[scan] == 46 && (hasAt(line, scan, ".iram") || hasAt(line, scan, ".text"))) {
+                if (scan == 0 || !referenceByte(line[scan - 1])) {
+                    at = scan
+                    break
+                }
+            }
+            scan = scan + 1
+        }
+        if (at < 0) break
+        var end = at + 5
+        while (end < line.size && (referenceByte(line[end]) || line[end] == 45)) end = end + 1
+        var addendEnd = -1
+        if (end + 3 <= line.size && (line[end] == 43 || line[end] == 45) && hasAt(line, end + 1, "0x")) {
+            var digits = end + 3
+            while (digits < line.size && hexNumber(line.slice(digits, digits + 1)) >= 0) digits = digits + 1
+            if (digits > end + 3) {
+                // The lookahead must not see a symbol byte; fewer hex digits would leave a hex digit there.
+                if (digits >= line.size || !referenceByte(line[digits])) addendEnd = digits
+            }
+        }
+        if (addendEnd >= 0) {
+            found.append(SectionReference(at, addendEnd, line.slice(at, end), line.slice(end, addendEnd)))
+            from = addendEnd
+        } else {
+            found.append(SectionReference(at, end, line.slice(at, end), ""))
+            from = end
+        }
+    }
+    found
+}
+
+fun skipsReferences(line: string): bool {
+    val stripped = pyLeftStrip(line)
+    stripped.startsWith("@section(") || stripped.startsWith(".section ") || stripped.startsWith(".pushsection ")
+}
+
+fun sourceSectionReferences(source: string): array<string> {
+    val references: array<string> = []
+    for (line in pySplitLines(source)) {
+        if (skipsReferences(line)) continue
+        for (reference in sectionReferences(line)) references.append(reference.section)
+    }
+    sortedUnique(references)
+}
+
+
+class SectionFunction(val symbol: string, val offset: int)
+
+// Section name to the function symbols (in symbol-table order) placed in an `.iram*`/`.text*` section.
+fun sectionFunctions(data: string): Map<string, array<SectionFunction>> {
+    val result: Map<string, array<SectionFunction>> = Map()
+    for (symbol in objectSymbols(data)) {
+        if (symbol.kind != 2 || symbol.section == "") continue
+        if (!(symbol.section.startsWith(".iram") || symbol.section.startsWith(".text"))) continue
+        if (!result.has(symbol.section)) {
+            val fresh: array<SectionFunction> = []
+            result.set(symbol.section, fresh)
+        }
+        val list = result.get(symbol.section)
+        if (list != null) list.append(SectionFunction(symbol.name, symbol.value))
+    }
+    result
+}
+
+// The unique label `.Labla_recovered_*_local_SAFE` defined on a line of its own, or "" (none or several).
+fun localTarget(source: string, symbol: string): string {
+    val suffix = "_local_" + safeIdentifier(symbol)
+    val found: array<string> = []
+    for (line in source.split("\n")) {
+        if (!line.startsWith(".Labla_recovered_") || !line.endsWith(":")) continue
+        val label = line.slice(0, line.size - 1)
+        if (!label.endsWith(suffix)) continue
+        val middle = label.slice(17, label.size - suffix.size)
+        if (label.size - suffix.size <= 17) continue
+        var valid = true
+        for (c in middle) {
+            if (!(isAlnum(c) || c == 95)) valid = false
+        }
+        if (!valid) continue
+        var present = false
+        for (other in found) {
+            if (other == label) present = true
+        }
+        if (!present) found.append(label)
+    }
+    if (found.size == 1) found[0] else ""
+}
+
+class TargetsResult(val sections: array<string>, val targets: array<string>, val starts: array<int>, val error: string)
+
+fun targetsForSource(path: string, source: string, functions: Map<string, array<SectionFunction>>,
+    references: array<string>): TargetsResult {
+    val abiSymbols = abiSymbolTokens(source)
+    val sections: array<string> = []
+    val targets: array<string> = []
+    val starts: array<int> = []
+    for (section in references) {
+        val entries = functions.get(section)
+        val chosen: array<SectionFunction> = []
+        if (entries != null) {
+            for (entry in entries) {
+                if (entry.offset == 0) chosen.append(entry)
+            }
+        }
+        if (chosen.size != 1) {
+            return TargetsResult(sections, targets, starts,
+                "${pyPath(path)}: ${section} has ${chosen.size} function entries in its source member")
+        }
+        val symbol = chosen[0].symbol
+        var isAbi = false
+        for (other in abiSymbols) {
+            if (other == symbol) isAbi = true
+        }
+        val target = if (isAbi) symbol else localTarget(source, symbol)
+        if (target == "") {
+            return TargetsResult(sections, targets, starts,
+                "${pyPath(path)}: cannot bind local ${section} target ${symbol} to a recovered Abla label")
+        }
+        sections.append(section)
+        targets.append(target)
+        starts.append(chosen[0].offset)
+    }
+    TargetsResult(sections, targets, starts, "")
+}
+
+class Rewritten(val text: string, val count: int)
+
+fun rewriteTargets(source: string, targets: TargetsResult): Rewritten {
+    var changed = 0
+    val output: array<string> = []
+    for (line in pySplitLinesKeepEnds(source)) {
+        if (skipsReferences(line)) {
+            output.append(line)
+            continue
+        }
+        val parts: array<string> = []
+        var last = 0
+        for (reference in sectionReferences(line)) {
+            var which = -1
+            var index = 0
+            while (index < targets.sections.size) {
+                if (targets.sections[index] == reference.section) which = index
+                index = index + 1
+            }
+            if (which < 0) continue
+            val addend = if (reference.addend == "") 0 else signedHex(reference.addend)
+            val delta = addend - targets.starts[which]
+            changed = changed + 1
+            parts.append(line.slice(last, reference.begin))
+            if (delta > 0) parts.append("${targets.targets[which]}+0x${hexText(delta)}")
+            else if (delta < 0) parts.append("${targets.targets[which]}-0x${hexText(-delta)}")
+            else parts.append(targets.targets[which])
+            last = reference.end
+        }
+        parts.append(line.slice(last, line.size))
+        output.append(parts.join(""))
+    }
+    Rewritten(output.join(""), changed)
+}
+
+// int("+0x1f", 16) and int("-0x1f", 16).
+fun signedHex(text: string): int {
+    val value = hexNumber(text.slice(3, text.size))
+    if (text[0] == 45) -value else value
+}
+
+class PlacementResult(val text: string, val count: int, val error: string)
+
+// Recover the original placement section for nested local functions: each `.local LABEL` helper's
+// `.pushsection` section becomes SECTION.abla.LABEL unless it is a `.text` section.
+fun rewriteLocalPlacements(source: string, labels: array<string>, sections: array<string>): PlacementResult {
+    var text = source
+    var changed = 0
+    var index = 0
+    while (index < labels.size) {
+        val label = labels[index]
+        val section = sections[index]
+        index = index + 1
+        val localOffset = text.indexOf(".local ${label}")
+        if (localOffset < 0) continue
+        val begin = rfindBefore(text, ".pushsection ", localOffset)
+        if (begin < 0 || rfindBefore(text, ".popsection", localOffset) > begin) {
+            return PlacementResult(source, 0, "local helper ${label} has no owning pushsection")
+        }
+        val nameBegin = begin + 13
+        var nameEnd = text.indexOf(",", nameBegin)
+        if (nameEnd < 0 || nameEnd >= localOffset) {
+            return PlacementResult(source, 0, "local helper ${label} has malformed pushsection")
+        }
+        val old = text.slice(nameBegin, nameEnd)
+        val new = if (section.startsWith(".text")) old else "${section}.abla.${safeIdentifier(label)}"
+        if (old != new) {
+            text = text.slice(0, nameBegin) + new + text.slice(nameEnd, text.size)
+            changed = changed + 1
+        }
+    }
+    PlacementResult(text, changed, "")
+}
+
+// Labels of nested local functions and the section each came from (later sections win).
+fun localPlacements(source: string, functions: Map<string, array<SectionFunction>>,
+    var labels: array<string>, var sections: array<string>): void {
+    for (section in functions.keys()) {
+        val entries = functions.get(section)
+        if (entries == null) continue
+        for (entry in entries) {
+            if (entry.offset != 0) continue
+            val target = localTarget(source, entry.symbol)
+            if (target == "") continue
+            var at = -1
+            var index = 0
+            while (index < labels.size) {
+                if (labels[index] == target) at = index
+                index = index + 1
+            }
+            if (at >= 0) {
+                sections[at] = section
+            } else {
+                labels.append(target)
+                sections.append(section)
+            }
+        }
+    }
+}
+
+fun main: int {
+    var archives = ""
+    var objdump = ""
+    var write = false
+    val sources: array<string> = []
+    var index = 0
+    val usage = "usage: resolve-recovered-executable-section-targets [-h] --archives ARCHIVES --objdump OBJDUMP [--write] sources [sources ...]"
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--archives" && index + 1 < processArgumentCount()) {
+            archives = processArgument(index + 1)
+            index = index + 1
+        } else if (argument.startsWith("--archives=")) {
+            archives = argument.slice(11, argument.size)
+        } else if (argument == "--objdump" && index + 1 < processArgumentCount()) {
+            objdump = processArgument(index + 1)
+            index = index + 1
+        } else if (argument.startsWith("--objdump=")) {
+            objdump = argument.slice(10, argument.size)
+        } else if (argument.size > 2 && argument.startsWith("--") && "--write".startsWith(argument)) {
+            write = true
+        } else if (argument == "-h" || argument == "--help") {
+            println(usage)
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln(usage)
+            eprintln("resolve-recovered-executable-section-targets: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            sources.append(argument)
+        }
+        index = index + 1
+    }
+    if (archives == "" || objdump == "" || sources.size == 0) {
+        eprintln(usage)
+        eprintln("resolve-recovered-executable-section-targets: error: the following arguments are required: --archives, --objdump, sources")
+        return 2
+    }
+    val pendingPaths: array<string> = []
+    val pendingTexts: array<string> = []
+    val pendingReferences: array<array<string>> = []
+    val pendingSymbols: array<array<string>> = []
+    val wanted: Map<string, int> = Map()
+    for (path in sources) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val references = sourceSectionReferences(read.text)
+        if (references.size == 0 && !read.text.contains(".pushsection .text.abla_")) continue
+        val symbols = abiSymbolTokens(read.text)
+        if (symbols.size == 0) {
+            eprintln("ValueError: ${pyPath(path)}: has section references but no ABI symbols")
+            return 1
+        }
+        pendingPaths.append(path)
+        pendingTexts.append(read.text)
+        pendingReferences.append(references)
+        pendingSymbols.append(symbols)
+        for (symbol in symbols) wanted.set(symbol, 1)
+    }
+    val found = archiveSymbolIndex(recursiveFiles(archives, ".a"), wanted)
+    if (found.error != "") {
+        eprintln(found.error)
+        return 1
+    }
+    var total = 0
+    val action = if (write) "rewrote" else "would rewrite"
+    var which = 0
+    while (which < pendingPaths.size) {
+        val path = pendingPaths[which]
+        val source = pendingTexts[which]
+        val member = chooseMember(path, pendingSymbols[which], found.owners)
+        if (member.error != "") {
+            eprintln("ValueError: ${member.error}")
+            return 1
+        }
+        val owner = member.owner
+        val instances = archiveInstances(owner.archive, owner.member)
+        if (instances != 1) {
+            eprintln("ValueError: duplicate archive member is unsupported: ${owner.archive}:${owner.member}")
+            return 1
+        }
+        val objects = memberObjects(owner.archive, owner.member)
+        if (objects.error != "") {
+            eprintln(objects.error)
+            return 1
+        }
+        val functions = sectionFunctions(objects.objects[0])
+        val targets = targetsForSource(path, source, functions, pendingReferences[which])
+        if (targets.error != "") {
+            eprintln("ValueError: ${targets.error}")
+            return 1
+        }
+        val rewritten = rewriteTargets(source, targets)
+        val labels: array<string> = []
+        val sections: array<string> = []
+        localPlacements(rewritten.text, functions, labels, sections)
+        val placed = rewriteLocalPlacements(rewritten.text, labels, sections)
+        if (placed.error != "") {
+            eprintln("ValueError: ${placed.error}")
+            return 1
+        }
+        val changed = rewritten.count + placed.count
+        if (write) Path(path).writeText(placed.text)
+        total = total + changed
+        println("${pyPath(path)}: ${action} ${rewritten.count} target(s) and ${placed.count} local placement(s) from ${Path(owner.archive).name()}:${owner.member}")
+        which = which + 1
+    }
+    println("${action} ${total} recovered executable-section target(s)")
+    0
+}
+
+class ChosenMember(val owner: ArchiveMember, val error: string)
+
+// The archive member defining the most of the source's ABI symbols; ambiguous or absent is an error.
+fun chooseMember(path: string, symbols: array<string>, owners: Map<string, array<ArchiveMember>>): ChosenMember {
+    val unique: array<string> = []
+    for (symbol in symbols) {
+        var present = false
+        for (other in unique) {
+            if (other == symbol) present = true
+        }
+        if (!present) unique.append(symbol)
+    }
+    val members: array<ArchiveMember> = []
+    val scores: array<int> = []
+    for (symbol in unique) {
+        val list = owners.get(symbol)
+        if (list == null) continue
+        for (owner in list) {
+            var at = -1
+            var index = 0
+            while (index < members.size) {
+                if (members[index].archive == owner.archive && members[index].member == owner.member) at = index
+                index = index + 1
+            }
+            if (at >= 0) scores[at] = scores[at] + 1
+            else {
+                members.append(owner)
+                scores.append(1)
+            }
+        }
+    }
+    val none = ArchiveMember("", "")
+    if (members.size == 0) return ChosenMember(none, "${pyPath(path)}: none of its ABI symbols exist in the archives")
+    var best = 0
+    for (score in scores) {
+        if (score > best) best = score
+    }
+    val tied: array<ArchiveMember> = []
+    var index = 0
+    while (index < members.size) {
+        if (scores[index] == best) tied.append(members[index])
+        index = index + 1
+    }
+    if (tied.size != 1) {
+        val rendered: array<string> = []
+        val order = sortedMembers(tied)
+        for (owner in order) rendered.append("${Path(owner.archive).name()}:${owner.member}")
+        return ChosenMember(none, "${pyPath(path)}: archive member is ambiguous at score ${best}: ${rendered.join(", ")}")
+    }
+    ChosenMember(tied[0], "")
+}
+
+fun sortedMembers(values: array<ArchiveMember>): array<ArchiveMember> {
+    val keys: array<string> = []
+    for (value in values) keys.append(value.archive)
+    val sorted = sortPaths(keys)
+    val result: array<ArchiveMember> = []
+    for (key in sorted) {
+        val same: array<string> = []
+        for (value in values) {
+            if (value.archive == key) same.append(value.member)
+        }
+        val ordered = sortedUnique(same)
+        for (member in ordered) {
+            var present = false
+            for (done in result) {
+                if (done.archive == key && done.member == member) present = true
+            }
+            if (!present) result.append(ArchiveMember(key, member))
+        }
+    }
+    result
+}

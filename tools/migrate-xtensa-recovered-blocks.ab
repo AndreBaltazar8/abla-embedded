@@ -1,0 +1,604 @@
+// Move opaque Xtensa strings into the parsed `$xtensa instructions` form.
+//
+//     tools/abla-tool migrate-xtensa-recovered-blocks [--check] [PATH ...]
+//
+// Without paths, every .ab file below `src` except src/xtensa/assembly.ab.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/regex"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+val defaultConstraints = "\"~{memory}\""
+
+val addressCall = regexCompile("""xtensaAssemblyReadU32\(\s*"movi \$0, ([A-Za-z_.$][A-Za-z0-9_.$]*)"\s*,\s*"=[ar]"\s*\)""")
+val immediateCall = regexCompile("""xtensaAssemblyReadU32\(\s*"movi \$0, ([0-9]+)"\s*,\s*"=[ar]"\s*\)""")
+val voidCallTemplate = regexCompile("""(?:movi\s+a8,\s*([A-Za-z_.$][A-Za-z0-9_.$]*)\ncallx8\s+a8|call8\s+([A-Za-z_.$][A-Za-z0-9_.$]*))""")
+val callTargetLine = regexCompile("""movi\s+a8,\s*([A-Za-z_.$][A-Za-z0-9_.$]*)""")
+val callxLine = regexCompile("""callx8\s+a8""")
+val call8Line = regexCompile("""call8\s+([A-Za-z_.$][A-Za-z0-9_.$]*)""")
+val resultLine = regexCompile("""mov(?:\.n)?\s+\$0,\s*a10""")
+
+// Python's str.isspace for the ASCII range.
+fun pySpace(c: int): bool = c == 32 || (c >= 9 && c <= 13) || (c >= 28 && c <= 31)
+
+fun pyStrip(text: string): string {
+    var begin = 0
+    var end = text.size
+    while (begin < end && pySpace(text[begin])) begin = begin + 1
+    while (end > begin && pySpace(text[end - 1])) end = end - 1
+    text.slice(begin, end)
+}
+
+// A failure the Python tool reports as an exception.
+class Failure(var message: string)
+
+// string_end: the index after the closing quote of the literal at `begin`; -1 when malformed.
+fun stringEnd(source: string, begin: int): int {
+    if (begin >= source.size || source[begin] != 34) return -1
+    var index = begin + 1
+    var escaped = false
+    while (index < source.size) {
+        val c = source[index]
+        if (escaped) escaped = false
+        else if (c == 92) escaped = true
+        else if (c == 34) return index + 1
+        index = index + 1
+    }
+    -1
+}
+
+class CallArguments(val comma: int, val close: int, val after: int, val ok: bool)
+
+// call_arguments: the top-level comma, the closing parenthesis and the next position.
+fun callArguments(source: string, begin: int): CallArguments {
+    val bad = CallArguments(-1, -1, -1, false)
+    var index = begin
+    var depth = 0
+    var comma = -1
+    while (index < source.size) {
+        val c = source[index]
+        if (c == 34) {
+            val end = stringEnd(source, index)
+            if (end < 0) return bad
+            index = end
+            continue
+        }
+        if (c == 40 || c == 91 || c == 123) {
+            depth = depth + 1
+        } else if (c == 41 || c == 93 || c == 125) {
+            if (c == 41 && depth == 0) {
+                if (comma < 0) return bad
+                return CallArguments(comma, index, index + 1, true)
+            }
+            depth = depth - 1
+            if (depth < 0) return bad
+        } else if (c == 44 && depth == 0 && comma < 0) {
+            comma = index
+        }
+        index = index + 1
+    }
+    bad
+}
+
+// split_arguments: the stripped top-level pieces between `begin` and `end`.
+fun splitArguments(source: string, begin: int, end: int, var failure: Failure): array<string> {
+    val pieces: array<string> = []
+    var argument = begin
+    var index = begin
+    var depth = 0
+    while (index < end) {
+        val c = source[index]
+        if (c == 34) {
+            val stop = stringEnd(source, index)
+            if (stop < 0) {
+                failure.message = "unterminated string literal"
+                return pieces
+            }
+            index = stop
+            continue
+        }
+        if (c == 40 || c == 91 || c == 123) depth = depth + 1
+        else if (c == 41 || c == 93 || c == 125) depth = depth - 1
+        else if (c == 44 && depth == 0) {
+            pieces.append(pyStrip(source.slice(argument, index)))
+            argument = index + 1
+        }
+        index = index + 1
+    }
+    pieces.append(pyStrip(source.slice(argument, end)))
+    pieces
+}
+
+fun hexDigitValue(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 97 && c <= 102) return c - 87
+    if (c >= 65 && c <= 70) return c - 55
+    -1
+}
+
+// decode_abla_string: the text of an Abla string literal as the compiler reads it (including `\$`,
+// and `\0` kept as written for inline-assembly operands).
+fun decodeAblaString(literal: string): string {
+    val raw = literal.slice(1, literal.size - 1)
+    val output: array<string> = []
+    var index = 0
+    while (index < raw.size) {
+        val c = raw[index]
+        if (c != 92 || index + 1 == raw.size) {
+            output.append(byteEncode(c))
+            index = index + 1
+            continue
+        }
+        val e = raw[index + 1]
+        if (e == 110) { output.append("\n"); index = index + 2; continue }
+        if (e == 114) { output.append("\r"); index = index + 2; continue }
+        if (e == 116) { output.append("\t"); index = index + 2; continue }
+        if (e == 98) { output.append(byteEncode(8)); index = index + 2; continue }
+        if (e == 34 || e == 39 || e == 92 || e == 36) { output.append(byteEncode(e)); index = index + 2; continue }
+        if (e == 48) { output.append("\\0"); index = index + 2; continue }
+        if (e == 120 && index + 3 < raw.size) {
+            val high = hexDigitValue(raw[index + 2])
+            val low = hexDigitValue(raw[index + 3])
+            if (high >= 0 && low >= 0) {
+                output.append(utf8Encode(high * 16 + low))
+                index = index + 4
+                continue
+            }
+        }
+        if (e == 117 && index + 5 < raw.size) {
+            val a = hexDigitValue(raw[index + 2])
+            val b = hexDigitValue(raw[index + 3])
+            val c2 = hexDigitValue(raw[index + 4])
+            val d = hexDigitValue(raw[index + 5])
+            if (a >= 0 && b >= 0 && c2 >= 0 && d >= 0) {
+                val codepoint = ((a * 16 + b) * 16 + c2) * 16 + d
+                if (codepoint == 9 || codepoint == 10 || codepoint == 13 || (codepoint >= 32 && codepoint <= 126)) {
+                    output.append(byteEncode(codepoint))
+                } else {
+                    output.append(raw.slice(index, index + 6))
+                }
+                index = index + 6
+                continue
+            }
+        }
+        // Unknown escapes survive unchanged in Abla.
+        output.append("\\")
+        output.append(byteEncode(e))
+        index = index + 2
+    }
+    output.join("")
+}
+
+class Decoded(val text: string, val ok: bool)
+
+// decode_concatenated_strings: the value of `"a" + "b" ...` with `//` comments and blanks between the
+// parts; `ok` is false for anything else.
+fun decodeConcatenatedStrings(expression: string, var failure: Failure): Decoded {
+    val no = Decoded("", false)
+    val values: array<string> = []
+    var index = 0
+    var expectingString = true
+    while (true) {
+        // skip_trivia
+        while (true) {
+            while (index < expression.size && pySpace(expression[index])) index = index + 1
+            if (hasAt(expression, index, "//")) {
+                val newline = expression.indexOf("\n", index + 2)
+                index = if (newline < 0) expression.size else newline + 1
+                continue
+            }
+            break
+        }
+        if (index == expression.size) break
+        if (expectingString) {
+            if (expression[index] != 34) return no
+            val end = stringEnd(expression, index)
+            if (end < 0) {
+                failure.message = "unterminated string literal"
+                return no
+            }
+            values.append(decodeAblaString(expression.slice(index, end)))
+            index = end
+        } else {
+            if (expression[index] != 43) return no
+            index = index + 1
+        }
+        expectingString = !expectingString
+    }
+    if (expectingString || values.size == 0) return no
+    Decoded(values.join(""), true)
+}
+
+// parsed_form: `$xtensa MODE { ... }` for an assembly text, or "" when the text holds a line `}`.
+fun parsedForm(assembly: string, mode: string): string {
+    if (assembly.contains("\n}")) return ""
+    val ending = if (assembly.endsWith("\n")) "" else "\n"
+    "\$xtensa ${mode} {\n${assembly}${ending}}"
+}
+
+class Replacement(val begin: int, val end: int, val text: string)
+
+// Sorted by (begin, end, text) descending, the order they are applied in.
+fun sortedReplacements(replacements: array<Replacement>): array<Replacement> {
+    val sorted: array<Replacement> = []
+    for (item in replacements) {
+        var place = sorted.size
+        while (place > 0 && replacementBefore(sorted[place - 1], item)) place = place - 1
+        sorted.append(item)
+        var index = sorted.size - 1
+        while (index > place) {
+            sorted[index] = sorted[index - 1]
+            index = index - 1
+        }
+        sorted[place] = item
+    }
+    sorted
+}
+
+// Whether `a` sorts before `b` in descending order: it has the larger key.
+fun replacementBefore(a: Replacement, b: Replacement): bool {
+    if (a.begin != b.begin) return a.begin < b.begin
+    if (a.end != b.end) return a.end < b.end
+    a.text < b.text
+}
+
+fun applyReplacements(source: string, replacements: array<Replacement>): string {
+    var migrated = source
+    for (item in sortedReplacements(replacements)) {
+        migrated = migrated.slice(0, item.begin) + item.text + migrated.slice(item.end, migrated.size)
+    }
+    migrated
+}
+
+class Migrated(val text: string, val count: int, val skipped: int, val error: string)
+
+// typed_call_target: the callee of a typed-call template, "" when the template has another shape;
+// `crashed` marks the shape on which the Python tool fails with an AttributeError.
+class CallTarget(val target: string, val crashed: bool)
+
+fun typedCallTarget(template: string, argumentCount: int): CallTarget {
+    val none = CallTarget("", false)
+    val void = voidCallTemplate.regex.matchFull(template)
+    if (void != null) return CallTarget(void.group(1) ?? (void.group(2) ?? ""), false)
+    val lines = pySplitLines(template)
+    var index = 0
+    while (index < argumentCount) {
+        if (index >= lines.size) return none
+        val move = regexCompile("mov(?:\\.n)?\\s+a${10 + index},\\s*\\\$${index + 1}")
+        if (move.regex.matchFull(lines[index]) == null) return none
+        index = index + 1
+    }
+    var target = ""
+    var targetFound = false
+    if (lines.size == argumentCount + 3) {
+        val found = callTargetLine.regex.matchFull(lines[lines.size - 3])
+        if (found == null || callxLine.regex.matchFull(lines[lines.size - 2]) == null) return none
+        target = found.group(1) ?? ""
+        targetFound = true
+    } else if (lines.size == argumentCount + 2) {
+        val found = call8Line.regex.matchFull(lines[lines.size - 2])
+        if (found != null) {
+            target = found.group(1) ?? ""
+            targetFound = true
+        }
+    } else {
+        return none
+    }
+    if (resultLine.regex.matchFull(lines[lines.size - 1]) == null) return none
+    if (!targetFound) return CallTarget("", true)
+    CallTarget(target, false)
+}
+
+class TypedCall(val name: string, val mode: string, val count: int)
+
+fun typedCalls(): array<TypedCall> {
+    val calls: array<TypedCall> = []
+    for (count in [1, 2, 3, 5, 6, 9]) calls.append(TypedCall("xtensaAssemblyCallVoid${count}(", "callVoid", count))
+    calls.append(TypedCall("xtensaAssemblyReadU32(", "call", 0))
+    calls.append(TypedCall("xtensaAssemblyReadU32WithU32(", "call", 1))
+    calls.append(TypedCall("xtensaAssemblyReadU32WithU32U32(", "call", 2))
+    calls.append(TypedCall("xtensaAssemblyReadU32WithU32U32U32(", "call", 3))
+    calls.append(TypedCall("xtensaAssemblyReadU32WithU32U32U32U32(", "call", 4))
+    calls
+}
+
+class TypedMigration(val text: string, val count: int, val error: string)
+
+fun migrateTypedCalls(source: string): TypedMigration {
+    val replacements: array<Replacement> = []
+    val failure = Failure("")
+    for (call in typedCalls()) {
+        var search = 0
+        while (true) {
+            val at = source.indexOf(call.name, search)
+            if (at < 0) break
+            val begin = at + call.name.size
+            val args = callArguments(source, begin)
+            if (!args.ok) {
+                search = begin
+                continue
+            }
+            val pieces = splitArguments(source, begin, args.close, failure)
+            if (failure.message != "") return TypedMigration(source, 0, failure.message)
+            if (pieces.size != call.count + 2) {
+                search = args.after
+                continue
+            }
+            val template = decodeConcatenatedStrings(pieces[0], failure)
+            if (failure.message != "") return TypedMigration(source, 0, failure.message)
+            if (template.ok) {
+                val target = typedCallTarget(template.text, call.count)
+                if (target.crashed) return TypedMigration(source, 0, "'NoneType' object has no attribute 'group'")
+                if (target.target != "") {
+                    val values: array<string> = []
+                    var index = 2
+                    while (index < pieces.size) {
+                        values.append(pieces[index])
+                        index = index + 1
+                    }
+                    replacements.append(Replacement(at, args.after, "\$xtensa ${call.mode} {${target.target}}(${values.join(", ")})"))
+                }
+            }
+            search = args.after
+        }
+    }
+    TypedMigration(applyReplacements(source, replacements), replacements.size, "")
+}
+
+// top_level_entry_offset: where the owning function's `entry` begins, ignoring pushed helper sections.
+fun topLevelEntryOffset(body: string): int {
+    var depth = 0
+    var offset = 0
+    for (line in pySplitLinesKeepEnds(body)) {
+        val stripped = pyStrip(line)
+        var token = ""
+        if (stripped.size > 0) {
+            var end = 0
+            val lead = line.size - pyLeftTrim(line).size
+            var scan = lead
+            while (scan < line.size && !pySpace(line[scan])) scan = scan + 1
+            end = scan
+            token = line.slice(lead, end)
+        }
+        if (token == ".popsection" && depth > 0) depth = depth - 1
+        if (depth == 0 && token == "entry") return offset
+        if (token == ".pushsection") depth = depth + 1
+        offset = offset + line.size
+    }
+    -1
+}
+
+fun pyLeftTrim(text: string): string {
+    var begin = 0
+    while (begin < text.size && pySpace(text[begin])) begin = begin + 1
+    text.slice(begin, text.size)
+}
+
+class SelfOffsets(val text: string, val count: int)
+
+val abiMarker = "// Original ABI symbol: "
+
+// The `$xtensa instructions[U32|U32Pure] {` header after `begin`, or the position past it; -1 when a
+// following ABI comment or the end of the text comes first (the tempered `.*?` of the pattern).
+fun instructionsHeaderEnd(source: string, begin: int): int {
+    var q = begin
+    while (q <= source.size) {
+        if (hasAt(source, q, "\$xtensa instructions")) {
+            var cursor = q + 20
+            var rest = -1
+            if (hasAt(source, cursor, "U32") && hasAt(source, cursor + 3, " {\n")) rest = cursor + 3 + 3
+            else if (hasAt(source, cursor, "U32Pure") && hasAt(source, cursor + 7, " {\n")) rest = cursor + 7 + 3
+            else if (hasAt(source, cursor, " {\n")) rest = cursor + 3
+            if (rest >= 0) return rest
+        }
+        if (q >= source.size) return -1
+        if (isLineStart(source, q) && hasAt(source, q, abiMarker)) return -1
+        q = q + 1
+    }
+    -1
+}
+
+fun isLineStart(text: string, at: int): bool = at == 0 || text[at - 1] == 10
+
+// Where the closing `}` line of the body begins (the lookahead `^\}$`), or -1.
+fun bodyEnd(source: string, begin: int): int {
+    var r = begin
+    while (r < source.size) {
+        if (source[r] == 125 && isLineStart(source, r) && (r + 1 == source.size || source[r + 1] == 10)) return r
+        r = r + 1
+    }
+    -1
+}
+
+fun retargetSelfOffsets(source: string): SelfOffsets {
+    val parts: array<string> = []
+    var last = 0
+    var replacements = 0
+    var at = 0
+    while (at < source.size) {
+        if (!(isLineStart(source, at) && hasAt(source, at, abiMarker))) {
+            at = nextLine(source, at)
+            continue
+        }
+        val newline = source.indexOf("\n", at)
+        val symbol = source.slice(at + abiMarker.size, if (newline < 0) source.size else newline)
+        if (newline < 0 || symbol.size == 0) {
+            at = nextLine(source, at)
+            continue
+        }
+        val headerEnd = instructionsHeaderEnd(source, newline + 1)
+        if (headerEnd < 0) {
+            at = nextLine(source, at)
+            continue
+        }
+        val end = bodyEnd(source, headerEnd)
+        if (end < 0) {
+            at = nextLine(source, at)
+            continue
+        }
+        val body = source.slice(headerEnd, end)
+        val entry = topLevelEntryOffset(body)
+        if (entry >= 0) {
+            val rewritten: array<string> = []
+            var bodyLast = 0
+            var from = 0
+            while (true) {
+                val found = body.indexOf(symbol, from)
+                if (found < 0) break
+                from = found + 1
+                if (found > 0 && isByteIn(body[found - 1], ".$")) continue
+                val after = found + symbol.size
+                if (!hasAt(body, after, "+0x")) continue
+                var digits = after + 3
+                while (digits < body.size && hexDigitValue(body[digits]) >= 0) digits = digits + 1
+                if (digits == after + 3) continue
+                val direction = if (found < entry) "f" else "b"
+                rewritten.append(body.slice(bodyLast, found))
+                rewritten.append("99991${direction}${body.slice(after, digits)}")
+                bodyLast = digits
+                from = digits
+                replacements = replacements + 1
+            }
+            rewritten.append(body.slice(bodyLast, body.size))
+            parts.append(source.slice(last, headerEnd))
+            parts.append(rewritten.join(""))
+            last = end
+        }
+        at = end
+    }
+    parts.append(source.slice(last, source.size))
+    SelfOffsets(parts.join(""), replacements)
+}
+
+fun nextLine(text: string, at: int): int {
+    val newline = text.indexOf("\n", at)
+    if (newline < 0) text.size else newline + 1
+}
+
+fun migrateSource(source: string): Migrated {
+    val replacements: array<Replacement> = []
+    var skipped = 0
+    val failure = Failure("")
+    val names: array<string> = ["xtensaAssemblyVoid(", "xtensaAssemblyReadU32("]
+    val modes: array<string> = ["instructions", "instructionsU32"]
+    var which = 0
+    while (which < names.size) {
+        val callName = names[which]
+        val mode = modes[which]
+        which = which + 1
+        var search = 0
+        while (true) {
+            val call = source.indexOf(callName, search)
+            if (call < 0) break
+            val argumentsBegin = call + callName.size
+            val args = callArguments(source, argumentsBegin)
+            if (!args.ok) {
+                skipped = skipped + 1
+                search = argumentsBegin
+                continue
+            }
+            val constraints = pyStrip(source.slice(args.comma + 1, args.close))
+            val assembly = decodeConcatenatedStrings(source.slice(argumentsBegin, args.comma), failure)
+            if (failure.message != "") return Migrated(source, 0, skipped, failure.message)
+            var replacement = ""
+            var haveReplacement = false
+            if (assembly.ok) {
+                replacement = parsedForm(assembly.text, mode)
+                haveReplacement = replacement != ""
+            }
+            if (constraints == defaultConstraints && haveReplacement) {
+                replacements.append(Replacement(call, args.after, replacement))
+            } else if (callName == "xtensaAssemblyVoid(") {
+                skipped = skipped + 1
+            }
+            search = args.after
+        }
+    }
+    var migrated = applyReplacements(source, replacements)
+    var addresses = 0
+    var parts: array<string> = []
+    var last = 0
+    for (found in addressCall.regex.findAll(migrated)) {
+        parts.append(migrated.slice(last, found.start()))
+        parts.append("\$xtensa address {${found.group(1) ?? ""}}")
+        last = found.end()
+        addresses = addresses + 1
+    }
+    parts.append(migrated.slice(last, migrated.size))
+    migrated = parts.join("")
+    var immediates = 0
+    parts = []
+    last = 0
+    for (found in immediateCall.regex.findAll(migrated)) {
+        parts.append(migrated.slice(last, found.start()))
+        parts.append("u32(${found.group(1) ?? ""})")
+        last = found.end()
+        immediates = immediates + 1
+    }
+    parts.append(migrated.slice(last, migrated.size))
+    migrated = parts.join("")
+    val typed = migrateTypedCalls(migrated)
+    if (typed.error != "") return Migrated(source, 0, skipped, typed.error)
+    val offsets = retargetSelfOffsets(typed.text)
+    Migrated(offsets.text, replacements.size + addresses + immediates + typed.count + offsets.count, skipped, "")
+}
+
+fun main: int {
+    var check = false
+    val given: array<string> = []
+    val usage = "usage: migrate-xtensa-recovered-blocks [-h] [--check] [paths ...]"
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument.size > 2 && argument.startsWith("--") && "--check".startsWith(argument)) {
+            check = true
+        } else if (argument == "-h" || argument == "--help") {
+            println(usage)
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln(usage)
+            eprintln("migrate-xtensa-recovered-blocks: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            given.append(argument)
+        }
+        index = index + 1
+    }
+    val candidates: array<string> = []
+    if (given.size > 0) {
+        for (argument in given) candidates.append(pyPath(argument))
+    } else {
+        for (path in recursiveFiles("src", ".ab")) candidates.append(path)
+    }
+    val paths: array<string> = []
+    for (path in candidates) {
+        if (Path(path).info().isFile() && path != "src/xtensa/assembly.ab") paths.append(path)
+    }
+    var changedFiles = 0
+    var migratedBlocks = 0
+    var skippedBlocks = 0
+    for (path in sortPaths(paths)) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = migrateSource(read.text)
+        if (result.error != "") {
+            eprintln("ValueError: ${result.error}")
+            return 1
+        }
+        skippedBlocks = skippedBlocks + result.skipped
+        if (result.count == 0) continue
+        changedFiles = changedFiles + 1
+        migratedBlocks = migratedBlocks + result.count
+        if (!check) Path(path).writeText(result.text)
+    }
+    println("${migratedBlocks} recovered block(s) in ${changedFiles} file(s); ${skippedBlocks} non-default or dynamic block(s) left explicit")
+    if (check && changedFiles > 0) return 1
+    0
+}

@@ -1,0 +1,227 @@
+// Resolve object-local .LC data symbols in monolithic recovered Abla source.
+//
+//     tools/abla-tool resolve-recovered-local-data-symbols --archives DIR SOURCE.ab [...]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+val abiSymbolPrefix = "// Original ABI symbol: "
+
+private fun localDataByte(c: int): bool = isByteIn(c, ".$")
+
+// Every `.LC...` name not preceded by [A-Za-z0-9_]: LOCAL_DATA.findall. With `definedOnly`, only those
+// followed by a colon (the labels the source defines).
+fun localDataNames(source: string, definedOnly: bool): array<string> {
+    val names: array<string> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf(".LC", from)
+        if (at < 0) break
+        from = at + 1
+        if (at > 0 && (isAlnum(source[at - 1]) || source[at - 1] == 95)) continue
+        var end = at + 3
+        while (end < source.size && localDataByte(source[end])) end = end + 1
+        if (definedOnly && !(end < source.size && source[end] == 58)) continue
+        names.append(source.slice(at, end))
+        from = end + (if (definedOnly) 1 else 0)
+    }
+    names
+}
+
+
+class SectionLabel(val label: string, val error: string)
+
+// The first label inside the recovered `.pushsection SECTION ... .popsection` of the source (all on
+// one line: an escaped assembly string).
+fun sectionStartLabel(source: string, section: string): SectionLabel {
+    val block = regexCompile("\\.pushsection " + regexEscape(section) + "(?:,.*?)?" + "\\\\n" + "(.*?)" + "\\.popsection")
+    if (!block.succeeded) return SectionLabel("", "bad section pattern ${section}: ${block.error.message}")
+    val found = block.regex.find(source)
+    if (found == null) return SectionLabel("", "recovered source does not own section ${section}")
+    val body = found.group(1) ?? ""
+    val label = localLabelPattern.regex.find(body)
+    if (label == null) return SectionLabel("", "recovered section ${section} has no start label")
+    SectionLabel(label.group(1) ?? "", "")
+}
+
+val localLabelPattern = regexCompile("""(?:^|\\n)([.$A-Za-z_][.$A-Za-z0-9_\\$]*):\\n""")
+
+class LocalData(val section: string, val offset: int)
+
+// Name to location for the LOCAL `.LC...` symbols of one object (a later symbol of a name wins).
+fun localDataLocations(data: string): Map<string, LocalData> {
+    val locations: Map<string, LocalData> = Map()
+    for (symbol in objectSymbols(data)) {
+        if (symbol.binding != 0 || symbol.sectionIndex <= 0 || symbol.sectionIndex >= 0xff00 || symbol.section == "") continue
+        if (!symbol.name.startsWith(".LC")) continue
+        var valid = true
+        for (c in symbol.name) {
+            if (!(isByteIn(c, ".$"))) valid = false
+        }
+        if (valid) locations.set(symbol.name, LocalData(symbol.section, symbol.value))
+    }
+    locations
+}
+
+class LocalResolution(val text: string, val count: int, val error: string)
+
+fun resolveLocalSource(path: string, source: string, index: Map<string, array<ArchiveMember>>): LocalResolution {
+    val defined = localDataNames(source, true)
+    val unresolved: array<string> = []
+    for (name in sortedUnique(localDataNames(source, false))) {
+        var isDefined = false
+        for (other in defined) {
+            if (other == name) isDefined = true
+        }
+        if (!isDefined) unresolved.append(name)
+    }
+    if (unresolved.size == 0) return LocalResolution(source, 0, "")
+    val owners: array<ArchiveMember> = []
+    for (symbol in linesWithPrefix(source, abiSymbolPrefix)) {
+        val candidates = index.get(symbol)
+        if (candidates != null) {
+            for (candidate in candidates) {
+                if (!containsMember(owners, candidate)) owners.append(candidate)
+            }
+        }
+    }
+    if (owners.size == 0) return LocalResolution(source, 0, "no archive member owns a recovered ABI symbol")
+    val locations: array<array<Map<string, LocalData>>> = []
+    for (owner in owners) {
+        val objects = memberObjects(owner.archive, owner.member)
+        if (objects.error != "") return LocalResolution(source, 0, objects.error)
+        val perInstance: array<Map<string, LocalData>> = []
+        for (data in objects.objects) perInstance.append(localDataLocations(data))
+        locations.append(perInstance)
+    }
+    val names: array<string> = []
+    val targets: array<string> = []
+    for (name in unresolved) {
+        val found: array<string> = []
+        val describe: array<string> = []
+        var ownerIndex = 0
+        while (ownerIndex < owners.size) {
+            for (instance in locations[ownerIndex]) {
+                val location = instance.get(name)
+                if (location == null) continue
+                val label = sectionStartLabel(source, location.section)
+                if (label.error != "") continue
+                val target = if (location.offset == 0) label.label else "${label.label}+0x${hexText(location.offset)}"
+                val owner = owners[ownerIndex]
+                val entry = "${owner.archive}(${owner.member}) -> ${target}"
+                var present = false
+                for (other in describe) {
+                    if (other == entry) present = true
+                }
+                if (!present) describe.append(entry)
+                var known = false
+                for (other in found) {
+                    if (other == target) known = true
+                }
+                if (!known) found.append(target)
+            }
+            ownerIndex = ownerIndex + 1
+        }
+        if (found.size != 1) {
+            val text = if (describe.size == 0) "none" else describe.join(", ")
+            return LocalResolution(source, 0, "${path}: ${name} has no unique recovered owner: ${text}")
+        }
+        names.append(name)
+        targets.append(found[0])
+    }
+    var text = source
+    for (index in reusedLongestFirstNames(names)) {
+        val template = pyReplacementTemplate(targets[index])
+        if (template.error != "") return LocalResolution(source, 0, template.error)
+        text = replaceBounded(text, names[index], template.text, "", ".$", "").text
+    }
+    LocalResolution(text, names.size, "")
+}
+
+// Indices of `names` longest first, equal lengths in their given order.
+fun reusedLongestFirstNames(names: array<string>): array<int> {
+    val order: array<int> = []
+    var index = 0
+    while (index < names.size) {
+        var at = order.size
+        while (at > 0 && names[order[at - 1]].size < names[index].size) at = at - 1
+        order.append(index)
+        var shift = order.size - 1
+        while (shift > at) {
+            order[shift] = order[shift - 1]
+            shift = shift - 1
+        }
+        order[at] = index
+        index = index + 1
+    }
+    order
+}
+
+fun main: int {
+    var archives = ""
+    val sources: array<string> = []
+    var index = 0
+    val usage = "usage: resolve-recovered-local-data-symbols [-h] --archives ARCHIVES sources [sources ...]"
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--archives" && index + 1 < processArgumentCount()) {
+            archives = processArgument(index + 1)
+            index = index + 1
+        } else if (argument.startsWith("--archives=")) {
+            archives = argument.slice(11, argument.size)
+        } else if (argument == "-h" || argument == "--help") {
+            println(usage)
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln(usage)
+            eprintln("resolve-recovered-local-data-symbols: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            sources.append(argument)
+        }
+        index = index + 1
+    }
+    if (archives == "" || sources.size == 0) {
+        eprintln(usage)
+        eprintln("resolve-recovered-local-data-symbols: error: the following arguments are required: --archives, sources")
+        return 2
+    }
+    val wanted: Map<string, int> = Map()
+    for (path in sources) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        for (symbol in linesWithPrefix(read.text, abiSymbolPrefix)) wanted.set(symbol, 1)
+    }
+    val found = archiveSymbolIndex(recursiveFiles(archives, ".a"), wanted)
+    if (found.error != "") {
+        eprintln(found.error)
+        return 1
+    }
+    var resolved = 0
+    for (path in sources) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = resolveLocalSource(path, read.text, found.owners)
+        if (result.error != "") {
+            eprintln("ValueError: ${result.error}")
+            return 1
+        }
+        if (result.count > 0) {
+            Path(path).writeText(result.text)
+            println("${pyPath(path)}: resolved ${result.count} local data symbol(s)")
+        }
+        resolved = resolved + result.count
+    }
+    println("resolved ${resolved} object-local data symbol(s)")
+    0
+}

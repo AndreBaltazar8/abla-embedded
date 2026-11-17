@@ -1,0 +1,142 @@
+// Bind section-local data references to labels in a recovered companion source.
+//
+//     tools/abla-tool resolve-recovered-reused-data-symbols OWNER.ab [...] -- TARGET.ab [...]
+
+import "abla/io"
+import "abla/text"
+import "abla/regex"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+// `.pushsection NAME ...\n BODY .popsection\n|"` in an escaped assembly string.
+val reusedBlockPattern = regexCompile("""\.pushsection\s+((?:[^,\\\s]|\\\$\\\$)+)(?:.|\n)*?\\n((?:.|\n)*?)\.popsection(?:\\n|")""")
+// The first label of a body: `(?:^|\n)LABEL:\n` with the escaped newline spelled as backslash-n.
+val reusedLabelPattern = regexCompile("""(?:^|\\n)([.$A-Za-z_][.$A-Za-z0-9_\\$]*):\\n""")
+
+class ReusedMappings(val sections: array<string>, val labels: array<string>, val error: string)
+
+fun reusedFindSection(mappings: ReusedMappings, section: string): int {
+    var index = 0
+    while (index < mappings.sections.size) {
+        if (mappings.sections[index] == section) return index
+        index = index + 1
+    }
+    -1
+}
+
+// Section name to its first label over the owner sources; `error` for conflicting owners.
+fun reusedCollectMappings(owners: array<string>): ReusedMappings {
+    val sections: array<string> = []
+    val labels: array<string> = []
+    for (source in owners) {
+        for (block in reusedBlockPattern.regex.findAll(source)) {
+            val section = block.group(1) ?? ""
+            val body = block.group(2) ?? ""
+            val label = reusedLabelPattern.regex.find(body)
+            if (label == null) continue
+            val name = label.group(1) ?? ""
+            val at = reusedFindSection(ReusedMappings(sections, labels, ""), section)
+            if (at >= 0) {
+                if (labels[at] != name) {
+                    return ReusedMappings(sections, labels,
+                        "conflicting recovered owner for ${section}: ${labels[at]} and ${name}")
+                }
+            } else {
+                sections.append(section)
+                labels.append(name)
+            }
+        }
+    }
+    ReusedMappings(sections, labels, "")
+}
+
+// Sections ordered longest first, equal lengths keeping their first-seen order.
+fun reusedLongestFirst(sections: array<string>): array<int> {
+    val order: array<int> = []
+    var index = 0
+    while (index < sections.size) {
+        var at = order.size
+        while (at > 0 && sections[order[at - 1]].size < sections[index].size) at = at - 1
+        order.append(index)
+        var shift = order.size - 1
+        while (shift > at) {
+            order[shift] = order[shift - 1]
+            shift = shift - 1
+        }
+        order[at] = index
+        index = index + 1
+    }
+    order
+}
+
+fun reusedResolve(source: string, mappings: ReusedMappings): Replaced {
+    var result = source
+    var count = 0
+    for (index in reusedLongestFirst(mappings.sections)) {
+        // `.pushsection NAME` keeps its own spelling; `\` and `$` continue a symbol here.
+        val replaced = replaceBounded(result, mappings.sections[index], mappings.labels[index],
+            "_.$\\", "_.$\\", ".pushsection ")
+        result = replaced.text
+        count = count + replaced.count
+    }
+    Replaced(result, count)
+}
+
+fun main: int {
+    var separator = -1
+    var index = 0
+    while (index < processArgumentCount()) {
+        if (processArgument(index) == "--" && separator < 0) separator = index
+        index = index + 1
+    }
+    if (processArgumentCount() < 3 || separator < 0) {
+        eprintln("usage: resolve-recovered-reused-data-symbols OWNER.ab [...] -- TARGET.ab [...]")
+        return 2
+    }
+    val owners: array<string> = []
+    val targets: array<string> = []
+    index = 0
+    while (index < separator) {
+        owners.append(processArgument(index))
+        index = index + 1
+    }
+    index = separator + 1
+    while (index < processArgumentCount()) {
+        targets.append(processArgument(index))
+        index = index + 1
+    }
+    val ownerTexts: array<string> = []
+    for (path in owners) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        ownerTexts.append(read.text)
+    }
+    val mappings = reusedCollectMappings(ownerTexts)
+    if (mappings.error != "") {
+        eprintln("ValueError: ${mappings.error}")
+        return 1
+    }
+    if (mappings.sections.size == 0) {
+        eprintln("ValueError: owner sources contain no recovered data sections")
+        return 1
+    }
+    var changed = 0
+    for (path in targets) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = reusedResolve(read.text, mappings)
+        if (result.count > 0) {
+            Path(path).writeText(result.text)
+            changed = changed + result.count
+            println("${pyPath(path)}: resolved ${result.count} reused data reference(s)")
+        }
+    }
+    println("resolved ${changed} reused data reference(s)")
+    0
+}

@@ -1,0 +1,596 @@
+// Helpers shared by the recovered-source transformers in tools/ (the
+// resolve-recovered-*, normalize-recovered-symbol-addends, centralize-abla-owned-storage,
+// order-static-u32-tables, migrate-xtensa-recovered-blocks and report-recovered-retention
+// programs). They reproduce what those tools used from Python's standard library:
+// universal-newline text reads, `str(pathlib.Path)`, `sorted(path.rglob(...))`, and the
+// `nm`/`ar` archive queries.
+
+import "abla/fs"
+import "abla/io"
+import "abla/text"
+import "abla/regex"
+import "abla/bytes"
+import "elf.ab"
+import "abla/process/command"
+
+// ---- text files ----
+
+class SourceText(val text: string, val error: string)
+
+// Path.read_text(): `\r\n` and `\r` read as `\n`.
+fun recoveredRead(path: string): SourceText {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded) return SourceText("", "cannot read ${path}")
+    var text = result.text
+    if (text.contains("\r")) text = text.replace("\r\n", "\n").replace("\r", "\n")
+    SourceText(text, "")
+}
+
+// ---- paths ----
+
+// str(pathlib.Path(value)): drops empty and "." components and a trailing slash.
+fun pyPath(value: string): string {
+    if (value == "") return "."
+    val parts: array<string> = []
+    for (part in value.split("/")) {
+        if (part != "" && part != ".") parts.append(part)
+    }
+    var text = parts.join("/")
+    if (value.startsWith("//") && !value.startsWith("///")) text = "//" + text
+    else if (value.startsWith("/")) text = "/" + text
+    if (text == "") "." else text
+}
+
+// Path ordering: component by component, not by the joined string.
+private fun pathLess(left: string, right: string): bool {
+    val a = pyPath(left).split("/")
+    val b = pyPath(right).split("/")
+    var index = 0
+    while (index < a.size && index < b.size) {
+        if (a[index] != b[index]) return a[index] < b[index]
+        index = index + 1
+    }
+    a.size < b.size
+}
+
+fun sortPaths(values: array<string>): array<string> {
+    // Insertion into a growing sorted array: the lists are archives and sources, a few hundred long.
+    val sorted: array<string> = []
+    for (value in values) {
+        var at = sorted.size
+        while (at > 0 && pathLess(value, sorted[at - 1])) at = at - 1
+        sorted.append(value)
+        var index = sorted.size - 1
+        while (index > at) {
+            sorted[index] = sorted[index - 1]
+            index = index - 1
+        }
+        sorted[at] = value
+    }
+    sorted
+}
+
+// sorted(root.rglob("*" + suffix)) (files and directories; directory links are not followed).
+fun recursiveFiles(root: string, suffix: string): array<string> {
+    val found: array<string> = []
+    recursiveFilesInto(root, suffix, found)
+    sortPaths(found)
+}
+
+private fun recursiveFilesInto(directory: string, suffix: string, var found: array<string>): void {
+    for (entry in Path(directory).entries()) {
+        val name = entry.name()
+        if (name.endsWith(suffix) && name.size > 0) found.append(entry.text)
+        if (entry.linkInfo().isDirectory()) recursiveFilesInto(entry.text, suffix, found)
+    }
+}
+
+// ---- symbol bytes ----
+
+fun isAlnum(c: int): bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
+// [A-Za-z0-9_] plus the bytes of `extra`.
+fun isByteIn(c: int, extra: string): bool {
+    if (isAlnum(c) || c == 95) return true
+    for (e in extra) {
+        if (e == c) return true
+    }
+    false
+}
+
+fun isSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+// Hex digits of `text` as a number; -1 when empty or not hexadecimal.
+fun hexNumber(text: string): int {
+    if (text.size == 0) return -1
+    var value = 0
+    for (c in text) {
+        var digit = -1
+        if (c >= 48 && c <= 57) digit = c - 48
+        else if (c >= 97 && c <= 102) digit = c - 87
+        else if (c >= 65 && c <= 70) digit = c - 55
+        if (digit < 0) return -1
+        value = value * 16 + digit
+    }
+    value
+}
+
+fun hexText(value: int): string {
+    if (value == 0) return "0"
+    var text = ""
+    var rest = value
+    while (rest > 0) {
+        val digit = rest & 15
+        text = byteEncode(if (digit < 10) 48 + digit else 87 + digit) + text
+        rest = rest >> 4
+    }
+    text
+}
+
+// ---- literal substitution ----
+
+class Replaced(val text: string, val count: int)
+
+// re.sub(rf"(?<!{skipPrefix})(?<![{before}]){needle}(?![{after}])", lambda _: replacement, source)
+// for a literal, non-empty `needle`; `before` and `after` list the bytes beyond [A-Za-z0-9_] that
+// forbid a match next to them (`alnum` false drops the [A-Za-z0-9_] part of the set).
+fun replaceBounded(source: string, needle: string, replacement: string, before: string,
+    after: string, skipPrefix: string, alnum: bool = true): Replaced {
+    val parts: array<string> = []
+    var last = 0
+    var from = 0
+    var count = 0
+    while (from <= source.size - needle.size) {
+        val at = source.indexOf(needle, from)
+        if (at < 0) break
+        val end = at + needle.size
+        var good = true
+        if (at > 0) {
+            val c = source[at - 1]
+            val inSet = if (alnum) isByteIn(c, before) else byteInList(c, before)
+            if (inSet) good = false
+        }
+        if (good && end < source.size) {
+            val c = source[end]
+            val inSet = if (alnum) isByteIn(c, after) else byteInList(c, after)
+            if (inSet) good = false
+        }
+        if (good && skipPrefix != "" && at >= skipPrefix.size &&
+            source.slice(at - skipPrefix.size, at) == skipPrefix) good = false
+        if (good) {
+            parts.append(source.slice(last, at))
+            parts.append(replacement)
+            last = end
+            from = end
+            count = count + 1
+        } else {
+            from = at + 1
+        }
+    }
+    parts.append(source.slice(last, source.size))
+    Replaced(parts.join(""), count)
+}
+
+fun byteInList(c: int, list: string): bool {
+    for (e in list) {
+        if (e == c) return true
+    }
+    false
+}
+
+// Lines of `source` split on "\n" (the final empty piece after a trailing newline is dropped,
+// like str.splitlines for text without other separators).
+fun sourceLines(source: string): array<string> {
+    val lines = source.split("\n")
+    if (lines.size > 0 && lines[lines.size - 1] == "") lines.truncate(lines.size - 1)
+    lines
+}
+
+// The value after `prefix` on each line that is exactly `prefix` plus a non-empty remainder
+// (re.findall(r"^PREFIX([^\n]+)$", source, re.MULTILINE)).
+fun linesWithPrefix(source: string, prefix: string): array<string> {
+    val found: array<string> = []
+    for (line in source.split("\n")) {
+        if (line.startsWith(prefix) && line.size > prefix.size) found.append(line.slice(prefix.size, line.size))
+    }
+    found
+}
+
+// ---- Python string and regex semantics ----
+
+// str.splitlines(): splits at \n, \r\n, \r, \v, \f, \x1c-\x1e, \x85,   and   (no empty last piece).
+fun pySplitLines(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var index = 0
+    val size = text.size
+    while (index < size) {
+        val c = text[index]
+        var breakLength = 0
+        if (c == 10 || c == 11 || c == 12 || (c >= 28 && c <= 30)) breakLength = 1
+        else if (c == 13) breakLength = if (index + 1 < size && text[index + 1] == 10) 2 else 1
+        else if (c == 0xc2 && index + 1 < size && text[index + 1] == 0x85) breakLength = 2
+        else if (c == 0xe2 && index + 2 < size && text[index + 1] == 0x80 &&
+            (text[index + 2] == 0xa8 || text[index + 2] == 0xa9)) breakLength = 3
+        if (breakLength > 0) {
+            lines.append(text.slice(begin, index))
+            index = index + breakLength
+            begin = index
+        } else {
+            index = index + 1
+        }
+    }
+    if (begin < size) lines.append(text.slice(begin, size))
+    lines
+}
+
+// A Python `\w` byte; bytes of multibyte characters count as word characters.
+fun isWordByte(c: int): bool = isAlnum(c) || c == 95 || c >= 128
+
+// Whether `\b` holds between byte positions index-1 and index of `text`.
+fun wordBoundaryAt(text: string, index: int): bool {
+    val before = index > 0 && isWordByte(text[index - 1])
+    val after = index < text.size && isWordByte(text[index])
+    before != after
+}
+
+// re.search(rf"\b{name}(?:{suffixes[0]}|{suffixes[1]}...)?\b", text) for a literal name: true when
+// some position holds a boundary, `name` and then a boundary or one suffix and a boundary.
+fun containsWordWithSuffix(text: string, name: string, suffixes: array<string>): bool {
+    var from = 0
+    while (from <= text.size - name.size) {
+        val at = text.indexOf(name, from)
+        if (at < 0) return false
+        if (wordBoundaryAt(text, at)) {
+            val end = at + name.size
+            if (wordBoundaryAt(text, end)) return true
+            for (suffix in suffixes) {
+                if (hasAt(text, end, suffix) && wordBoundaryAt(text, end + suffix.size)) return true
+            }
+        }
+        from = at + 1
+    }
+    false
+}
+
+// str.rstrip(): ASCII whitespace at the end.
+fun pyRightStrip(text: string): string {
+    var end = text.size
+    while (end > 0 && isSpace(text[end - 1])) end = end - 1
+    text.slice(0, end)
+}
+
+// pathlib.Path(value).suffix == ".ab": a final dot that is not the first character of the name.
+fun hasSuffix(name: string, suffix: string): bool {
+    if (!name.endsWith(suffix)) return false
+    name.size > suffix.size
+}
+
+// Whether `text` holds `needle` at byte offset `index`.
+fun hasAt(text: string, index: int, needle: string): bool =
+    index >= 0 && index + needle.size <= text.size && text.slice(index, index + needle.size) == needle
+
+// ---- archives (nm, ar) and the objects inside ----
+
+class ArchiveMember(val archive: string, val member: string)
+
+class ArchiveIndex(val owners: Map<string, array<ArchiveMember>>, val error: string)
+
+private val nmMemberPattern = regexCompile("""^(.*\.a):([^:]+):[0-9A-Fa-f]+\s+\S\s+(\S+)$""")
+
+// The text of the last whitespace-separated token of `line`.
+private fun lastToken(line: string): string {
+    var end = line.size
+    while (end > 0 && isSpace(line[end - 1])) end = end - 1
+    var begin = end
+    while (begin > 0 && !isSpace(line[begin - 1])) begin = begin - 1
+    line.slice(begin, end)
+}
+
+// `nm -A --defined-only` over every archive: symbol -> the archive members defining it that are in
+// `wanted`, in first-seen order without repeats.
+fun archiveSymbolIndex(archives: array<string>, wanted: Map<string, int>): ArchiveIndex {
+    val owners: Map<string, array<ArchiveMember>> = Map()
+    for (archive in archives) {
+        val result = command("nm").argument("-A").argument("--defined-only").argument(archive).capture()
+        if (result.status != 0) return ArchiveIndex(owners, "nm failed on ${archive}")
+        for (line in result.output.split("\n")) {
+            if (!wanted.has(lastToken(line))) continue
+            val match = nmMemberPattern.regex.find(line)
+            if (match == null) continue
+            val symbol = match.group(3) ?? ""
+            if (!wanted.has(symbol)) continue
+            val owner = ArchiveMember(pyPath(match.group(1) ?? ""), match.group(2) ?? "")
+            if (!owners.has(symbol)) {
+                val fresh: array<ArchiveMember> = []
+                owners.set(symbol, fresh)
+            }
+            val list = owners.get(symbol)
+            if (list != null && !containsMember(list, owner)) list.append(owner)
+        }
+    }
+    ArchiveIndex(owners, "")
+}
+
+fun containsMember(list: array<ArchiveMember>, owner: ArchiveMember): bool {
+    for (item in list) {
+        if (item.archive == owner.archive && item.member == owner.member) return true
+    }
+    false
+}
+
+class MemberObjects(val objects: array<string>, val error: string)
+
+// How many members of `archive` are called `member` (`ar t`); -1 when ar fails.
+fun archiveInstances(archive: string, member: string): int {
+    val result = command("ar").argument("t").argument(archive).capture()
+    if (result.status != 0) return -1
+    var count = 0
+    for (line in result.output.split("\n")) {
+        if (line == member) count = count + 1
+    }
+    count
+}
+
+// The contents of the `instance`th (1-based) member called `member`, extracted with `ar xN`.
+fun archiveMemberInstance(archive: string, member: string, instance: int): SourceText {
+    val absolute = if (archive.startsWith("/")) archive else currentDirectory().text + "/" + archive
+    val made = command("mktemp").argument("-d").capture()
+    if (made.status != 0) return SourceText("", "cannot create a temporary directory")
+    val directory = made.output.trim()
+    val extracted = command("ar").argument("xN").argument("${instance}").argument(absolute).argument(member).directory(directory).run()
+    var result = SourceText("", "ar xN failed on ${archive}")
+    if (extracted == 0) {
+        val read = Path(directory).child(member).readTextResult()
+        result = if (read.succeeded) SourceText(read.text, "") else SourceText("", "cannot read the extracted ${member}")
+    }
+    Path(directory).removeTree()
+    result
+}
+
+// Every object of the archive members called `member` (`ar p` for one, `ar xN` for each of several).
+fun memberObjects(archive: string, member: string): MemberObjects {
+    val objects: array<string> = []
+    val instances = archiveInstances(archive, member)
+    if (instances < 0) return MemberObjects(objects, "ar failed on ${archive}")
+    if (instances == 1) {
+        // `ar p` prints the one member (its bytes are not text, but a string holds any bytes).
+        val printed = command("ar").argument("p").argument(archive).argument(member).capture()
+        if (printed.status != 0) return MemberObjects(objects, "ar failed on ${archive}")
+        objects.append(printed.output)
+        return MemberObjects(objects, "")
+    }
+    var instance = 1
+    while (instance <= instances) {
+        val object = archiveMemberInstance(archive, member, instance)
+        if (object.error != "") return MemberObjects(objects, object.error)
+        objects.append(object.text)
+        instance = instance + 1
+    }
+    MemberObjects(objects, "")
+}
+
+// ---- objects ----
+
+class ObjectSymbol(val name: string, val value: int, val kind: int, val binding: int,
+    val sectionIndex: int, val section: string)
+
+// The symbol table (first SHT_SYMTAB) with each symbol's section name ("" when it has none).
+fun objectSymbols(data: string): array<ObjectSymbol> {
+    val result: array<ObjectSymbol> = []
+    val elf = elf32Parse(data)
+    if (elf.error != "") return result
+    var table = -1
+    var index = 0
+    while (index < elf.sections.size) {
+        if (table < 0 && elf.sections[index].kind == ELF_SHT_SYMTAB) table = index
+        index = index + 1
+    }
+    for (symbol in elf.symbols(table)) {
+        var section = ""
+        if (symbol.sectionIndex > 0 && symbol.sectionIndex < elf.sections.size) {
+            section = elf.sections[symbol.sectionIndex].name
+        }
+        result.append(ObjectSymbol(symbol.name, symbol.value, symbol.kind(), symbol.binding(),
+            symbol.sectionIndex, section))
+    }
+    result
+}
+
+// `[a, b]` as Python prints a list of ints.
+fun intListText(values: array<int>): string {
+    val parts: array<string> = []
+    for (value in values) parts.append("${value}")
+    "[" + parts.join(", ") + "]"
+}
+
+// re.sub(r"[^A-Za-z0-9_]", "_", text): one underscore per other character.
+fun safeIdentifier(text: string): string {
+    val parts: array<string> = []
+    for (c in text) {
+        if (isAlnum(c) || c == 95) parts.append(byteEncode(c))
+        else if ((c & 0xc0) != 0x80) parts.append("_")
+    }
+    parts.join("")
+}
+
+// re.escape for a literal used inside a pattern of abla/regex.
+fun regexEscape(text: string): string {
+    val parts: array<string> = []
+    for (c in text) {
+        if (isAlnum(c) || c == 95 || c >= 128 || c == 32) parts.append(byteEncode(c))
+        else parts.append("\\" + byteEncode(c))
+    }
+    parts.join("")
+}
+
+class TemplateResult(val text: string, val error: string)
+
+// What `re.sub(pattern, template, ...)` inserts for a template without group references: `\\`, `\n`,
+// `\t`, ... become their character, other escaped punctuation stays as written, and an escaped letter
+// or digit is an error.
+fun pyReplacementTemplate(template: string): TemplateResult {
+    val parts: array<string> = []
+    var index = 0
+    while (index < template.size) {
+        val c = template[index]
+        if (c != 92 || index + 1 >= template.size) {
+            parts.append(byteEncode(c))
+            index = index + 1
+            continue
+        }
+        val e = template[index + 1]
+        if (e == 92) parts.append("\\")
+        else if (e == 110) parts.append("\n")
+        else if (e == 116) parts.append("\t")
+        else if (e == 114) parts.append("\r")
+        else if (e == 102) parts.append(byteEncode(12))
+        else if (e == 118) parts.append(byteEncode(11))
+        else if (e == 97) parts.append(byteEncode(7))
+        else if (e == 98 || e == 103 || (e >= 48 && e <= 57) || isAlnum(e)) {
+            return TemplateResult("", "bad escape \\${byteEncode(e)}")
+        } else {
+            parts.append("\\")
+            parts.append(byteEncode(e))
+        }
+        index = index + 2
+    }
+    TemplateResult(parts.join(""), "")
+}
+
+// `// Original ABI symbol: NAME` lines whose value is one whitespace-free token
+// (re.findall(r"^// Original ABI symbol: (\S+)$", source, re.MULTILINE)).
+fun abiSymbolTokens(source: string): array<string> {
+    val found: array<string> = []
+    for (value in linesWithPrefix(source, "// Original ABI symbol: ")) {
+        var blank = false
+        for (c in value) {
+            if (isSpace(c)) blank = true
+        }
+        if (!blank) found.append(value)
+    }
+    found
+}
+
+// str.splitlines(keepends=True) for the separators `pySplitLines` knows.
+fun pySplitLinesKeepEnds(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var index = 0
+    val size = text.size
+    while (index < size) {
+        val c = text[index]
+        var breakLength = 0
+        if (c == 10 || c == 11 || c == 12 || (c >= 28 && c <= 30)) breakLength = 1
+        else if (c == 13) breakLength = if (index + 1 < size && text[index + 1] == 10) 2 else 1
+        else if (c == 0xc2 && index + 1 < size && text[index + 1] == 0x85) breakLength = 2
+        else if (c == 0xe2 && index + 2 < size && text[index + 1] == 0x80 &&
+            (text[index + 2] == 0xa8 || text[index + 2] == 0xa9)) breakLength = 3
+        if (breakLength > 0) {
+            index = index + breakLength
+            lines.append(text.slice(begin, index))
+            begin = index
+        } else {
+            index = index + 1
+        }
+    }
+    if (begin < size) lines.append(text.slice(begin, size))
+    lines
+}
+
+// str.rfind(needle, 0, end): the last start at which `needle` lies wholly before `end`.
+fun rfindBefore(text: string, needle: string, end: int): int {
+    var at = end - needle.size
+    while (at >= 0) {
+        if (hasAt(text, at, needle)) return at
+        at = at - 1
+    }
+    -1
+}
+
+// str.lstrip() for ASCII whitespace.
+fun pyLeftStrip(text: string): string {
+    var begin = 0
+    while (begin < text.size && isSpace(text[begin])) begin = begin + 1
+    text.slice(begin, text.size)
+}
+
+// ---- paths on disk ----
+
+// os.path.abspath: the working directory joined with a relative path, `.` and `..` folded away.
+fun pyAbsolutePath(path: string): string {
+    val joined = if (path.startsWith("/")) path else currentDirectory().text + "/" + path
+    val parts: array<string> = []
+    for (part in joined.split("/")) {
+        if (part == "" || part == ".") continue
+        if (part == "..") {
+            if (parts.size > 0) parts.truncate(parts.size - 1)
+            continue
+        }
+        parts.append(part)
+    }
+    "/" + parts.join("/")
+}
+
+// os.path.relpath(path, start), both made absolute first.
+fun pyRelativePath(path: string, start: string): string {
+    val target = pyAbsolutePath(path).split("/")
+    val base = pyAbsolutePath(start).split("/")
+    var common = 0
+    while (common < target.size && common < base.size && target[common] == base[common]) common = common + 1
+    val parts: array<string> = []
+    var up = common
+    while (up < base.size) {
+        parts.append("..")
+        up = up + 1
+    }
+    var down = common
+    while (down < target.size) {
+        parts.append(target[down])
+        down = down + 1
+    }
+    // The leading "" of an absolute path is not a component.
+    val cleaned: array<string> = []
+    for (part in parts) {
+        if (part != "") cleaned.append(part)
+    }
+    if (cleaned.size == 0) "." else cleaned.join("/")
+}
+
+// pathlib.Path.resolve() (symbolic links followed, missing parts allowed).
+fun pyResolve(path: string): string {
+    val result = command("realpath").argument("-m").argument("--").argument(path).capture()
+    if (result.status != 0) return pyAbsolutePath(path)
+    result.output.trim()
+}
+
+// pathlib.Path(value).parent as text.
+fun pyParent(path: string): string {
+    val text = pyPath(path)
+    val cut = text.lastIndexOf("/")
+    if (cut < 0) return "."
+    if (cut == 0) return "/"
+    text.slice(0, cut)
+}
+
+// sorted(set(values)) for strings.
+fun sortedUnique(values: array<string>): array<string> {
+    val sorted: array<string> = []
+    for (value in values) {
+        var present = false
+        for (other in sorted) {
+            if (other == value) present = true
+        }
+        if (present) continue
+        var place = sorted.size
+        while (place > 0 && value < sorted[place - 1]) place = place - 1
+        sorted.append(value)
+        var index = sorted.size - 1
+        while (index > place) {
+            sorted[index] = sorted[index - 1]
+            index = index - 1
+        }
+        sorted[place] = value
+    }
+    sorted
+}
