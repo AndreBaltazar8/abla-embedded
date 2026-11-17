@@ -1,0 +1,236 @@
+// Work around LLVM 23.1's Xtensa `Cannot select: Constant<N>` failure.
+//
+// Upstream Xtensa selects `(add (shl x, 1|2|3), C)` as ADDX2/4/8 with C as a
+// register operand but never materializes a C that does not fit MOVI, so
+// instruction selection aborts. Usage (textual IR on stdin/stdout):
+//
+//     tools/abla-tool tools/esp-llvm-bin/opaque-xtensa-constant.ab FUNCTION N < in.ll > out.ll
+//
+// When N itself does not occur (the DAG folded it from other constants, e.g.
+// `(x | 0x1FFFFD80) << 3` becomes `+ -5120`), every i32 constant of FUNCTION
+// outside MOVI's -2048..2047 range is treated the same way. Each such constant
+// needs MOVI/L32R materialization anyway.
+//
+// Inside FUNCTION only, ordinary `i32 N` operands become one value produced by
+// an empty inline-asm identity at the entry block. The value is the same; the
+// DAG can no longer fold it into the ADDX pattern and materializes it with
+// MOVI/L32R like any other large constant. Switch case values and GEP indices
+// must stay constants and are left alone.
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "../lib/asm-text.ab"
+
+fun irIsWord(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+// Python's `(?<=\bi32 )|(?<=, )|(?<=\[ )` before position `at`.
+fun irOperandStart(text: string, at: int): bool {
+    if (at < 2 || text[at - 1] != 32) return false
+    val before = text[at - 2]
+    if (before == 44 || before == 91) return true
+    if (at >= 4 && before == 50 && text[at - 3] == 51 && text[at - 4] == 105) {
+        return at == 4 || !irIsWord(text[at - 5])
+    }
+    false
+}
+
+// `\s*,\s*label` at `at`.
+fun irLabelFollows(text: string, at: int): bool {
+    var cursor = at
+    while (cursor < text.size && asmIsSpace(text[cursor])) cursor = cursor + 1
+    if (cursor >= text.size || text[cursor] != 44) return false
+    cursor = cursor + 1
+    while (cursor < text.size && asmIsSpace(text[cursor])) cursor = cursor + 1
+    text.slice(cursor, text.size).startsWith("label")
+}
+
+// The first position at or after `from` where `value` is an operand: after an
+// operand start, followed by a word boundary and not by `, label`; -1 if none.
+fun irFindOperand(text: string, value: string, from: int): int {
+    if (value.size == 0) return -1
+    val lastWord = irIsWord(value[value.size - 1])
+    var at = text.indexOf(value, from)
+    while (at >= 0) {
+        val end = at + value.size
+        val nextWord = end < text.size && irIsWord(text[end])
+        if (irOperandStart(text, at) && lastWord != nextWord && !irLabelFollows(text, end)) return at
+        at = text.indexOf(value, at + 1)
+    }
+    -1
+}
+
+// `line` with every operand `value` replaced by `name`, and how many.
+class IrReplacement(val text: string, val count: int)
+
+fun irReplaceOperand(line: string, value: string, name: string): IrReplacement {
+    var found = irFindOperand(line, value, 0)
+    if (found < 0) return IrReplacement(line, 0)
+    val parts: array<string> = []
+    var count = 0
+    var position = 0
+    while (found >= 0) {
+        parts.append(line.slice(position, found))
+        parts.append(name)
+        count = count + 1
+        position = found + value.size
+        found = irFindOperand(line, value, position)
+    }
+    parts.append(line.slice(position, line.size))
+    IrReplacement(parts.join(""), count)
+}
+
+fun irEligible(line: string): bool {
+    if (!line.contains("i32") || line.contains("getelementptr") || line.contains("switch")) return false
+    // `\s*i32 -?\d+, label`
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (scan.word("i32 ")) {
+        if (scan.integer(true) != null && scan.word(", label")) return false
+    }
+    true
+}
+
+// Every `-?\d+` operand of `text`, in order (Python's re.findall).
+fun irFindNumbers(text: string): array<string> {
+    val found: array<string> = []
+    var at = 0
+    while (at < text.size) {
+        var matched = -1
+        if (at >= 2 && irOperandStart(text, at) && (text[at] == 45 || asmIsDigit(text[at]))) {
+            val scan = AsmScan(text, at)
+            val number = scan.integer(true)
+            if (number != null && !(scan.pos < text.size && irIsWord(text[scan.pos])) &&
+                !irLabelFollows(text, scan.pos)) {
+                found.append(number)
+                matched = scan.pos
+            }
+        }
+        at = if (matched >= 0) matched else at + 1
+    }
+    found
+}
+
+class OpaqueResult(val text: string, val error: string)
+
+fun lineStartsWithName(line: string, name: string): bool = asmLstrip(line).startsWith(name)
+
+// `[\w.$-]+:` at the start of `line`.
+fun irStartsWithLabel(line: string): bool {
+    var at = 0
+    while (at < line.size && (irIsWord(line[at]) || line[at] == 46 || line[at] == 36 || line[at] == 45)) at = at + 1
+    at > 0 && at < line.size && line[at] == 58
+}
+
+fun makeOpaque(text: string, function: string, constant: string): OpaqueResult {
+    // `(?m)^define [^\n]*@FUNCTION\(`
+    val needle = "@$function("
+    var headerEnd = -1
+    var lineStart = 0
+    while (headerEnd < 0 && lineStart <= text.size) {
+        var lineEnd = text.indexOf("\n", lineStart)
+        if (lineEnd < 0) lineEnd = text.size
+        if (text.slice(lineStart, lineEnd).startsWith("define ")) {
+            val last = text.slice(lineStart, lineEnd).lastIndexOf(needle)
+            if (last >= 0) headerEnd = lineStart + last + needle.size
+        }
+        lineStart = lineEnd + 1
+    }
+    if (headerEnd < 0) return OpaqueResult("", "opaque-xtensa-constant: no function $function")
+    val brace = text.indexOf("{\n", headerEnd)
+    if (brace < 0) return OpaqueResult("", "opaque-xtensa-constant: function $function has no body")
+    val bodyStart = brace + 2
+    val bodyEnd = text.indexOf("\n}\n", bodyStart)
+    if (bodyEnd < 0) return OpaqueResult("", "opaque-xtensa-constant: function $function has no end")
+    val lines = text.slice(bodyStart, bodyEnd).split("\n")
+
+    var constants: array<string> = [constant]
+    var present = false
+    for (line in lines) {
+        if (!present && irEligible(line) && irFindOperand(line, constant, 0) >= 0) present = true
+    }
+    if (!present) {
+        val eligible: array<string> = []
+        for (line in lines) {
+            if (irEligible(line)) eligible.append(line)
+        }
+        val distinct: array<string> = []
+        for (value in irFindNumbers(eligible.join("\n"))) {
+            val number = asmIntegerValue(value)
+            if (number < -2048 || number > 2047) {
+                var known = false
+                for (other in distinct) {
+                    if (other == value) known = true
+                }
+                if (!known) distinct.append(value)
+            }
+        }
+        // sorted by value
+        constants = []
+        for (value in distinct) {
+            var at = 0
+            while (at < constants.size && asmIntegerValue(constants[at]) <= asmIntegerValue(value)) at = at + 1
+            constants.append(value)
+            var move = constants.size - 1
+            while (move > at) {
+                constants[move] = constants[move - 1]
+                move = move - 1
+            }
+            constants[at] = value
+        }
+    }
+    val definitions: array<string> = []
+    for (value in constants) {
+        val digits = if (value.startsWith("-")) value.slice(1, value.size) else value
+        val name = "%abla.opaque.$digits" + (if (value.startsWith("-")) "n" else "")
+        var count = 0
+        var index = 0
+        while (index < lines.size) {
+            val line = lines[index]
+            if (irEligible(line) && !lineStartsWithName(line, name)) {
+                val replaced = irReplaceOperand(line, value, name)
+                lines[index] = replaced.text
+                count = count + replaced.count
+            }
+            index = index + 1
+        }
+        if (count > 0) definitions.append("  $name = call i32 asm \"\", \"=r,0\"(i32 $value)")
+    }
+    if (definitions.size == 0) {
+        return OpaqueResult("", "opaque-xtensa-constant: no large constant in $function")
+    }
+    // The first line of the body is the entry label (or the first instruction).
+    val first = if (irStartsWithLabel(lines[0])) 1 else 0
+    val result: array<string> = []
+    var at = 0
+    while (at < first) {
+        result.append(lines[at])
+        at = at + 1
+    }
+    for (definition in definitions) result.append(definition)
+    while (at < lines.size) {
+        result.append(lines[at])
+        at = at + 1
+    }
+    OpaqueResult(text.slice(0, bodyStart) + result.join("\n") + text.slice(bodyEnd, text.size), "")
+}
+
+fun main: int {
+    if (processArgumentCount() != 2) {
+        eprintln("usage: opaque-xtensa-constant FUNCTION N < in.ll > out.ll")
+        return 2
+    }
+    val input = asmReadStandardInput()
+    if (!input.succeeded) {
+        eprintln("opaque-xtensa-constant: cannot read standard input")
+        return 1
+    }
+    val result = makeOpaque(input.text, processArgument(0), processArgument(1))
+    if (result.error != "") {
+        eprintln(result.error)
+        return 1
+    }
+    print(result.text)
+    0
+}

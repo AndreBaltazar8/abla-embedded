@@ -1,0 +1,227 @@
+// Text helpers shared by the Xtensa assembly filters in tools/esp-llvm-bin
+// (stdin/stdout text filters over LLVM-emitted assembly). They mirror the Python
+// the filters replaced: whitespace is Python's ASCII isspace (9-13, 28-32), a
+// register is a0..a15, and input read as text has universal newlines.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+
+fun asmIsSpace(byte: int): bool = byte == 32 || (byte >= 9 && byte <= 13) || (byte >= 28 && byte <= 31)
+
+fun asmIsDigit(byte: int): bool = byte >= 48 && byte <= 57
+
+// Python's str.strip() / lstrip() / rstrip() for ASCII text.
+fun asmStrip(text: string): string {
+    var begin = 0
+    while (begin < text.size && asmIsSpace(text[begin])) begin = begin + 1
+    var end = text.size
+    while (end > begin && asmIsSpace(text[end - 1])) end = end - 1
+    text.slice(begin, end)
+}
+
+fun asmLstrip(text: string): string {
+    var begin = 0
+    while (begin < text.size && asmIsSpace(text[begin])) begin = begin + 1
+    text.slice(begin, text.size)
+}
+
+fun asmRstrip(text: string): string {
+    var end = text.size
+    while (end > 0 && asmIsSpace(text[end - 1])) end = end - 1
+    text.slice(0, end)
+}
+
+// Text with universal newlines, as Python's open() in text mode gives it (its stdin does not: standard input is read as is).
+fun asmUniversalNewlines(text: string): string {
+    if (text.indexOf("\r") < 0) return text
+    text.replace("\r\n", "\n").replace("\r", "\n")
+}
+
+class AsmInput(val text: string, val succeeded: bool)
+
+fun asmReadStandardInput(): AsmInput {
+    val result = Path("/dev/stdin").readTextResult()
+    AsmInput(result.text, result.succeeded)
+}
+
+fun asmReadFile(path: string): AsmInput {
+    val result = Path(path).readTextResult()
+    AsmInput(asmUniversalNewlines(result.text), result.succeeded)
+}
+
+// The lines of `text` without their "\n" (a final line without one still counts;
+// text ending in "\n" has no empty last line), like iterating a Python file.
+fun asmLines(text: string): array<string> {
+    val pieces = text.split("\n")
+    if (pieces.size > 0 && pieces[pieces.size - 1] == "") pieces.truncate(pieces.size - 1)
+    pieces
+}
+
+// The lines of `text` with their "\n", like file.readlines().
+fun asmLinesKeepingNewlines(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    while (begin < text.size) {
+        val found = text.indexOf("\n", begin)
+        if (found < 0) {
+            lines.append(text.slice(begin, text.size))
+            begin = text.size
+        } else {
+            lines.append(text.slice(begin, found + 1))
+            begin = found + 1
+        }
+    }
+    lines
+}
+
+// Writes each line followed by "\n".
+fun asmWriteLines(lines: array<string>): void {
+    val buffer = byteBuffer()
+    for (line in lines) {
+        buffer.appendText(line)
+        buffer.appendText("\n")
+    }
+    print(buffer.toText())
+}
+
+fun asmWriteText(parts: array<string>): void {
+    val buffer = byteBuffer()
+    for (part in parts) buffer.appendText(part)
+    print(buffer.toText())
+}
+
+// A cursor over a line, for hand-written matching of the instruction forms the
+// filters recognise (the Python used one regular expression per form).
+class AsmScan(val text: string, var pos: int) {
+    fun atEnd(): bool = this.pos >= this.text.size
+
+    fun skipSpaces(): void {
+        while (this.pos < this.text.size && asmIsSpace(this.text[this.pos])) this.pos = this.pos + 1
+    }
+
+    // `\s+`: at least one space.
+    fun needSpace(): bool {
+        val before = this.pos
+        this.skipSpaces()
+        this.pos > before
+    }
+
+    // The literal `word` at the position.
+    fun word(word: string): bool {
+        if (this.pos + word.size > this.text.size) return false
+        if (this.text.slice(this.pos, this.pos + word.size) != word) return false
+        this.pos = this.pos + word.size
+        true
+    }
+
+    // `\s*$`.
+    fun onlySpaceLeft(): bool {
+        this.skipSpaces()
+        this.pos == this.text.size
+    }
+
+    // a0 .. a15 (the longest run of digits must be such a number).
+    fun reg(): string? {
+        if (this.pos >= this.text.size || this.text[this.pos] != 97) return null
+        var end = this.pos + 1
+        while (end < this.text.size && asmIsDigit(this.text[end])) end = end + 1
+        val digits = end - this.pos - 1
+        if (digits == 1) {
+            val name = this.text.slice(this.pos, end)
+            this.pos = end
+            return name
+        }
+        if (digits == 2 && this.text[this.pos + 1] == 49 && this.text[this.pos + 2] <= 53) {
+            val name = this.text.slice(this.pos, end)
+            this.pos = end
+            return name
+        }
+        null
+    }
+
+    // `-?\d+`, as the text; null when absent.
+    fun integer(signed: bool): string? {
+        var end = this.pos
+        if (signed && end < this.text.size && this.text[end] == 45) end = end + 1
+        val first = end
+        while (end < this.text.size && asmIsDigit(this.text[end])) end = end + 1
+        if (end == first) return null
+        val value = this.text.slice(this.pos, end)
+        this.pos = end
+        value
+    }
+}
+
+// A decimal integer text as an int; values that do not fit are clamped far
+// outside every range the filters compare against.
+fun asmIntegerValue(text: string): int {
+    var negative = false
+    var index = 0
+    if (text.size > 0 && text[0] == 45) {
+        negative = true
+        index = 1
+    }
+    var value = 0
+    while (index < text.size) {
+        if (value > 100000000000) value = 100000000000 else value = value * 10 + (text[index] - 48)
+        index = index + 1
+    }
+    if (negative) -value else value
+}
+
+// Blank in Python's `[ \t]`.
+fun asmIsBlank(byte: int): bool = byte == 32 || byte == 9
+
+fun asmIsWord(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+// `word` appears in `text` at `at`.
+fun asmHasAt(text: string, at: int, word: string): bool {
+    if (at < 0 || at + word.size > text.size) return false
+    var index = 0
+    while (index < word.size) {
+        if (text[at + index] != word[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+// `text` without trailing "\n" characters (Python's rstrip("\n")).
+fun asmChomp(text: string): string {
+    var end = text.size
+    while (end > 0 && text[end - 1] == 10) end = end - 1
+    if (end == text.size) text else text.slice(0, end)
+}
+
+// The first position at or after `at` that is not a space or tab.
+fun asmSkipBlanks(text: string, at: int): int {
+    var cursor = at
+    while (cursor < text.size && asmIsBlank(text[cursor])) cursor = cursor + 1
+    cursor
+}
+
+// The end of the run of digits that starts at `at` (`at` itself when none).
+fun asmDigitsEnd(text: string, at: int): int {
+    var cursor = at
+    while (cursor < text.size && asmIsDigit(text[cursor])) cursor = cursor + 1
+    cursor
+}
+
+// The end of the run of word characters (`\w`) that starts at `at`.
+fun asmWordEnd(text: string, at: int): int {
+    var cursor = at
+    while (cursor < text.size && asmIsWord(text[cursor])) cursor = cursor + 1
+    cursor
+}
+
+// `a\d+`: any register name, however large the number.
+fun AsmScan.anyReg(): string? {
+    if (this.pos >= this.text.size || this.text[this.pos] != 97) return null
+    val end = asmDigitsEnd(this.text, this.pos + 1)
+    if (end == this.pos + 1) return null
+    val name = this.text.slice(this.pos, end)
+    this.pos = end
+    name
+}

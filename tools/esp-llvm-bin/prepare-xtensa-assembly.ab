@@ -1,0 +1,915 @@
+// Prepare one LLVM Xtensa assembly stream for the external assembler.
+//
+// LLVM emits temporary `.literal` directives at their use sites. With text
+// section literals the assembler otherwise inserts a branch and pool at the
+// callable symbol, before Xtensa's windowed `entry` instruction. Hoist only
+// LLVM-owned temporary literals ahead of the function symbol. Literals written
+// inside Abla's parsed `$xtensa` blocks keep their explicit structural layout.
+//
+//     tools/abla-tool tools/esp-llvm-bin/prepare-xtensa-assembly.ab < in.s > out.s
+//
+// The functions are the module the tests import (tests/iram-companion-data.ab).
+// Lines carry their "\n", as Python's readlines() gave them. An assembly the
+// passes cannot prove safe is an error: nothing is written, the status is 1.
+
+import "abla/io"
+import "abla/text"
+import "../lib/asm-text.ab"
+
+// A line list or the reason the passes refused the assembly.
+class PreparedLines(val lines: array<string>, val error: string)
+
+fun preparedFailure(error: string): PreparedLines {
+    val none: array<string> = []
+    PreparedLines(none, error)
+}
+
+// `^[ \t]*\.type[ \t]+(?P<name>[^,]+),[ \t]*@function[ \t]*$`: the raw name, or null.
+fun functionTypeName(raw: string): string? {
+    val line = asmChomp(raw)
+    val start = asmSkipBlanks(line, 0)
+    if (start >= line.size || line[start] != 46 || !asmHasAt(line, start, ".type")) return null
+    val afterType = start + 5
+    val nameStart = asmSkipBlanks(line, afterType)
+    if (nameStart == afterType) return null
+    val comma = line.indexOf(",", nameStart)
+    if (comma < 0) return null
+    var begin = nameStart
+    // `[ \t]+` gives a blank back to the name when the name would be empty.
+    if (comma == nameStart) {
+        if (nameStart - afterType < 2) return null
+        begin = comma - 1
+    }
+    var cursor = asmSkipBlanks(line, comma + 1)
+    if (!asmHasAt(line, cursor, "@function")) return null
+    cursor = asmSkipBlanks(line, cursor + 9)
+    if (cursor != line.size) return null
+    line.slice(begin, comma)
+}
+
+// `^[ \t]*\.literal[ \t]+(?:\.Ltmp[0-9]+|\.LCPI[0-9]+_[0-9]+),`
+fun isGeneratedLiteral(line: string): bool {
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, ".literal")) return false
+    val afterWord = start + 8
+    val symbol = asmSkipBlanks(line, afterWord)
+    if (symbol == afterWord) return false
+    if (asmHasAt(line, symbol, ".Ltmp")) {
+        val end = asmDigitsEnd(line, symbol + 5)
+        return end > symbol + 5 && asmHasAt(line, end, ",")
+    }
+    if (asmHasAt(line, symbol, ".LCPI")) {
+        val first = asmDigitsEnd(line, symbol + 5)
+        if (first == symbol + 5 || !asmHasAt(line, first, "_")) return false
+        val second = asmDigitsEnd(line, first + 1)
+        return second > first + 1 && asmHasAt(line, second, ",")
+    }
+    false
+}
+
+// `^[ \t]*j[ \t]+(?P<label>\.LBB[0-9]+_[0-9]+)[ \t]*$` on the line without "\n": the label, or null.
+fun islandJumpLabel(raw: string): string? {
+    val line = asmChomp(raw)
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, "j")) return null
+    val label = asmSkipBlanks(line, start + 1)
+    if (label == start + 1 || !asmHasAt(line, label, ".LBB")) return null
+    val first = asmDigitsEnd(line, label + 4)
+    if (first == label + 4 || !asmHasAt(line, first, "_")) return null
+    val second = asmDigitsEnd(line, first + 1)
+    if (second == first + 1) return null
+    if (asmSkipBlanks(line, second) != line.size) return null
+    line.slice(label, second)
+}
+
+// `^[ \t]*entry(?:[ \t]|$)`
+fun isEntry(line: string): bool {
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, "entry")) return false
+    val after = start + 5
+    after >= line.size || asmIsBlank(line[after]) || (line[after] == 10 && after + 1 == line.size)
+}
+
+// `^[ \t]*\.cfi_`
+fun isCfi(line: string): bool = asmHasAt(line, asmSkipBlanks(line, 0), ".cfi_")
+
+// `^[ \t]*\.section[ \t]+\.WindowVectors\.text,"axR",@progbits,unique,[0-9]+[ \t]*$` on the line without "\n".
+fun isWindowVectorSection(raw: string): bool {
+    val line = asmChomp(raw)
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, ".section")) return false
+    val name = asmSkipBlanks(line, start + 8)
+    if (name == start + 8) return false
+    val fixed = ".WindowVectors.text,\"axR\",@progbits,unique,"
+    if (!asmHasAt(line, name, fixed)) return false
+    val digits = name + fixed.size
+    val end = asmDigitsEnd(line, digits)
+    end > digits && asmSkipBlanks(line, end) == line.size
+}
+
+// The code `lines[at]` as the label of function `name`:
+// `^[ \t]*NAME:[ \t]*(?:#.*)?$` on the line without "\n".
+fun isFunctionLabel(raw: string, name: string): bool {
+    val line = asmChomp(raw)
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, name) || !asmHasAt(line, start + name.size, ":")) return false
+    val rest = asmSkipBlanks(line, start + name.size + 1)
+    rest == line.size || line[rest] == 35
+}
+
+// `^[ \t]*\.size[ \t]+NAME,`
+fun isFunctionSize(line: string, name: string): bool {
+    val start = asmSkipBlanks(line, 0)
+    if (!asmHasAt(line, start, ".size")) return false
+    val symbol = asmSkipBlanks(line, start + 5)
+    symbol > start + 5 && asmHasAt(line, symbol, name) && asmHasAt(line, symbol + name.size, ",")
+}
+
+class SectionLine(val prefix: string, val name: string, val suffix: string)
+
+// `^(\s*\.section\s+)([^,\s]+)(.*)$` on the line without "\n".
+fun parseSectionLine(raw: string): SectionLine? {
+    val line = asmChomp(raw)
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (!scan.word(".section") || !scan.needSpace()) return null
+    val prefixEnd = scan.pos
+    var end = prefixEnd
+    while (end < line.size && line[end] != 44 && !asmIsSpace(line[end])) end = end + 1
+    if (end == prefixEnd) return null
+    SectionLine(line.slice(0, prefixEnd), line.slice(prefixEnd, end), line.slice(end, line.size))
+}
+
+// `\s*\.type\s+(\.Lswitch\.table\.([^,\s]+)),\s*@object` at the start of `line`:
+// [symbol, function] or an empty array.
+fun parseTypedTable(line: string): array<string> {
+    val none: array<string> = []
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (!scan.word(".type") || !scan.needSpace()) return none
+    val symbolStart = scan.pos
+    if (!scan.word(".Lswitch.table.")) return none
+    val ownerStart = scan.pos
+    var end = ownerStart
+    while (end < line.size && line[end] != 44 && !asmIsSpace(line[end])) end = end + 1
+    if (end == ownerStart || end >= line.size || line[end] != 44) return none
+    scan.pos = end + 1
+    scan.skipSpaces()
+    if (!scan.word("@object")) return none
+    [line.slice(symbolStart, end), line.slice(ownerStart, end)]
+}
+
+// `\s*\.size\s+SYMBOL\s*,` at the start of `line`.
+fun isSizeOfSymbol(line: string, symbol: string): bool {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (!scan.word(".size") || !scan.needSpace() || !scan.word(symbol)) return false
+    scan.skipSpaces()
+    scan.word(",")
+}
+
+fun contains(values: array<string>, value: string): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+// Keep LLVM per-function constant/jump tables accessible with cache off.
+//
+// Xtensa codegen emits .rodata.<function> even for explicitly IRAM functions.
+// IDF's .dram1.* mapping loads these constants into internal RAM. Match exact
+// function ownership; never move unrelated data or user inline assembly.
+fun placeIramCompanionData(lines: array<string>): array<string> {
+    val iramFunctions: array<string> = []
+    var section = ""
+    var inline = false
+    for (line in lines) {
+        val stripped = asmStrip(line)
+        if (stripped == "#APP") inline = true
+        if (stripped == "#NO_APP") {
+            inline = false
+            continue
+        }
+        if (inline) continue
+        val match = parseSectionLine(line)
+        if (match != null) {
+            section = match.name
+        } else if (stripped == ".text" || stripped == ".data" || stripped == ".bss") {
+            section = stripped
+        }
+        val function = functionTypeName(line)
+        if (function != null && (section == ".iram1" || section.startsWith(".iram1."))) {
+            iramFunctions.append(asmStrip(function))
+        }
+    }
+    if (iramFunctions.size == 0) return copyRange(lines, 0, lines.size)
+    val output: array<string> = []
+    inline = false
+    var tableSymbol = ""
+    var mergeRestore: string? = null
+    for (original in lines) {
+        var line = original
+        val stripped = asmStrip(line)
+        if (stripped == "#APP") inline = true
+        if (stripped == "#NO_APP") inline = false
+        val match = if (inline) null else parseSectionLine(line)
+        if (!inline) {
+            val typed = parseTypedTable(line)
+            if (typed.size == 2) tableSymbol = if (contains(iramFunctions, typed[1])) typed[0] else ""
+        }
+        val newline = if (line.endsWith("\n")) "\n" else ""
+        if (match != null && match.name.startsWith(".rodata.cst") && tableSymbol != "") {
+            mergeRestore = line
+            output.append("${match.prefix}.dram1.abla.rodata.$tableSymbol${match.suffix}$newline")
+            continue
+        }
+        var owner = ""
+        var owned = false
+        if (match != null && match.name.startsWith(".rodata.")) {
+            owner = match.name.slice(8, match.name.size)
+            owned = true
+            if (owner.startsWith(".Lswitch.table.")) owner = owner.slice(15, owner.size)
+        }
+        if (owned && contains(iramFunctions, owner) && match != null) {
+            line = "${match.prefix}.dram1.abla${match.name}${match.suffix}$newline"
+        }
+        output.append(line)
+        if (tableSymbol != "" && isSizeOfSymbol(line, tableSymbol)) {
+            if (mergeRestore != null) output.append(mergeRestore ?? "")
+            mergeRestore = null
+            tableSymbol = ""
+        }
+    }
+    output
+}
+
+// A function found by functionSpan: `body` is the index of its label line, `end`
+// the index after its `.size` line; `error` is set when it has no `.size`.
+class FunctionSpan(val found: bool, val body: int, val end: int, val error: string)
+
+fun noFunctionSpan(): FunctionSpan = FunctionSpan(false, 0, 0, "")
+
+fun functionSpan(lines: array<string>, index: int): FunctionSpan {
+    val typed = functionTypeName(lines[index])
+    if (typed == null) return noFunctionSpan()
+    val name = asmStrip(typed)
+    var body = index + 1
+    while (body < lines.size && !isFunctionLabel(lines[body], name)) {
+        val stripped = asmLstrip(lines[body])
+        if (stripped.startsWith(".type") || stripped.startsWith(".section") ||
+            stripped.startsWith(".set\t$name,") || stripped.startsWith(".set $name,")) {
+            return noFunctionSpan()
+        }
+        body = body + 1
+    }
+    if (body == lines.size) return noFunctionSpan()
+    var end = body + 1
+    while (end < lines.size && !isFunctionSize(lines[end], name)) end = end + 1
+    if (end == lines.size) return FunctionSpan(false, 0, 0, "function $name has no matching .size")
+    FunctionSpan(true, body, end + 1, "")
+}
+
+// `^\s*addi(?:\.n)?\s+(a\d+),\s*a1,\s*(-?\d+)\s*$`: [register, amount] or empty.
+fun parseStackAdjust(code: string): array<string> {
+    val none: array<string> = []
+    val scan = AsmScan(code, 0)
+    scan.skipSpaces()
+    if (!scan.word("addi")) return none
+    scan.word(".n")
+    if (!scan.needSpace()) return none
+    val register = scan.anyReg() ?? return none
+    if (!scan.word(",")) return none
+    scan.skipSpaces()
+    if (!scan.word("a1,")) return none
+    scan.skipSpaces()
+    val amount = scan.integer(true) ?? return none
+    if (!scan.onlySpaceLeft()) return none
+    [register, amount]
+}
+
+// The target of a jump or branch to a `.LBB` label (`(j(?:\.n)?|b\w*(?:\.\w+)?)\s+.*?(\.LBB\d+_\d+)`
+// matching all of `code`): [opcode, label] or empty.
+fun parseLabelJump(code: string): array<string> {
+    val none: array<string> = []
+    var end = 0
+    if (code.startsWith("j")) {
+        end = if (asmHasAt(code, 1, ".n")) 3 else 1
+    } else if (code.startsWith("b")) {
+        end = asmWordEnd(code, 1)
+        if (end < code.size && code[end] == 46) {
+            val after = asmWordEnd(code, end + 1)
+            if (after > end + 1) end = after
+        }
+    } else {
+        return none
+    }
+    if (end >= code.size || !asmIsSpace(code[end])) return none
+    var cursor = end
+    while (cursor < code.size && asmIsSpace(code[cursor])) cursor = cursor + 1
+    val label = code.lastIndexOf(".LBB")
+    if (label < cursor) return none
+    val first = asmDigitsEnd(code, label + 4)
+    if (first == label + 4 || first >= code.size || code[first] != 95) return none
+    val second = asmDigitsEnd(code, first + 1)
+    if (second == first + 1 || second != code.size) return none
+    [code.slice(0, end), code.slice(label, code.size)]
+}
+
+// `\ba1\b` somewhere in `code`.
+fun mentionsA1(code: string): bool {
+    var at = code.indexOf("a1")
+    while (at >= 0) {
+        val before = at == 0 || !asmIsWord(code[at - 1])
+        val after = at + 2 >= code.size || !asmIsWord(code[at + 2])
+        if (before && after) return true
+        at = code.indexOf("a1", at + 1)
+    }
+    false
+}
+
+// `\w+(?:\.\w+)?\s+` at the start of `code`: the position after the whitespace, or -1.
+fun afterOpcode(code: string): int {
+    var end = asmWordEnd(code, 0)
+    if (end == 0) return -1
+    if (end < code.size && code[end] == 46) {
+        val after = asmWordEnd(code, end + 1)
+        if (after > end + 1) end = after
+    }
+    if (end >= code.size || !asmIsSpace(code[end])) return -1
+    while (end < code.size && asmIsSpace(code[end])) end = end + 1
+    end
+}
+
+// `\w+(?:\.\w+)?\s+REG(?:,|$)` at the start of `code`.
+fun firstOperandIs(code: string, register: string): bool {
+    val at = afterOpcode(code)
+    if (at < 0 || !asmHasAt(code, at, register)) return false
+    val after = at + register.size
+    after >= code.size || code[after] == 44
+}
+
+// `(?:b\w*|j\w*|call\w*|ret\w*|loop\w*|ill\w*)\b` at the start of `code`.
+fun startsWithControlOpcode(code: string): bool =
+    code.startsWith("b") || code.startsWith("j") || code.startsWith("call") ||
+        code.startsWith("ret") || code.startsWith("loop") || code.startsWith("ill")
+
+// `movsp\s+a1,\s*REG`, all of `code`.
+fun isMovspTo(code: string, register: string): bool {
+    val scan = AsmScan(code, 0)
+    if (!scan.word("movsp") || !scan.needSpace() || !scan.word("a1,")) return false
+    scan.skipSpaces()
+    code.slice(scan.pos, code.size) == register
+}
+
+// `(?:movsp|entry)\b|\w+(?:\.\w+)?\s+a1,` at the start of `code`.
+fun mutatesStackPointer(code: string): bool {
+    if (code.startsWith("movsp") && (code.size == 5 || !asmIsWord(code[5]))) return true
+    if (code.startsWith("entry") && (code.size == 5 || !asmIsWord(code[5]))) return true
+    val at = afterOpcode(code)
+    at >= 0 && asmHasAt(code, at, "a1,")
+}
+
+// `[ls](8|16|32)\w*(?:\.n)?\s+a\d+,\s*a1,\s*(-?\d+)`, all of `code`: [width, offset] or empty.
+fun parseStackAccess(code: string): array<string> {
+    val none: array<string> = []
+    if (code.size < 3 || (code[0] != 108 && code[0] != 115)) return none
+    var width = ""
+    var at = 1
+    if (code[1] == 56) {
+        width = "8"
+        at = 2
+    } else if (asmHasAt(code, 1, "16")) {
+        width = "16"
+        at = 3
+    } else if (asmHasAt(code, 1, "32")) {
+        width = "32"
+        at = 3
+    } else {
+        return none
+    }
+    at = asmWordEnd(code, at)
+    if (asmHasAt(code, at, ".n")) at = at + 2
+    val scan = AsmScan(code, at)
+    if (!scan.needSpace()) return none
+    val register = scan.anyReg()
+    if (register == null || !scan.word(",")) return none
+    scan.skipSpaces()
+    if (!scan.word("a1,")) return none
+    scan.skipSpaces()
+    val offset = scan.integer(true) ?? return none
+    if (scan.pos != code.size) return none
+    [width, offset]
+}
+
+// `mov(?:\.n)?\s+a\d+,\s*a1`, all of `code`.
+fun isStartAddress(code: string): bool {
+    val scan = AsmScan(code, 0)
+    if (!scan.word("mov")) return false
+    scan.word(".n")
+    if (!scan.needSpace() || scan.anyReg() == null || !scan.word(",")) return false
+    scan.skipSpaces()
+    scan.word("a1") && scan.pos == code.size
+}
+
+// `call(?:x)?8\s` at the start of `code`.
+fun isCall8(code: string): bool {
+    var at = 4
+    if (!code.startsWith("call")) return false
+    if (asmHasAt(code, at, "x")) at = at + 1
+    at < code.size && code[at] == 56 && at + 1 < code.size && asmIsSpace(code[at + 1])
+}
+
+// `re.split(r"[\s,]+", code)[-1]`.
+fun lastOperand(code: string): string {
+    var end = code.size
+    var start = end
+    while (start > 0 && !asmIsSpace(code[start - 1]) && code[start - 1] != 44) start = start - 1
+    code.slice(start, end)
+}
+
+class FrameState(val size: int, val called: bool, val pending: string)
+
+class FrameWork(val pos: int, val state: FrameState)
+
+class FramePair(val register: string, val amount: int, val moves: array<int>, val key: string)
+
+fun positionsContain(values: array<int>, value: int): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun sortedKey(values: array<int>): string {
+    val sorted: array<int> = []
+    for (value in values) {
+        var at = 0
+        while (at < sorted.size && sorted[at] < value) at = at + 1
+        sorted.append(value)
+        var move = sorted.size - 1
+        while (move > at) {
+            sorted[move] = sorted[move - 1]
+            move = move - 1
+        }
+        sorted[at] = value
+    }
+    val parts: array<string> = []
+    for (value in sorted) parts.append("$value")
+    parts.join(",")
+}
+
+// Prove outgoing-frame balance over generated control flow before padding.
+//
+// State is (outstanding byte count, has called, pending MOVSP sites). Every
+// predecessor must agree, including zero-frame predecessors. Inline assembly
+// is opaque and untouched; it may never be crossed with an outstanding frame.
+fun alignOutgoingCallFrames(lines: array<string>): PreparedLines {
+    val result: array<string> = []
+    for (line in lines) result.append(line)
+    // LLVM jump tables live after .size. Their entries are additional CFG
+    // roots with no outgoing frame; every generated indirect jump is checked
+    // below to prohibit crossing it with an outstanding adjustment.
+    val jumpTargets: array<string> = []
+    for (line in lines) {
+        if (line.indexOf(".word") < 0) continue
+        val scan = AsmScan(line, 0)
+        scan.skipSpaces()
+        if (!scan.word(".word") || !scan.needSpace() || !scan.word(".LBB")) continue
+        val first = asmDigitsEnd(line, scan.pos)
+        if (first == scan.pos || !asmHasAt(line, first, "_")) continue
+        val second = asmDigitsEnd(line, first + 1)
+        if (second == first + 1) continue
+        scan.pos = second
+        if (!scan.onlySpaceLeft()) continue
+        val label = line.slice(line.indexOf(".LBB"), second)
+        if (!contains(jumpTargets, label)) jumpTargets.append(label)
+    }
+    var index = 0
+    while (index < lines.size) {
+        val span = functionSpan(lines, index)
+        if (span.error != "") return preparedFailure(span.error)
+        if (!span.found) {
+            index = index + 1
+            continue
+        }
+        val begin = span.body
+        val end = span.end
+        val count = end - begin
+        val text: array<string> = []
+        val opaque: array<bool> = []
+        val labels: Map<string, int> = Map()
+        var inline = false
+        var pos = begin
+        while (pos < end) {
+            val raw = asmStrip(lines[pos])
+            if (raw == "#APP") inline = true
+            opaque.append(inline)
+            if (raw == "#NO_APP") inline = false
+            val hash = raw.indexOf("#")
+            val code = if (hash < 0) raw else asmStrip(raw.slice(0, hash))
+            text.append(code)
+            if (code.endsWith(":") && !inline) labels.set(code.slice(0, code.size - 1), pos)
+            pos = pos + 1
+        }
+        // Positions are relative to `begin` in text and opaque.
+        val pairs: Map<int, FramePair> = Map()
+        val pairOrder: array<int> = []
+        pos = begin
+        while (pos < end - 1) {
+            val current = pos
+            pos = pos + 1
+            if (opaque[current - begin]) continue
+            val match = parseStackAdjust(text[current - begin])
+            if (match.size == 0) continue
+            val amount = asmIntegerValue(match[1])
+            if (amount % 16 == 0) continue
+            // Machine scheduling can put the ADDI before an unconditional
+            // edge and MOVSP in its successors. Prove bounded paths
+            // with neither source/destination clobbers nor observations
+            // of A1; the CFG state below also validates all incoming edges.
+            val cursors: array<int> = [current + 1]
+            val seen: array<int> = []
+            val moves: array<int> = []
+            var valid = true
+            while (cursors.size > 0 && valid) {
+                val cursor = cursors[cursors.size - 1]
+                cursors.truncate(cursors.size - 1)
+                if (positionsContain(seen, cursor)) continue
+                if (cursor >= end || seen.size >= 32) {
+                    valid = false
+                    break
+                }
+                seen.append(cursor)
+                val code = text[cursor - begin]
+                if (opaque[cursor - begin]) {
+                    valid = false
+                    break
+                }
+                if (isMovspTo(code, match[0])) {
+                    if (!positionsContain(moves, cursor)) moves.append(cursor)
+                    continue
+                }
+                val jump = parseLabelJump(code)
+                if (jump.size == 2 && labels.has(jump[1])) {
+                    cursors.append(labels.get(jump[1]) ?? 0)
+                    if (jump[0] != "j" && jump[0] != "j.n") cursors.append(cursor + 1)
+                    continue
+                }
+                if (code != "" && !code.startsWith(".") && !code.endsWith(":")) {
+                    if (mentionsA1(code) || firstOperandIs(code, match[0]) || startsWithControlOpcode(code)) {
+                        valid = false
+                        break
+                    }
+                }
+                cursors.append(cursor + 1)
+            }
+            if (valid && moves.size > 0) {
+                val magnitude = if (amount < 0) -amount else amount
+                if (((magnitude + 15) & -16) > 127) {
+                    return preparedFailure("outgoing adjustment encoding overflow at line ${current + 1}")
+                }
+                pairs.set(current, FramePair(match[0], amount, moves, sortedKey(moves)))
+                pairOrder.append(current)
+            }
+        }
+        if (pairOrder.size == 0) {
+            index = end
+            continue
+        }
+        val noPending = ""
+        val states: array<FrameState?> = []
+        var fill = 0
+        while (fill < count) {
+            states.append(null)
+            fill = fill + 1
+        }
+        val movesOf: Map<string, array<int>> = Map()
+        for (record in pairOrder) {
+            val pair = pairs.get(record)
+            if (pair != null) movesOf.set(pair.key, pair.moves)
+        }
+        val start = FrameState(0, false, noPending)
+        val work: array<FrameWork> = [FrameWork(begin, start)]
+        for (label in jumpTargets) {
+            if (labels.has(label)) work.append(FrameWork(labels.get(label) ?? 0, start))
+        }
+        val visited: array<int> = []
+        while (work.size > 0) {
+            val item = work[work.size - 1]
+            work.truncate(work.size - 1)
+            val at = item.pos
+            var state = item.state
+            if (at >= end) {
+                if (state.size != 0 || state.pending != noPending) {
+                    return preparedFailure("unbalanced frame at function end line $end")
+                }
+                continue
+            }
+            val known = states[at - begin]
+            if (known != null) {
+                if (known.size != state.size || known.called != state.called || known.pending != state.pending) {
+                    return preparedFailure("inconsistent call-frame join at line ${at + 1}")
+                }
+                continue
+            }
+            states[at - begin] = state
+            val size = state.size
+            val called = state.called
+            val pending = state.pending
+            val code = text[at - begin]
+            val next = at + 1
+            val pair = pairs.get(at)
+            if (pair != null) {
+                if (pending != noPending) return preparedFailure("overlapping stack adjustment at line ${at + 1}")
+                if (pair.amount < 0) {
+                    if (size != 0) return preparedFailure("nested outgoing frame at line ${at + 1}")
+                    state = FrameState(-pair.amount, false, pair.key)
+                } else {
+                    if (size != pair.amount || !called) {
+                        return preparedFailure("unmatched outgoing restore at line ${at + 1}")
+                    }
+                    state = FrameState(0, false, pair.key)
+                }
+                val magnitude = if (pair.amount < 0) -pair.amount else pair.amount
+                val rounded = (magnitude + 15) & -16
+                result[at] = "\taddi\t${pair.register}, a1, ${if (pair.amount > 0) rounded else -rounded}\n"
+                if (!positionsContain(visited, at)) visited.append(at)
+                work.append(FrameWork(next, state))
+                continue
+            }
+            if (pending != noPending && positionsContain(movesOf.get(pending) ?? [], at)) {
+                work.append(FrameWork(next, FrameState(size, called, noPending)))
+                continue
+            }
+            if (size != 0) {
+                if (opaque[at - begin]) return preparedFailure("inline assembly in outgoing frame at line ${at + 1}")
+                if (mutatesStackPointer(code)) return preparedFailure("SP mutation in outgoing frame at line ${at + 1}")
+                val access = parseStackAccess(code)
+                if (access.size == 2) {
+                    val offset = asmIntegerValue(access[1])
+                    if (!(0 <= offset && offset + asmIntegerValue(access[0]) / 8 <= size)) {
+                        return preparedFailure("non-argument stack access at line ${at + 1}")
+                    }
+                }
+                if (mentionsA1(code) && access.size == 0) {
+                    val address = parseStackAdjust(code)
+                    val provenAddress = address.size == 2 &&
+                        0 <= asmIntegerValue(address[1]) && asmIntegerValue(address[1]) <= size
+                    if (!isStartAddress(code) && !provenAddress) {
+                        return preparedFailure("unproven outgoing stack address at line ${at + 1}: $code")
+                    }
+                }
+                if (isCall8(code)) {
+                    state = FrameState(size, true, pending)
+                } else if (code.startsWith("call")) {
+                    return preparedFailure("unknown call ABI in outgoing frame at line ${at + 1}")
+                }
+            }
+            if (opaque[at - begin] || code == "" || code.startsWith(".") || code.endsWith(":")) {
+                work.append(FrameWork(next, state))
+                continue
+            }
+            val operation = firstWord(code)
+            if (operation.startsWith("loop")) {
+                return preparedFailure("implicit hardware-loop edge requires separate proof at line ${at + 1}")
+            }
+            if (operation.startsWith("ret") || operation.startsWith("ill")) {
+                if (state.size != 0 || state.pending != noPending) {
+                    return preparedFailure("outstanding frame at terminal line ${at + 1}")
+                }
+                continue
+            }
+            if (operation == "j" || operation == "j.n" || operation.startsWith("b")) {
+                val target = lastOperand(code)
+                if (!labels.has(target)) return preparedFailure("unknown control edge at line ${at + 1}: $code")
+                work.append(FrameWork(labels.get(target) ?? 0, state))
+                if (operation != "j" && operation != "j.n") work.append(FrameWork(next, state))
+                continue
+            }
+            if (operation == "jx" || operation == "jx.n") {
+                if (state.size != 0) return preparedFailure("indirect edge in outgoing frame at line ${at + 1}")
+                continue
+            }
+            work.append(FrameWork(next, state))
+        }
+        var missing = -1
+        for (record in pairOrder) {
+            if (!positionsContain(visited, record) && (missing < 0 || record < missing)) missing = record
+        }
+        if (missing >= 0) {
+            return preparedFailure("unreachable or unproven outgoing adjustment at line ${missing + 1}")
+        }
+        index = end
+    }
+    PreparedLines(result, "")
+}
+
+// `code.split()[0]`.
+fun firstWord(code: string): string {
+    var start = 0
+    while (start < code.size && asmIsSpace(code[start])) start = start + 1
+    var end = start
+    while (end < code.size && !asmIsSpace(code[end])) end = end + 1
+    code.slice(start, end)
+}
+
+fun markerText(marker: string): string? = when (marker) {
+    "# ABLA_XTENSA_LITERAL_POSITION" -> "\t.literal_position\n"
+    // A literal pool after ENTRY that execution jumps over (src/xtensa/assembly.ab).
+    "# ABLA_XTENSA_LITERAL_ISLAND" -> "\tj 99993f\n\t.literal_position\n\t.align 4\n99993:\n"
+    "# ABLA_XTENSA_BEGIN_NO_TRANSFORM" -> "\t.begin no-transform\n"
+    "# ABLA_XTENSA_END_NO_TRANSFORM" -> "\t.end no-transform\n"
+    else -> null
+}
+
+// The line to emit for `line`, or null to drop it.
+fun normalizedLine(line: string): string? {
+    if (isCfi(line)) return null
+    if (isWindowVectorSection(line)) {
+        // Xtensa's six window vectors and the alloca entry are one fixed-offset
+        // architectural table. LLVM uses unique fragments for functions that
+        // share an explicit section; merge only this table before assembly.
+        return "\t.section\t.WindowVectors.text,\"axR\",@progbits\n"
+    }
+    val marker = markerText(asmStrip(line))
+    if (marker != null) return marker
+    line
+}
+
+fun ignorableComment(line: string): bool {
+    val stripped = asmStrip(line)
+    stripped == "" || stripped.startsWith("#") || isCfi(line)
+}
+
+// LLVM's branch-around-pool prologue after its pool was hoisted: lines
+// jump up to and including target are removed, except those before jump.
+// jump is -1 when there is no such prologue.
+class IslandCut(val jump: int, val target: int)
+
+fun islandCut(block: array<string>, labelIndex: int): IslandCut {
+    var jumpIndex = labelIndex + 1
+    while (jumpIndex < block.size && ignorableComment(block[jumpIndex])) jumpIndex = jumpIndex + 1
+    if (jumpIndex == block.size) return IslandCut(-1, -1)
+    val jumpLabel = islandJumpLabel(block[jumpIndex])
+    if (jumpLabel == null) return IslandCut(-1, -1)
+
+    val targetText = "$jumpLabel:"
+    var targetIndex = jumpIndex + 1
+    var allowed = true
+    while (targetIndex < block.size) {
+        val stripped = asmStrip(block[targetIndex])
+        if (stripped.startsWith(targetText)) break
+        if (!(ignorableComment(block[targetIndex]) || stripped.startsWith(".p2align") ||
+            stripped == ".literal_position" || isGeneratedLiteral(block[targetIndex]))) {
+            allowed = false
+            break
+        }
+        targetIndex = targetIndex + 1
+    }
+    if (!allowed || targetIndex == block.size) return IslandCut(-1, -1)
+
+    var entryIndex = targetIndex + 1
+    while (entryIndex < block.size && ignorableComment(block[entryIndex])) entryIndex = entryIndex + 1
+    if (entryIndex == block.size || !isEntry(block[entryIndex])) return IslandCut(-1, -1)
+    IslandCut(jumpIndex, targetIndex)
+}
+
+fun copyRange(lines: array<string>, begin: int, end: int): array<string> {
+    val copy: array<string> = []
+    var at = begin
+    while (at < end) {
+        copy.append(lines[at])
+        at = at + 1
+    }
+    copy
+}
+
+class ChildFunction(val begin: int, val end: int, val label: int)
+
+// Prepare a function without stealing literals from nested helpers.
+fun prepareFunction(block: array<string>, labelIndex: int): PreparedLines {
+    // LLVM's first literal island precedes the mandatory windowed `entry`.
+    // Hoist only that island ahead of the callable symbol. Later islands are
+    // range-extension pools deliberately placed inside very large functions;
+    // moving them all to the front makes Xtensa's signed 18-bit L32R reach
+    // overflow in a monolithic firmware initializer.
+    var entryIndex = block.size
+    var entryCursor = labelIndex + 1
+    while (entryCursor < block.size) {
+        if (isEntry(block[entryCursor])) {
+            entryIndex = entryCursor
+            break
+        }
+        entryCursor = entryCursor + 1
+    }
+    val children: array<ChildFunction> = []
+    var cursor = labelIndex + 1
+    while (cursor < block.size - 1) {
+        val span = functionSpan(block, cursor)
+        if (span.error != "") return preparedFailure(span.error)
+        if (!span.found) {
+            cursor = cursor + 1
+            continue
+        }
+        children.append(ChildFunction(cursor, span.end, span.body))
+        cursor = span.end
+    }
+
+    val literals: array<string> = []
+    val rebuilt: array<string> = []
+    cursor = 0
+    for (child in children) {
+        var lineIndex = cursor
+        while (lineIndex < child.begin) {
+            val line = block[lineIndex]
+            if (lineIndex < entryIndex && isGeneratedLiteral(line)) literals.append(line) else rebuilt.append(line)
+            lineIndex = lineIndex + 1
+        }
+        val prepared = prepareFunction(copyRange(block, child.begin, child.end), child.label - child.begin)
+        if (prepared.error != "") return prepared
+        for (line in prepared.lines) rebuilt.append(line)
+        cursor = child.end
+    }
+    var lineIndex = cursor
+    while (lineIndex < block.size) {
+        val line = block[lineIndex]
+        if (lineIndex < entryIndex && isGeneratedLiteral(line)) literals.append(line) else rebuilt.append(line)
+        lineIndex = lineIndex + 1
+    }
+
+    val typed = functionTypeName(rebuilt[0])
+    if (typed == null) return preparedFailure("prepared function lost its type record")
+    val name = asmStrip(typed)
+    var preparedLabel = -1
+    var at = 0
+    while (preparedLabel < 0 && at < rebuilt.size) {
+        if (isFunctionLabel(rebuilt[at], name)) preparedLabel = at
+        at = at + 1
+    }
+    if (preparedLabel < 0) return preparedFailure("prepared function lost its label")
+    val cut = islandCut(rebuilt, preparedLabel)
+    val result: array<string> = []
+    if (literals.size > 0) {
+        for (line in literals) result.append(line)
+        result.append("\t.literal_position\n")
+    }
+    var copyAt = 0
+    while (copyAt < rebuilt.size) {
+        // The jump and everything up to its target label leave.
+        if (cut.jump >= 0 && copyAt == cut.jump) copyAt = cut.target + 1
+        if (copyAt < rebuilt.size) result.append(rebuilt[copyAt])
+        copyAt = copyAt + 1
+    }
+    PreparedLines(result, "")
+}
+
+fun prepareAssembly(source: array<string>): PreparedLines {
+    val placed = placeIramCompanionData(source)
+    val aligned = alignOutgoingCallFrames(placed)
+    if (aligned.error != "") return aligned
+    val lines = aligned.lines
+    val output: array<string> = []
+    var index = 0
+    while (index < lines.size) {
+        if (functionTypeName(lines[index]) == null) {
+            val line = normalizedLine(lines[index])
+            if (line != null) output.append(line)
+            index = index + 1
+            continue
+        }
+        val span = functionSpan(lines, index)
+        if (span.error != "") return preparedFailure(span.error)
+        if (!span.found) {
+            // LLVM also emits `.type alias,@function` followed by `.set` for
+            // aliases. They have no body or `.size` and require no pooling.
+            val normalized = normalizedLine(lines[index])
+            if (normalized != null) output.append(normalized)
+            index = index + 1
+            continue
+        }
+        val prepared = prepareFunction(copyRange(lines, index, span.end), span.body - index)
+        if (prepared.error != "") return prepared
+        for (line in prepared.lines) {
+            val normalized = normalizedLine(line)
+            if (normalized != null) output.append(normalized)
+        }
+        index = span.end
+    }
+    PreparedLines(output, "")
+}
+
+fun main: int {
+    val input = asmReadStandardInput()
+    if (!input.succeeded) {
+        eprintln("prepare-xtensa-assembly: cannot read standard input")
+        return 1
+    }
+    val prepared = prepareAssembly(asmLinesKeepingNewlines(input.text))
+    if (prepared.error != "") {
+        eprintln("prepare-xtensa-assembly: ${prepared.error}")
+        return 1
+    }
+    asmWriteText(prepared.lines)
+    0
+}

@@ -1,0 +1,394 @@
+// Map scalar Abla LLVM fingerprints in llvm-nm -S output to source declarations.
+//
+// Only plain named functions with explicit scalar parameters/results are parsed;
+// extensions/generics/default arguments remain unmapped, never guessed.
+//
+//     tools/abla-tool map-llvm-scalar-symbols NM ROOT... [--baseline NM] [--limit N]
+//
+// NM is `llvm-nm -S --size-sort`-style text (`address size t symbol` lines); each ROOT
+// is a directory searched for .ab sources. Prints a tab-separated table of the
+// LIMIT (default 20) largest symbols with their size change against the baseline
+// and the declaration their name fingerprints.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/asm-text.ab"
+
+fun isWordByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+fun isScalarType(name: string): bool = when (name) {
+    "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "int", "bool", "void", "f32", "f64" -> true
+    else -> false
+}
+
+fun fingerprint(parts: array<string>, seed: int, factor: int, modulus: int): int {
+    var value = seed
+    for (part in parts) {
+        for (byte in part) value = (value * factor + byte + 1) % modulus
+    }
+    value
+}
+
+class NmSymbol(val size: int, val address: string)
+
+fun isHexText(text: string): bool {
+    if (text.size == 0) return false
+    for (byte in text) {
+        if (!((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102))) return false
+    }
+    true
+}
+
+fun hexValue(text: string): int {
+    var value = 0
+    for (byte in text) {
+        val digit = if (byte <= 57) byte - 48 else if (byte <= 70) byte - 55 else byte - 87
+        value = value * 16 + digit
+    }
+    value
+}
+
+// str.splitlines() for the separators text files carry.
+fun pythonLines(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var at = 0
+    while (at < text.size) {
+        val byte = text[at]
+        if (byte == 10 || byte == 13 || byte == 11 || byte == 12 || byte == 28 || byte == 29 || byte == 30) {
+            lines.append(text.slice(begin, at))
+            if (byte == 13 && at + 1 < text.size && text[at + 1] == 10) at = at + 1
+            begin = at + 1
+        }
+        at = at + 1
+    }
+    if (begin < text.size) lines.append(text.slice(begin, text.size))
+    lines
+}
+
+// Whitespace-separated fields of `line`.
+fun fieldsOf(line: string): array<string> {
+    val fields: array<string> = []
+    var at = 0
+    while (at < line.size) {
+        while (at < line.size && asmIsSpace(line[at])) at = at + 1
+        val begin = at
+        while (at < line.size && !asmIsSpace(line[at])) at = at + 1
+        if (at > begin) fields.append(line.slice(begin, at))
+    }
+    fields
+}
+
+// symbol -> (size, address) for the `address size t|T name` lines of an nm listing.
+fun parseSymbols(text: string): Map<string, NmSymbol> {
+    val result: Map<string, NmSymbol> = Map()
+    for (line in pythonLines(text)) {
+        val fields = fieldsOf(line)
+        if (fields.size == 4 && isHexText(fields[0]) && isHexText(fields[1]) &&
+            (fields[2] == "t" || fields[2] == "T")) {
+            result.set(fields[3], NmSymbol(hexValue(fields[1]), fields[0]))
+        }
+    }
+    result
+}
+
+// `source` with comments (block, non-nested, and to end of line) replaced by as
+// many newlines as they contained. Strings are not special, as in the Python.
+fun stripComments(source: string): string {
+    val parts: array<string> = []
+    var copied = 0
+    var at = 0
+    while (at < source.size) {
+        var end = -1
+        if (source[at] == 47 && at + 1 < source.size) {
+            if (source[at + 1] == 42) {
+                val close = source.indexOf("*/", at + 2)
+                if (close >= 0) end = close + 2
+            } else if (source[at + 1] == 47) {
+                val newline = source.indexOf("\n", at)
+                end = if (newline < 0) source.size else newline
+            }
+        }
+        if (end < 0) {
+            at = at + 1
+        } else {
+            parts.append(source.slice(copied, at))
+            var newlines = 0
+            var inside = at
+            while (inside < end) {
+                if (source[inside] == 10) newlines = newlines + 1
+                inside = inside + 1
+            }
+            if (newlines > 0) parts.append("\n".repeat(newlines))
+            copied = end
+            at = end
+        }
+    }
+    parts.append(source.slice(copied, source.size))
+    parts.join("")
+}
+
+class Declaration(val name: string, val key: string, val line: int)
+
+// `name: type` with scalar `type` filling the whole text (Python's fullmatch of
+// `(\w+)\s*:\s*(SCALAR)`); returns [name, type] or an empty array.
+fun scalarParameter(text: string): array<string> {
+    val none: array<string> = []
+    var at = 0
+    while (at < text.size && isWordByte(text[at])) at = at + 1
+    if (at == 0) return none
+    val name = text.slice(0, at)
+    while (at < text.size && asmIsSpace(text[at])) at = at + 1
+    if (at >= text.size || text[at] != 58) return none
+    at = at + 1
+    while (at < text.size && asmIsSpace(text[at])) at = at + 1
+    val type = text.slice(at, text.size)
+    if (!isScalarType(type)) return none
+    [name, type]
+}
+
+// The declarations `fun NAME(scalar params): scalar` of `source`, with the key of
+// the LLVM symbol the compiler gives them.
+fun scalarDeclarations(source: string): array<Declaration> {
+    val clean = stripComments(source)
+    val found: array<Declaration> = []
+    var from = 0
+    var line = 1
+    var counted = 0
+    while (from < clean.size) {
+        val at = clean.indexOf("fun", from)
+        if (at < 0) break
+        from = at + 1
+        if (at > 0 && isWordByte(clean[at - 1])) continue
+        var cursor = at + 3
+        val spaceStart = cursor
+        while (cursor < clean.size && asmIsSpace(clean[cursor])) cursor = cursor + 1
+        if (cursor == spaceStart) continue
+        val nameStart = cursor
+        while (cursor < clean.size && isWordByte(clean[cursor])) cursor = cursor + 1
+        if (cursor == nameStart) continue
+        val name = clean.slice(nameStart, cursor)
+        while (cursor < clean.size && asmIsSpace(clean[cursor])) cursor = cursor + 1
+        if (cursor >= clean.size || clean[cursor] != 40) continue
+        cursor = cursor + 1
+        val parametersStart = cursor
+        while (cursor < clean.size && clean[cursor] != 40 && clean[cursor] != 41) cursor = cursor + 1
+        if (cursor >= clean.size || clean[cursor] != 41) continue
+        val parameters = clean.slice(parametersStart, cursor)
+        cursor = cursor + 1
+        while (cursor < clean.size && asmIsSpace(clean[cursor])) cursor = cursor + 1
+        if (cursor >= clean.size || clean[cursor] != 58) continue
+        cursor = cursor + 1
+        while (cursor < clean.size && asmIsSpace(clean[cursor])) cursor = cursor + 1
+        val typeStart = cursor
+        while (cursor < clean.size && isWordByte(clean[cursor])) cursor = cursor + 1
+        val result = clean.slice(typeStart, cursor)
+        if (!isScalarType(result)) continue
+        // A match: the next search starts after it.
+        from = cursor
+        val parts: array<string> = [name]
+        var valid = true
+        for (piece in parameters.split(",")) {
+            val parameter = asmStrip(piece)
+            if (parameter == "") continue
+            val pair = scalarParameter(parameter)
+            if (pair.size == 0) {
+                valid = false
+                break
+            }
+            parts.append(pair[0])
+            parts.append(pair[1])
+        }
+        if (!valid) continue
+        parts.append(result)
+        val first = fingerprint(parts, 41, 269, 1000000007)
+        val second = fingerprint(parts, 101, 271, 1000000009)
+        while (counted < at) {
+            if (clean[counted] == 10) line = line + 1
+            counted = counted + 1
+        }
+        found.append(Declaration(name, "abla_fn_${first}_$second", line))
+    }
+    found
+}
+
+// The path as pathlib prints it: no empty or "." components, "." for none.
+fun normalizedPath(path: string): string {
+    val parts: array<string> = []
+    for (part in path.split("/")) {
+        if (part != "" && part != ".") parts.append(part)
+    }
+    val joined = parts.join("/")
+    if (path.startsWith("/")) "/$joined" else if (joined == "") "." else joined
+}
+
+fun joinPath(base: string, name: string): string =
+    if (base == ".") name else if (base.endsWith("/")) "$base$name" else "$base/$name"
+
+fun collectSources(directory: Path, display: string, var files: array<Path>, var names: array<string>): void {
+    for (entry in directory.entries()) {
+        val name = entry.name()
+        val shown = joinPath(display, name)
+        val link = entry.linkInfo()
+        if (link.isDirectory()) {
+            collectSources(entry, shown, files, names)
+        } else if (name.endsWith(".ab") && (link.kind != 4 || entry.info().isFile())) {
+            files.append(entry)
+            names.append(shown)
+        }
+    }
+}
+
+fun usage(): string =
+    "usage: map-llvm-scalar-symbols [-h] [--baseline BASELINE] [--limit LIMIT] nm roots [roots ...]"
+
+fun main: int {
+    var nm = ""
+    var baseline = ""
+    var limit = 20
+    val roots: array<string> = []
+    var positionals = 0
+    var options = true
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        var value = ""
+        var name = ""
+        if (options && argument == "--") {
+            options = false
+            continue
+        }
+        if (options && (argument == "-h" || argument == "--help")) {
+            println(usage())
+            println("")
+            println("Map scalar Abla LLVM fingerprints in llvm-nm -S output to source declarations.")
+            return 0
+        }
+        if (options && (argument == "--baseline" || argument == "--limit")) {
+            if (index >= processArgumentCount()) {
+                eprintln(usage())
+                eprintln("map-llvm-scalar-symbols: error: argument $argument: expected one argument")
+                return 2
+            }
+            name = argument
+            value = processArgument(index)
+            index = index + 1
+        } else if (options && argument.startsWith("--baseline=")) {
+            name = "--baseline"
+            value = argument.slice(11, argument.size)
+        } else if (options && argument.startsWith("--limit=")) {
+            name = "--limit"
+            value = argument.slice(8, argument.size)
+        } else if (options && argument.startsWith("-") && argument.size > 1 && !asmIsDigit(argument[1])) {
+            eprintln(usage())
+            eprintln("map-llvm-scalar-symbols: error: unrecognized arguments: $argument")
+            return 2
+        }
+        if (name == "--baseline") {
+            baseline = value
+        } else if (name == "--limit") {
+            val scan = AsmScan(asmStrip(value), 0)
+            val digits = scan.integer(true)
+            if (digits == null || scan.pos != asmStrip(value).size) {
+                eprintln(usage())
+                eprintln("map-llvm-scalar-symbols: error: argument --limit: invalid int value: '$value'")
+                return 2
+            }
+            limit = asmIntegerValue(digits)
+        } else {
+            if (positionals == 0) nm = argument else roots.append(argument)
+            positionals = positionals + 1
+        }
+    }
+    if (positionals < 2) {
+        eprintln(usage())
+        eprintln("map-llvm-scalar-symbols: error: the following arguments are required: " +
+            (if (positionals == 0) "nm, roots" else "roots"))
+        return 2
+    }
+
+    // fingerprint -> distinct "name path:line" labels
+    val mapping: Map<string, array<string>> = Map()
+    for (root in roots) {
+        val display = normalizedPath(root)
+        val files: array<Path> = []
+        val names: array<string> = []
+        collectSources(Path(root), display, files, names)
+        var at = 0
+        while (at < files.size) {
+            val read = files[at].readTextResult()
+            if (!read.succeeded) {
+                eprintln("map-llvm-scalar-symbols: cannot read ${names[at]}")
+                return 1
+            }
+            for (declaration in scalarDeclarations(read.text)) {
+                val label = "${declaration.name} ${names[at]}:${declaration.line}"
+                val known = mapping.get(declaration.key)
+                if (known == null) {
+                    mapping.set(declaration.key, [label])
+                } else {
+                    var present = false
+                    for (other in known) {
+                        if (other == label) present = true
+                    }
+                    if (!present) known.append(label)
+                }
+            }
+            at = at + 1
+        }
+    }
+    val nmText = Path(nm).readTextResult()
+    if (!nmText.succeeded) {
+        eprintln("map-llvm-scalar-symbols: cannot read $nm")
+        return 1
+    }
+    val symbols = parseSymbols(nmText.text)
+    var baselineSymbols: Map<string, NmSymbol> = Map()
+    if (baseline != "") {
+        val baselineText = Path(baseline).readTextResult()
+        if (!baselineText.succeeded) {
+            eprintln("map-llvm-scalar-symbols: cannot read $baseline")
+            return 1
+        }
+        baselineSymbols = parseSymbols(baselineText.text)
+    }
+    // size descending, then name ascending
+    val order: array<string> = []
+    for (symbol in symbols.keys()) {
+        val size = (symbols.get(symbol) ?? NmSymbol(0, "")).size
+        var at = 0
+        while (at < order.size) {
+            val other = order[at]
+            val otherSize = (symbols.get(other) ?? NmSymbol(0, "")).size
+            if (otherSize < size || (otherSize == size && other > symbol)) break
+            at = at + 1
+        }
+        order.append(symbol)
+        var move = order.size - 1
+        while (move > at) {
+            order[move] = order[move - 1]
+            move = move - 1
+        }
+        order[at] = symbol
+    }
+    val end = if (limit >= 0) (if (limit < order.size) limit else order.size) else (if (order.size + limit > 0) order.size + limit else 0)
+    val lines: array<string> = ["bytes\tdelta\taddress\tsymbol\tdeclaration"]
+    var shown = 0
+    while (shown < end) {
+        val symbol = order[shown]
+        val entry = symbols.get(symbol) ?? NmSymbol(0, "")
+        val key = if (symbol.endsWith("_direct")) symbol.slice(0, symbol.size - 7) else symbol
+        val matches = mapping.get(key)
+        val label = if (matches != null && matches.size == 1) matches[0] else "$symbol [unmapped or ambiguous]"
+        val before = baselineSymbols.get(symbol)
+        val delta = if (before != null) "${entry.size - before.size}" else "?"
+        lines.append("${entry.size}\t$delta\t${entry.address}\t$symbol\t$label")
+        shown = shown + 1
+    }
+    asmWriteLines(lines)
+    0
+}

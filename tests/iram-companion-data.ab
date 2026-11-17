@@ -1,0 +1,125 @@
+// Placement of IRAM functions' companion data by tools/esp-llvm-bin/prepare-xtensa-assembly.ab,
+// and the cache-internal section guard of tools/check-cache-internal-object.ab.
+
+import "abla/io"
+import "abla/text"
+import "../tools/esp-llvm-bin/prepare-xtensa-assembly.ab"
+import "../tools/check-cache-internal-object.ab" as guard
+
+var failures = 0
+
+fun check(ok: bool, label: string): void {
+    if (!ok) {
+        println("FAIL $label")
+        failures = failures + 1
+    }
+}
+
+fun linesOf(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    while (begin < text.size) {
+        val found = text.indexOf("\n", begin)
+        val end = if (found < 0) text.size else found + 1
+        lines.append(text.slice(begin, end))
+        begin = end
+    }
+    lines
+}
+
+fun placed(text: string): string = placeIramCompanionData(linesOf(text)).join("")
+
+// `text` with the first `old` replaced.
+fun replaceFirst(text: string, old: string, replacement: string): string {
+    val at = text.indexOf(old)
+    if (at < 0) return text
+    text.slice(0, at) + replacement + text.slice(at + old.size, text.size)
+}
+
+fun checkEqual(actual: string, expected: string, label: string): void {
+    if (actual != expected) {
+        println("FAIL $label: expected\n$expected\ngot\n$actual")
+        failures = failures + 1
+    }
+}
+
+fun main: int {
+    val source = "\t.section .iram1.abla.worker,\"ax\",@progbits\n" +
+        "\t.type worker,@function\n" +
+        "worker:\n" +
+        "\tentry a1, 32\n" +
+        "\tretw\n" +
+        "\t.size worker, .-worker\n" +
+        "\t.section .rodata.worker,\"a\",@progbits\n" +
+        "\t.p2align 2\n" +
+        ".LJTI0_0:\n" +
+        "\t.word .LBB0_1\n" +
+        "\t.section .text.normal,\"ax\",@progbits\n" +
+        "\t.type normal,@function\n" +
+        "\t.section .rodata.normal,\"a\",@progbits\n" +
+        "\t.word 42\n" +
+        "\t.section .rodata.worker_suffix,\"a\",@progbits\n" +
+        "\t.word 43\n" +
+        "#APP\n" +
+        "\t.section .rodata.worker,\"a\",@progbits\n" +
+        "\t.word 44\n" +
+        "#NO_APP\n"
+    val expected = replaceFirst(source, ".section .rodata.worker,", ".section .dram1.abla.rodata.worker,")
+    val actual = placed(source)
+    checkEqual(actual, expected, "IRAM companion placement")
+    checkEqual(placed(actual), actual, "placement is idempotent")
+    check(placeIramCompanionData([]).size == 0, "empty input")
+    val prepared = prepareAssembly(linesOf(source))
+    check(prepared.error == "", "prepare accepts the module: ${prepared.error}")
+    checkEqual(prepared.lines.join(""), expected, "prepare keeps ordinary and user assembly")
+    if (failures == 0) {
+        println("PASS: exact IRAM companion placement, ordinary/user assembly preservation and idempotence")
+    }
+
+    val switches = source +
+        "\t.section .rodata..Lswitch.table.worker,\"a\",@progbits\n" +
+        "\t.word 80\n" +
+        "\t.section .rodata..Lswitch.table.worker_suffix,\"a\",@progbits\n" +
+        "\t.word 40\n" +
+        "\t.section .rodata..Lswitch.table.normal,\"a\",@progbits\n" +
+        "\t.word 20\n"
+    val switched = placed(switches)
+    val switchTail = replaceFirst(
+        switches.slice(source.size, switches.size),
+        ".section .rodata..Lswitch.table.worker,", ".section .dram1.abla.rodata..Lswitch.table.worker,")
+    checkEqual(switched, expected + switchTail, "switch lookup tables follow their function")
+    checkEqual(placed(switched), switched, "switch placement is idempotent")
+    if (failures == 0) println("PASS: LLVM switch lookup tables retain exact IRAM function ownership")
+
+    val merged = source +
+        "\t.type .Lswitch.table.worker,@object\n" +
+        "\t.section .rodata.cst16,\"aM\",@progbits,16\n" +
+        ".Lswitch.table.worker:\n" +
+        "\t.word 1,2,3,4\n" +
+        "\t.size .Lswitch.table.worker,16\n" +
+        "ordinary:\n" +
+        "\t.word 5,6,7,8\n"
+    val mergedActual = placed(merged)
+    check(mergedActual.contains("\t.section .dram1.abla.rodata..Lswitch.table.worker,\"aM\",@progbits,16"),
+        "merged constant moves to its own DRAM section")
+    check(mergedActual.contains("\t.size .Lswitch.table.worker,16\n\t.section .rodata.cst16,\"aM\",@progbits,16\nordinary:"),
+        "the section after the owned object is restored")
+    checkEqual(placed(mergedActual), mergedActual, "merged placement is idempotent")
+    if (failures == 0) println("PASS: owned merged switch constants move only their object, not following data")
+
+    // Section guard of the cache-internal object check: flags 6 is ALLOC|EXEC, 2 is ALLOC.
+    val valid: array<guard.SectionPlacement> = [
+        guard.SectionPlacement(".iram1.test", 6, 64), guard.SectionPlacement(".dram1.table", 2, 16),
+        guard.SectionPlacement(".text", 6, 0), guard.SectionPlacement(".debug", 0, 100)
+    ]
+    check(guard.validateCacheInternalSections(valid) == "", "valid internal closure: ${guard.validateCacheInternalSections(valid)}")
+    val flashCode: array<guard.SectionPlacement> = [guard.SectionPlacement(".text.fn", 6, 8)]
+    val flashData: array<guard.SectionPlacement> = [guard.SectionPlacement(".iram1.fn", 6, 8), guard.SectionPlacement(".rodata.fn", 2, 16)]
+    val noCode: array<guard.SectionPlacement> = [guard.SectionPlacement(".dram1.data", 2, 4)]
+    check(guard.validateCacheInternalSections(flashCode) != "", "flash code accepted")
+    check(guard.validateCacheInternalSections(flashData) != "", "flash data accepted")
+    check(guard.validateCacheInternalSections(noCode) != "", "empty code closure accepted")
+    if (failures == 0) println("PASS: section guard rejects flash code, flash data and empty closures")
+    if (failures != 0) return 1
+    0
+}

@@ -1,0 +1,684 @@
+// Select EXTUI for `and` with a low-bit mask in LLVM Xtensa assembly.
+//
+// LLVM 23.1's Xtensa selector never emits EXTUI for `x & 0xff`, `(x >> n) & 1`
+// and similar zero-extensions. It builds the mask in a register (`movi`, or an
+// `l32r` literal for 0xffff) and uses a 3-byte `and`: 6 bytes plus a literal
+// where GCC emits one 3-byte `extui`. This pass rewrites
+//
+//     [srli aT, aS, n] ... movi aK, 2^w-1 ... and aD, aT, aK      (w = 1..16)
+//
+// to `extui aD, aS, n, w` (or `extui aD, aT, 0, w` without a shift). EXTUI is
+// the zero-extending field extract, so the rewritten instruction computes the
+// identical value; the `movi`/`l32r`/`srli` that fed the old `and` are then
+// removed only when liveness over the function's control-flow graph proves
+// their result unused. A function containing an instruction this file does not
+// model is left untouched. `.literal` entries nothing references any more are
+// dropped.
+//
+//     tools/abla-tool tools/esp-llvm-bin/fuse-xtensa-extui.ab < in.s > out.s
+//
+// Registers are bit sets (bit n is aN) in the liveness analysis.
+
+import "abla/io"
+import "abla/text"
+import "abla/process/environment"
+import "../lib/asm-text.ab"
+
+// `^a(?:1[0-5]|[0-9])$`: the register number, or -1.
+fun registerNumber(operand: string): int {
+    if (operand.size < 2 || operand.size > 3 || operand[0] != 97) return -1
+    if (operand.size == 2) {
+        return if (asmIsDigit(operand[1])) operand[1] - 48 else -1
+    }
+    if (operand[1] == 49 && operand[2] >= 48 && operand[2] <= 53) return 10 + operand[2] - 48
+    -1
+}
+
+fun isRegister(operand: string): bool = registerNumber(operand) >= 0
+
+fun defFirstOpcode(op: string): bool = when (op) {
+    "l32i", "l32i.n", "l16ui", "l16si", "l8ui", "l32r", "movi", "movi.n", "mov.n",
+    "or", "and", "xor", "add", "add.n", "sub", "addx2", "addx4", "addx8", "subx2",
+    "subx4", "subx8", "mull", "mulh", "muluh", "quos", "quou", "rems", "remu",
+    "neg", "abs", "srli", "slli", "srai", "extui", "sext", "addi", "addi.n", "addmi",
+    "min", "max", "minu", "maxu", "src", "nsa", "nsau", "sll", "srl", "sra", "clamps",
+    "mul16s", "mul16u", "l32ai", "mulsh", "movsp" -> true
+    else -> false
+}
+
+fun defAndUseFirstOpcode(op: string): bool = when (op) {
+    "moveqz", "movnez", "movltz", "movgez" -> true
+    else -> false
+}
+
+fun useOnlyOpcode(op: string): bool = when (op) {
+    "s32i", "s32i.n", "s16i", "s8i", "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "bltz", "bgez", "beqi", "bnei", "blti", "bgei", "bltui", "bgeui",
+    "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci", "bbsi", "beqz.n", "bnez.n",
+    "ssl", "ssr", "ssa8l", "ssa8b", "ssai", "jx", "lsi", "ssi" -> true
+    else -> false
+}
+
+fun noRegsOpcode(op: string): bool = when (op) {
+    "ill", "ill.n", "break", "break.n", "memw", "extw", "isync", "dsync", "esync", "rsync",
+    "nop", "nop.n", "j", "entry" -> true
+    else -> false
+}
+
+fun branchOpcode(op: string): bool = when (op) {
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "bltz", "bgez", "beqi", "bnei",
+    "blti", "bgei", "bltui", "bgeui", "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci",
+    "bbsi", "beqz.n", "bnez.n" -> true
+    else -> false
+}
+
+fun returnOpcode(op: string): bool = when (op) {
+    "retw", "retw.n", "ret", "ret.n", "ill", "ill.n" -> true
+    else -> false
+}
+
+fun removableOpcode(op: string): bool = when (op) {
+    "movi", "movi.n", "srli", "l32r" -> true
+    else -> false
+}
+
+// What the parsed text of one line holds: `opcode` and `label` are "" when the
+// line has none.
+class ParsedLine(val opcode: string, val operands: array<string>, val label: string)
+
+// `^([.\w$]+):` at the start of `code`: the label, or "".
+fun labelOf(code: string): string {
+    var end = 0
+    while (end < code.size && (asmIsWord(code[end]) || code[end] == 46 || code[end] == 36)) end = end + 1
+    if (end > 0 && end < code.size && code[end] == 58) code.slice(0, end) else ""
+}
+
+fun parseLine(text: string): ParsedLine {
+    val none: array<string> = []
+    val hash = text.indexOf("#")
+    val code = asmStrip(if (hash < 0) text else text.slice(0, hash))
+    if (code == "") return ParsedLine("", none, "")
+    val label = labelOf(code)
+    if (label != "") return ParsedLine("", none, label)
+    if (code.startsWith(".")) return ParsedLine("", none, "")
+    var end = 0
+    while (end < code.size && !asmIsSpace(code[end])) end = end + 1
+    val operands: array<string> = []
+    var start = end
+    while (start < code.size && asmIsSpace(code[start])) start = start + 1
+    if (start < code.size) {
+        for (piece in code.slice(start, code.size).split(",")) operands.append(asmStrip(piece))
+    }
+    ParsedLine(code.slice(0, end), operands, "")
+}
+
+fun registerBits(operands: array<string>): array<int> {
+    val registers: array<int> = []
+    for (operand in operands) {
+        val number = registerNumber(operand)
+        if (number >= 0) registers.append(number)
+    }
+    registers
+}
+
+fun maskOf(registers: array<int>, from: int): int {
+    var mask = 0
+    var at = from
+    while (at < registers.size) {
+        mask = mask | (1 << registers[at])
+        at = at + 1
+    }
+    mask
+}
+
+// What an instruction defines and uses (register bit sets), and whether the
+// analysis models it (`known` is false for an unknown opcode or a missing register).
+class Effects(val defs: int, val uses: int, val known: bool)
+
+fun effectsOf(op: string, operands: array<string>): Effects {
+    if (op == "") return Effects(0, 0, true)
+    val registers = registerBits(operands)
+    if (defFirstOpcode(op)) {
+        if (registers.size == 0) return Effects(0, 0, false)
+        return Effects(1 << registers[0], maskOf(registers, 1), true)
+    }
+    if (defAndUseFirstOpcode(op)) {
+        if (registers.size == 0) return Effects(0, 0, false)
+        return Effects(1 << registers[0], maskOf(registers, 0), true)
+    }
+    if (useOnlyOpcode(op)) return Effects(0, maskOf(registers, 0), true)
+    if (noRegsOpcode(op)) return Effects(0, 0, true)
+    if (returnOpcode(op)) return Effects(0, 12, true)
+    if (op == "callx8" || op == "call8") return Effects(0xff00, maskOf(registers, 0) | 0xfc00, true)
+    if (op.startsWith("rsr.") || op.startsWith("rur.")) {
+        if (registers.size == 0) return Effects(0, 0, false)
+        return Effects(1 << registers[0], 0, true)
+    }
+    if (op.startsWith("wsr.") || op.startsWith("wur.")) return Effects(0, maskOf(registers, 0), true)
+    if (op.startsWith("xsr.")) {
+        if (registers.size == 0) return Effects(0, 0, false)
+        return Effects(1 << registers[0], maskOf(registers, 0), true)
+    }
+    Effects(0, 0, false)
+}
+
+// The width of a mask 2^w-1 (w = 1..16), or -1.
+fun maskWidth(value: int): int {
+    if (value > 0 && (value & (value + 1)) == 0 && value < 65536) {
+        var width = 0
+        var rest = value
+        while (rest > 0) {
+            width = width + 1
+            rest = rest >> 1
+        }
+        return width
+    }
+    -1
+}
+
+// Python's int() of an operand that is a plain (signed) decimal number.
+class ParsedInt(val ok: bool, val value: int)
+
+fun parseDecimal(text: string): ParsedInt {
+    val scan = AsmScan(text, 0)
+    var signed = false
+    if (text.startsWith("+")) {
+        scan.pos = 1
+    } else {
+        signed = true
+    }
+    val digits = scan.integer(signed)
+    if (digits == null || scan.pos != text.size) return ParsedInt(false, 0)
+    ParsedInt(true, asmIntegerValue(digits))
+}
+
+// The non-dead items of a body (indexes) when the analysis models them all.
+class Analysis(val ok: bool, val live: array<int>)
+
+// One function's lines, parsed: the arrays are index-aligned. `after` holds the
+// registers live after each item of the latest analysis.
+class Body(
+    val text: array<string>,
+    val opcode: array<string>,
+    val operands: array<array<string>>,
+    val label: array<string>,
+    val dead: array<bool>,
+    val asm: array<bool>,
+    val defs: array<int>,
+    val uses: array<int>,
+    val known: array<bool>,
+    val after: array<int>
+) {
+    fun size(): int = this.text.size
+
+    fun add(line: string, inline: bool): void {
+        val parsed = parseLine(line)
+        val effects = effectsOf(parsed.opcode, parsed.operands)
+        this.text.append(line)
+        this.opcode.append(parsed.opcode)
+        this.operands.append(parsed.operands)
+        this.label.append(parsed.label)
+        this.dead.append(false)
+        this.asm.append(inline)
+        this.defs.append(effects.defs)
+        this.uses.append(effects.uses)
+        this.known.append(effects.known)
+        this.after.append(0)
+    }
+
+    // Replace item `i` by an instruction.
+    fun rewrite(i: int, text: string, opcode: string, operands: array<string>): void {
+        val effects = effectsOf(opcode, operands)
+        this.text[i] = text
+        this.opcode[i] = opcode
+        this.operands[i] = operands
+        this.defs[i] = effects.defs
+        this.uses[i] = effects.uses
+        this.known[i] = effects.known
+    }
+
+    fun endsBlock(i: int): bool {
+        val op = this.opcode[i]
+        op != "" && (branchOpcode(op) || op == "j" || op == "jx" || returnOpcode(op))
+    }
+
+    // Live registers after each non-dead item (stored in `after`); not ok when
+    // the function holds something the analysis does not model.
+    fun analyse(): Analysis {
+        val live: array<int> = []
+        var at = 0
+        while (at < this.text.size) {
+            if (!this.dead[at]) live.append(at)
+            at = at + 1
+        }
+        val n = live.size
+        val starts: array<bool> = []
+        var fill = 0
+        while (fill <= n) {
+            starts.append(false)
+            fill = fill + 1
+        }
+        starts[0] = true
+        val labelAt: Map<string, int> = Map()
+        var index = 0
+        while (index < n) {
+            val item = live[index]
+            if (this.label[item] != "") {
+                labelAt.set(this.label[item], index)
+                starts[index] = true
+            }
+            if (this.endsBlock(item)) starts[index + 1] = true
+            index = index + 1
+        }
+        val blockBegin: array<int> = []
+        val blockEnd: array<int> = []
+        val blockOf: array<int> = []
+        index = 0
+        while (index < n) {
+            if (starts[index]) {
+                if (blockBegin.size > 0) blockEnd.append(index)
+                blockBegin.append(index)
+            }
+            blockOf.append(blockBegin.size - 1)
+            index = index + 1
+        }
+        if (blockBegin.size > 0) blockEnd.append(n)
+        val blocks = blockBegin.size
+        // Blocks of `.LBB` labels: where an indirect jump may land.
+        val landing: array<int> = []
+        for (name in labelAt.keys()) {
+            if (name.startsWith(".LBB")) {
+                val block = blockOf[labelAt.get(name) ?? 0]
+                var present = false
+                for (other in landing) {
+                    if (other == block) present = true
+                }
+                if (!present) landing.append(block)
+            }
+        }
+        val successors: array<array<int>> = []
+        var number = 0
+        while (number < blocks) {
+            val targets: array<int> = []
+            var fall = number + 1 < blocks
+            var lastIndex = -1
+            var cursor = blockEnd[number] - 1
+            while (lastIndex < 0 && cursor >= blockBegin[number]) {
+                if (this.opcode[live[cursor]] != "") lastIndex = cursor
+                cursor = cursor - 1
+            }
+            if (lastIndex >= 0) {
+                val last = live[lastIndex]
+                val op = this.opcode[last]
+                val operands = this.operands[last]
+                if (op == "j") {
+                    if (operands.size == 0 || !labelAt.has(operands[0])) return Analysis(false, live)
+                    targets.append(blockOf[labelAt.get(operands[0]) ?? 0])
+                    fall = false
+                } else if (branchOpcode(op)) {
+                    if (operands.size == 0 || !labelAt.has(operands[operands.size - 1])) return Analysis(false, live)
+                    targets.append(blockOf[labelAt.get(operands[operands.size - 1]) ?? 0])
+                } else if (op == "jx") {
+                    for (block in landing) targets.append(block)
+                    fall = false
+                } else if (returnOpcode(op)) {
+                    fall = false
+                }
+            }
+            if (fall) targets.append(number + 1)
+            successors.append(targets)
+            number = number + 1
+        }
+        // Every item the analysis walks must be modelled.
+        for (item in live) {
+            if (this.opcode[item] != "" && !this.known[item]) return Analysis(false, live)
+        }
+        val liveIn: array<int> = []
+        number = 0
+        while (number < blocks) {
+            liveIn.append(0)
+            number = number + 1
+        }
+        var changed = true
+        while (changed) {
+            changed = false
+            number = blocks - 1
+            while (number >= 0) {
+                var mask = 0
+                for (target in successors[number]) mask = mask | liveIn[target]
+                var position = blockEnd[number] - 1
+                while (position >= blockBegin[number]) {
+                    val item = live[position]
+                    if (this.opcode[item] != "") mask = (mask & ~this.defs[item]) | this.uses[item]
+                    position = position - 1
+                }
+                if (mask != liveIn[number]) {
+                    liveIn[number] = mask
+                    changed = true
+                }
+                number = number - 1
+            }
+        }
+        number = 0
+        while (number < blocks) {
+            var mask = 0
+            for (target in successors[number]) mask = mask | liveIn[target]
+            var position = blockEnd[number] - 1
+            while (position >= blockBegin[number]) {
+                val item = live[position]
+                this.after[item] = mask
+                if (this.opcode[item] != "") mask = (mask & ~this.defs[item]) | this.uses[item]
+                position = position - 1
+            }
+            number = number + 1
+        }
+        Analysis(true, live)
+    }
+
+    fun blockPrefix(index: int): int {
+        var cursor = index
+        while (cursor > 0) {
+            if (this.label[cursor] != "") return cursor
+            if (this.endsBlock(cursor - 1)) return cursor
+            cursor = cursor - 1
+        }
+        0
+    }
+
+    // The nearest earlier instruction of the block that defines `register`, or -1.
+    fun reachingDef(index: int, register: string): int {
+        val first = this.blockPrefix(index)
+        val bit = registerNumber(register)
+        var cursor = index - 1
+        while (cursor >= first) {
+            if (this.opcode[cursor] != "" && bit >= 0 && (this.defs[cursor] & (1 << bit)) != 0) return cursor
+            cursor = cursor - 1
+        }
+        -1
+    }
+
+    // `and aD, x, y ; beqz/bnez aD, L` -> bnone/bany (bbci/bbsi for one bit).
+    fun fuseBranch(index: int): bool {
+        val dest = this.operands[index][0]
+        val left = this.operands[index][1]
+        val right = this.operands[index][2]
+        val following = index + 1
+        if (following >= this.text.size || this.dead[following]) return false
+        val op = this.opcode[following]
+        if (this.asm[following] || !(op == "beqz" || op == "bnez" || op == "beqz.n" || op == "bnez.n") ||
+            this.operands[following].size != 2 || this.operands[following][0] != dest) return false
+        val destBit = registerNumber(dest)
+        if (destBit >= 0 && (this.after[following] & (1 << destBit)) != 0) return false
+        val zero = op.startsWith("beqz")
+        val label = this.operands[following][1]
+        var attempt = 0
+        while (attempt < 2) {
+            val source = if (attempt == 0) left else right
+            val maskRegister = if (attempt == 0) right else left
+            attempt = attempt + 1
+            val maskIndex = this.reachingDef(index, maskRegister)
+            if (maskIndex >= 0 && !this.asm[maskIndex] &&
+                (this.opcode[maskIndex] == "movi" || this.opcode[maskIndex] == "movi.n")) {
+                if (this.operands[maskIndex].size < 2) continue
+                val parsed = parseDecimal(this.operands[maskIndex][1])
+                if (!parsed.ok) continue
+                val value = parsed.value
+                if (value > 0 && (value & (value - 1)) == 0 && source != maskRegister) {
+                    var bit = 0
+                    var rest = value
+                    while (rest > 1) {
+                        bit = bit + 1
+                        rest = rest >> 1
+                    }
+                    val replacement = if (zero) "bbci" else "bbsi"
+                    this.rewrite(index, "\t$replacement\t$source, $bit, $label", replacement, [source, "$bit", label])
+                    this.dead[following] = true
+                    return true
+                }
+            }
+        }
+        val replacement = if (zero) "bnone" else "bany"
+        this.rewrite(index, "\t$replacement\t$left, $right, $label", replacement, [left, right, label])
+        this.dead[following] = true
+        true
+    }
+
+    fun convert(literals: Map<string, int>, branches: bool): int {
+        var count = 0
+        if (branches) this.analyse()
+        var index = 0
+        while (index < this.text.size) {
+            val at = index
+            index = index + 1
+            if (this.dead[at] || this.asm[at] || this.opcode[at] != "and" || this.operands[at].size != 3) continue
+            val dest = this.operands[at][0]
+            val left = this.operands[at][1]
+            val right = this.operands[at][2]
+            if (!(isRegister(dest) && isRegister(left) && isRegister(right))) continue
+            if (branches && this.fuseBranch(at)) {
+                count = count + 1
+                continue
+            }
+            var attempt = 0
+            while (attempt < 2) {
+                val source = if (attempt == 0) left else right
+                val maskRegister = if (attempt == 0) right else left
+                attempt = attempt + 1
+                if (source == maskRegister) continue
+                val maskIndex = this.reachingDef(at, maskRegister)
+                if (maskIndex < 0) continue
+                if (this.asm[maskIndex]) continue
+                var width = -1
+                val definition = this.opcode[maskIndex]
+                val definitionOperands = this.operands[maskIndex]
+                if ((definition == "movi" || definition == "movi.n") && definitionOperands.size == 2) {
+                    val parsed = parseDecimal(definitionOperands[1])
+                    if (parsed.ok) width = maskWidth(parsed.value)
+                } else if (definition == "l32r" && definitionOperands.size >= 2 && literals.has(definitionOperands[1])) {
+                    width = maskWidth(literals.get(definitionOperands[1]) ?? 0)
+                }
+                if (width < 0) continue
+                var base = source
+                var shift = 0
+                val shiftIndex = this.reachingDef(at, source)
+                if (shiftIndex >= 0 && this.opcode[shiftIndex] == "srli" && !this.asm[shiftIndex]) {
+                    val shiftedOperands = this.operands[shiftIndex]
+                    if (shiftedOperands.size >= 3) {
+                        val origin = shiftedOperands[1]
+                        val amount = parseDecimal(shiftedOperands[2])
+                        val originBit = registerNumber(origin)
+                        if (amount.ok && originBit >= 0 && amount.value + width <= 32) {
+                            // The origin register must keep its value up to the `and`.
+                            var keeps = true
+                            var between = shiftIndex + 1
+                            while (between < at) {
+                                if (this.opcode[between] != "" && (this.defs[between] & (1 << originBit)) != 0) keeps = false
+                                between = between + 1
+                            }
+                            if (keeps) {
+                                base = origin
+                                shift = amount.value
+                            }
+                        }
+                    }
+                }
+                this.rewrite(at, "\textui\t$dest, $base, $shift, $width", "extui", [dest, base, "$shift", "$width"])
+                count = count + 1
+                break
+            }
+        }
+        count
+    }
+
+    // Drop what became dead; false when the analysis cannot model the function.
+    fun eliminateDead(var used: Map<string, int>): bool {
+        var changed = true
+        while (changed) {
+            changed = false
+            val analysis = this.analyse()
+            if (!analysis.ok) return false
+            for (item in analysis.live) {
+                val op = this.opcode[item]
+                val operands = this.operands[item]
+                if (removableOpcode(op) && !this.asm[item] && operands.size > 0 && isRegister(operands[0]) &&
+                    (op != "l32r" || (operands.size > 1 && operands[1].startsWith(".LCPI")))) {
+                    if ((this.after[item] & (1 << registerNumber(operands[0]))) == 0) {
+                        this.dead[item] = true
+                        changed = true
+                        if (op == "l32r") used.set(operands[1], (used.get(operands[1]) ?? 0) - 1)
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+class FunctionResult(val lines: array<string>, val count: int)
+
+fun processFunction(lines: array<string>, literals: Map<string, int>, var used: Map<string, int>, branches: bool): FunctionResult {
+    val body = Body([], [], [], [], [], [], [], [], [], [])
+    var inline = false
+    var hasAnd = false
+    for (line in lines) {
+        val stripped = asmStrip(line)
+        if (stripped == "#APP") {
+            inline = true
+        } else if (stripped == "#NO_APP") {
+            inline = false
+        }
+        body.add(line, inline)
+    }
+    for (op in body.opcode) {
+        if (op == "and") hasAnd = true
+    }
+    if (!hasAnd) return FunctionResult(lines, 0)
+    if (!body.analyse().ok) return FunctionResult(lines, 0)
+    val count = body.convert(literals, branches)
+    if (count == 0) return FunctionResult(lines, 0)
+    val localUsed: Map<string, int> = Map()
+    for (name in used.keys()) localUsed.set(name, used.get(name) ?? 0)
+    if (!body.eliminateDead(localUsed)) return FunctionResult(lines, 0)
+    for (name in localUsed.keys()) used.set(name, localUsed.get(name) ?? 0)
+    val kept: array<string> = []
+    var at = 0
+    while (at < body.text.size) {
+        if (!body.dead[at]) kept.append(body.text[at])
+        at = at + 1
+    }
+    FunctionResult(kept, count)
+}
+
+// Every `\.LCPI\d+_\d+` in `line`, in order.
+fun literalNames(line: string): array<string> {
+    val names: array<string> = []
+    var at = line.indexOf(".LCPI")
+    while (at >= 0) {
+        val first = asmDigitsEnd(line, at + 5)
+        var next = at + 1
+        if (first > at + 5 && first < line.size && line[first] == 95) {
+            val second = asmDigitsEnd(line, first + 1)
+            if (second > first + 1) {
+                names.append(line.slice(at, second))
+                next = second
+            }
+        }
+        at = line.indexOf(".LCPI", next)
+    }
+    names
+}
+
+class LiteralLine(val name: string, val value: int)
+
+// `^\s*\.literal\s+(\.LCPI\d+_\d+),\s*(-?\d+)\s*$`, or "" as the name.
+fun parseLiteralLine(line: string): LiteralLine {
+    val none = LiteralLine("", 0)
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (!scan.word(".literal") || !scan.needSpace()) return none
+    val start = scan.pos
+    if (!scan.word(".LCPI")) return none
+    val first = asmDigitsEnd(line, scan.pos)
+    if (first == scan.pos || first >= line.size || line[first] != 95) return none
+    val second = asmDigitsEnd(line, first + 1)
+    if (second == first + 1) return none
+    scan.pos = second
+    if (!scan.word(",")) return none
+    scan.skipSpaces()
+    val number = scan.integer(true) ?? return none
+    if (!scan.onlySpaceLeft()) return none
+    LiteralLine(line.slice(start, second), asmIntegerValue(number))
+}
+
+// `^\s*\.literal\s+(\.LCPI\d+_\d+),` -> the literal's name, or "".
+fun literalDefinitionName(line: string): string {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    if (!scan.word(".literal") || !scan.needSpace()) return ""
+    val start = scan.pos
+    if (!scan.word(".LCPI")) return ""
+    val first = asmDigitsEnd(line, scan.pos)
+    if (first == scan.pos || first >= line.size || line[first] != 95) return ""
+    val second = asmDigitsEnd(line, first + 1)
+    if (second == first + 1 || second >= line.size || line[second] != 44) return ""
+    line.slice(start, second)
+}
+
+class FuseResult(val text: string, val count: int)
+
+fun fuseExtui(text: string, branches: bool): FuseResult {
+    val lines = text.split("\n")
+    val literals: Map<string, int> = Map()
+    val used: Map<string, int> = Map()
+    for (line in lines) {
+        val literal = parseLiteralLine(line)
+        if (literal.name != "") literals.set(literal.name, literal.value)
+        if (!asmLstrip(line).startsWith(".literal")) {
+            for (name in literalNames(line)) used.set(name, (used.get(name) ?? 0) + 1)
+        }
+    }
+    val out: array<string> = []
+    var index = 0
+    var total = 0
+    while (index < lines.size) {
+        val line = lines[index]
+        if (line.contains("-- Begin function")) {
+            var end = index + 1
+            while (end < lines.size && !lines[end].contains("-- End function")) end = end + 1
+            val body: array<string> = []
+            var at = index + 1
+            while (at < end) {
+                body.append(lines[at])
+                at = at + 1
+            }
+            val processed = processFunction(body, literals, used, branches)
+            total = total + processed.count
+            out.append(line)
+            for (kept in processed.lines) out.append(kept)
+            index = end
+            continue
+        }
+        out.append(line)
+        index = index + 1
+    }
+    val result: array<string> = []
+    for (line in out) {
+        val name = literalDefinitionName(line)
+        if (name != "" && literals.has(name) && (used.get(name) ?? 0) <= 0) continue
+        result.append(line)
+    }
+    FuseResult(result.join("\n"), total)
+}
+
+fun main: int {
+    val input = asmReadStandardInput()
+    if (!input.succeeded) {
+        eprintln("fuse-xtensa-extui: cannot read standard input")
+        return 1
+    }
+    val branches = processEnvironmentOr("ABLA_XTENSA_BRANCH_FUSE", "1") == "1"
+    val result = fuseExtui(input.text, branches)
+    print(result.text)
+    eprint("fuse-xtensa-extui: ${result.count} extui\n")
+    0
+}
