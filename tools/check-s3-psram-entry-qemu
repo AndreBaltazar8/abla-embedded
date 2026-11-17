@@ -1,94 +1,163 @@
-#!/usr/bin/env python3
-"""Execute startup/refusal on an existing RAM ELF. No physical device access.
+#!/usr/bin/env bash
+# Execute startup/refusal on an existing RAM ELF. No physical device access.
+#
+# Poison BSS in the paused emulator to verify Abla clears it. Default proof is
+# zero; optional proof1 tests refusal of the actual reset clock/peer snapshot.
+# This does NOT emulate analog PSRAM calibration or certify a board image.
+#
+#   tools/check-s3-psram-entry-qemu [ELF] [--admission-refusal | --invalid-request]
+#
+# --admission-refusal  supply proof in emulator only; verify actual reset clock/peer state is refused
+# --invalid-request    proof3 with invalid memory arguments must be refused before clock preparation
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+elf=$root/build/tests/esp32s3-psram-entry.link.elf
+scenario=missing
+given_elf=
+for argument in "$@"; do
+    case $argument in
+        --admission-refusal | --invalid-request)
+            if [[ $scenario != missing ]]; then
+                echo 'select one refusal scenario' >&2
+                exit 2
+            fi
+            scenario=${argument#--}
+            ;;
+        -*) echo "unknown option $argument" >&2; exit 2 ;;
+        *)
+            if [[ -n $given_elf ]]; then echo 'one ELF only' >&2; exit 2; fi
+            given_elf=$argument
+            ;;
+    esac
+done
+if [[ -n $given_elf ]]; then elf=$(readlink -f -- "$given_elf"); fi
+source "$root/tools/lib/s3-qemu.sh"
 
-Poison BSS in the paused emulator to verify Abla clears it. Default proof is
-zero; optional proof1 tests refusal of the actual reset clock/peer snapshot.
-This does NOT emulate analog PSRAM calibration or certify a board image.
-"""
-import argparse, os, pathlib, shutil, socket, struct, subprocess, tempfile, time
+symbols=$("$root/tools/abla-tool" elf-symbols "$elf" @entry .iram1.abla.s3BootVectors abla_boot_entry \
+    __abla_bss_low __abla_bss_top __abla_psram_result __abla_psram_request __abla_boot_stack_low __abla_boot_stack_top)
+value() { awk -v n="$1" -v c="$2" '$1 == n { print $c }' <<<"$symbols"; }
+entry=$(value @entry 2)
+vectors=$(value .iram1.abla.s3BootVectors 2)
+boot_entry=$(value abla_boot_entry 2)
+boot_size=$(value abla_boot_entry 3)
+bss=$(value __abla_bss_low 2)
+end=$(value __abla_bss_top 2)
+result=$(value __abla_psram_result 2)
+request=$(value __abla_psram_request 2)
+stack_low=$(value __abla_boot_stack_low 2)
+stack_top=$(value __abla_boot_stack_top 2)
+halt=$((boot_size == 0 ? 0 : boot_entry + boot_size - 3))
+((vectors % 1024 == 0)) || { echo 'boot vectors are not 1 KiB aligned' >&2; exit 1; }
+((entry == boot_entry)) || { echo 'ELF entry is not abla_boot_entry' >&2; exit 1; }
+((0x3fc88000 <= bss && bss < end && end <= stack_low && stack_low < stack_top && stack_top <= 0x3fcc9000)) ||
+    { echo 'BSS or boot stack outside the expected internal RAM window' >&2; exit 1; }
 
-root = pathlib.Path(__file__).resolve().parent.parent
-home = pathlib.Path.home()
-parser=argparse.ArgumentParser(description=__doc__)
-parser.add_argument('elf',nargs='?',default=str(root/'build/tests/esp32s3-psram-entry.link.elf'))
-parser.add_argument('--admission-refusal',action='store_true',help='supply proof in emulator only; verify actual reset clock/peer state is refused')
-parser.add_argument('--invalid-request',action='store_true',help='proof3 with invalid memory arguments must be refused before clock preparation')
-options=parser.parse_args()
-if options.admission_refusal and options.invalid_request: parser.error('select one refusal scenario')
-elf=pathlib.Path(options.elf).resolve()
-data=elf.read_bytes()
-assert data[:6] == b'\x7fELF\x01\x01'
-table=struct.unpack_from('<I',data,32)[0]
-stride,count=struct.unpack_from('<HH',data,46)
-assert stride == 40
-headers=[struct.unpack_from('<10I',data,table+i*40) for i in range(count)]
-sh=headers[struct.unpack_from('<H',data,50)[0]];section_names=data[sh[4]:sh[4]+sh[5]]
-vectors=[h[3] for h in headers if section_names[h[0]:].split(b'\0',1)[0] == b'.iram1.abla.s3BootVectors']
-assert len(vectors) == 1 and vectors[0] & 1023 == 0
-symbols={}
-for h in headers:
-    if h[1] != 2: continue
-    sh=headers[h[6]];strings=data[sh[4]:sh[4]+sh[5]]
-    for p in range(h[4],h[4]+h[5],16):
-        n,value,size,_,_,section=struct.unpack_from('<IIIBBH',data,p)
-        name=strings[n:].split(b'\0',1)[0].decode()
-        if name and section: symbols[name]=(value,size)
-entry,size=symbols['abla_boot_entry'];halt=entry+size-3
-assert struct.unpack_from('<I',data,24)[0] == entry
-bss=symbols['__abla_bss_low'][0];end=symbols['__abla_bss_top'][0]
-result=symbols['__abla_psram_result'][0];request=symbols['__abla_psram_request'][0]
-stack_low=symbols['__abla_boot_stack_low'][0];stack_top=symbols['__abla_boot_stack_top'][0]
-assert 0x3fc88000 <= bss < end <= stack_low < stack_top <= 0x3fcc9000
-runner=['steam-run'] if shutil.which('steam-run') else []
-qemu=os.environ.get('ABLA_S3_QEMU',str(home/'.cache/abla-embedded/qemu-20250817/qemu/bin/qemu-system-xtensa'))
-gdb=os.environ.get('ABLA_S3_GDB',str(home/'.espressif/tools/xtensa-esp-elf-gdb/17.1_20260402/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb'))
-qrunner=runner[:]
-if os.environ.get('ABLA_QEMU_LIBRARY_PATH'): qrunner+=['env','LD_LIBRARY_PATH='+os.environ['ABLA_QEMU_LIBRARY_PATH']]
-with socket.socket() as probe:
-    probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
-with tempfile.TemporaryFile(mode='w+') as log:
-    process=subprocess.Popen(qrunner+[qemu,'-M','esp32s3','-display','none','-serial','none','-monitor','none','-nic','none',
-        '-device',f'loader,file={elf},cpu-num=0','-S','-gdb',f'tcp:127.0.0.1:{port}'],stdout=log,stderr=log,cwd=root)
-    try:
-        deadline=time.monotonic()+10
-        while True:
-            if process.poll() is not None:
-                log.seek(0);raise RuntimeError(log.read())
-            try:
-                with socket.create_connection(('127.0.0.1',port),timeout=.1): break
-            except OSError:
-                if time.monotonic()>deadline: raise TimeoutError('QEMU listener')
-                time.sleep(.05)
-        addresses=[0x60002000,0x60003000,0x60002014,0x60003014,0x60003050,0x600030ec,0x600c4000,0x600c4060,0x600c0060,0x600c0010,0x60008000,0x6000807c]
-        commands=[f'target remote 127.0.0.1:{port}',
-            f'python inferior=gdb.selected_inferior(); inferior.write_memory({bss}, bytes([165])*{end-bss})',
-            'python expected_status=2',
-            *([f'python inferior.write_memory({request+4},(3).to_bytes(4,"little")); inferior.write_memory({request+48},(1800).to_bytes(4,"little"))'] if options.invalid_request else []),
-            *([f'python inferior.write_memory({request+4},(1).to_bytes(4,"little")); inferior.write_memory({request+48},(1800).to_bytes(4,"little"))',
-                f'python inferior.write_memory({request+8},b"".join(v.to_bytes(4,"little") for v in [0x3c100000,65536,4194304,80,0,0,5,1,0,0]))',
-                'python rd=lambda a:int.from_bytes(inferior.read_memory(a,4),"little"); sysclk=rd(0x600c0060); cpu=rd(0x600c0010); power=rd(0x60008000); peer=rd(0x600c0000)',
-                'python mismatch=(4 if ((sysclk>>10)&3)!=1 or not(cpu&4) or (cpu&3)==3 or power&0x540 else 0)|(8 if not(peer&4) else 0); assert mismatch != 0; expected_status=0x40000|mismatch'] if options.admission_refusal else []),
-            f'python addresses={addresses!r}; before=[bytes(inferior.read_memory(a,4)) for a in addresses]; req=bytes(inferior.read_memory({request},52))',
-            f'hbreak *{halt}', 'continue',
-            f'python assert int(gdb.parse_and_eval("$pc")) == {halt}',
-            f'python actual=bytes(inferior.read_memory({bss},{end-bss})); expected=bytearray({end-bss}); expected[{result-bss}:{result-bss+4}]=expected_status.to_bytes(4,"little"); assert actual == bytes(expected)',
-            f'python assert bytes(inferior.read_memory({request},52)) == req',
-            'python assert before == [bytes(inferior.read_memory(a,4)) for a in addresses]',
-            f'python assert {stack_low} <= int(gdb.parse_and_eval("$a1")) < {stack_top}',
-            f'python assert int(gdb.parse_and_eval("$vecbase")) == {vectors[0]} and int(gdb.parse_and_eval("$cpenable")) == 0',
-            'python assert int(gdb.parse_and_eval("$intenable")) == 0 and (int(gdb.parse_and_eval("$ps")) & 15) == 15',
-            'info registers pc vecbase ps a1',
-            'python print("S3_STARTUP_REFUSAL_PASS")', 'disconnect']
-        args=runner+[gdb,'-q','-nx','-batch',str(elf)]
-        for command in commands: args+=['-ex',command]
-        completed=subprocess.run(args,capture_output=True,text=True,timeout=10)
-        if completed.returncode or 'S3_STARTUP_REFUSAL_PASS' not in completed.stdout or 'Traceback' in completed.stderr:
-            raise RuntimeError(completed.stdout+completed.stderr)
-        print(completed.stdout,end='')
-        reason='clock/peer admission' if options.admission_refusal else 'invalid-memory-request' if options.invalid_request else 'missing-contract'
-        print('PASS: S3 emulator executed entry, BSS clearing and '+reason+' refusal without clock/supply/MSPI/cache mutation; not PSRAM/hardware proof')
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try: process.wait(timeout=3)
-            except subprocess.TimeoutExpired: process.kill();process.wait()
+# Peripheral words that must not change, then the script for GDB (plain commands only).
+addresses=(0x60002000 0x60003000 0x60002014 0x60003014 0x60003050 0x600030ec 0x600c4000 0x600c4060 0x600c0060 0x600c0010 0x60008000 0x6000807c)
+script=$work/check.gdb
+{
+    echo "target remote 127.0.0.1:%PORT%"
+    # Poison the whole BSS with 0xa5 so that only Abla's own clearing can make it zero.
+    echo "restore $work/poison.bin binary $bss"
+    echo 'set $expected_status = 2'
+    if [[ $scenario == invalid-request ]]; then
+        echo "set *(unsigned int *)($request + 4) = 3"
+        echo "set *(unsigned int *)($request + 48) = 1800"
+    fi
+    if [[ $scenario == admission-refusal ]]; then
+        echo "set *(unsigned int *)($request + 4) = 1"
+        echo "set *(unsigned int *)($request + 48) = 1800"
+        offset=8
+        for word in 0x3c100000 65536 4194304 80 0 0 5 1 0 0; do
+            echo "set *(unsigned int *)($request + $offset) = $word"
+            offset=$((offset + 4))
+        done
+        echo 'set $sysclk = *(unsigned int *)0x600c0060'
+        echo 'set $cpu = *(unsigned int *)0x600c0010'
+        echo 'set $power = *(unsigned int *)0x60008000'
+        echo 'set $peer = *(unsigned int *)0x600c0000'
+        echo 'set $mismatch = ((((($sysclk >> 10) & 3) != 1) || (!($cpu & 4)) || (($cpu & 3) == 3) || (($power & 0x540) != 0)) ? 4 : 0) | ((!($peer & 4)) ? 8 : 0)'
+        echo 'if $mismatch == 0'
+        echo '  printf "FAIL: the reset clock/peer state would not be refused\n"'
+        echo '  quit 1'
+        echo 'end'
+        echo 'set $expected_status = 0x40000 | $mismatch'
+    fi
+    index=0
+    for address in "${addresses[@]}"; do
+        echo "set \$before$index = *(unsigned int *)$address"
+        index=$((index + 1))
+    done
+    for ((index = 0; index < 13; index++)); do
+        echo "set \$request$index = *(unsigned int *)($request + $((index * 4)))"
+    done
+    echo "hbreak *$halt"
+    echo continue
+    echo "if (unsigned long)\$pc != $halt"
+    echo '  printf "FAIL: stopped at a different pc\n"'
+    echo '  quit 1'
+    echo 'end'
+    echo "dump binary memory $work/actual.bin $bss $end"
+    echo 'printf "EXPECTED_STATUS=%u\n", $expected_status'
+    for ((index = 0; index < 13; index++)); do
+        echo "if *(unsigned int *)($request + $((index * 4))) != \$request$index"
+        echo '  printf "FAIL: the request block changed\n"'
+        echo '  quit 1'
+        echo 'end'
+    done
+    index=0
+    for address in "${addresses[@]}"; do
+        echo "if *(unsigned int *)$address != \$before$index"
+        echo "  printf \"FAIL: clock/supply/MSPI/cache register $address changed\\n\""
+        echo '  quit 1'
+        echo 'end'
+        index=$((index + 1))
+    done
+    echo "if (unsigned long)\$a1 < $stack_low || (unsigned long)\$a1 >= $stack_top"
+    echo '  printf "FAIL: stack pointer outside the boot stack\n"'
+    echo '  quit 1'
+    echo 'end'
+    echo "if (unsigned long)\$vecbase != $vectors || \$cpenable != 0"
+    echo '  printf "FAIL: vecbase or cpenable\n"'
+    echo '  quit 1'
+    echo 'end'
+    echo 'if $intenable != 0 || (($ps & 15) != 15)'
+    echo '  printf "FAIL: interrupts are enabled\n"'
+    echo '  quit 1'
+    echo 'end'
+    echo 'info registers pc vecbase ps a1'
+    echo 'printf "S3_STARTUP_REFUSAL_PASS\n"'
+    echo disconnect
+} >"$script"
+
+head -c $((end - bss)) /dev/zero | tr '\0' '\245' >"$work/poison.bin"
+start_qemu
+sed -i "s/%PORT%/$port/" "$script"
+set +e
+output=$(timeout 10 "${runner[@]}" "$gdb" -q -nx -batch -x "$script" "$elf" 2>"$work/gdb.err")
+status=$?
+set -e
+if ((status != 0)) || [[ $output != *S3_STARTUP_REFUSAL_PASS* ]]; then
+    printf '%s\n' "$output"
+    cat "$work/gdb.err" >&2
+    exit 1
+fi
+expected_status=$(sed -n 's/^EXPECTED_STATUS=//p' <<<"$output")
+# Expected BSS: all zero but the result word, which holds the refusal status.
+head -c $((end - bss)) /dev/zero >"$work/expected.bin"
+printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((expected_status & 255)) $(((expected_status >> 8) & 255)) \
+    $(((expected_status >> 16) & 255)) $(((expected_status >> 24) & 255)))" |
+    dd of="$work/expected.bin" bs=1 seek=$((result - bss)) conv=notrunc status=none
+if ! cmp -s "$work/expected.bin" "$work/actual.bin"; then
+    printf '%s\n' "$output"
+    echo 'BSS after startup differs from "all zero but the result word"' >&2
+    cmp "$work/expected.bin" "$work/actual.bin" >&2 || true
+    exit 1
+fi
+printf '%s\n' "$output" | grep -v '^EXPECTED_STATUS='
+case $scenario in
+    admission-refusal) reason='clock/peer admission' ;;
+    invalid-request) reason='invalid-memory-request' ;;
+    *) reason='missing-contract' ;;
+esac
+echo "PASS: S3 emulator executed entry, BSS clearing and $reason refusal without clock/supply/MSPI/cache mutation; not PSRAM/hardware proof"
