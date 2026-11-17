@@ -1,0 +1,169 @@
+// Lower numeric startup store layouts to exact mutable byte globals.
+//
+//     tools/abla-tool lower-recovered-static-mutable-byte-layouts [--write] PATH...
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "lib/recovered-text.ab"
+import "lib/static-storage.ab"
+
+class ByteLayouts(val text: string, val layouts: int, val bytes: int)
+
+fun layoutByteExpression(contents: string): array<string> {
+    val literals = rtByteLiterals(contents)
+    if (literals.size == 1) return ["nativeStaticMutableBytes(${literals[0]})"]
+    val result: array<string> = ["nativeStaticMutableBytes(", "    ("]
+    var index = 0
+    while (index < literals.size) {
+        result.append("        ${literals[index]}${if (index + 1 < literals.size) " +" else ""}")
+        index += 1
+    }
+    result.append("    )")
+    result.append(")")
+    result
+}
+
+// A decimal value, optionally negative, reduced modulo 2^64 (the width masks it further).
+private fun layoutValue(text: string): int {
+    var negative = false
+    var start = 0
+    if (text.startsWith("-")) {
+        negative = true
+        start = 1
+    }
+    var value = 0
+    var index = start
+    while (index < text.size) {
+        value = value * 10 + text[index] - 48
+        index += 1
+    }
+    if (negative) 0 - value else value
+}
+
+fun layoutLowerSource(source: string): ByteLayouts {
+    val lines = rtSplitLines(source, false)
+    val output: array<string> = []
+    var layouts = 0
+    var totalBytes = 0
+    var index = 0
+    while (index < lines.size) {
+        val storage = ssMatchLine(ssStorage, lines[index])
+        if (storage == null) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val base = ssGroup(storage, 1)
+        val size = rtParseDecimal(ssGroup(storage, 2))
+        var cursor = index + 1
+        val initializer = if (cursor < lines.size) ssMatchLine(ssInitializer, lines[cursor]) else null
+        if (initializer == null || ssGroup(initializer, 1) != base) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        cursor += 1
+        val widths: array<int> = []
+        val offsets: array<int> = []
+        val values: array<int> = []
+        var reading = true
+        while (reading && cursor < lines.size) {
+            val store = ssMatchLine(ssStoreAny, lines[cursor])
+            if (store == null || ssGroup(store, 2) != base) {
+                reading = false
+            } else {
+                widths.append(rtParseDecimal(ssGroup(store, 1)))
+                offsets.append(rtParseDecimal(ssGroup(store, 3)))
+                values.append(layoutValue(ssGroup(store, 4)))
+                cursor += 1
+            }
+        }
+        var valid = size > 0 && widths.size > 0
+        // Offsets are bounded by `size` before any cell is marked, so the occupied map stays small.
+        val occupied: Map<int, bool> = Map()
+        var k = 0
+        while (valid && k < widths.size) {
+            val widthBytes = widths[k] / 8
+            val offset = offsets[k]
+            valid = offset >= 0 && offset % widthBytes == 0 && offset + widthBytes <= size
+            var cell = offset
+            while (valid && cell < offset + widthBytes) {
+                if (occupied.has(cell)) valid = false
+                occupied.set(cell, true)
+                cell += 1
+            }
+            k += 1
+        }
+        if (valid) valid = ssTrailerValid(lines, cursor, base)
+        if (!valid) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val contents: array<int> = filledArray(size, 0)
+        k = 0
+        while (k < widths.size) {
+            val widthBytes = widths[k] / 8
+            var b = 0
+            while (b < widthBytes) {
+                contents[offsets[k] + b] = (values[k] >>> (8 * b)) & 255
+                b += 1
+            }
+            k += 1
+        }
+        val bytes: array<string> = []
+        for (value in contents) bytes.append(byteEncode(value))
+        val expression = layoutByteExpression(bytes.join(""))
+        output.append("val ${base}Storage = ${expression[0]}")
+        var e = 1
+        while (e < expression.size) {
+            output.append(expression[e])
+            e += 1
+        }
+        output.append("val ${base}Initialized = ${base}Storage")
+        output.append("val ${base} = u32(${base}Initialized)")
+        layouts += 1
+        totalBytes += size
+        index = cursor + 4
+    }
+    ByteLayouts(ssJoinLines(output, source), layouts, totalBytes)
+}
+
+fun main: int {
+    val usage = "lower-recovered-static-mutable-byte-layouts [-h] [--write] paths [paths ...]"
+    val args = rtParseArguments(["--write"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error != "") return rtUsageError("lower-recovered-static-mutable-byte-layouts", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-recovered-static-mutable-byte-layouts", usage, "the following arguments are required: paths")
+    }
+    val write = args.has("--write")
+    var changedFiles = 0
+    var layouts = 0
+    var totalBytes = 0
+    for (path in rtSourceFiles(args.positionals, false, false)) {
+        val original = rtRead(path)
+        if (original.error != "") {
+            eprintln(original.error)
+            return 1
+        }
+        val lowered = layoutLowerSource(original.text)
+        if (lowered.text == original.text) continue
+        changedFiles += 1
+        layouts += lowered.layouts
+        totalBytes += lowered.bytes
+        if (write) {
+            val error = rtWrite(path, lowered.text)
+            if (error != "") {
+                eprintln(error)
+                return 1
+            }
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("${action} ${layouts} mutable byte layout(s) with ${totalBytes} link-time byte(s) in ${changedFiles} file(s)")
+    0
+}
