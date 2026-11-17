@@ -1,0 +1,126 @@
+// Check linked RV32 startup/trap instructions. Not execution/hardware proof.
+//
+//     tools/abla-tool check-p4-internal-entry APPLICATION.elf
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+class EntryCheck(val elf: Elf32, val symbols: Map<string, RawSymbol>, var error: string) {
+    fun fail(message: string): void {
+        if (this.error == "") this.error = message
+    }
+    fun address(name: string): int {
+        val symbol = this.symbols.get(name)
+        if (symbol == null) {
+            this.fail("missing symbol $name")
+            return 0
+        }
+        symbol.value
+    }
+    fun read(start: int, size: int): string {
+        val loaded = elfReadLoaded(this.elf, start, size)
+        if (!loaded.ok) {
+            this.fail("instruction/data outside loaded sections")
+            return ""
+        }
+        loaded.bytes
+    }
+    // The code at `start` is exactly these 32-bit words.
+    fun words(start: int, expected: array<int>): void {
+        val code = this.read(start, expected.size * 4)
+        var i = 0
+        while (i < expected.size) {
+            if (elfU32(code, i * 4) != expected[i]) {
+                this.fail("unexpected instruction word at 0x${hexText(start + i * 4)}")
+                return
+            }
+            i = i + 1
+        }
+    }
+    // AUIPC + ADDI (or JALR when `call`) forming `target` in register `reg`.
+    fun pair(start: int, reg: int, target: int, call: bool): void {
+        val code = this.read(start, 8)
+        val hi = elfU32(code, 0)
+        val lo = elfU32(code, 4)
+        if ((hi & 0xfff) != ((reg << 7) | 0x17)) {
+            this.fail("expected AUIPC x$reg at 0x${hexText(start)}")
+            return
+        }
+        if ((lo & 0xfffff) != ((reg << 15) | (reg << 7) | (if (call) 0x67 else 0x13))) {
+            this.fail("expected the low half of the address pair at 0x${hexText(start + 4)}")
+            return
+        }
+        var immediate = lo >> 20
+        if ((immediate & 0x800) != 0) immediate = immediate - 0x1000
+        if (((start + (hi & 0xfffff000) + immediate) & 0xffffffff) != target) {
+            this.fail("address pair at 0x${hexText(start)} does not reach 0x${hexText(target)}")
+        }
+    }
+}
+
+fun validateP4Entry(data: string): string {
+    val elf = elf32ParseLoose(data)
+    if (elf.error != "") return elf.error
+    val named = elfNamedSymbols(elf)
+    if (named.error != "") return named.error
+    val c = EntryCheck(elf, named.symbols, "")
+    val entry = c.address("abla_p4_application_entry")
+    val fault = c.address("abla_p4_early_fault_entry")
+    val record = c.address("abla_p4_early_fault_record")
+    if (c.error != "") return c.error
+    if (elfU32(data, 24) != entry) return "ELF entry is not abla_p4_application_entry"
+    if (entry % 64 != 0 || fault % 64 != 0 || fault != entry + 128) return "entry/fault vectors misplaced"
+    val faultSymbol = named.symbols.get("abla_p4_early_fault_entry")
+    val recordSymbol = named.symbols.get("abla_p4_early_fault_record")
+    if (faultSymbol == null || recordSymbol == null) return "missing fault symbols"
+    if (faultSymbol.binding() != 0 || recordSymbol.binding() != 0) return "fault symbols must be local"
+    if (c.read(record, 32) != elfZeros(32)) return "fault record must start zeroed"
+    // Secondary-core and failed MTVEC readback branches go directly to park.
+    c.words(entry, [0x30047073, 0xf14022f3, 0x04029a63])
+    c.pair(entry + 12, 5, fault, false)
+    c.words(entry + 20, [0x0032e293, 0x30529073, 0x30502373, 0x02629e63])
+    val offsets = [36, 44, 52, 60]
+    val registers = [3, 2, 5, 6]
+    val names = ["__abla_gp", "__abla_stack_top", "__abla_bss_start", "__abla_bss_end"]
+    var i = 0
+    while (i < 4) {
+        c.pair(entry + offsets[i], registers[i], c.address(names[i]), false)
+        i = i + 1
+    }
+    if (c.error != "") return c.error
+    if (c.address("__abla_stack_top") % 16 != 0) return "stack top is not 16-byte aligned"
+    if (c.address("__abla_bss_start") % 4 != 0 || c.address("__abla_bss_end") % 4 != 0) return "BSS bounds are not word aligned"
+    c.words(entry + 68, [0x0062f863, 0x0002a023, 0x00428293, 0xff5ff06f])
+    c.pair(entry + 84, 1, c.address("abla_p4_application_main"), true)
+    c.words(entry + 92, [0x30047073, 0x10500073, 0xff9ff06f])
+    c.words(fault, [0x30047073])
+    c.pair(fault + 4, 5, record, false)
+    // No stack loads/calls; CSR evidence then SP/RA, fences and magic last.
+    c.words(fault + 12, [0x0002a023, 0xf1402373, 0x0062a223, 0x34202373,
+        0x0062a423, 0x34102373, 0x0062a623, 0x34302373,
+        0x0062a823, 0x30002373, 0x0062aa23, 0x0022ac23,
+        0x0012ae23, 0x0330000f, 0x50345337, 0x45230313,
+        0x0062a023, 0x0330000f, 0x10500073, 0xffdff06f])
+    c.error
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-p4-internal-entry APPLICATION.elf")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = validateP4Entry(file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: P4 entry, core guard, trap vector/readback, GP/SP/BSS, call and private fault record instructions (not hardware proof)")
+    0
+}

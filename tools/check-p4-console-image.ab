@@ -1,0 +1,128 @@
+// Offline P4 RAM-console image/ELF equivalence. Never accesses a device.
+//
+// Checks payload, revision guard and reserved-memory boundaries, not bootability.
+// Flash header settings must still match the intended board/bootloader.
+//
+//     tools/abla-tool check-p4-console-image ELF BIN LAYOUT
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/crypto"
+import "abla/integer"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+// Adds the bytes of `payload` at `address`; false when one is already present (overlap).
+fun insertPayload(var memory: Map<int, int>, address: int, payload: string): bool {
+    var offset = 0
+    while (offset < payload.size) {
+        if (memory.has(address + offset)) return false
+        memory.set(address + offset, payload[offset])
+        offset = offset + 1
+    }
+    true
+}
+
+fun validateConsoleImage(elf: string, image: string, layout: int): string {
+    if (layout != 1 && layout != 3) return "unsupported layout"
+    val base = if (layout == 1) 0x4ff10000 else 0x4ff80000
+    val revisionLow = if (layout == 1) 0 else 300
+    val revisionHigh = if (layout == 1) 299 else 399
+    if (elf.size < 52 || elfSlice(elf, 0, 6) != elfHex("7f454c460101")) return "expected ELF32 LE"
+    if (elfU16(elf, 16) != 2 || elfU16(elf, 18) != 243) return "expected RISC-V executable"
+    val entry = elfU32(elf, 24)
+    val phoff = elfU32(elf, 28)
+    val stride = elfU16(elf, 42)
+    val count = elfU16(elf, 44)
+    if (stride != 32 || count < 1 || count > 16 || phoff + stride * count > elf.size) return "invalid program headers"
+    val expected: Map<int, int> = Map()
+    var executable = false
+    val spanStart: array<int> = []
+    val spanEnd: array<int> = []
+    var index = 0
+    while (index < count) {
+        val at = phoff + index * stride
+        index = index + 1
+        if (elfU32(elf, at) != 1) continue
+        val offset = elfU32(elf, at + 4)
+        val address = elfU32(elf, at + 8)
+        val physical = elfU32(elf, at + 12)
+        val size = elfU32(elf, at + 16)
+        val reserved = elfU32(elf, at + 20)
+        val flags = elfU32(elf, at + 24)
+        if (address != physical || size > reserved || offset + size > elf.size) return "invalid ELF load segment"
+        if (!(base <= address && address + reserved <= base + 0x18000)) return "ELF load outside selected RAM window"
+        if ((flags & 1) != 0 && (flags & 2) != 0) return "writable executable segment"
+        var span = 0
+        while (span < spanStart.size) {
+            if (address < spanEnd[span] && spanStart[span] < address + reserved) return "overlapping ELF memory reservations"
+            span = span + 1
+        }
+        spanStart.append(address)
+        spanEnd.append(address + reserved)
+        if ((flags & 1) != 0 && address <= entry && entry < address + size) executable = true
+        if (!insertPayload(expected, address, elfSlice(elf, offset, offset + size))) return "overlapping load segments"
+    }
+    if (!executable || expected.size == 0) return "entry is not backed by executable bytes"
+    if (image.size < 64 || image[0] != 0xe9 || image[1] < 1 || image[1] > 16) return "invalid image header"
+    if (elfU32(image, 4) != entry) return "entry mismatch"
+    if (elfU16(image, 12) != 18) return "not a P4 image"
+    if (elfU16(image, 15) != revisionLow || elfU16(image, 17) != revisionHigh) return "wrong revision guard"
+    if (image[23] != 1) return "SHA256 required"
+    val actual: Map<int, int> = Map()
+    var cursor = 24
+    var checksum = 0xef
+    var segment = 0
+    while (segment < image[1]) {
+        segment = segment + 1
+        if (cursor + 8 > image.size) return "truncated image segment"
+        val address = elfU32(image, cursor)
+        val size = elfU32(image, cursor + 4)
+        cursor = cursor + 8
+        if (size <= 0 || size % 4 != 0 || cursor + size > image.size) return "invalid image segment size"
+        if (!(base <= address && address + size <= base + 0x18000)) return "image segment outside selected RAM"
+        val payload = elfSlice(image, cursor, cursor + size)
+        if (!insertPayload(actual, address, payload)) return "overlapping load segments"
+        for (value in payload) checksum = checksum ^ value
+        cursor = cursor + size
+    }
+    val footer = cursor + (15 - cursor % 16)
+    if (image.size != footer + 33) return "unexpected trailing/signature data"
+    if (!isZero(elfSlice(image, cursor, footer)) || image[footer] != checksum) return "invalid XOR footer"
+    if (sha256(elfSlice(image, 0, image.size - 32)) != elfSlice(image, image.size - 32, image.size)) return "invalid SHA256"
+    if (actual.size != expected.size) return "image bytes differ from ELF load payloads"
+    for (address in expected.keys()) {
+        if (actual.get(address) != expected.get(address)) return "image bytes differ from ELF load payloads"
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 3) {
+        eprintln("usage: check-p4-console-image ELF BIN LAYOUT")
+        return 2
+    }
+    val layout = processArgument(2).parseInt()
+    if (layout == null) {
+        eprintln("invalid literal for int(): " + processArgument(2))
+        return 1
+    }
+    val elf = readBinaryFile(processArgument(0))
+    if (elf.error != "") {
+        eprintln(elf.error)
+        return 1
+    }
+    val image = readBinaryFile(processArgument(1))
+    if (image.error != "") {
+        eprintln(image.error)
+        return 1
+    }
+    val error = validateConsoleImage(elf.data, image.data, layout)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: P4 image matches ELF payload/entry, RAM layout, revision guard and checksums (not hardware proof)")
+    0
+}

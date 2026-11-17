@@ -1,0 +1,137 @@
+// Check linked S3 placement and actual L32R targets; not boot or stack-depth proof.
+//
+//     tools/abla-tool check-paper-s3-sleep-layout LINKED.elf
+//
+// Disassembles the whole ELF with the S3 GNU objdump (see check-s3-fatal-vectors).
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+class Placement(val name: string, val low: int, val high: int)
+
+class LayoutReport(val sections: int, val loads: int, val error: string)
+
+fun layoutFail(message: string): LayoutReport = LayoutReport(0, 0, message)
+
+fun leadingHex(text: string): int {
+    var end = 0
+    while (end < text.size && isHexLower(text[end])) end = end + 1
+    if (end == 0) -1 else parseHex(text.slice(0, end))
+}
+
+fun validatePaperSleepLayout(path: string, data: string): LayoutReport {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return layoutFail(elf.error)
+    val propIndex = elf.sectionIndex(".xt.prop")
+    if (propIndex < 0 || elf.sections[propIndex].size == 0) {
+        return layoutFail("Xtensa instruction/padding metadata required for exact disassembly")
+    }
+    val windowNames = [".iram1", ".dram1", ".bss", ".sleep_storage", ".sleep_stack", ".flash_text", ".flash_rodata"]
+    val windowLow = [0x40378400, 0x3fc98000, 0x3fc98000, 0x3fc98000, 0x3fc98000, 0x42000020, 0x3c000020]
+    val windowHigh = [0x40388000, 0x3fca8000, 0x3fca8000, 0x3fca8000, 0x3fca8000, 0x42100020, 0x3c100020]
+    val allocated: array<Placement> = []
+    val kinds: array<int> = []
+    for (section in elf.sections) {
+        if ((section.flags & 2) == 0 || section.size == 0) continue
+        var window = -1
+        var w = 0
+        while (w < windowNames.size) {
+            if (windowNames[w] == section.name) window = w
+            w = w + 1
+        }
+        if (window < 0) return layoutFail("unexpected allocated section " + section.name)
+        if (!(windowLow[window] <= section.address && section.address + section.size <= windowHigh[window])) {
+            return layoutFail("section outside reserved window " + section.name)
+        }
+        allocated.append(Placement(section.name, section.address, section.address + section.size))
+        kinds.append(section.kind)
+    }
+    var a = 0
+    while (a < allocated.size) {
+        var b = a + 1
+        while (b < allocated.size) {
+            if (allocated[a].low < allocated[b].high && allocated[b].low < allocated[a].high) {
+                return layoutFail("overlapping allocated sections " + allocated[a].name + "/" + allocated[b].name)
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    val scan = elfScanSymbols(elf, true)
+    if (scan.error != "") return layoutFail(scan.error)
+    val lows: array<int> = []
+    val highs: array<int> = []
+    for (symbol in scan.symbols) {
+        if (symbol.kind() == 2 && symbol.size != 0 && symbol.sectionIndex < elf.sections.size) {
+            lows.append(symbol.value)
+            highs.append(symbol.value + symbol.size)
+        }
+    }
+    val listing = runS3Objdump(["-d", path])
+    if (listing.status != 0) return layoutFail("objdump failed")
+    var loads = 0
+    for (line in listing.output.split("\n")) {
+        val insn = parseDisasmLine(line)
+        if (insn == null || insn.op != "l32r" || insn.width != 3 || insn.args.size < 2) continue
+        val register = insn.args[0]
+        if (!register.startsWith("a") || register.size < 2 || register.slice(1, register.size).parseInt() == null) continue
+        val target = leadingHex(insn.args[1])
+        if (target < 0) continue
+        val pc = insn.address
+        // The raw word: the instruction bytes as printed (most significant first).
+        val word = insnWord(line)
+        var inFunction = false
+        var f = 0
+        while (f < lows.size) {
+            if (lows[f] <= pc && pc < highs[f]) inFunction = true
+            f = f + 1
+        }
+        if (!inFunction) continue // literal-pool bytes disassembled as instructions
+        val expected = ((pc + 3) & ~3) + ((word >> 8) << 2) - 0x40000
+        if (target != expected || (target & 3) != 0) return layoutFail("invalid resolved L32R at ${hexText(pc)}")
+        var storage = ""
+        var p = 0
+        while (p < allocated.size && storage == "") {
+            if (kinds[p] != 8 && allocated[p].low <= target && target + 4 <= allocated[p].high) storage = allocated[p].name
+            p = p + 1
+        }
+        if (storage == "" || (0x40378400 <= pc && pc < 0x40388000 && storage != ".iram1")) {
+            return layoutFail("L32R at ${hexText(pc)} reaches unavailable literal ${hexText(target)}")
+        }
+        loads = loads + 1
+    }
+    if (lows.size == 0 || loads == 0) return layoutFail("no linked function/literal evidence")
+    LayoutReport(allocated.size, loads, "")
+}
+
+// The hexadecimal instruction word printed after `ADDRESS:` in an objdump line.
+fun insnWord(line: string): int {
+    val colon = line.indexOf(":")
+    var i = colon + 1
+    while (i < line.size && isSpace(line[i])) i = i + 1
+    val start = i
+    while (i < line.size && isHexLower(line[i])) i = i + 1
+    parseHex(line.slice(start, i))
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-paper-s3-sleep-layout LINKED.elf")
+        return 2
+    }
+    val path = processArgument(0)
+    val file = readBinaryFile(path)
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val report = validatePaperSleepLayout(path, file.data)
+    if (report.error != "") {
+        eprintln(report.error)
+        return 1
+    }
+    println("PASS: ${report.sections} allocated sections in reserved windows; ${report.loads} resolved L32R targets checked; not stack-depth/hardware proof")
+    0
+}

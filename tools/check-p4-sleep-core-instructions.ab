@@ -1,0 +1,424 @@
+// Execute the linked LLVM RV32 boundary, not a source-level mock.
+//
+// Bounded integer/CSR model; no claim of P4 ROM/cache/PMU or physical validation.
+//
+//     tools/abla-tool check-p4-sleep-core-instructions build/tests/sleep-core-p4.elf
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+val MASK = 0xffffffff
+val FRAME = 0x4ff20000
+val CALLBACK = 0x4ff30000
+val RETURN = 0x12340000
+val ROM_RETURN = 0x12340004
+
+fun saved(): array<int> = [1, 2, 3, 4, 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+
+fun traps(): array<int> = [0x300, 0x305, 0x307, 0x342, 0x343, 0x304, 0x344, 0x341, 0x340]
+
+fun signed32(value: int): int = signExtend(value & MASK, 32)
+
+class Rv32Machine(
+    val mem: Map<int, int>,
+    val regs: array<int>,
+    var csrs: Map<int, int>,
+    val oldCsrs: Map<int, int>,
+    val before: array<int>,
+    val csrAccess: array<int>,
+    val stores: array<int>,
+    val entry: int,
+    val wakeEntry: int,
+    val table: int,
+    var pc: int,
+    var fences: int,
+    var callbacks: int,
+    var error: string
+) {
+    fun fail(message: string): void {
+        if (this.error == "") this.error = message
+    }
+    fun byteAt(address: int): int {
+        val value = this.mem.get(address)
+        if (value == null) {
+            this.fail("read from unmapped address 0x${hexText(address & MASK)}")
+            return 0
+        }
+        value
+    }
+    fun get(address: int): int {
+        if ((address & 3) != 0) {
+            this.fail("unaligned word access 0x${hexText(address & MASK)}")
+            return 0
+        }
+        this.byteAt(address) | (this.byteAt(address + 1) << 8) | (this.byteAt(address + 2) << 16) | (this.byteAt(address + 3) << 24)
+    }
+    fun put(address: int, value: int): void {
+        val allowed = (address >= FRAME && address < FRAME + 148) || (address >= this.table && address < this.table + 8) ||
+            (address >= 0x4ff2ef00 && address < 0x4ff2f000)
+        if ((address & 3) != 0 || !allowed) {
+            this.fail("store outside the frame, core table and own stack: 0x${hexText(address & MASK)}")
+            return
+        }
+        var i = 0
+        while (i < 4) {
+            this.mem.set(address + i, (value >> (8 * i)) & 255)
+            i = i + 1
+        }
+        this.stores.append(address)
+    }
+    fun csrValue(csr: int): int = this.csrs.get(csr) ?? 0
+
+    fun step(): void {
+        val ins = this.get(this.pc)
+        if (this.error != "") return
+        val op = ins & 127
+        val rd = (ins >> 7) & 31
+        val f3 = (ins >> 12) & 7
+        val rs1 = (ins >> 15) & 31
+        val rs2 = (ins >> 20) & 31
+        val f7 = ins >> 25
+        val a = this.regs[rs1]
+        val b = this.regs[rs2]
+        val imm = signExtend(ins >> 20, 12)
+        var nextPc = this.pc + 4
+        var value = 0
+        var has = false
+        if (op == 0x37) {
+            value = ins & 0xfffff000
+            has = true
+        } else if (op == 0x17) {
+            value = this.pc + (ins & 0xfffff000)
+            has = true
+        } else if (op == 0x13) {
+            has = true
+            if (f3 == 0) {
+                value = a + imm
+            } else if (f3 == 7) {
+                value = a & imm
+            } else if (f3 == 6) {
+                value = a | imm
+            } else if (f3 == 1) {
+                value = a << (rs2 & 31)
+            } else {
+                this.fail("unsupported OP-IMM 0x${hexText(ins)}")
+                return
+            }
+        } else if (op == 0x33 && f7 == 0 && (f3 == 0 || f3 == 6)) {
+            value = if (f3 == 0) a + b else a | b
+            has = true
+        } else if (op == 3 && f3 == 2) {
+            value = this.get((a + imm) & MASK)
+            has = true
+        } else if (op == 3 && f3 == 4) {
+            value = this.byteAt((a + imm) & MASK)
+            has = true
+        } else if (op == 0x23 && f3 == 2) {
+            val offset = signExtend(((ins >> 25) << 5) | ((ins >> 7) & 31), 12)
+            this.put((a + offset) & MASK, b)
+        } else if (op == 0x63) {
+            val offset = signExtend(((ins >> 31) << 12) | (((ins >> 7) & 1) << 11) | (((ins >> 25) & 63) << 5) | (((ins >> 8) & 15) << 1), 13)
+            var take = false
+            if (f3 == 0) {
+                take = a == b
+            } else if (f3 == 1) {
+                take = a != b
+            } else if (f3 == 4) {
+                take = signed32(a) < signed32(b)
+            } else if (f3 == 5) {
+                take = signed32(a) >= signed32(b)
+            } else if (f3 == 6) {
+                take = a < b
+            } else if (f3 == 7) {
+                take = a >= b
+            } else {
+                this.fail("unsupported branch 0x${hexText(ins)}")
+                return
+            }
+            if (take) nextPc = this.pc + offset
+        } else if (op == 0x6f) {
+            val offset = signExtend(((ins >> 31) << 20) | (((ins >> 12) & 255) << 12) | (((ins >> 20) & 1) << 11) | (((ins >> 21) & 1023) << 1), 21)
+            value = nextPc
+            has = true
+            nextPc = this.pc + offset
+        } else if (op == 0x67 && f3 == 0) {
+            value = nextPc
+            has = true
+            nextPc = (a + imm) & ~1
+        } else if (op == 0x0f) {
+            this.fences = this.fences + 1
+        } else if (op == 0x73 && f3 != 0) {
+            val csr = ins >> 20
+            this.csrAccess.append(csr)
+            value = this.csrValue(csr)
+            has = true
+            val source = if (f3 >= 5) rs1 else a
+            val mode = f3 & 3
+            if (mode == 1) {
+                this.csrs.set(csr, source)
+            } else if (source != 0 && mode == 2) {
+                this.csrs.set(csr, value | source)
+            } else if (source != 0 && mode == 3) {
+                this.csrs.set(csr, value & ~source & MASK)
+            }
+        } else {
+            this.fail("unsupported instruction at 0x${hexText(this.pc)}: 0x${hexText(ins)}")
+            return
+        }
+        if (has && rd != 0) this.regs[rd] = value & MASK
+        this.regs[0] = 0
+        this.pc = nextPc & MASK
+    }
+
+    fun run(wake: bool): string {
+        var budget = 0
+        while (budget < 1000) {
+            budget = budget + 1
+            if (this.pc == RETURN || this.pc == ROM_RETURN) return this.error
+            if (this.pc == CALLBACK) {
+                this.callbacks = this.callbacks + 1
+                if (this.callbacks != 1) return "callback ran more than once"
+                if (this.regs[10] != 0xdeadbeef) return "callback argument lost"
+                val hart = this.csrValue(0xf14)
+                if (this.get(this.table + hart * 4) != FRAME) return "core frame pointer not published before the callback"
+                if (this.get(FRAME + 4) != 1 || this.fences != 1) return "frame state/fence before the callback differs"
+                if (this.error != "") return this.error
+                if (wake) {
+                    var r = 1
+                    this.regs[0] = 0
+                    while (r < 32) {
+                        this.regs[r] = 0x76540000 + r * 16
+                        r = r + 1
+                    }
+                    this.regs[1] = ROM_RETURN
+                    val fresh: Map<int, int> = Map()
+                    fresh.set(0xf14, hart)
+                    fresh.set(0x300, 0)
+                    this.csrs = fresh
+                    this.pc = this.wakeEntry
+                } else {
+                    val returnPc = this.regs[1]
+                    for (r in [1, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31]) {
+                        this.regs[r] = 0xbad00000 + r
+                    }
+                    this.regs[1] = returnPc
+                    this.regs[10] = 0x87654321
+                    this.pc = returnPc
+                }
+                continue
+            }
+            this.step()
+            if (this.error != "") return this.error
+        }
+        "instruction budget exceeded"
+    }
+}
+
+fun newMachine(initial: Map<int, int>, table: int, entry: int, hart: int, revision: int): Rv32Machine {
+    val mem: Map<int, int> = Map()
+    for (address in initial.keys()) mem.set(address, initial.get(address) ?? 0)
+    val regs: array<int> = [0]
+    var i = 1
+    while (i < 32) {
+        regs.append((0xa5100000 + i * 0x1234) & MASK)
+        i = i + 1
+    }
+    regs[1] = RETURN
+    regs[2] = 0x4ff2f000
+    regs[10] = FRAME
+    regs[11] = CALLBACK
+    regs[12] = 0xdeadbeef
+    regs[13] = revision
+    val before: array<int> = []
+    for (value in regs) before.append(value)
+    val csrs: Map<int, int> = Map()
+    val trapList = traps()
+    i = 0
+    while (i < trapList.size) {
+        csrs.set(trapList[i], 0x25000000 + i * 256)
+        i = i + 1
+    }
+    csrs.set(0x300, 0x1880)
+    csrs.set(0x347, 0x12340000)
+    csrs.set(0xf14, hart)
+    val oldCsrs: Map<int, int> = Map()
+    for (key in csrs.keys()) oldCsrs.set(key, csrs.get(key) ?? 0)
+    val m = Rv32Machine(mem, regs, csrs, oldCsrs, before, [], [], entry, entry + 16, table, entry, 0, 0, "")
+    i = 0
+    while (i < 148) {
+        mem.set(FRAME + i, 0)
+        i = i + 1
+    }
+    m.put(FRAME + 144, 0x1234abcd)
+    m.stores.clear()
+    m
+}
+
+fun savedKept(m: Rv32Machine): bool {
+    for (r in saved()) {
+        if (m.regs[r] != m.before[r]) return false
+    }
+    true
+}
+
+fun trapsKept(m: Rv32Machine): bool {
+    for (c in traps()) {
+        if ((m.csrs.get(c) ?? -1) != (m.oldCsrs.get(c) ?? -2)) return false
+    }
+    true
+}
+
+fun accessed(m: Rv32Machine, csr: int): bool {
+    for (value in m.csrAccess) {
+        if (value == csr) return true
+    }
+    false
+}
+
+// Runs every scenario; (case count, "") or (0, first error).
+class SleepCoreReport(val cases: int, val error: string)
+
+fun checkSleepCore(data: string): SleepCoreReport {
+    val elf = elf32ParseLoose(data)
+    if (elf.error != "") return SleepCoreReport(0, elf.error)
+    if (elfU16(data, 18) != 243) return SleepCoreReport(0, "expected RISC-V ELF")
+    val initial: Map<int, int> = Map()
+    for (section in elf.sections) {
+        if ((section.flags & 2) == 0) continue
+        var i = 0
+        while (i < section.size) {
+            initial.set(section.address + i, if (section.kind == 8) 0 else elfU8(data, section.offset + i))
+            i = i + 1
+        }
+    }
+    val named = elfNamedSymbolsStepped(elf, true)
+    if (named.error != "") return SleepCoreReport(0, named.error)
+    var cores = 0
+    var entry = 0
+    for (section in elf.sections) {
+        if ((section.flags & 4) != 0 && section.address == 0x4ff01000) {
+            cores = cores + 1
+            entry = section.address
+        }
+    }
+    if (cores != 1) return SleepCoreReport(0, "expected exactly one core section at 0x4ff01000")
+    val tableSymbol = named.symbols.get(".Labla_p4_core_frames")
+    val publicSymbol = named.symbols.get("abla_esp32p4_sleep_core_example")
+    if (tableSymbol == null || publicSymbol == null) return SleepCoreReport(0, "missing core frame table or public entry symbol")
+    val table = tableSymbol.value
+    val wake = entry + 16
+    val public = publicSymbol.value
+    var cases = 0
+    for (isPublic in [false, true]) {
+        for (hart in [0, 1]) {
+            for (revision in [0, 1, 299, 300, 399]) {
+                for (wakes in [false, true]) {
+                    val m = newMachine(initial, table, entry, hart, revision)
+                    if (isPublic) {
+                        m.pc = public
+                        m.regs[14] = 1
+                        m.regs[15] = 1
+                    }
+                    val ran = m.run(wakes)
+                    if (ran != "") return SleepCoreReport(0, ran)
+                    if (m.pc != RETURN || m.callbacks != 1) return SleepCoreReport(0, "boundary did not return after exactly one callback")
+                    if (!savedKept(m)) return SleepCoreReport(0, "callee-saved registers changed")
+                    if (!trapsKept(m)) return SleepCoreReport(0, "trap CSRs changed")
+                    if (accessed(m, 0x347) != (revision >= 300)) return SleepCoreReport(0, "revision CSR access does not follow the revision guard")
+                    if (revision >= 300 && (m.csrs.get(0x347) ?? -1) != (m.oldCsrs.get(0x347) ?? -2)) {
+                        return SleepCoreReport(0, "revision CSR not restored")
+                    }
+                    if (m.regs[10] != (if (wakes) 0 else 0x87654321)) return SleepCoreReport(0, "wrong result register")
+                    if (m.get(FRAME + 4) != (if (wakes) 3 else 2)) return SleepCoreReport(0, "wrong final frame state")
+                    if (m.get(table) != 0 || m.get(table + 4) != 0) return SleepCoreReport(0, "core frame table not cleared")
+                    if (m.get(FRAME + 144) != 0x1234abcd) return SleepCoreReport(0, "caller data inside the frame was modified")
+                    if (m.fences != 2) return SleepCoreReport(0, "expected exactly two fences")
+                    if (m.error != "") return SleepCoreReport(0, m.error)
+                    cases = cases + 1
+                }
+            }
+        }
+    }
+    for (reason in ["interrupts", "hart", "nested"]) {
+        val m = newMachine(initial, table, entry, 0, 300)
+        if (reason == "interrupts") {
+            m.csrs.set(0x300, m.csrValue(0x300) | 8)
+        } else if (reason == "hart") {
+            m.csrs.set(0xf14, 2)
+        } else {
+            m.put(table, 0x4ff24000)
+            m.stores.clear()
+        }
+        val ran = m.run(false)
+        if (ran != "") return SleepCoreReport(0, ran)
+        if (m.callbacks != 0 || m.stores.size != 0) return SleepCoreReport(0, "$reason: refused entry still ran or stored")
+        if (m.regs[10] != 3) return SleepCoreReport(0, "$reason: wrong refusal code")
+        if (!savedKept(m)) return SleepCoreReport(0, "$reason: callee-saved registers changed")
+        cases = cases + 1
+    }
+    for (hart in [0, 1, 2]) {
+        val m = newMachine(initial, table, entry, hart, 300)
+        m.pc = wake
+        m.regs[1] = ROM_RETURN
+        val ran = m.run(false)
+        if (ran != "") return SleepCoreReport(0, ran)
+        if (m.pc != ROM_RETURN || m.stores.size != 0 || m.callbacks != 0) return SleepCoreReport(0, "stray wake entry was not inert")
+        cases = cases + 1
+    }
+    for (reason in ["address", "unaligned", "callback", "revision", "exclusive", "live"]) {
+        val m = newMachine(initial, table, entry, 0, 300)
+        m.pc = public
+        m.regs[14] = 1
+        m.regs[15] = 1
+        if (reason == "address") {
+            m.regs[10] = 0
+        } else if (reason == "unaligned") {
+            m.regs[10] = FRAME + 1
+        } else if (reason == "callback") {
+            m.regs[11] = CALLBACK + 1
+        } else if (reason == "revision") {
+            m.regs[13] = 400
+        } else if (reason == "exclusive") {
+            m.regs[15] = 0
+        } else {
+            m.put(FRAME, 1)
+            m.stores.clear()
+        }
+        val ran = m.run(false)
+        if (ran != "") return SleepCoreReport(0, ran)
+        if (m.pc != RETURN || m.callbacks != 0 || m.regs[10] != 2) return SleepCoreReport(0, "$reason: public wrapper did not refuse")
+        if (!savedKept(m)) return SleepCoreReport(0, "$reason: callee-saved registers changed")
+        for (address in m.stores) {
+            if (!(address >= 0x4ff2ef00 && address < 0x4ff2f000)) return SleepCoreReport(0, "$reason: store outside the own stack")
+        }
+        cases = cases + 1
+    }
+    val last = newMachine(initial, table, entry, 0, 300)
+    last.pc = public
+    last.regs[14] = 0
+    val ran = last.run(false)
+    if (ran != "") return SleepCoreReport(0, ran)
+    if (last.pc != RETURN || last.regs[10] != wake || last.callbacks != 0) return SleepCoreReport(0, "wake-address query wrong")
+    SleepCoreReport(cases + 1, "")
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-p4-sleep-core-instructions SLEEP-CORE.elf")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val report = checkSleepCore(file.data)
+    if (report.error != "") {
+        eprintln(report.error)
+        return 1
+    }
+    println("PASS: ${report.cases} emitted-RV32 sleep boundary scenarios; no physical ROM/PMU claim")
+    0
+}
