@@ -1,0 +1,171 @@
+// Restore post-tested semantics for already structured Xtensa LOOP instructions.
+//
+//     tools/abla-tool repair-lifted-plain-loops [--write] [--revert] PATHS...
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/abfiles.ab"
+
+class LoopTransform(val text: string, val count: int, val error: string)
+
+private fun isDigit(byte: int): bool = byte >= 48 && byte <= 57
+
+private fun isWord(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+private fun isSpace(byte: int): bool = byte == 32 || (byte >= 9 && byte <= 13)
+
+private fun leadingSpaces(line: string): int {
+    var index = 0
+    while (index < line.size && line[index] == 32) index = index + 1
+    index
+}
+
+// `recoveredLoopRemaining[0-9]+` at `from`: its end, or -1.
+private fun counterEnd(line: string, from: int): int {
+    val name = "recoveredLoopRemaining"
+    if (!line.slice(from, line.size).startsWith(name)) return -1
+    var index = from + name.size
+    val digits = index
+    while (index < line.size && isDigit(line[index])) index = index + 1
+    if (index == digits) -1 else index
+}
+
+// `^( *)while \((recoveredLoopRemaining[0-9]+) != u32\(0\)\) \{$`: the counter name, or "".
+private fun plainHeader(line: string): string {
+    val indent = leadingSpaces(line)
+    if (!line.slice(indent, line.size).startsWith("while (")) return ""
+    val begin = indent + 7
+    val end = counterEnd(line, begin)
+    if (end < 0) return ""
+    if (line.slice(end, line.size) != " != u32(0)) {") return ""
+    line.slice(begin, end)
+}
+
+// `^( *)while \(true\) \{$` (the repaired spelling).
+private fun repairedHeader(line: string): bool =
+    line.slice(leadingSpaces(line), line.size) == "while (true) {"
+
+// `INDENT    if \((recoveredLoopRemaining[0-9]+) == u32\(0\)\) break`: the counter, or "".
+private fun trailerCounter(line: string, indent: string): string {
+    val prefix = "$indent    if ("
+    if (!line.startsWith(prefix)) return ""
+    val end = counterEnd(line, prefix.size)
+    if (end < 0) return ""
+    if (line.slice(end, line.size) != " == u32(0)) break") return ""
+    line.slice(prefix.size, end)
+}
+
+// `\bNAME\s*=` somewhere in the body.
+private fun updatesCounter(body: string, name: string): bool {
+    var from = 0
+    while (true) {
+        val found = body.indexOf(name, from)
+        if (found < 0) return false
+        from = found + 1
+        if (found > 0 && isWord(body[found - 1])) continue
+        var index = found + name.size
+        while (index < body.size && isSpace(body[index])) index = index + 1
+        if (index < body.size && body[index] == 61) return true
+    }
+    false
+}
+
+fun transformLoops(source: string, revert: bool): LoopTransform {
+    val lines = source.split("\n")
+    val output: array<string> = []
+    var changed = 0
+    var index = 0
+    while (index < lines.size) {
+        val text = lines[index]
+        var name = if (revert) "" else plainHeader(text)
+        val matched = if (revert) repairedHeader(text) else name != ""
+        if (!matched) {
+            output.append(text)
+            index = index + 1
+            continue
+        }
+        val indent = text.slice(0, leadingSpaces(text))
+        var end = index + 1
+        while (end < lines.size && lines[end] != indent + "}") end = end + 1
+        if (end == lines.size) {
+            return LoopTransform("", 0, "unterminated lifted loop at line ${index + 1}")
+        }
+        val bodyBegin = index + 1
+        var bodyEnd = end
+        if (revert) {
+            val trailer = if (bodyEnd == bodyBegin) "" else trailerCounter(lines[bodyEnd - 1], indent)
+            if (trailer == "") {
+                output.append(text)
+                index = index + 1
+                continue
+            }
+            name = trailer
+            bodyEnd = bodyEnd - 1
+        }
+        val bodyLines: array<string> = []
+        var at = bodyBegin
+        while (at < bodyEnd) {
+            bodyLines.append(lines[at])
+            at = at + 1
+        }
+        if (!updatesCounter(bodyLines.join("\n"), name)) {
+            return LoopTransform("", 0, "lifted loop does not update $name at line ${index + 1}")
+        }
+        if (revert) {
+            output.append("${indent}while ($name != u32(0)) {")
+            for (line in bodyLines) output.append(line)
+        } else {
+            output.append("${indent}while (true) {")
+            for (line in bodyLines) output.append(line)
+            output.append("$indent    if ($name == u32(0)) break")
+        }
+        output.append(lines[end])
+        changed = changed + 1
+        index = end + 1
+    }
+    LoopTransform(output.join("\n"), changed, "")
+}
+
+fun main: int {
+    var write = false
+    var revert = false
+    val arguments: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--write") write = true
+        else if (argument == "--revert") revert = true
+        else arguments.append(argument)
+        index = index + 1
+    }
+    if (arguments.size == 0) {
+        eprintln("usage: repair-lifted-plain-loops [--write] [--revert] PATHS...")
+        return 2
+    }
+    val found: array<string> = []
+    for (argument in arguments) {
+        if (Path(argument).info().isDirectory()) rglobAb(argument, found)
+        else if (argument.endsWith(".ab")) found.append(argument)
+    }
+    var total = 0
+    var changedFiles = 0
+    for (file in found) {
+        val source = Path(file).readText()
+        val result = transformLoops(source, revert)
+        if (result.error != "") {
+            eprintln("ValueError: ${result.error}")
+            return 1
+        }
+        total = total + result.count
+        if (result.text != source) {
+            changedFiles = changedFiles + 1
+            if (write) Path(file).writeText(result.text)
+        }
+    }
+    val verb = if (write) "repaired" else "would repair"
+    println("$verb $total plain LOOP(s) across $changedFiles file(s)")
+    0
+}
