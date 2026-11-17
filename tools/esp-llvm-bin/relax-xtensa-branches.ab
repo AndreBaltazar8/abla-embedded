@@ -1,0 +1,200 @@
+// Relax out-of-range Xtensa conditional branches, as GNU as does.
+//
+// LLVM 23.1's Xtensa assembler reports `fixup value out of range` instead of
+// relaxing a conditional branch whose target is beyond its 8- or 12-bit reach.
+// Recovered raw-assembly bodies hit this when they grow (for example
+// `call8 f` recovered as `movi a8, f; callx8 a8`). Usage:
+//
+//     tools/abla-tool tools/esp-llvm-bin/relax-xtensa-branches.ab FILE.s LINE...
+//
+// rewrites each listed line `bCC operands, target` in place as
+//
+//     bNOT-CC operands, .Labla_relax_N
+//     j target
+//     .Labla_relax_N:
+//
+// (N unique across repeated runs on the same file), which is GNU as's own
+// relaxation: same behavior, one extra jump on the originally taken path.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "../lib/asm-text.ab"
+
+// The branch with the opposite condition, "" for an opcode that is not a
+// conditional branch.
+fun branchInverse(op: string): string = when (op) {
+    "beq" -> "bne"
+    "bne" -> "beq"
+    "blt" -> "bge"
+    "bge" -> "blt"
+    "bltu" -> "bgeu"
+    "bgeu" -> "bltu"
+    "beqi" -> "bnei"
+    "bnei" -> "beqi"
+    "blti" -> "bgei"
+    "bgei" -> "blti"
+    "bltui" -> "bgeui"
+    "bgeui" -> "bltui"
+    "beqz" -> "bnez"
+    "bnez" -> "beqz"
+    "bltz" -> "bgez"
+    "bgez" -> "bltz"
+    "ball" -> "bnall"
+    "bnall" -> "ball"
+    "bany" -> "bnone"
+    "bnone" -> "bany"
+    "bbc" -> "bbs"
+    "bbs" -> "bbc"
+    "bbci" -> "bbsi"
+    "bbsi" -> "bbci"
+    "bbci.l" -> "bbsi.l"
+    "bbsi.l" -> "bbci.l"
+    else -> ""
+}
+
+class BranchLine(val indent: string, val op: string, val operands: string, val target: string)
+
+fun isBranchLetter(byte: int): bool = (byte >= 97 && byte <= 122) || byte == 46
+
+// `^(\s*)(b[a-z.]+)\s+(.*),\s*([^\s,]+)\s*$`, or null.
+fun parseBranchLine(line: string): BranchLine? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    if (scan.pos >= line.size || line[scan.pos] != 98) return null
+    var end = scan.pos + 1
+    val opStart = scan.pos
+    while (end < line.size && isBranchLetter(line[end])) end = end + 1
+    if (end == opStart + 1) return null
+    val op = line.slice(opStart, end)
+    scan.pos = end
+    if (!scan.needSpace()) return null
+    val operandsStart = scan.pos
+    val comma = line.lastIndexOf(",")
+    if (comma < operandsStart) return null
+    // After the comma: spaces, a target without spaces or commas, spaces.
+    var cursor = comma + 1
+    while (cursor < line.size && asmIsSpace(line[cursor])) cursor = cursor + 1
+    val targetStart = cursor
+    while (cursor < line.size && !asmIsSpace(line[cursor]) && line[cursor] != 44) cursor = cursor + 1
+    if (cursor == targetStart) return null
+    val targetEnd = cursor
+    while (cursor < line.size && asmIsSpace(line[cursor])) cursor = cursor + 1
+    if (cursor != line.size) return null
+    BranchLine(indent, op, line.slice(operandsStart, comma), line.slice(targetStart, targetEnd))
+}
+
+// `^\.Labla_relax_\d+:`.
+fun isRelaxLabel(line: string): bool {
+    if (!line.startsWith(".Labla_relax_")) return false
+    var cursor = 13
+    val first = cursor
+    while (cursor < line.size && asmIsDigit(line[cursor])) cursor = cursor + 1
+    cursor > first && cursor < line.size && line[cursor] == 58
+}
+
+class RelaxResult(val text: string, val relaxed: int, val error: string)
+
+// `text` with the branches on the 1-based `numbers` (ascending, distinct)
+// relaxed.
+fun relaxBranches(text: string, numbers: array<int>): RelaxResult {
+    val lines = text.split("\n")
+    var existing = 0
+    for (line in lines) {
+        if (isRelaxLabel(line)) existing = existing + 1
+    }
+    var relaxed = 0
+    var index = numbers.size - 1
+    while (index >= 0) {
+        val number = numbers[index]
+        if (number < 1 || number > lines.size) {
+            return RelaxResult("", relaxed, "relax-xtensa-branches: line $number is outside the file")
+        }
+        val current = lines[number - 1]
+        val parsed = parseBranchLine(current)
+        var op = ""
+        if (parsed != null) {
+            op = parsed.op
+            if (op.endsWith(".n")) op = op.slice(0, op.size - 2)
+        }
+        if (parsed == null || branchInverse(op) == "") {
+            return RelaxResult("", relaxed,
+                "relax-xtensa-branches: line $number is not a conditional branch: ${asmStrip(current)}")
+        }
+        val label = ".Labla_relax_${existing + relaxed}"
+        val indent = if (parsed.indent == "") "\t" else parsed.indent
+        lines[number - 1] = "$indent${branchInverse(op)}\t${parsed.operands}, $label\n" +
+            "${indent}j\t${parsed.target}\n$label:"
+        relaxed = relaxed + 1
+        index = index - 1
+    }
+    RelaxResult(lines.join("\n"), relaxed, "")
+}
+
+// The distinct values of `arguments`, ascending; null when one is not an integer.
+fun sortedLineNumbers(arguments: array<string>): array<int>? {
+    val numbers: array<int> = []
+    for (argument in arguments) {
+        val scan = AsmScan(argument, 0)
+        val digits = scan.integer(true) ?? return null
+        if (scan.pos != argument.size) return null
+        numbers.append(asmIntegerValue(digits))
+    }
+    // insertion sort, dropping duplicates
+    val sorted: array<int> = []
+    for (number in numbers) {
+        var at = 0
+        var duplicate = false
+        while (at < sorted.size && sorted[at] <= number) {
+            if (sorted[at] == number) duplicate = true
+            at = at + 1
+        }
+        if (!duplicate) {
+            sorted.append(number)
+            var move = sorted.size - 1
+            while (move > at) {
+                sorted[move] = sorted[move - 1]
+                move = move - 1
+            }
+            sorted[at] = number
+        }
+    }
+    sorted
+}
+
+fun main: int {
+    if (processArgumentCount() < 2) {
+        eprint("Relax out-of-range Xtensa conditional branches, as GNU as does.\n\nLLVM 23.1's Xtensa assembler reports `fixup value out of range` instead of\nrelaxing a conditional branch whose target is beyond its 8- or 12-bit reach.\nRecovered raw-assembly bodies hit this when they grow (for example\n`call8 f` recovered as `movi a8, f; callx8 a8`). Usage:\n\n  relax-xtensa-branches FILE.s LINE...\n\nrewrites each listed line `bCC operands, target` in place as\n\n  bNOT-CC operands, .Labla_relax_N\n  j target\n.Labla_relax_N:\n\n(N unique across repeated runs on the same file), which is GNU as's own relaxation: same behavior, one extra jump on the\noriginally taken path.\n\n")
+        return 2
+    }
+    val path = processArgument(0)
+    val arguments: array<string> = []
+    var index = 1
+    while (index < processArgumentCount()) {
+        arguments.append(processArgument(index))
+        index = index + 1
+    }
+    val numbers = sortedLineNumbers(arguments)
+    if (numbers == null) {
+        eprintln("relax-xtensa-branches: line numbers must be integers")
+        return 1
+    }
+    val input = asmReadFile(path)
+    if (!input.succeeded) {
+        eprintln("relax-xtensa-branches: cannot read $path")
+        return 1
+    }
+    val result = relaxBranches(input.text, numbers)
+    if (result.error != "") {
+        eprintln(result.error)
+        return 1
+    }
+    if (!Path(path).writeText(result.text)) {
+        eprintln("relax-xtensa-branches: cannot write $path")
+        return 1
+    }
+    eprintln("relaxed ${result.relaxed} branch(es)")
+    0
+}

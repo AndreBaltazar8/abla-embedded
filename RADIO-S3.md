@@ -74,7 +74,7 @@ Measured causes and the tool-side fixes (see `tools/` for each):
   `lint-recovered-unit` credits them in DRIFT-CALL): -3.5 KB;
 - LLVM inlines exported recovered functions into callers while the function
   itself must stay (`mark-recovered-noinline`): -3.2 KB;
-- LLVM 23.1 never selects EXTUI or BBCI/BNONE (`esp-llvm-bin/fuse-xtensa-extui`,
+- LLVM 23.1 never selects EXTUI or BBCI/BNONE (`esp-llvm-bin/fuse-xtensa-extui.ab`,
   liveness-checked rewrite of the final assembly): -2.0 KB.
 
 Not worth it: sharing literal-pool words across functions (the image keeps only
@@ -158,7 +158,7 @@ Classic-only assumptions to parameterize (from a tooling survey):
 - the `esp32Recovered` / `esp32Data_` naming and `src/esp32/...` outputs;
 - `direct-recovered-xtensa-calls` ABI-to-Abla mapping (classic modules);
 - `tools/idf/xtensa-monolithic-link.cmake` (returns unless `IDF_TARGET` is
-  `esp32`), `prepare-esp32-vector-literals`, `check-classic-clock-link`.
+  `esp32`), `prepare-esp32-vector-literals.ab`, `check-classic-clock-link`.
 
 ## Making recovery repeatable per chip
 

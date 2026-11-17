@@ -1,0 +1,202 @@
+// Rewrite LLVM Xtensa assembly to Code Density (16-bit) forms where exact.
+//
+// Upstream LLVM's Xtensa code generator rarely selects the narrow (.n)
+// encodings that Espressif's toolchain uses for ~40% of instructions. Each
+// rewrite here is a pure re-encoding with identical semantics, within the ISA's
+// narrow operand ranges. Branches are left alone (narrow branches are
+// forward-only with short ranges the assembler would have to check) and inline
+// assembly (#APP ... #NO_APP) is copied verbatim, as is any
+// .begin no-transform region, because its exact layout may matter.
+// Shrinking code only shortens distances, so l32r and branch ranges stay valid.
+//
+// LLVM's text output also places each function's .literal_position/.literal
+// directives before its `.section .text.<fn>` switch, while the previous
+// function's jump-table (.rodata) section is current. llvm-mc names literal
+// pools after the current section, so they would land in `.rodata.<fn>.literal`
+// (flash data, out of l32r range). Literal runs are therefore held until the
+// function's text section is current, giving `.literal.<fn>` beside its code.
+//
+// Call-frame (.cfi_*) directives are dropped unless ABLA_ESP_KEEP_UNWIND=1:
+// the wrapper strips .eh_frame afterwards anyway, and LLVM 23.1's Xtensa
+// assembler rejects the frame-pointer form `.cfi_def_cfa a7, N` it emits.
+//
+//     tools/abla-tool tools/esp-llvm-bin/narrow-xtensa-assembly.ab < in.s > out.s
+
+import "abla/io"
+import "abla/text"
+import "abla/process/environment"
+import "../lib/asm-text.ab"
+
+// `or aD, aS, aS` -> `mov.n aD, aS`.
+fun narrowOrMove(line: string): string? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    if (!scan.word("or") || !scan.needSpace()) return null
+    val destination = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val first = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val second = scan.reg() ?? return null
+    if (!scan.onlySpaceLeft()) return null
+    if (first == second) return "${indent}mov.n\t$destination, $first"
+    line
+}
+
+// `movi aD, N` -> `movi.n aD, N` for -32 <= N <= 95.
+fun narrowMovi(line: string): string? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    if (!scan.word("movi") || !scan.needSpace()) return null
+    val destination = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val number = scan.integer(true) ?? return null
+    if (!scan.onlySpaceLeft()) return null
+    val value = asmIntegerValue(number)
+    if (value >= -32 && value <= 95) return "${indent}movi.n\t$destination, $number"
+    line
+}
+
+// `l32i|s32i aT, aS, N` -> `.n` form for N a multiple of 4 in 0..60.
+fun narrowLoadStore(line: string): string? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    var mnemonic = "l32i"
+    if (!scan.word("l32i")) {
+        if (!scan.word("s32i")) return null
+        mnemonic = "s32i"
+    }
+    if (!scan.needSpace()) return null
+    val value = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val base = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val number = scan.integer(false) ?? return null
+    if (!scan.onlySpaceLeft()) return null
+    val offset = asmIntegerValue(number)
+    if (offset >= 0 && offset <= 60 && offset % 4 == 0) return "$indent$mnemonic.n\t$value, $base, $offset"
+    line
+}
+
+// `add aD, aS, aT` -> `add.n`.
+fun narrowAdd(line: string): string? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    if (!scan.word("add") || !scan.needSpace()) return null
+    val destination = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val first = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val second = scan.reg() ?? return null
+    if (!scan.onlySpaceLeft()) return null
+    "${indent}add.n\t$destination, $first, $second"
+}
+
+// `addi aD, aS, N` -> `addi.n` for N = -1 or 1..15.
+fun narrowAddi(line: string): string? {
+    val scan = AsmScan(line, 0)
+    scan.skipSpaces()
+    val indent = line.slice(0, scan.pos)
+    if (!scan.word("addi") || !scan.needSpace()) return null
+    val destination = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val source = scan.reg() ?? return null
+    if (!scan.word(",")) return null
+    scan.skipSpaces()
+    val number = scan.integer(true) ?? return null
+    if (!scan.onlySpaceLeft()) return null
+    val value = asmIntegerValue(number)
+    if (value == -1 || (value >= 1 && value <= 15)) return "${indent}addi.n\t$destination, $source, $value"
+    line
+}
+
+// `line` (code only, trailing whitespace removed) narrowed when it has an exact
+// Code Density form.
+fun narrowLine(line: string): string {
+    // The mnemonic decides which form can match; skip the others cheaply.
+    var start = 0
+    while (start < line.size && asmIsSpace(line[start])) start = start + 1
+    if (start >= line.size) return line
+    val first = line[start]
+    var result: string? = null
+    if (first == 111) {
+        result = narrowOrMove(line)
+    } else if (first == 109) {
+        result = narrowMovi(line)
+    } else if (first == 108 || first == 115) {
+        result = narrowLoadStore(line)
+    } else if (first == 97) {
+        result = narrowAdd(line)
+        if (result == null) result = narrowAddi(line)
+    }
+    result ?? line
+}
+
+fun isLiteral(stripped: string): bool =
+    stripped.startsWith(".literal_position") || stripped.startsWith(".literal ")
+
+fun narrowAssembly(lines: array<string>, keepUnwind: bool): array<string> {
+    val out: array<string> = []
+    val held: array<string> = []
+    var verbatim = 0
+    for (line in lines) {
+        var current = line
+        val stripped = asmStrip(current)
+        if (!keepUnwind && stripped.startsWith(".cfi_")) continue
+        if (verbatim == 0 && isLiteral(stripped)) {
+            held.append(current)
+            continue
+        }
+        if (held.size > 0) {
+            // Keep holding across section switches and blank/comment lines;
+            // release at the first real line, once the function's section is
+            // current.
+            if (stripped == "" || stripped.startsWith("#") || stripped.startsWith(".section")) {
+                out.append(current)
+                continue
+            }
+            for (literal in held) out.append(literal)
+            held.clear()
+        }
+        if (stripped.startsWith("#APP") || (stripped.startsWith(".begin") && stripped.contains("no-transform"))) {
+            verbatim = verbatim + 1
+        } else if (stripped.startsWith("#NO_APP") || (stripped.startsWith(".end") && stripped.contains("no-transform"))) {
+            verbatim = if (verbatim > 1) verbatim - 1 else 0
+        } else if (verbatim == 0 && !stripped.startsWith(".")) {
+            // Directives (string data may contain `#`) and lines that do not
+            // narrow are copied byte for byte.
+            val hash = current.indexOf("#")
+            val code = if (hash < 0) current else current.slice(0, hash)
+            val trimmed = asmRstrip(code)
+            val narrowed = narrowLine(trimmed)
+            if (narrowed != trimmed) {
+                current = if (hash < 0) narrowed else "$narrowed #${current.slice(hash + 1, current.size)}"
+            }
+        }
+        out.append(current)
+    }
+    for (literal in held) out.append(literal)
+    out
+}
+
+fun main: int {
+    val input = asmReadStandardInput()
+    if (!input.succeeded) {
+        eprintln("narrow-xtensa-assembly: cannot read standard input")
+        return 1
+    }
+    val keepUnwind = processEnvironmentOr("ABLA_ESP_KEEP_UNWIND", "") == "1"
+    asmWriteLines(narrowAssembly(asmLines(input.text), keepUnwind))
+    0
+}
