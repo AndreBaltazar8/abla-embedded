@@ -1,0 +1,352 @@
+// Lower target subparser calls that already have ordinary Abla equivalents.
+//
+// Recovered ESP32 functions should use the Xtensa subparser only for operations
+// that cannot be represented by Abla or its target-neutral native intrinsics.
+// This pass makes indirect calls, ordinary memory accesses, device accesses, and
+// memory barriers ordinary Abla calls so LLVM can see their operands and the
+// source no longer presents them as recovered Xtensa instructions.
+//
+//     tools/abla-tool lower-xtensa-boundaries-to-abla [--write] PATH...
+import "abla/io"
+import "abla/text"
+import "lib/recovered-text.ab"
+
+/** The lowerable modes, in the (sorted) order the totals are printed. */
+fun boundaryModes(): array<string> = [
+    "atomicCompareExchange", "callAddress", "callAddressWide", "dataSynchronize", "deviceLoad32",
+    "deviceStore32", "eventSynchronize", "externalRegisterRead", "instructionSynchronize", "load16",
+    "load32", "load8", "memoryBarrier", "raiseInterruptLevel", "read", "restoreProcessorState",
+    "returnAddress", "semihosting", "stackPointer", "store16", "store32", "store8", "tlsAddress",
+    "trapLoop", "write", "writeDataTlb", "writeInstructionTlb"
+]
+
+fun boundaryLowerable(mode: string): bool {
+    for (candidate in boundaryModes()) if (candidate == mode) return true
+    false
+}
+
+fun boundaryOwnedTlsSize(symbol: string): int = when (symbol) {
+    ".Labla_recovered_picolibc_strtok_data__tbss__strtok_last" -> 4
+    "_localtime_buf" -> 36
+    "errno" -> 4
+    else -> -1
+}
+
+fun boundaryRegisterRead(instruction: string): string = when (instruction) {
+    "rsr.ccount" -> "xtensaReadCycleCount()"
+    "rsr.debugcause" -> "xtensaReadDebugCause()"
+    "rsr.epc1" -> "xtensaReadExceptionProgramCounter1()"
+    "rsr.epc2" -> "xtensaReadExceptionProgramCounter2()"
+    "rsr.epc3" -> "xtensaReadExceptionProgramCounter3()"
+    "rsr.epc4" -> "xtensaReadExceptionProgramCounter4()"
+    "rsr.ibreakenable" -> "xtensaReadInstructionBreakpointEnable()"
+    "rsr.intenable" -> "xtensaReadInterruptEnableRegister()"
+    "rsr.interrupt" -> "xtensaReadPendingInterruptRegister()"
+    "rsr.prid" -> "xtensaReadProcessorId()"
+    "rsr.ps" -> "xtensaReadProcessorState()"
+    "rur.threadptr" -> "xtensaReadThreadPointer()"
+    else -> ""
+}
+
+fun boundaryRegisterWrite(instruction: string): string = when (instruction) {
+    "wsr.ccount" -> "xtensaWriteCycleCount"
+    "wsr.dbreaka0" -> "xtensaWriteDataBreakpointAddress0"
+    "wsr.dbreaka1" -> "xtensaWriteDataBreakpointAddress1"
+    "wsr.dbreakc0" -> "xtensaWriteDataBreakpointControl0"
+    "wsr.dbreakc1" -> "xtensaWriteDataBreakpointControl1"
+    "wsr.ibreaka0" -> "xtensaWriteInstructionBreakpointAddress0"
+    "wsr.ibreaka1" -> "xtensaWriteInstructionBreakpointAddress1"
+    "wsr.ibreakenable" -> "xtensaWriteInstructionBreakpointEnable"
+    "wsr.intclear" -> "xtensaWritePendingInterruptClear"
+    "wsr.intenable" -> "xtensaWriteInterruptEnableRegister"
+    "wsr.ps" -> "xtensaWriteProcessorState"
+    "wsr.vecbase" -> "xtensaWriteVectorBase"
+    "wur.threadptr" -> "xtensaWriteThreadPointer"
+    else -> ""
+}
+
+/** A lowered call spelling, or an error (the Python ValueError message). */
+class BoundaryCall(val text: string, val native: bool, val memory: bool, val error: string)
+
+private fun boundaryFail(message: string): BoundaryCall = BoundaryCall("", false, false, message)
+
+private fun boundaryPlain(text: string): BoundaryCall = BoundaryCall(text, false, false, "")
+
+fun boundaryIndirectCall(arguments: array<string>, wide: bool): BoundaryCall {
+    if (arguments.size == 0) return boundaryFail("indirect call has no target address")
+    if (arguments.size > 8) return boundaryFail("indirect call has more than seven scalar arguments")
+    val result = if (wide) "I64" else "I32"
+    val intrinsic = "ablaUnsafeCall${result}" + "I32".repeat(arguments.size - 1)
+    val operands: array<string> = []
+    for (argument in arguments) operands.append("int(${argument})")
+    val conversion = if (wide) "u64" else "u32"
+    BoundaryCall("${conversion}(${intrinsic}(${operands.join(", ")}))", true, false, "")
+}
+
+
+
+fun boundaryLowerCallImpl(mode: string, arguments: array<string>): BoundaryCall {
+    val count = arguments.size
+    if (mode == "atomicCompareExchange") {
+        if (count != 3) return boundaryFail("atomicCompareExchange expects three arguments")
+        val operands: array<string> = []
+        for (argument in arguments) operands.append("int(${argument})")
+        return BoundaryCall("u32(nativeAtomicCompareExchangeU32(${operands.join(", ")}))", true, false, "")
+    }
+    if (mode == "callAddress") return boundaryIndirectCall(arguments, false)
+    if (mode == "callAddressWide") return boundaryIndirectCall(arguments, true)
+    if (mode == "eventSynchronize") {
+        if (count != 0) return boundaryFail("eventSynchronize expects no arguments")
+        return boundaryPlain("xtensaEventSynchronize()")
+    }
+    if (mode == "dataSynchronize") {
+        if (count != 0) return boundaryFail("dataSynchronize expects no arguments")
+        return boundaryPlain("xtensaDataSynchronize()")
+    }
+    if (mode == "instructionSynchronize") {
+        if (count != 0) return boundaryFail("instructionSynchronize expects no arguments")
+        return boundaryPlain("xtensaInstructionSynchronize()")
+    }
+    if (mode == "restoreProcessorState") {
+        if (count != 1) return boundaryFail("restoreProcessorState expects one argument")
+        return boundaryPlain("xtensaRestoreProcessorState(${arguments[0]})")
+    }
+    if (mode == "returnAddress") {
+        if (count != 0) return boundaryFail("returnAddress expects no arguments")
+        return boundaryPlain("xtensaReturnAddress()")
+    }
+    if (mode == "stackPointer") {
+        if (count != 0) return boundaryFail("stackPointer expects no arguments")
+        return boundaryPlain("xtensaStackPointer()")
+    }
+    if (mode == "externalRegisterRead") {
+        if (count != 1) return boundaryFail("externalRegisterRead expects one argument")
+        return boundaryPlain("xtensaExternalRegisterRead(${arguments[0]})")
+    }
+    if (mode == "semihosting") {
+        if (count != 2) return boundaryFail("semihosting expects two arguments")
+        return boundaryPlain("xtensaSemihosting(${arguments[0]}, ${arguments[1]})")
+    }
+    if (mode == "writeDataTlb" || mode == "writeInstructionTlb") {
+        if (count != 2) return boundaryFail("${mode} expects two arguments")
+        val wrapper = if (mode == "writeDataTlb") "xtensaWriteDataTlb" else "xtensaWriteInstructionTlb"
+        return boundaryPlain("${wrapper}(${arguments[0]}, ${arguments[1]})")
+    }
+    if (mode == "load8" || mode == "load16" || mode == "load32") {
+        if (count != 1) return boundaryFail("${mode} expects one argument")
+        val width = mode.slice(4, mode.size)
+        return BoundaryCall("u32(ablaUnsafeLoadU${width}(nativePointerFromAddress(int(${arguments[0]}))))", false, true, "")
+    }
+    if (mode == "store8" || mode == "store16" || mode == "store32") {
+        if (count != 2) return boundaryFail("${mode} expects two arguments")
+        val width = mode.slice(5, mode.size)
+        return BoundaryCall(
+            "ablaUnsafeStoreU${width}(nativePointerFromAddress(int(${arguments[0]})), int(${arguments[1]}))",
+            false, true, "")
+    }
+    if (mode == "deviceLoad32") {
+        if (count != 1) return boundaryFail("deviceLoad32 expects one argument")
+        return boundaryPlain("xtensaDeviceLoadU32(${arguments[0]})")
+    }
+    if (mode == "deviceStore32") {
+        if (count != 2) return boundaryFail("deviceStore32 expects two arguments")
+        return boundaryPlain("xtensaDeviceStoreU32(${arguments[0]}, ${arguments[1]})")
+    }
+    if (mode == "memoryBarrier") {
+        if (count != 0) return boundaryFail("memoryBarrier expects no arguments")
+        return boundaryPlain("xtensaMemoryBarrier()")
+    }
+    boundaryFail("unsupported lowering mode: ${mode}")
+}
+
+fun boundaryEnsureImport(source: string, statement: string): string {
+    if (source.contains(statement)) return source
+    rtInsertAfterImports(source, statement + "\n")
+}
+
+class BoundaryLowered(val text: string, val counts: array<int>, val error: string)
+
+private fun boundaryCountIndex(mode: string): int {
+    val modes = boundaryModes()
+    var k = 0
+    while (k < modes.size) {
+        if (modes[k] == mode) return k
+        k += 1
+    }
+    -1
+}
+
+private fun boundaryAlnum(c: int): bool = rtIsAlnum(c) || c >= 128
+
+private fun boundaryError(counts: array<int>, message: string): BoundaryLowered = BoundaryLowered("", counts, message)
+
+fun boundaryLowerSource(source: string): BoundaryLowered {
+    val counts: array<int> = filledArray(boundaryModes().size, 0)
+    var needsNative = false
+    var needsMemory = false
+    val output: array<string> = []
+    var cursor = 0
+    val prefix = "\$xtensa "
+    while (true) {
+        val start = source.indexOf(prefix, cursor)
+        if (start < 0) {
+            output.append(source.slice(cursor, source.size))
+            break
+        }
+        output.append(source.slice(cursor, start))
+        val modeStart = start + prefix.size
+        var modeEnd = modeStart
+        while (modeEnd < source.size && boundaryAlnum(source[modeEnd])) modeEnd += 1
+        val mode = source.slice(modeStart, modeEnd)
+        if (!boundaryLowerable(mode)) {
+            output.append(source.slice(start, modeEnd))
+            cursor = modeEnd
+            continue
+        }
+        val slot = boundaryCountIndex(mode)
+        val opening = rtSkipSpace(source, modeEnd)
+        if (mode == "raiseInterruptLevel" || mode == "trapLoop") {
+            if (opening >= source.size || source[opening] != 123) {
+                return boundaryError(counts, "${mode} does not have a braced operand")
+            }
+            val closing = source.indexOf("}", opening + 1)
+            if (closing < 0) return boundaryError(counts, "unterminated ${mode} operand")
+            val operand = rtStrip(source.slice(opening + 1, closing))
+            if (mode == "raiseInterruptLevel" && (operand == "0" || operand == "3" || operand == "5")) {
+                output.append("xtensaRaiseInterruptLevel${operand}()")
+                counts[slot] += 1
+            } else if (mode == "trapLoop" && operand == "ill") {
+                output.append("xtensaTrapForever()")
+                counts[slot] += 1
+            } else {
+                output.append(source.slice(start, closing + 1))
+            }
+            cursor = closing + 1
+            continue
+        }
+        if (mode == "read") {
+            if (opening >= source.size || source[opening] != 123) {
+                return boundaryError(counts, "read does not have a braced instruction")
+            }
+            val closing = source.indexOf("}", opening + 1)
+            if (closing < 0) return boundaryError(counts, "unterminated read instruction")
+            val replacement = boundaryRegisterRead(rtStrip(source.slice(opening + 1, closing)))
+            if (replacement == "") {
+                output.append(source.slice(start, closing + 1))
+            } else {
+                output.append(replacement)
+                counts[slot] += 1
+            }
+            cursor = closing + 1
+            continue
+        }
+        if (mode == "tlsAddress") {
+            if (opening >= source.size || source[opening] != 123) {
+                return boundaryError(counts, "tlsAddress does not have a braced symbol")
+            }
+            val closing = source.indexOf("}", opening + 1)
+            if (closing < 0) return boundaryError(counts, "unterminated tlsAddress symbol")
+            val symbol = rtStrip(source.slice(opening + 1, closing))
+            val size = boundaryOwnedTlsSize(symbol)
+            if (size < 0) {
+                output.append(source.slice(start, closing + 1))
+            } else {
+                output.append("u32(nativeLinkedThreadLocalAllocate(${size}, \"${symbol}\"))")
+                counts[slot] += 1
+                needsMemory = true
+            }
+            cursor = closing + 1
+            continue
+        }
+        if (opening >= source.size || source[opening] != 40) {
+            return boundaryError(counts, "${mode} does not have a parenthesized call")
+        }
+        val closing = rtMatchingParenthesis(source, opening)
+        if (closing < 0) return boundaryError(counts, "unterminated call at byte ${opening}")
+        val arguments = rtSplitArguments(source.slice(opening + 1, closing))
+        if (mode == "write") {
+            val instructionOpening = rtSkipSpace(source, closing + 1)
+            if (instructionOpening >= source.size || source[instructionOpening] != 123) {
+                return boundaryError(counts, "write does not have a braced instruction")
+            }
+            val instructionClosing = source.indexOf("}", instructionOpening + 1)
+            if (instructionClosing < 0) return boundaryError(counts, "unterminated write instruction")
+            val wrapper = boundaryRegisterWrite(rtStrip(source.slice(instructionOpening + 1, instructionClosing)))
+            if (wrapper == "") {
+                output.append(source.slice(start, instructionClosing + 1))
+            } else {
+                if (arguments.size != 1) return boundaryError(counts, "write expects one value")
+                output.append("${wrapper}(${arguments[0]})")
+                counts[slot] += 1
+            }
+            cursor = instructionClosing + 1
+            continue
+        }
+        val call = boundaryLowerCallImpl(mode, arguments)
+        if (call.error != "") return boundaryError(counts, call.error)
+        output.append(call.text)
+        counts[slot] += 1
+        needsNative = needsNative || call.native
+        needsMemory = needsMemory || call.memory
+        cursor = closing + 1
+    }
+    var lowered = output.join("")
+    if (needsNative) lowered = boundaryEnsureImport(lowered, "import \"abla/unsafe/native\"")
+    if (needsMemory) lowered = boundaryEnsureImport(lowered, "import \"abla/unsafe/memory\"")
+    BoundaryLowered(lowered, counts, "")
+}
+
+fun main: int {
+    val usage = "lower-xtensa-boundaries-to-abla [-h] [--write] paths [paths ...]"
+    val args = rtParseArguments(["--write"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error != "") return rtUsageError("lower-xtensa-boundaries-to-abla", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-xtensa-boundaries-to-abla", usage, "the following arguments are required: paths")
+    }
+    val write = args.has("--write")
+    val modes = boundaryModes()
+    val totals: array<int> = filledArray(modes.size, 0)
+    var changed = 0
+    for (path in rtSourceFiles(args.positionals, false, true)) {
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val lowered = boundaryLowerSource(read.text)
+        if (lowered.error != "") {
+            eprintln("ValueError: ${lowered.error}")
+            return 1
+        }
+        if (lowered.text == read.text) continue
+        changed += 1
+        var k = 0
+        while (k < modes.size) {
+            totals[k] += lowered.counts[k]
+            k += 1
+        }
+        if (write) {
+            val error = rtWrite(path, lowered.text)
+            if (error != "") {
+                eprintln(error)
+                return 1
+            }
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    var sum = 0
+    val details: array<string> = []
+    var k = 0
+    while (k < modes.size) {
+        sum += totals[k]
+        details.append("${modes[k]}=${totals[k]}")
+        k += 1
+    }
+    println("${action} ${sum} boundary calls in ${changed} files")
+    println(details.join(", "))
+    0
+}

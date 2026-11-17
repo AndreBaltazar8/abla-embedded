@@ -1,0 +1,808 @@
+// Replace same-module Xtensa symbol addresses with Abla-owned addresses.
+//
+// Recovered modules retain exact ABI symbol comments and deterministic names for
+// their static data. When an address use and its owner are in the same module,
+// there is no linker boundary: nativeFunctionAddress or the static allocation's
+// ordinary Abla value is both more precise and more optimizable.
+//
+//     tools/abla-tool lower-abla-owned-symbol-addresses [--write]
+//         [--cross-module-functions] [--cross-module-data] [--calls] PATH...
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/crypto"
+import "abla/array"
+import "lib/recovered-text.ab"
+
+// ---- scanners (the regular expressions of the Python tool, written out) ----
+
+// One `// Original [section-local ] ABI symbol: SYMBOL` comment binding to a function name.
+class AbBinding(val symbol: string, val name: string)
+
+// The position after "(" of `(?:\s*//[^\n]*\n|\s*@[A-Za-z_][^\n]*\n)*\s*(?:trusted\s+)?fun\s+IDENT\s*\(` at `at`, name in `out`; -1 if none.
+private fun abFunctionHeaderEnd(text: string, at: int, var out: array<string>): int {
+    var pos = at
+    var scanning = true
+    while (scanning) {
+        val j = rtSkipSpace(text, pos)
+        if (rtAt(text, j, "//")) {
+            val nl = text.indexOf("\n", j)
+            if (nl < 0) scanning = false else pos = nl + 1
+        } else if (j + 1 < text.size && text[j] == 64 && rtIsIdentStart(text[j + 1])) {
+            val nl = text.indexOf("\n", j)
+            if (nl < 0) scanning = false else pos = nl + 1
+        } else {
+            scanning = false
+        }
+    }
+    var j = rtSkipSpace(text, pos)
+    if (rtAt(text, j, "trusted") && j + 7 < text.size && rtIsSpace(text[j + 7])) j = rtSkipSpace(text, j + 7)
+    if (!rtAt(text, j, "fun")) return -1
+    if (j + 3 >= text.size || !rtIsSpace(text[j + 3])) return -1
+    j = rtSkipSpace(text, j + 3)
+    val end = rtIdentEnd(text, j)
+    if (end < 0) return -1
+    val open = rtSkipSpace(text, end)
+    if (open >= text.size || text[open] != 40) return -1
+    out.append(text.slice(j, end))
+    open + 1
+}
+
+// FUNCTION / SECTION_FUNCTION.findall: `label` is the comment prefix. Symbols are returned unstripped.
+fun abFunctionBindings(source: string, label: string): array<AbBinding> {
+    val found: array<AbBinding> = []
+    var at = source.indexOf(label, 0)
+    while (at >= 0) {
+        val q = at + label.size
+        val wsEnd = rtSkipSpace(source, q)
+        var matched = false
+        var end = -1
+        var s = wsEnd
+        var lastTried = -1
+        while (!matched && s >= q) {
+            if (s < source.size && source[s] != 10) {
+                val lineEnd = source.indexOf("\n", s)
+                if (lineEnd >= 0 && lineEnd != lastTried) {
+                    lastTried = lineEnd
+                    val name: array<string> = []
+                    val after = abFunctionHeaderEnd(source, lineEnd + 1, name)
+                    if (after >= 0) {
+                        found.append(AbBinding(source.slice(s, lineEnd), name[0]))
+                        matched = true
+                        end = after
+                    }
+                }
+            }
+            s -= 1
+        }
+        at = if (matched) source.indexOf(label, end) else source.indexOf(label, at + 1)
+    }
+    found
+}
+
+// `#?(?:internal|export)Function\(\s*"IDENT"\s*,\s*"([^"]+)"\s*\)`: (name, symbol) pairs; `onlyInternal` drops `export`.
+class AbInternal(val name: string, val symbol: string)
+
+fun abInternalBindings(source: string, onlyInternal: bool): array<AbInternal> {
+    val found: array<AbInternal> = []
+    var at = source.indexOf("Function(", 0)
+    while (at >= 0) {
+        var next = at + 1
+        val isInternal = at >= 8 && source.slice(at - 8, at) == "internal"
+        val isExport = !onlyInternal && at >= 6 && source.slice(at - 6, at) == "export"
+        if (isInternal || isExport) {
+            var i = rtSkipSpace(source, at + 9)
+            if (rtAt(source, i, "\"")) {
+                val nameStart = i + 1
+                val nameEnd = rtIdentEnd(source, nameStart)
+                if (nameEnd >= 0 && rtAt(source, nameEnd, "\"")) {
+                    i = rtSkipSpace(source, nameEnd + 1)
+                    if (rtAt(source, i, ",")) {
+                        i = rtSkipSpace(source, i + 1)
+                        if (rtAt(source, i, "\"")) {
+                            val symbolStart = i + 1
+                            val quote = source.indexOf("\"", symbolStart)
+                            if (quote > symbolStart) {
+                                i = rtSkipSpace(source, quote + 1)
+                                if (rtAt(source, i, ")")) {
+                                    found.append(AbInternal(source.slice(nameStart, nameEnd), source.slice(symbolStart, quote)))
+                                    next = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        at = source.indexOf("Function(", next)
+    }
+    found
+}
+
+// `\$xtensa\s+(call|callWide)\s+\{\{?\s*([^{}\s]+)\s*\}\}?\s*\(\s*(\)?)`
+class AbCall(val start: int, val end: int, val wide: bool, val symbol: string, val closed: bool)
+
+fun abCallAt(text: string, at: int): AbCall {
+    val none = AbCall(at, -1, false, "", false)
+    if (!rtAt(text, at, "\$xtensa")) return none
+    var i = at + 7
+    if (i >= text.size || !rtIsSpace(text[i])) return none
+    i = rtSkipSpace(text, i)
+    var wide = false
+    if (rtAt(text, i, "callWide") && i + 8 < text.size && rtIsSpace(text[i + 8])) {
+        wide = true
+        i += 8
+    } else if (rtAt(text, i, "call") && i + 4 < text.size && rtIsSpace(text[i + 4])) {
+        i += 4
+    } else {
+        return none
+    }
+    i = rtSkipSpace(text, i)
+    if (i >= text.size || text[i] != 123) return none
+    i += 1
+    if (i < text.size && text[i] == 123) i += 1
+    i = rtSkipSpace(text, i)
+    val symbolStart = i
+    while (i < text.size && text[i] != 123 && text[i] != 125 && !rtIsSpace(text[i])) i += 1
+    if (i == symbolStart) return none
+    val symbolEnd = i
+    i = rtSkipSpace(text, i)
+    if (i >= text.size || text[i] != 125) return none
+    i += 1
+    if (i < text.size && text[i] == 125) i += 1
+    i = rtSkipSpace(text, i)
+    if (i >= text.size || text[i] != 40) return none
+    i += 1
+    i = rtSkipSpace(text, i)
+    var closed = false
+    if (i < text.size && text[i] == 41) {
+        closed = true
+        i += 1
+    }
+    AbCall(at, i, wide, text.slice(symbolStart, symbolEnd), closed)
+}
+
+fun abCalls(text: string): array<AbCall> {
+    val found: array<AbCall> = []
+    var at = text.indexOf("\$xtensa", 0)
+    while (at >= 0) {
+        val m = abCallAt(text, at)
+        if (m.end >= 0) {
+            found.append(m)
+            at = text.indexOf("\$xtensa", m.end)
+        } else {
+            at = text.indexOf("\$xtensa", at + 1)
+        }
+    }
+    found
+}
+
+// The ends of `(?m)^val\s+` names: `(?m)^val\s+(esp32Data_[A-Za-z0-9_]+)\s*=`; every declared name in order.
+fun abDataDeclarations(source: string): array<string> {
+    val names: array<string> = []
+    var cursor = 0
+    var p = 0
+    while (p <= source.size) {
+        if ((p == 0 || source[p - 1] == 10) && p >= cursor && rtAt(source, p, "val") && p + 3 < source.size && rtIsSpace(source[p + 3])) {
+            val i = rtSkipSpace(source, p + 3)
+            if (rtAt(source, i, "esp32Data_")) {
+                var j = i + 10
+                while (j < source.size && rtIsWord(source[j])) j += 1
+                if (j > i + 10) {
+                    val k = rtSkipSpace(source, j)
+                    if (k < source.size && source[k] == 61) {
+                        names.append(source.slice(i, j))
+                        cursor = k + 1
+                    }
+                }
+            }
+        }
+        p += 1
+    }
+    names
+}
+
+// `(?m)^val\s+IDENTIFIER\s*=` anywhere.
+fun abHasDataDeclaration(source: string, identifier: string): bool {
+    var p = 0
+    while (p < source.size) {
+        if (p == 0 || source[p - 1] == 10) {
+            if (rtAt(source, p, "val") && p + 3 < source.size && rtIsSpace(source[p + 3])) {
+                val i = rtSkipSpace(source, p + 3)
+                if (rtAt(source, i, identifier)) {
+                    val k = rtSkipSpace(source, i + identifier.size)
+                    if (k < source.size && source[k] == 61) return true
+                }
+            }
+        }
+        p += 1
+    }
+    false
+}
+
+// DECLARATION.findall: `(?m)^(?:@[A-Za-z_][^\n]*\n)*\s*(?:trusted\s+)?fun\s+IDENT\s*\(`.
+fun abDeclarations(source: string): array<string> {
+    val names: array<string> = []
+    var p = 0
+    var cursor = 0
+    while (p < source.size) {
+        if ((p == 0 || source[p - 1] == 10) && p >= cursor) {
+            var pos = p
+            var scanning = true
+            while (scanning) {
+                if (pos + 1 < source.size && source[pos] == 64 && rtIsIdentStart(source[pos + 1])) {
+                    val nl = source.indexOf("\n", pos)
+                    if (nl < 0) scanning = false else pos = nl + 1
+                } else {
+                    scanning = false
+                }
+            }
+            var j = rtSkipSpace(source, pos)
+            if (rtAt(source, j, "trusted") && j + 7 < source.size && rtIsSpace(source[j + 7])) j = rtSkipSpace(source, j + 7)
+            if (rtAt(source, j, "fun") && j + 3 < source.size && rtIsSpace(source[j + 3])) {
+                j = rtSkipSpace(source, j + 3)
+                val end = rtIdentEnd(source, j)
+                if (end >= 0) {
+                    val open = rtSkipSpace(source, end)
+                    if (open < source.size && source[open] == 40) {
+                        names.append(source.slice(j, end))
+                        cursor = open + 1
+                    }
+                }
+            }
+        }
+        p += 1
+    }
+    names
+}
+
+// `(?m)^import\s+"([^"]+)"\s*$`
+fun abImports(source: string): array<string> {
+    val found: array<string> = []
+    var cursor = 0
+    var p = 0
+    while (p < source.size) {
+        if ((p == 0 || source[p - 1] == 10) && p >= cursor && rtAt(source, p, "import") && p + 6 < source.size && rtIsSpace(source[p + 6])) {
+            val i = rtSkipSpace(source, p + 6)
+            if (rtAt(source, i, "\"")) {
+                val close = source.indexOf("\"", i + 1)
+                if (close > i + 1) {
+                    val runEnd = rtSkipSpace(source, close + 1)
+                    var lastNewline = -1
+                    var k = close + 1
+                    while (k < runEnd) {
+                        if (source[k] == 10) lastNewline = k
+                        k += 1
+                    }
+                    if (lastNewline >= 0 || runEnd == source.size) {
+                        found.append(source.slice(i + 1, close))
+                        cursor = if (lastNewline >= 0) lastNewline else runEnd
+                    }
+                }
+            }
+        }
+        p += 1
+    }
+    found
+}
+
+// ---- names ----
+
+// `re.sub(r"[^A-Za-z0-9]+", "_", value)`, with the result's "_" ends stripped.
+fun abReadable(value: string): string {
+    // Build with explicit indexes so the original characters are kept.
+    val out: array<string> = []
+    var run = false
+    var k = 0
+    while (k < value.size) {
+        val c = value[k]
+        if (rtIsAlnum(c)) {
+            out.append(value.slice(k, k + 1))
+            run = false
+        } else if (!run) {
+            out.append("_")
+            run = true
+        }
+        k += 1
+    }
+    var text = out.join("")
+    var begin = 0
+    var end = text.size
+    while (begin < end && text[begin] == 95) begin += 1
+    while (end > begin && text[end - 1] == 95) end -= 1
+    text.slice(begin, end)
+}
+
+fun abDataIdentifier(symbol: string): string {
+    var readable = abReadable(symbol)
+    if (readable == "" || rtIsDigit(readable[0])) readable = "data_" + readable
+    val digest = hexEncode(sha1(symbol)).slice(0, 10)
+    "esp32Data_${readable}_${digest}"
+}
+
+fun abLocalKey(symbol: string): string {
+    var value = symbol
+    if (value.startsWith(".text.")) value = value.slice(6, value.size)
+    value = value.replace("\$part\$", "_part_")
+    abReadable(value).lowercase()
+}
+
+// True when abLocalKey(bound) ends with "local_KEY" or "local_text_KEY".
+fun abKeyMatches(boundKey: string, key: string): bool =
+    boundKey.endsWith("local_" + key) || boundKey.endsWith("local_text_" + key)
+
+private fun abInsertImports(source: string, imports: array<string>): string {
+    val sorted = sortedStrings(imports)
+    val existing: Map<string, bool> = Map()
+    for (line in rtSplitLines(source, false)) existing.set(line, true)
+    val statements: array<string> = []
+    for (name in sorted) {
+        val statement = "import \"${name}\""
+        if (!existing.has(statement)) statements.append(statement + "\n")
+    }
+    if (statements.size == 0) return source
+    rtInsertAfterImports(source, statements.join(""))
+}
+
+fun abEnsureImports(source: string, imports: Map<string, bool>): string = abInsertImports(source, imports.keys())
+
+// ---- same-module lowering ----
+
+class AbLowered(val text: string, val functions: int, val data: int)
+
+fun abLowerSource(source: string): AbLowered {
+    val functions: Map<string, string> = Map()
+    for (b in abFunctionBindings(source, "// Original ABI symbol:")) functions.set(rtStrip(b.symbol), b.name)
+    for (b in abFunctionBindings(source, "// Original section-local ABI symbol:")) functions.set(rtStrip(b.symbol), b.name)
+    val internals = abInternalBindings(source, false)
+    for (b in internals) functions.set(b.symbol, b.name)
+    val addresses = rtAddresses(source)
+    val symbols: array<string> = []
+    val seenSymbols: Map<string, bool> = Map()
+    for (a in addresses) {
+        if (!seenSymbols.has(a.symbol)) {
+            seenSymbols.set(a.symbol, true)
+            symbols.append(a.symbol)
+        }
+    }
+    // Aliases: the Python tool unpacks (function name, symbol) pairs as (bound, function), so the
+    // candidate it binds is the symbol text of the matching binding.
+    val internalKeys: array<string> = []
+    for (b in internals) internalKeys.append(abLocalKey(b.name))
+    for (symbol in symbols) {
+        if (functions.has(symbol)) continue
+        val key = abLocalKey(symbol)
+        val candidates: Map<string, bool> = Map()
+        var k = 0
+        while (k < internals.size) {
+            if (abKeyMatches(internalKeys[k], key)) candidates.set(internals[k].symbol, true)
+            k += 1
+        }
+        if (candidates.size == 1) functions.set(symbol, candidates.keys()[0])
+    }
+    val data: Map<string, string> = Map()
+    val identifiers: array<string> = []
+    for (name in abDataDeclarations(source)) {
+        if (!name.endsWith("Storage") && !name.endsWith("Initialized")) {
+            var present = false
+            for (existing in identifiers) if (existing == name) present = true
+            if (!present) identifiers.append(name)
+        }
+    }
+    for (symbol in symbols) {
+        val identifier = abDataIdentifier(symbol)
+        if (abHasDataDeclaration(source, identifier)) {
+            data.set(symbol, identifier)
+            continue
+        }
+        val key = abLocalKey(symbol)
+        val needle = key + "_" + key
+        val candidates: Map<string, bool> = Map()
+        for (candidate in identifiers) {
+            val lowered = candidate.lowercase()
+            var at = lowered.indexOf(needle, 0)
+            var hit = false
+            while (at >= 0 && !hit) {
+                val before = at == 0 || lowered[at - 1] == 95
+                val afterIndex = at + needle.size
+                val after = afterIndex == lowered.size || lowered[afterIndex] == 95
+                if (before && after) hit = true else at = lowered.indexOf(needle, at + 1)
+            }
+            if (hit) candidates.set(candidate, true)
+        }
+        if (candidates.size == 1) data.set(symbol, candidates.keys()[0])
+    }
+    var functionCount = 0
+    var dataCount = 0
+    val out: array<string> = []
+    var cursor = 0
+    for (a in addresses) {
+        val function = functions.get(a.symbol)
+        if (function != null) {
+            out.append(source.slice(cursor, a.start))
+            out.append("u32(nativeFunctionAddress(${function}))")
+            cursor = a.end
+            functionCount += 1
+        } else {
+            val value = data.get(a.symbol)
+            if (value != null) {
+                out.append(source.slice(cursor, a.start))
+                out.append(value)
+                cursor = a.end
+                dataCount += 1
+            }
+        }
+    }
+    out.append(source.slice(cursor, source.size))
+    var lowered = out.join("")
+    if (functionCount > 0) {
+        val imports: Map<string, bool> = Map()
+        imports.set("abla/unsafe/native", true)
+        lowered = abEnsureImports(lowered, imports)
+    }
+    AbLowered(lowered, functionCount, dataCount)
+}
+
+// ---- cross-module lowering ----
+
+// The files and their import graph.
+class AbGraph(
+    val edges: Map<string, bool>,
+    val neighbours: Map<string, array<string>>
+)
+
+fun abImportGraph(paths: array<string>): AbGraph {
+    val known: Map<string, string> = Map()
+    for (path in paths) known.set(rtAbsolute(path), path)
+    val graph = AbGraph(Map(), Map())
+    for (path in paths) graph.neighbours.set(path, [])
+    for (path in paths) {
+        val read = rtRead(path)
+        for (imported in abImports(read.text)) {
+            if (!imported.endsWith(".ab")) continue
+            val resolved = if (imported.startsWith("/")) rtNormalize(imported)
+                else rtAbsolute(rtPathParent(path) + "/" + imported)
+            val owner = known.get(resolved)
+            if (owner != null) abAddEdge(graph, path, owner)
+        }
+    }
+    graph
+}
+
+fun abAddEdge(var graph: AbGraph, from: string, to: string): void {
+    val key = from + "\0" + to
+    if (graph.edges.has(key)) return
+    graph.edges.set(key, true)
+    val list = graph.neighbours.get(from)
+    if (list == null) graph.neighbours.set(from, [to]) else list.append(to)
+}
+
+fun abHasEdge(graph: AbGraph, from: string, to: string): bool = graph.edges.has(from + "\0" + to)
+
+fun abReaches(graph: AbGraph, start: string, wanted: string): bool {
+    val pending: array<string> = [start]
+    val seen: Map<string, bool> = Map()
+    while (pending.size > 0) {
+        val current = pending.removeLast()
+        if (current == wanted) return true
+        if (seen.has(current)) continue
+        seen.set(current, true)
+        val next = graph.neighbours.get(current)
+        if (next != null) for (n in next) pending.append(n)
+    }
+    false
+}
+
+private fun abStem(path: string): string {
+    val name = rtPathName(path)
+    val dot = name.lastIndexOf(".")
+    if (dot > 0 && dot < name.size - 1) name.slice(0, dot) else name
+}
+
+class AbCross(val lowered: int, val cycles: int, val linkOwners: int)
+
+fun abCallSpelling(call: AbCall, function: string): string {
+    val mode = if (call.wide) "callAddressWide" else "callAddress"
+    val separator = if (call.closed) "" else ", "
+    "\$xtensa ${mode}(u32(nativeFunctionAddress(${function}))${separator}" + (if (call.closed) ")" else "")
+}
+
+fun abLowerCrossFunctions(paths: array<string>, write: bool, calls: bool): AbCross {
+    val sources: Map<string, string> = Map()
+    for (path in paths) sources.set(path, rtRead(path).text)
+    // function name -> owning file; ambiguous names are dropped.
+    val definitions: Map<string, string> = Map()
+    val ambiguousNames: Map<string, bool> = Map()
+    for (path in paths) {
+        for (name in abDeclarations(sources.get(path) ?? "")) {
+            val previous = definitions.get(name)
+            if (previous != null && previous != path) ambiguousNames.set(name, true) else definitions.set(name, path)
+        }
+    }
+    for (name in ambiguousNames.keys()) definitions.remove(name)
+
+    val symbolName: Map<string, string> = Map()
+    val symbolOwner: Map<string, string> = Map()
+    val ambiguousSymbols: Map<string, bool> = Map()
+    for (path in paths) {
+        val source = sources.get(path) ?? ""
+        val candidateSymbols: array<string> = []
+        val candidateNames: array<string> = []
+        for (b in abFunctionBindings(source, "// Original ABI symbol:")) {
+            candidateSymbols.append(rtStrip(b.symbol))
+            candidateNames.append(b.name)
+        }
+        for (b in abFunctionBindings(source, "// Original section-local ABI symbol:")) {
+            candidateSymbols.append(rtStrip(b.symbol))
+            candidateNames.append(b.name)
+        }
+        for (b in abInternalBindings(source, false)) {
+            candidateSymbols.append(b.symbol)
+            candidateNames.append(b.name)
+        }
+        var k = 0
+        while (k < candidateSymbols.size) {
+            val symbol = candidateSymbols[k]
+            val name = candidateNames[k]
+            val owner = definitions.get(name)
+            if (owner != null) {
+                val previousName = symbolName.get(symbol)
+                val previousOwner = symbolOwner.get(symbol)
+                if (previousName != null && (previousName != name || previousOwner != owner)) {
+                    ambiguousSymbols.set(symbol, true)
+                } else {
+                    symbolName.set(symbol, name)
+                    symbolOwner.set(symbol, owner)
+                }
+            }
+            k += 1
+        }
+    }
+    for (symbol in ambiguousSymbols.keys()) {
+        symbolName.remove(symbol)
+        symbolOwner.remove(symbol)
+    }
+
+    // The same exact-suffix rule within one module applies to callbacks owned by another module.
+    val bindingKeys: array<string> = []
+    val bindingNames: array<string> = []
+    val bindingOwners: array<string> = []
+    for (path in paths) {
+        val source = sources.get(path) ?? ""
+        for (b in abInternalBindings(source, false)) {
+            val owner = definitions.get(b.name)
+            if (owner != null) {
+                bindingKeys.append(abLocalKey(b.symbol))
+                bindingNames.append(b.name)
+                bindingOwners.append(owner)
+            }
+        }
+        for (b in abFunctionBindings(source, "// Original section-local ABI symbol:")) {
+            val owner = definitions.get(b.name)
+            if (owner != null) {
+                bindingKeys.append(abLocalKey(rtStrip(b.symbol)))
+                bindingNames.append(b.name)
+                bindingOwners.append(owner)
+            }
+        }
+    }
+    val internalFunctions: Map<string, bool> = Map()
+    for (path in paths) {
+        for (b in abInternalBindings(sources.get(path) ?? "", true)) internalFunctions.set(b.name, true)
+    }
+    for (path in paths) {
+        val source = sources.get(path) ?? ""
+        val wanted: array<string> = []
+        for (a in rtAddresses(source)) wanted.append(a.symbol)
+        if (calls) for (c in abCalls(source)) wanted.append(c.symbol)
+        for (symbol in wanted) {
+            if (symbolName.has(symbol)) continue
+            val key = abLocalKey(symbol)
+            val candidates: Map<string, bool> = Map()
+            var first = -1
+            var k = 0
+            while (k < bindingKeys.size) {
+                if (abKeyMatches(bindingKeys[k], key)) {
+                    val id = bindingNames[k] + "\0" + bindingOwners[k]
+                    if (!candidates.has(id)) {
+                        candidates.set(id, true)
+                        first = k
+                    }
+                }
+                k += 1
+            }
+            if (candidates.size == 1) {
+                symbolName.set(symbol, bindingNames[first])
+                symbolOwner.set(symbol, bindingOwners[first])
+            }
+        }
+    }
+
+    val graph = abImportGraph(paths)
+    var loweredCount = 0
+    var cycleCount = 0
+    var linkOwnerCount = 0
+    for (path in paths) {
+        val source = sources.get(path) ?? ""
+        val imports: Map<string, bool> = Map()
+        var needsNative = false
+        // Both passes in one: ADDRESS over the source, then CALL over its result.
+        var current = source
+        var pass = 0
+        while (pass < (if (calls) 2 else 1)) {
+            val out: array<string> = []
+            var cursor = 0
+            val addressMatches = if (pass == 0) rtAddresses(current) else []
+            val callMatches = if (pass == 1) abCalls(current) else []
+            val count = if (pass == 0) addressMatches.size else callMatches.size
+            var m = 0
+            while (m < count) {
+                val isCall = pass == 1
+                val start = if (isCall) callMatches[m].start else addressMatches[m].start
+                val end = if (isCall) callMatches[m].end else addressMatches[m].end
+                val symbol = if (isCall) callMatches[m].symbol else addressMatches[m].symbol
+                m += 1
+                val function = symbolName.get(symbol)
+                val owner = symbolOwner.get(symbol)
+                if (function == null || owner == null) continue
+                // Calls are lowered only for functions that keep a link name just for assembly
+                // (internalFunction): a global one is followed by the linker through its real relocation.
+                if (isCall && !internalFunctions.has(function)) continue
+                var replacement = ""
+                if (isCall) replacement = abCallSpelling(callMatches[m - 1], function)
+                else replacement = "u32(nativeFunctionAddress(${function}))"
+                var lower = false
+                if (owner == path) {
+                    loweredCount += 1
+                    needsNative = true
+                    lower = true
+                } else if (abStem(owner).contains("_link")) {
+                    // Importing a compatibility link-selector would retain precisely the public ABI root
+                    // this conversion is intended to eliminate.
+                    linkOwnerCount += 1
+                } else if (abReaches(graph, owner, path)) {
+                    cycleCount += 1
+                } else {
+                    abAddEdge(graph, path, owner)
+                    imports.set(rtRelativeImport(path, owner), true)
+                    loweredCount += 1
+                    needsNative = true
+                    lower = true
+                }
+                if (lower) {
+                    out.append(current.slice(cursor, start))
+                    out.append(replacement)
+                    cursor = end
+                }
+            }
+            out.append(current.slice(cursor, current.size))
+            current = out.join("")
+            pass += 1
+        }
+        var lowered = current
+        if (needsNative) {
+            imports.set("abla/unsafe/native", true)
+            lowered = abEnsureImports(lowered, imports)
+        }
+        if (lowered != source && write) {
+            val error = rtWrite(path, lowered)
+            if (error != "") {
+                eprintln(error)
+            }
+        }
+    }
+    AbCross(loweredCount, cycleCount, linkOwnerCount)
+}
+
+class AbCrossData(val lowered: int, val cycles: int)
+
+fun abLowerCrossData(paths: array<string>, write: bool): AbCrossData {
+    val sources: Map<string, string> = Map()
+    for (path in paths) sources.set(path, rtRead(path).text)
+    val declarations: Map<string, string> = Map()
+    val ambiguous: Map<string, bool> = Map()
+    for (path in paths) {
+        for (identifier in abDataDeclarations(sources.get(path) ?? "")) {
+            val previous = declarations.get(identifier)
+            if (previous != null && previous != path) ambiguous.set(identifier, true) else declarations.set(identifier, path)
+        }
+    }
+    for (identifier in ambiguous.keys()) declarations.remove(identifier)
+    val symbolIdentifier: Map<string, string> = Map()
+    val symbolOwner: Map<string, string> = Map()
+    for (path in paths) {
+        for (a in rtAddresses(sources.get(path) ?? "")) {
+            val identifier = abDataIdentifier(a.symbol)
+            val owner = declarations.get(identifier)
+            if (owner != null) {
+                symbolIdentifier.set(a.symbol, identifier)
+                symbolOwner.set(a.symbol, owner)
+            }
+        }
+    }
+    val graph = abImportGraph(paths)
+    var loweredCount = 0
+    var cycleCount = 0
+    for (path in paths) {
+        val source = sources.get(path) ?? ""
+        val imports: Map<string, bool> = Map()
+        val out: array<string> = []
+        var cursor = 0
+        for (a in rtAddresses(source)) {
+            val identifier = symbolIdentifier.get(a.symbol)
+            val owner = symbolOwner.get(a.symbol)
+            if (identifier == null || owner == null) continue
+            if (owner != path) {
+                // An already imported owner adds no dependency edge.
+                if (!abHasEdge(graph, path, owner) && abReaches(graph, owner, path)) {
+                    cycleCount += 1
+                    continue
+                }
+                abAddEdge(graph, path, owner)
+                imports.set(rtRelativeImport(path, owner), true)
+            }
+            loweredCount += 1
+            out.append(source.slice(cursor, a.start))
+            out.append(identifier)
+            cursor = a.end
+        }
+        out.append(source.slice(cursor, source.size))
+        var lowered = out.join("")
+        if (imports.size > 0) lowered = abEnsureImports(lowered, imports)
+        if (lowered != source && write) {
+            val error = rtWrite(path, lowered)
+            if (error != "") {
+                eprintln(error)
+            }
+        }
+    }
+    AbCrossData(loweredCount, cycleCount)
+}
+
+fun main: int {
+    val usage = "lower-abla-owned-symbol-addresses [-h] [--write] [--cross-module-functions] [--cross-module-data] [--calls] paths [paths ...]"
+    val args = rtParseArguments(["--write", "--cross-module-functions", "--cross-module-data", "--calls"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error != "") return rtUsageError("lower-abla-owned-symbol-addresses", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-abla-owned-symbol-addresses", usage, "the following arguments are required: paths")
+    }
+    val write = args.has("--write")
+    val paths = rtSourceFiles(args.positionals, false, true)
+    var functions = 0
+    var data = 0
+    var changed = 0
+    for (path in paths) {
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val lowered = abLowerSource(read.text)
+        if (lowered.text == read.text) continue
+        changed += 1
+        functions += lowered.functions
+        data += lowered.data
+        if (write) {
+            val error = rtWrite(path, lowered.text)
+            if (error != "") {
+                eprintln(error)
+                return 1
+            }
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("${action} ${functions} function and ${data} data addresses in ${changed} files")
+    if (args.has("--cross-module-functions")) {
+        val cross = abLowerCrossFunctions(paths, write, args.has("--calls"))
+        println("${action} ${cross.lowered} cross-module function addresses; skipped cycles=${cross.cycles}, link-selector owners=${cross.linkOwners}")
+    }
+    if (args.has("--cross-module-data")) {
+        val cross = abLowerCrossData(paths, write)
+        println("${action} ${cross.lowered} cross-module data addresses; skipped cycles=${cross.cycles}")
+    }
+    0
+}
