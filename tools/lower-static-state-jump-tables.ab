@@ -1,0 +1,205 @@
+// Lower recovered static u32 state tables to pure Abla `when` flow.
+//
+//     tools/abla-tool lower-static-state-jump-tables [--write] PATH...
+import "abla/io"
+import "abla/regex"
+import "abla/text"
+import "abla/process/exit"
+import "lib/recovered-text.ab"
+
+private fun sjCompile(pattern: string): Regex {
+    val result = regexCompile(pattern)
+    if (!result.succeeded) panic("bad pattern ${pattern}: ${result.error.message}")
+    result.regex
+}
+
+// BASE: rN = esp32Data_...   (the table).  INDEX: rA = (rS << u32(2)) + rB.  LOAD / JUMP follow.
+val sjBase = sjCompile("^(\\s*)(r[0-9]+) = (esp32Data_[A-Za-z0-9_]+)$")
+val sjIndex = sjCompile("^(\\s*)(r[0-9]+) = \\((r[0-9]+) << u32\\(2\\)\\) \\+ (r[0-9]+)$")
+val sjLoad = sjCompile("^(\\s*)(r[0-9]+) = u32\\(ablaUnsafeLoadU32\\(nativePointerFromAddress\\(int\\((r[0-9]+)\\)\\)\\)\\)$")
+val sjJump = sjCompile("^(\\s*)programCounter = int\\((r[0-9]+)\\)$")
+
+class StateTables(val names: array<string>, val values: array<array<int>>)
+
+fun sjGroup(m: RegexMatch?, index: int): string {
+    if (m == null) return ""
+    val g = m.group(index)
+    if (g == null) "" else g
+}
+
+/** Little-endian u32 words of the \xHH escapes in a nativeStaticBytes(...) body. */
+fun sjWords(body: string): array<int> {
+    val bytes: array<int> = []
+    var i = 0
+    while (i + 3 < body.size) {
+        if (body[i] == 92 && body[i + 1] == 120) {
+            val high = sjHex(body[i + 2])
+            val low = sjHex(body[i + 3])
+            if (high >= 0 && low >= 0) {
+                bytes.append(high * 16 + low)
+                i += 4
+                continue
+            }
+        }
+        i += 1
+    }
+    val words: array<int> = []
+    var offset = 0
+    while (offset + 3 < bytes.size) {
+        words.append(bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24))
+        offset += 4
+    }
+    words
+}
+
+fun sjHex(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 65 && c <= 70) return c - 55
+    if (c >= 97 && c <= 102) return c - 87
+    -1
+}
+
+/**
+ * `val esp32Data_XStorage = nativeStaticBytes(BODY\n)\nval esp32Data_XInitialized =`: the tables
+ * of one source, in order of appearance (a later table of the same name replaces an earlier one).
+ */
+fun sjTables(source: string): StateTables {
+    val names: array<string> = []
+    val values: array<array<int>> = []
+    val prefix = "val esp32Data_"
+    var at = source.indexOf(prefix, 0)
+    while (at >= 0) {
+        var next = at + 1
+        val runStart = at + prefix.size
+        var j = runStart
+        while (j < source.size && rtIsWord(source[j])) j += 1
+        // The run before " = " must be a base (one or more characters) followed by "Storage".
+        if (j - runStart >= 8 && source.slice(j - 7, j) == "Storage" && rtAt(source, j, " = nativeStaticBytes(")) {
+            val base = "esp32Data_" + source.slice(runStart, j - 7)
+            val bodyStart = j + 21
+            val terminator = "\n)\nval ${base}Initialized ="
+            val end = source.indexOf(terminator, bodyStart)
+            if (end >= 0) {
+                val words = sjWords(source.slice(bodyStart, end))
+                var boundary = 0
+                while (boundary < words.size && words[boundary] < 4096) boundary += 1
+                if (boundary > 0) {
+                    val kept: array<int> = []
+                    var k = 0
+                    while (k < boundary) {
+                        kept.append(words[k])
+                        k += 1
+                    }
+                    var slot = -1
+                    k = 0
+                    while (k < names.size) {
+                        if (names[k] == base) slot = k
+                        k += 1
+                    }
+                    if (slot >= 0) {
+                        values[slot] = kept
+                    } else {
+                        names.append(base)
+                        values.append(kept)
+                    }
+                }
+                next = end + terminator.size
+            }
+        }
+        at = source.indexOf(prefix, next)
+    }
+    StateTables(names, values)
+}
+
+class JumpLowered(val text: string, val count: int)
+
+fun sjTransform(source: string): JumpLowered {
+    val available = sjTables(source)
+    val lines = rtSplitLines(source, true)
+    val output: array<string> = []
+    var lowered = 0
+    var index = 0
+    while (index < lines.size) {
+        val first = sjFullLine(sjBase, lines[index])
+        var slot = -1
+        if (first != null) {
+            var k = 0
+            while (k < available.names.size) {
+                if (available.names[k] == sjGroup(first, 3)) slot = k
+                k += 1
+            }
+        }
+        if (first == null || slot < 0 || index + 3 >= lines.size) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val second = sjFullLine(sjIndex, lines[index + 1])
+        val third = sjFullLine(sjLoad, lines[index + 2])
+        val fourth = sjFullLine(sjJump, lines[index + 3])
+        if (second == null || third == null || fourth == null ||
+            sjGroup(second, 1) != sjGroup(first, 1) || sjGroup(third, 1) != sjGroup(first, 1) ||
+            sjGroup(fourth, 1) != sjGroup(first, 1) || sjGroup(second, 4) != sjGroup(first, 2) ||
+            sjGroup(third, 3) != sjGroup(second, 2) || sjGroup(fourth, 2) != sjGroup(third, 2)) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val indent = sjGroup(first, 1)
+        output.append("${indent}programCounter = when (${sjGroup(second, 3)}) {\n")
+        var selector = 0
+        for (target in available.values[slot]) {
+            output.append("${indent}    ${selector} -> ${target}\n")
+            selector += 1
+        }
+        output.append("${indent}    else -> -1\n${indent}}\n")
+        lowered += 1
+        index += 4
+    }
+    JumpLowered(output.join(""), lowered)
+}
+
+/** fullmatch of a line with its "\n" removed (`lines[i].rstrip("\n")`). */
+fun sjFullLine(re: Regex, line: string): RegexMatch? {
+    var text = line
+    while (text.endsWith("\n")) text = text.slice(0, text.size - 1)
+    re.find(text, 0)
+}
+
+fun main: int {
+    val usage = "lower-static-state-jump-tables [-h] [--write] paths [paths ...]"
+    val args = rtParseArguments(["--write"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error != "") return rtUsageError("lower-static-state-jump-tables", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-static-state-jump-tables", usage, "the following arguments are required: paths")
+    }
+    val write = args.has("--write")
+    var count = 0
+    var changed = 0
+    for (path in rtSourceFiles(args.positionals, true, false)) {
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = sjTransform(read.text)
+        if (result.count > 0) {
+            println("${path}: ${result.count}")
+            count += result.count
+            changed += 1
+            if (write) {
+                val error = rtWrite(path, result.text)
+                if (error != "") {
+                    eprintln(error)
+                    return 1
+                }
+            }
+        }
+    }
+    println("${if (write) "lowered" else "would lower"} ${count} table jump(s) across ${changed} file(s)")
+    0
+}

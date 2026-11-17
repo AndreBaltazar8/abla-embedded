@@ -1,0 +1,558 @@
+// Helpers shared by the tools/lower-* text transformers of the recovery pipeline.
+//
+// These programs were Python scripts working on whole recovered .ab sources; the
+// helpers keep the few Python behaviours they relied on: str.strip and re's \s
+// (ASCII whitespace plus the 0x1c-0x1f separators), str.splitlines, universal
+// newlines on read, Path.rglob("*.ab") in sorted order, pathlib's lexical path
+// spelling, and a small argparse-like command line parser.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+
+fun rtIsSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13) || (c >= 28 && c <= 31)
+fun rtIsDigit(c: int): bool = c >= 48 && c <= 57
+fun rtIsAlpha(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+fun rtIsAlnum(c: int): bool = rtIsAlpha(c) || rtIsDigit(c)
+fun rtIsWord(c: int): bool = rtIsAlnum(c) || c == 95
+fun rtIsIdentStart(c: int): bool = rtIsAlpha(c) || c == 95
+
+/** The first index at or after `from` that is not whitespace (the length at the end). */
+fun rtSkipSpace(text: string, from: int): int {
+    var i = from
+    while (i < text.size && rtIsSpace(text[i])) i += 1
+    i
+}
+
+/** True when `literal` is the text at index `at`. */
+fun rtAt(text: string, at: int, literal: string): bool {
+    if (at < 0 || at + literal.size > text.size) return false
+    var k = 0
+    while (k < literal.size) {
+        if (text[at + k] != literal[k]) return false
+        k += 1
+    }
+    true
+}
+
+/** The end of the identifier ([A-Za-z_][A-Za-z0-9_]*) starting at `at`, or -1 when there is none. */
+fun rtIdentEnd(text: string, at: int): int {
+    if (at >= text.size || !rtIsIdentStart(text[at])) return -1
+    var i = at + 1
+    while (i < text.size && rtIsWord(text[i])) i += 1
+    i
+}
+
+/** str.strip(). */
+fun rtStrip(text: string): string {
+    var begin = 0
+    var end = text.size
+    while (begin < end && rtIsSpace(text[begin])) begin += 1
+    while (end > begin && rtIsSpace(text[end - 1])) end -= 1
+    if (begin == 0 && end == text.size) text else text.slice(begin, end)
+}
+
+/** str.splitlines(keepends) for the ASCII line boundaries \n, \r, \r\n, \v, \f and 0x1c-0x1e. */
+fun rtSplitLines(text: string, keepEnds: bool): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var i = 0
+    while (i < text.size) {
+        val c = text[i]
+        if (c == 10 || c == 13 || c == 11 || c == 12 || (c >= 28 && c <= 30)) {
+            var next = i + 1
+            if (c == 13 && next < text.size && text[next] == 10) next += 1
+            lines.append(text.slice(begin, if (keepEnds) next else i))
+            begin = next
+            i = next
+        } else {
+            i += 1
+        }
+    }
+    if (begin < text.size) lines.append(text.slice(begin, text.size))
+    lines
+}
+
+/** The line starts of `text` split at \n only (what re's MULTILINE ^ sees), ends kept. */
+fun rtSplitNewlines(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var i = text.indexOf("\n", 0)
+    while (i >= 0) {
+        lines.append(text.slice(begin, i + 1))
+        begin = i + 1
+        i = text.indexOf("\n", begin)
+    }
+    if (begin < text.size) lines.append(text.slice(begin, text.size))
+    lines
+}
+
+/** "\n" when the text ends with one, as the tools re-add it after "\n".join(lines). */
+fun rtTrailingNewline(text: string): string = if (text.endsWith("\n")) "\n" else ""
+
+class RtRead(val text: string, val error: string)
+
+/** Path.read_text(): universal newlines (\r\n and \r become \n). */
+fun rtRead(path: string): RtRead {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded) return RtRead("", "cannot read ${path}")
+    var text = result.text
+    if (text.indexOf("\r", 0) >= 0) text = text.replace("\r\n", "\n").replace("\r", "\n")
+    RtRead(text, "")
+}
+
+/** Path.write_text(). Returns an error message, "" on success. */
+fun rtWrite(path: string, text: string): string =
+    if (Path(path).writeText(text)) "" else "cannot write ${path}"
+
+// ---- paths (pathlib's lexical spelling) ----
+
+/** str(Path(value)): duplicate slashes, "." components and a trailing slash dropped. */
+fun rtPathText(value: string): string {
+    val absolute = value.startsWith("/")
+    val parts: array<string> = []
+    for (part in value.split("/")) {
+        if (part != "" && part != ".") parts.append(part)
+    }
+    // pathlib keeps exactly two leading slashes ("//x") and collapses three or more.
+    var prefix = ""
+    if (absolute) {
+        prefix = "/"
+        if (value.startsWith("//") && !value.startsWith("///")) prefix = "//"
+    }
+    if (parts.size == 0) return if (absolute) prefix else "."
+    prefix + parts.join("/")
+}
+
+fun rtPathJoin(directory: string, name: string): string =
+    if (directory == "." ) name else if (directory.endsWith("/")) directory + name else directory + "/" + name
+
+fun rtPathName(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash < 0) path else path.slice(slash + 1, path.size)
+}
+
+fun rtPathParent(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash < 0) return "."
+    if (slash == 0) return "/"
+    path.slice(0, slash)
+}
+
+/** Path.suffix. */
+fun rtPathSuffix(path: string): string {
+    val name = rtPathName(path)
+    val dot = name.lastIndexOf(".")
+    if (dot > 0 && dot < name.size - 1) name.slice(dot, name.size) else ""
+}
+
+fun rtIsDirectory(path: string): bool = Path(path).info().isDirectory()
+
+/** Lexical normalization (a/./b/../c -> a/c); leading ".." of a relative path are kept. */
+fun rtNormalize(path: string): string {
+    val absolute = path.startsWith("/")
+    val parts: array<string> = []
+    for (part in path.split("/")) {
+        if (part == "" || part == ".") continue
+        if (part == "..") {
+            if (parts.size > 0 && parts[parts.size - 1] != "..") {
+                parts.truncate(parts.size - 1)
+            } else if (!absolute) {
+                parts.append("..")
+            }
+            continue
+        }
+        parts.append(part)
+    }
+    val joined = parts.join("/")
+    if (absolute) "/" + joined else if (joined == "") "." else joined
+}
+
+/** os.path.abspath: relative paths are taken from the current directory. */
+fun rtAbsolute(path: string): string =
+    if (path.startsWith("/")) rtNormalize(path) else rtNormalize(currentDirectory().text + "/" + path)
+
+/** os.path.relpath(target, start). */
+fun rtRelativePath(target: string, start: string): string {
+    val to = rtAbsolute(target)
+    val from = rtAbsolute(start)
+    val toParts: array<string> = if (to == ".") [] else to.split("/")
+    val fromParts: array<string> = if (from == ".") [] else from.split("/")
+    var common = 0
+    while (common < toParts.size && common < fromParts.size && toParts[common] == fromParts[common]) common += 1
+    val parts: array<string> = []
+    var k = common
+    while (k < fromParts.size) {
+        parts.append("..")
+        k += 1
+    }
+    k = common
+    while (k < toParts.size) {
+        parts.append(toParts[k])
+        k += 1
+    }
+    if (parts.size == 0) "." else parts.join("/")
+}
+
+/** The import spelling the tools use: relpath, "./" prefixed unless it starts with ".", then
+ *  PurePath(...).as_posix(), which drops the "./" again. */
+fun rtRelativeImport(caller: string, owner: string): string {
+    var value = rtRelativePath(owner, rtPathParent(caller))
+    if (!value.startsWith(".")) value = "./" + value
+    rtPathText(value)
+}
+
+// Paths compare component-wise, so a/b sorts before a-b/c although "-" < "/".
+private fun rtSortKey(path: string): string = path.split("/").join("\0")
+
+fun rtSortPaths(paths: array<string>): array<string> {
+    val keys: array<string> = []
+    for (path in paths) keys.append(rtSortKey(path))
+    val sorted = sortedStrings(keys)
+    val result: array<string> = []
+    for (key in sorted) result.append(key.split("\0").join("/"))
+    result
+}
+
+private fun rtGlobAb(directory: string, var found: array<string>): void {
+    for (entry in Path(directory).entries()) {
+        val child = rtPathJoin(directory, rtPathName(entry.text))
+        if (child.endsWith(".ab")) found.append(child)
+        if (rtIsDirectory(child)) rtGlobAb(child, found)
+    }
+}
+
+/** sorted(Path(directory).rglob("*.ab")) */
+fun rtRglobAb(directory: string): array<string> {
+    val found: array<string> = []
+    rtGlobAb(directory, found)
+    rtSortPaths(found)
+}
+
+/** The tools' input listing: a directory contributes its sorted *.ab files, a file argument
+ *  itself (only a .ab one unless `anyFile`). */
+fun rtSourceFiles(arguments: array<string>, anyFile: bool, unique: bool): array<string> {
+    val files: array<string> = []
+    for (argument in arguments) {
+        val path = rtPathText(argument)
+        if (rtIsDirectory(path)) {
+            for (file in rtRglobAb(path)) files.append(file)
+        } else if (anyFile || rtPathSuffix(path) == ".ab") {
+            files.append(path)
+        }
+    }
+    if (!unique) return files
+    val seen: Map<string, bool> = Map()
+    val result: array<string> = []
+    for (file in files) {
+        if (!seen.has(file)) {
+            seen.set(file, true)
+            result.append(file)
+        }
+    }
+    result
+}
+
+// ---- sources ----
+
+/** Insert `text` after the leading run of `import ` lines. */
+fun rtInsertAfterImports(source: string, text: string): string {
+    val lines = rtSplitLines(source, true)
+    var insertion = 0
+    while (insertion < lines.size && lines[insertion].startsWith("import ")) insertion += 1
+    val out: array<string> = []
+    var k = 0
+    while (k < lines.size) {
+        if (k == insertion) out.append(text)
+        out.append(lines[k])
+        k += 1
+    }
+    if (insertion >= lines.size) out.append(text)
+    out.join("")
+}
+
+/** The index of the bracket matching the "(" at `opening` (quotes and escapes respected), or -1. */
+fun rtMatchingParenthesis(source: string, opening: int): int {
+    var depth = 0
+    var quote = 0
+    var escaped = false
+    var index = opening
+    while (index < source.size) {
+        val c = source[index]
+        if (quote != 0) {
+            if (escaped) escaped = false
+            else if (c == 92) escaped = true
+            else if (c == quote) quote = 0
+        } else if (c == 34 || c == 39) {
+            quote = c
+        } else if (c == 40) {
+            depth += 1
+        } else if (c == 41) {
+            depth -= 1
+            if (depth == 0) return index
+        }
+        index += 1
+    }
+    -1
+}
+
+/** Split call arguments at top-level commas, each stripped; [] for blank text. */
+fun rtSplitArguments(source: string): array<string> {
+    val result: array<string> = []
+    if (rtStrip(source) == "") return result
+    var start = 0
+    var round = 0
+    var square = 0
+    var brace = 0
+    var quote = 0
+    var escaped = false
+    var index = 0
+    while (index < source.size) {
+        val c = source[index]
+        if (quote != 0) {
+            if (escaped) escaped = false
+            else if (c == 92) escaped = true
+            else if (c == quote) quote = 0
+        } else if (c == 34 || c == 39) {
+            quote = c
+        } else if (c == 40) {
+            round += 1
+        } else if (c == 41) {
+            round -= 1
+        } else if (c == 91) {
+            square += 1
+        } else if (c == 93) {
+            square -= 1
+        } else if (c == 123) {
+            brace += 1
+        } else if (c == 125) {
+            brace -= 1
+        } else if (c == 44 && round == 0 && square == 0 && brace == 0) {
+            result.append(rtStrip(source.slice(start, index)))
+            start = index + 1
+        }
+        index += 1
+    }
+    result.append(rtStrip(source.slice(start, source.size)))
+    result
+}
+
+/** A decimal number of digits only, saturating at 2^62; -1 when `text` is empty or not digits. */
+fun rtParseDecimal(text: string): int {
+    if (text.size == 0) return -1
+    var value = 0
+    for (c in text) {
+        if (!rtIsDigit(c)) return -1
+        if (value < 460000000000000000) value = value * 10 + c - 48
+    }
+    value
+}
+
+/** The two-digit lower-case hex spelling of a byte. */
+fun rtHexByte(value: int): string {
+    val digits = "0123456789abcdef"
+    digits.slice((value >> 4) & 15, ((value >> 4) & 15) + 1) + digits.slice(value & 15, (value & 15) + 1)
+}
+
+/** `"\x..\x.."` chunks of 32 bytes: the literal spelling of the Python `abla_bytes` helpers. */
+fun rtByteLiterals(value: string): array<string> {
+    val chunks: array<string> = []
+    var offset = 0
+    while (offset < value.size) {
+        val end = if (offset + 32 < value.size) offset + 32 else value.size
+        val parts: array<string> = ["\""]
+        var k = offset
+        while (k < end) {
+            parts.append("\\x")
+            parts.append(rtHexByte(value[k]))
+            k += 1
+        }
+        parts.append("\"")
+        chunks.append(parts.join(""))
+        offset += 32
+    }
+    chunks
+}
+
+// ---- command line (a small argparse) ----
+
+/**
+ * Parsed arguments. `names`/`values` list the options that were given, in order (a flag has the
+ * value ""); `positionals` are the remaining arguments. `error` is a usage error message.
+ */
+class RtArgs(
+    val names: array<string>,
+    val values: array<string>,
+    val positionals: array<string>,
+    val error: string,
+    val help: bool
+) {
+    fun has(name: string): bool {
+        for (given in this.names) if (given == name) return true
+        false
+    }
+    /** The last value given for `name`, or `fallback`. */
+    fun value(name: string, fallback: string): string {
+        var result = fallback
+        var k = 0
+        while (k < this.names.size) {
+            if (this.names[k] == name) result = this.values[k]
+            k += 1
+        }
+        result
+    }
+}
+
+private fun rtArgsFail(message: string): RtArgs = RtArgs([], [], [], message, false)
+
+private fun rtLooksLikeOption(text: string): bool {
+    if (text.size < 2 || text[0] != 45) return false
+    if (rtIsDigit(text[1]) || text[1] == 46) return false
+    !text.contains(" ")
+}
+
+/**
+ * Parse the process arguments. `flags` are options without a value, `valued` take one value. Long
+ * options may be abbreviated to a unique prefix and written `--name=value`; `--` ends the options.
+ */
+fun rtParseArguments(flags: array<string>, valued: array<string>): RtArgs {
+    val names: array<string> = []
+    val values: array<string> = []
+    val positionals: array<string> = []
+    val unknown: array<string> = []
+    var optionsEnded = false
+    var help = false
+    var index = 0
+    val count = processArgumentCount()
+    while (index < count) {
+        val argument = processArgument(index)
+        index += 1
+        if (optionsEnded || !rtLooksLikeOption(argument)) {
+            positionals.append(argument)
+        } else if (argument == "--") {
+            optionsEnded = true
+        } else if (argument == "-h" || argument == "--help") {
+            help = true
+        } else if (argument.startsWith("--")) {
+            var name = argument
+            var attached = ""
+            var hasAttached = false
+            val equals = argument.indexOf("=", 0)
+            if (equals >= 0) {
+                name = argument.slice(0, equals)
+                attached = argument.slice(equals + 1, argument.size)
+                hasAttached = true
+            }
+            var resolved = ""
+            var matches = 0
+            var exact = false
+            for (candidate in flags) {
+                if (candidate == name) { resolved = candidate; exact = true }
+            }
+            for (candidate in valued) {
+                if (candidate == name) { resolved = candidate; exact = true }
+            }
+            if (!exact) {
+                for (candidate in flags) {
+                    if (candidate.startsWith(name)) { resolved = candidate; matches += 1 }
+                }
+                for (candidate in valued) {
+                    if (candidate.startsWith(name)) { resolved = candidate; matches += 1 }
+                }
+                if (matches > 1) return rtArgsFail("ambiguous option: ${name}")
+                if (matches == 0) resolved = ""
+            }
+            if (resolved == "") {
+                unknown.append(argument)
+            } else {
+                var takesValue = false
+                for (candidate in valued) if (candidate == resolved) takesValue = true
+                if (takesValue) {
+                    if (hasAttached) {
+                        names.append(resolved)
+                        values.append(attached)
+                    } else if (index < count && !rtLooksLikeOption(processArgument(index))) {
+                        names.append(resolved)
+                        values.append(processArgument(index))
+                        index += 1
+                    } else {
+                        return rtArgsFail("argument ${resolved}: expected one argument")
+                    }
+                } else if (hasAttached) {
+                    return rtArgsFail("argument ${resolved}: ignored explicit argument '${attached}'")
+                } else {
+                    names.append(resolved)
+                    values.append("")
+                }
+            }
+        } else {
+            unknown.append(argument)
+        }
+    }
+    RtArgs(names, values, positionals, if (unknown.size > 0) "unrecognized arguments: ${unknown.join(" ")}" else "", help)
+}
+
+/** Print an argparse-style usage error and return exit status 2. */
+fun rtUsageError(program: string, usage: string, message: string): int {
+    eprintln("usage: ${usage}")
+    eprintln("${program}: error: ${message}")
+    2
+}
+
+// ---- `$xtensa address {symbol}` ----
+
+/** A match of `\$xtensa\s+address\s+\{\{?\s*([^{}\s]+)\s*\}\}?`: `end` is -1 when there is none. */
+class RtAddress(val start: int, val end: int, val symbol: string)
+
+/** Try the pattern at exactly `at` (which must be the `$` of `$xtensa`). */
+fun rtAddressAt(text: string, at: int): RtAddress {
+    val none = RtAddress(at, -1, "")
+    if (!rtAt(text, at, "\$xtensa")) return none
+    var i = at + 7
+    if (i >= text.size || !rtIsSpace(text[i])) return none
+    i = rtSkipSpace(text, i)
+    if (!rtAt(text, i, "address")) return none
+    i += 7
+    if (i >= text.size || !rtIsSpace(text[i])) return none
+    i = rtSkipSpace(text, i)
+    if (i >= text.size || text[i] != 123) return none
+    i += 1
+    if (i < text.size && text[i] == 123) i += 1
+    i = rtSkipSpace(text, i)
+    val symbolStart = i
+    while (i < text.size && text[i] != 123 && text[i] != 125 && !rtIsSpace(text[i])) i += 1
+    if (i == symbolStart) return none
+    val symbolEnd = i
+    i = rtSkipSpace(text, i)
+    if (i >= text.size || text[i] != 125) return none
+    i += 1
+    if (i < text.size && text[i] == 125) i += 1
+    RtAddress(at, i, text.slice(symbolStart, symbolEnd))
+}
+
+/** Every non-overlapping address match, left to right (re.finditer). */
+fun rtAddresses(text: string): array<RtAddress> {
+    val found: array<RtAddress> = []
+    var at = text.indexOf("\$xtensa", 0)
+    while (at >= 0) {
+        val m = rtAddressAt(text, at)
+        if (m.end >= 0) {
+            found.append(m)
+            at = text.indexOf("\$xtensa", m.end)
+        } else {
+            at = text.indexOf("\$xtensa", at + 1)
+        }
+    }
+    found
+}
+
+/** The positional arguments from `from` on, joined by spaces (argparse's "unrecognized arguments" list). */
+fun rtRest(values: array<string>, from: int): string {
+    val rest: array<string> = []
+    var k = from
+    while (k < values.size) {
+        rest.append(values[k])
+        k += 1
+    }
+    rest.join(" ")
+}

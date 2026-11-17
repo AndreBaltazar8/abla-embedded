@@ -1,0 +1,183 @@
+// Lower trivially structured recovered dispatchers to ordinary Abla bodies.
+//
+// The recovered Xtensa lifter originally represented every function as a
+// program-counter loop, including functions with one unconditional basic block.
+// This pass removes only that mechanically provable case. Multi-block control
+// flow, counter assignments, and blocks without an unconditional terminator are
+// left byte-for-byte unchanged for a later CFG structurizer.
+//
+//     tools/abla-tool lower-single-block-recovered-functions [--write] [--verbose] PATH...
+import "abla/io"
+import "abla/text"
+import "lib/recovered-text.ab"
+
+val sbHead = ["    var programCounter = 0\n"]
+val sbLoopVariables = ["    var loopCounter = u32(0)\n", "    var loopStart = 0\n", "    var loopEnd = 0\n"]
+val sbLoopHead = [
+    "        if (loopCounter != u32(0) && programCounter == loopEnd) {\n",
+    "            loopCounter = loopCounter - u32(1)\n",
+    "            if (loopCounter != u32(0)) programCounter = loopStart\n",
+    "        }\n"
+]
+val sbTail = ["        }\n", "            else -> ablaRuntimeTrap()\n", "        }\n", "    }\n"]
+
+/** True when lines[at..] start with `expected`, every line equal. */
+fun sbLinesAt(lines: array<string>, at: int, expected: array<string>): bool {
+    if (at + expected.size > lines.size) return false
+    var k = 0
+    while (k < expected.size) {
+        if (lines[at + k] != expected[k]) return false
+        k += 1
+    }
+    true
+}
+
+/** The end line (exclusive) of a dispatcher starting at line `at`, with the body's line range; end -1 if none. */
+class SbMatch(val bodyBegin: int, val bodyEnd: int, val end: int)
+
+fun sbMatchAt(lines: array<string>, at: int): SbMatch {
+    val none = SbMatch(0, 0, -1)
+    if (!sbLinesAt(lines, at, sbHead)) return none
+    var i = at + 1
+    if (sbLinesAt(lines, i, sbLoopVariables)) i += 3
+    if (!sbLinesAt(lines, i, ["    while (true) {\n"])) return none
+    i += 1
+    if (sbLinesAt(lines, i, sbLoopHead)) i += 4
+    if (!sbLinesAt(lines, i, ["        when (programCounter) {\n", "            0 -> {\n"])) return none
+    i += 2
+    val bodyBegin = i
+    while (i < lines.size) {
+        if (sbLinesAt(lines, i, sbTail)) return SbMatch(bodyBegin, i, i + 4)
+        i += 1
+    }
+    none
+}
+
+private fun sbStateName(word: string): bool =
+    word == "programCounter" || word == "loopCounter" || word == "loopStart" || word == "loopEnd"
+
+/** A line of the body starts an `N -> {` arm, or any state variable is named. */
+fun sbRejected(body: array<string>): bool {
+    for (line in body) {
+        if (line.startsWith("            ")) {
+            var i = 12
+            val digits = i
+            while (i < line.size && rtIsDigit(line[i])) i += 1
+            if (i > digits && rtAt(line, i, " -> {")) return true
+        }
+        var j = 0
+        while (j < line.size) {
+            if (rtIsWord(line[j])) {
+                var k = j
+                while (k < line.size && rtIsWord(line[k])) k += 1
+                if (sbStateName(line.slice(j, k))) return true
+                j = k
+            } else {
+                j += 1
+            }
+        }
+    }
+    false
+}
+
+private fun sbTerminator(text: string): bool {
+    if (text == "ablaRuntimeTrap()" || text == "return") return true
+    text.startsWith("return") && text.size >= 8 && rtIsSpace(text[6])
+}
+
+class SbBody(val lowered: bool, val text: string)
+
+fun sbLowerBody(lines: array<string>, begin: int, end: int): SbBody {
+    val body: array<string> = []
+    var k = begin
+    while (k < end) {
+        body.append(lines[k])
+        k += 1
+    }
+    if (sbRejected(body)) return SbBody(false, "")
+    // The last non-blank, non-comment line (splitlines semantics: other line breaks split too).
+    var last = ""
+    var any = false
+    for (line in rtSplitLines(body.join(""), false)) {
+        val stripped = rtStrip(line)
+        if (stripped != "" && !line.trimStart().startsWith("//")) {
+            last = stripped
+            any = true
+        }
+    }
+    if (!any || !sbTerminator(last)) return SbBody(false, "")
+    val out: array<string> = []
+    for (line in rtSplitLines(body.join(""), true)) {
+        out.append(if (line.startsWith("        ")) line.slice(8, line.size) else line)
+    }
+    SbBody(true, out.join(""))
+}
+
+class SbResult(val text: string, val count: int)
+
+fun sbTransform(source: string): SbResult {
+    val lines = rtSplitNewlines(source)
+    val out: array<string> = []
+    var count = 0
+    var i = 0
+    while (i < lines.size) {
+        val m = sbMatchAt(lines, i)
+        if (m.end >= 0) {
+            val body = sbLowerBody(lines, m.bodyBegin, m.bodyEnd)
+            if (body.lowered) {
+                out.append(body.text)
+                count += 1
+            } else {
+                var k = i
+                while (k < m.end) {
+                    out.append(lines[k])
+                    k += 1
+                }
+            }
+            i = m.end
+        } else {
+            out.append(lines[i])
+            i += 1
+        }
+    }
+    SbResult(out.join(""), count)
+}
+
+fun main: int {
+    val usage = "lower-single-block-recovered-functions [-h] [--write] [--verbose] paths [paths ...]"
+    val args = rtParseArguments(["--write", "--verbose"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error != "") return rtUsageError("lower-single-block-recovered-functions", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-single-block-recovered-functions", usage, "the following arguments are required: paths")
+    }
+    val write = args.has("--write")
+    var changedFiles = 0
+    var loweredFunctions = 0
+    for (path in rtSourceFiles(args.positionals, false, false)) {
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = sbTransform(read.text)
+        loweredFunctions += result.count
+        if (result.text != read.text) {
+            changedFiles += 1
+            if (args.has("--verbose")) println("${path}: ${result.count}")
+            if (write) {
+                val error = rtWrite(path, result.text)
+                if (error != "") {
+                    eprintln(error)
+                    return 1
+                }
+            }
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("${action} ${loweredFunctions} single-block function(s) across ${changedFiles} file(s)")
+    0
+}

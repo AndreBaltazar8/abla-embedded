@@ -1,0 +1,171 @@
+// The startup-store layout the lower-recovered-static-* passes recognise:
+//
+//   val NAMEStorage = nativeStaticAllocate(SIZE)
+//   trusted fun NAMEInitialize(): int {
+//       ablaUnsafeStoreU32(nativePointerFromAddress(NAMEStorage + OFFSET), VALUE)
+//       ...
+//       NAMEStorage
+//   }
+//   val NAMEInitialized = NAMEInitialize()
+//   val NAME = u32(NAMEInitialized)
+import "abla/regex"
+import "abla/process/exit"
+import "abla/text"
+import "recovered-text.ab"
+
+private fun ssCompile(pattern: string): Regex {
+    val result = regexCompile(pattern)
+    if (!result.succeeded) panic("bad pattern ${pattern}: ${result.error.message}")
+    result.regex
+}
+
+val ssStorage = ssCompile("^val ([A-Za-z_][A-Za-z0-9_]*)Storage = nativeStaticAllocate\\(([0-9]+)\\)$")
+val ssInitializer = ssCompile("^trusted fun ([A-Za-z_][A-Za-z0-9_]*)Initialize\\(\\): int \\{$")
+val ssStoreWord = ssCompile(
+    "^    ablaUnsafeStoreU32\\(nativePointerFromAddress\\(([A-Za-z_][A-Za-z0-9_]*)Storage \\+ ([0-9]+)\\), (.+)\\)$")
+val ssStoreAny = ssCompile(
+    "^    ablaUnsafeStoreU(8|16|32|64)\\(nativePointerFromAddress\\(([A-Za-z_][A-Za-z0-9_]*)Storage \\+ ([0-9]+)\\), (-?[0-9]+)\\)$")
+val ssReturn = ssCompile("^    ([A-Za-z_][A-Za-z0-9_]*)Storage$")
+val ssInitialized = ssCompile("^val ([A-Za-z_][A-Za-z0-9_]*)Initialized = ([A-Za-z_][A-Za-z0-9_]*)Initialize\\(\\)$")
+val ssAddress = ssCompile("^val ([A-Za-z_][A-Za-z0-9_]*) = u32\\(([A-Za-z_][A-Za-z0-9_]*)Initialized\\)$")
+
+/** The text of group `index`, "" when there is no match (callers test `m != null` first). */
+fun ssGroup(m: RegexMatch?, index: int): string {
+    if (m == null) return ""
+    val g = m.group(index)
+    if (g == null) "" else g
+}
+
+/**
+ * The four closing lines of a recognised layout at `cursor`: `NAMEStorage`, `}`, the Initialized
+ * line and the address line, all for `base`; requires `cursor + 4 < lines.size` as the tools do.
+ */
+fun ssTrailerValid(lines: array<string>, cursor: int, base: string): bool {
+    if (!(cursor + 4 < lines.size)) return false
+    val returned = ssReturn.find(lines[cursor], 0)
+    if (returned == null || ssGroup(returned, 1) != base) return false
+    if (lines[cursor + 1] != "}") return false
+    val initialized = ssInitialized.find(lines[cursor + 2], 0)
+    if (initialized == null || ssGroup(initialized, 1) != base || ssGroup(initialized, 2) != base) return false
+    val address = ssAddress.find(lines[cursor + 3], 0)
+    if (address == null || ssGroup(address, 1) != base || ssGroup(address, 2) != base) return false
+    true
+}
+
+/** `^` .. `$` regexes only ever match a whole line: a match must start at 0. */
+fun ssMatchLine(re: Regex, line: string): RegexMatch? = re.find(line, 0)
+
+/** Calls the table values may contain: type conversions and function addresses only. */
+fun ssConstantExpression(value: string): bool {
+    for (c in value) {
+        // [ ] { } ? : & | * / % < > = ! " '
+        if (c == 91 || c == 93 || c == 123 || c == 125 || c == 63 || c == 58 || c == 38 || c == 124 ||
+            c == 42 || c == 47 || c == 37 || c == 60 || c == 62 || c == 61 || c == 33 || c == 34 ||
+            c == 39) return false
+    }
+    var i = 0
+    while (i < value.size) {
+        if (rtIsIdentStart(value[i])) {
+            val end = rtIdentEnd(value, i)
+            val next = rtSkipSpace(value, end)
+            if (next < value.size && value[next] == 40) {
+                val name = value.slice(i, end)
+                val allowed = name == "int" || name == "i8" || name == "i16" || name == "i32" ||
+                    name == "i64" || name == "u8" || name == "u16" || name == "u32" || name == "u64" ||
+                    name == "nativeFunctionAddress"
+                if (!allowed) return false
+                i = next + 1
+            } else {
+                i = end
+            }
+        } else {
+            i += 1
+        }
+    }
+    true
+}
+
+/** The text lines of a file joined back, with the original trailing newline. */
+fun ssJoinLines(output: array<string>, source: string): string = output.join("\n") + rtTrailingNewline(source)
+
+class SsLowered(val text: string, val count: int, val units: int)
+
+/**
+ * lower_source of the two u32 table passes. `rodata` selects the immutable nativeStaticU32s pass
+ * (storage whose name contains `_data_rodata_`); the other pass takes the remaining storage and
+ * writes nativeStaticMutableU32s.
+ */
+fun ssLowerU32(source: string, rodata: bool): SsLowered {
+    val lines = rtSplitLines(source, false)
+    val output: array<string> = []
+    var tables = 0
+    var words = 0
+    var index = 0
+    while (index < lines.size) {
+        val storage = ssMatchLine(ssStorage, lines[index])
+        if (storage == null || ssGroup(storage, 1).contains("_data_rodata_") != rodata) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val base = ssGroup(storage, 1)
+        val size = rtParseDecimal(ssGroup(storage, 2))
+        var cursor = index + 1
+        if (cursor >= lines.size) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val initializer = ssMatchLine(ssInitializer, lines[cursor])
+        if (initializer == null || ssGroup(initializer, 1) != base) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        cursor += 1
+        val storedOffsets: array<int> = []
+        val stored: Map<int, string> = Map()
+        var duplicate = false
+        var reading = true
+        while (reading && cursor < lines.size) {
+            val store = ssMatchLine(ssStoreWord, lines[cursor])
+            if (store == null || ssGroup(store, 1) != base) {
+                reading = false
+            } else {
+                val offset = rtParseDecimal(ssGroup(store, 2))
+                if (stored.has(offset)) duplicate = true else storedOffsets.append(offset)
+                stored.set(offset, ssGroup(store, 3))
+                cursor += 1
+            }
+        }
+        var valid = size > 0 && size % 4 == 0 && storedOffsets.size > 0 && !duplicate
+        var k = 0
+        while (valid && k < storedOffsets.size) {
+            if (storedOffsets[k] % 4 != 0 || storedOffsets[k] >= size) valid = false
+            if (!ssConstantExpression(stored.get(storedOffsets[k]) ?? "")) valid = false
+            k += 1
+        }
+        if (valid) valid = ssTrailerValid(lines, cursor, base)
+        if (!valid) {
+            output.append(lines[index])
+            index += 1
+            continue
+        }
+        val count = size / 4
+        val constructor = if (rodata) "nativeStaticU32s" else "nativeStaticMutableU32s"
+        output.append("val ${base}Storage = ${constructor}([")
+        var word = 0
+        while (word < count) {
+            val value = stored.get(word * 4) ?? "0"
+            output.append("    ${value}${if (word + 1 < count) "," else ""}")
+            word += 1
+        }
+        output.append("])")
+        output.append("val ${base}Initialized = ${base}Storage")
+        output.append("val ${base} = u32(${base}Initialized)")
+        tables += 1
+        words += count
+        index = cursor + 4
+    }
+    SsLowered(ssJoinLines(output, source), tables, words)
+}
