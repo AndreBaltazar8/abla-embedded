@@ -1,0 +1,207 @@
+// Require direct-call reachability to named Abla sources in optimized LLVM.
+//
+// This supplements symbol-closure checks; it is not execution/hardware proof.
+// Pass optimized .bc or .ll, exported entry, then required abla.source names.
+// An inlined-away required boundary fails deliberately: review the new IR before
+// changing the check, rather than silently weakening retained-path evidence.
+//
+//     tools/abla-tool check-target-reachability optimized.bc entry required-source [...]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/llvm_ir.ab"
+
+class ReachResult(val chains: array<string>, val error: string)
+
+fun reachFail(message: string): ReachResult {
+    val none: array<string> = []
+    ReachResult(none, message)
+}
+
+// `attributes #N = ... "abla.source"="NAME"`: the source name of each attribute group.
+fun reachSourceGroups(ir: string): Map<string, string> {
+    val groups: Map<string, string> = Map()
+    for (line in ir.split("\n")) {
+        if (!line.startsWith("attributes #")) continue
+        val number = irDigitsAt(line, 12)
+        if (number == "" || !line.slice(12 + number.size, line.size).startsWith(" = ")) continue
+        val marker = line.indexOf("\"abla.source\"=\"", 12 + number.size + 3)
+        if (marker < 0) continue
+        val begin = marker + 15
+        val end = line.indexOf("\"", begin)
+        if (end > begin) groups.set(number, line.slice(begin, end))
+    }
+    groups
+}
+
+// `@NAME = ... alias ... ptr @TARGET` lines: alias name -> target.
+fun reachAliases(ir: string): Map<string, string> {
+    val aliases: Map<string, string> = Map()
+    for (rawLine in ir.split("\n")) {
+        if (!rawLine.startsWith("@")) continue
+        val line = rawLine.trimEnd()
+        val name = irNameAt(line, 1)
+        if (name == "" || !line.slice(1 + name.size, line.size).startsWith(" = ")) continue
+        // `\balias\b` somewhere after the name.
+        var hasAlias = false
+        var at = line.indexOf("alias", 1 + name.size)
+        while (at >= 0 && !hasAlias) {
+            val before = at > 0 && irIsWordChar(line[at - 1])
+            val after = at + 5 < line.size && irIsWordChar(line[at + 5])
+            if (!before && !after) hasAlias = true
+            at = line.indexOf("alias", at + 1)
+        }
+        if (!hasAlias) continue
+        // The last `ptr @TARGET` that runs to the end of the line.
+        var found = ""
+        var search = line.indexOf("ptr @")
+        while (search >= 0) {
+            val target = irNameAt(line, search + 5)
+            if (target != "" && search + 5 + target.size == line.size) found = target
+            search = line.indexOf("ptr @", search + 1)
+        }
+        if (found != "") aliases.set(name, found)
+    }
+    aliases
+}
+
+// The names a function body calls directly: the first `@name(` after each `call`/`invoke`.
+fun reachCalls(body: string): array<string> {
+    val calls: array<string> = []
+    for (line in body.split("\n")) {
+        var position = 0
+        while (position < line.size) {
+            val call = irWordAt(line, "call", position)
+            val invoke = irWordAt(line, "invoke", position)
+            val keyword = if (call >= 0 && (invoke < 0 || call < invoke)) call else invoke
+            if (keyword < 0) break
+            var at = line.indexOf("@", keyword + 4)
+            var matched = -1
+            while (at >= 0 && matched < 0) {
+                val name = irNameAt(line, at + 1)
+                if (name != "" && at + 1 + name.size < line.size && line[at + 1 + name.size] == 40) {
+                    calls.append(name)
+                    matched = at + 2 + name.size
+                } else {
+                    at = line.indexOf("@", at + 1)
+                }
+            }
+            if (matched < 0) break
+            position = matched
+        }
+    }
+    calls
+}
+
+// The text stored under `key` ("" when absent).
+fun reachText(map: Map<string, string>, key: string): string {
+    val value = map.get(key)
+    if (value == null) "" else value
+}
+
+class ReachFunction(val calls: array<string>, val source: string)
+
+fun inspectReachability(ir: string, entry: string, required: array<string>): ReachResult {
+    val groups = reachSourceGroups(ir)
+    val functions: Map<string, ReachFunction> = Map()
+    for (function in irFunctions(ir)) {
+        var source = function.name
+        // The first `#N {` of the header names the attribute group of the function.
+        var group = ""
+        var hash = function.header.indexOf("#")
+        while (hash >= 0 && group == "") {
+            val number = irDigitsAt(function.header, hash + 1)
+            if (number != "" && function.header.slice(hash + 1 + number.size, function.header.size).trimStart().startsWith("{")) {
+                group = number
+            }
+            hash = function.header.indexOf("#", hash + 1)
+        }
+        if (group != "" && groups.has(group)) {
+            val named = groups.get(group)
+            if (named != null) source = named
+        }
+        functions.set(function.name, ReachFunction(reachCalls(function.body), source))
+    }
+    val aliases = reachAliases(ir)
+    for (name in aliases.keys()) {
+        val target = aliases.get(name)
+        if (target == null) continue
+        functions.set(name, ReachFunction([target], name))
+    }
+    if (!functions.has(entry)) return reachFail("missing defined entry: $entry")
+    val order: array<string> = [entry]
+    val paths: Map<string, string> = Map()
+    paths.set(entry, entry)
+    var head = 0
+    while (head < order.size) {
+        val caller = order[head]
+        head = head + 1
+        val function = functions.get(caller)
+        if (function == null) continue
+        for (callee in function.calls) {
+            if (functions.has(callee) && !paths.has(callee)) {
+                paths.set(callee, reachText(paths, caller) + " " + callee)
+                order.append(callee)
+            }
+        }
+    }
+    val chains: array<string> = []
+    for (wanted in required) {
+        var chain = ""
+        var found = false
+        for (name in order) {
+            val function = functions.get(name)
+            if (function != null && function.source == wanted && !found) {
+                found = true
+                val parts: array<string> = []
+                for (step in reachText(paths, name).split(" ")) {
+                    val stepFunction = functions.get(step)
+                    parts.append(if (stepFunction == null) step else stepFunction.source)
+                }
+                chain = parts.join(" -> ")
+            }
+        }
+        if (!found) return reachFail("$entry cannot reach retained source: $wanted")
+        chains.append(chain)
+    }
+    ReachResult(chains, "")
+}
+
+fun main: int {
+    if (processArgumentCount() < 3) {
+        eprintln("usage: check-target-reachability optimized.bc entry required-source [...]")
+        return 1
+    }
+    val path = processArgument(0)
+    var ir = ""
+    if (path.endsWith(".ll")) {
+        val read = Path(path).readTextResult()
+        if (!read.succeeded) {
+            eprintln("cannot read $path")
+            return 1
+        }
+        ir = read.text
+    } else {
+        val disassembly = irDisassemble(path)
+        if (disassembly.error != "") {
+            eprintln(disassembly.error)
+            return 1
+        }
+        ir = disassembly.text
+    }
+    val required: array<string> = []
+    var index = 2
+    while (index < processArgumentCount()) {
+        required.append(processArgument(index))
+        index = index + 1
+    }
+    val result = inspectReachability(ir, processArgument(1), required)
+    if (result.error != "") {
+        eprintln(result.error)
+        return 1
+    }
+    for (chain in result.chains) println("PASS retained path: $chain")
+    0
+}
