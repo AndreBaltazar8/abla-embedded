@@ -1,0 +1,312 @@
+// Convert an ESP32-P4 ELF to the ESP application image format, like
+// `esptool --chip esp32p4 elf2image` for the images this project builds (a program of
+// plain PROGBITS sections, no ESP-IDF application descriptor). Offline only; never flashes.
+//
+//     tools/abla-tool p4-elf2image --min-rev-full N --max-rev-full N \
+//         --flash-mode qio|qout|dio|dout --flash-freq 80m|40m|26m|20m \
+//         --flash-size 1MB|2MB|4MB|8MB|16MB|32MB|64MB|128MB --output OUT.bin IN.elf
+//
+// Layout (esptool bin_image.py, ESP32FirmwareImage): 8-byte common header, 16-byte extended
+// header (chip id 18, revision window, appended SHA-256), the ELF's loadable sections merged
+// where they touch inside one memory type, flash-mapped segments placed at offsets congruent
+// to their address modulo 64 KiB (padded with the head of RAM segments, else zeros), the
+// remaining RAM segments, the XOR checksum padded to 16 bytes and the SHA-256 of the image.
+// Anything this does not handle (an ESP-IDF `.flash.appdesc` section, which esptool patches
+// and sizes the MMU page from) is refused instead of guessed.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/integer"
+import "abla/crypto"
+import "abla/process/arguments"
+import "lib/elf.ab"
+
+val P4_IROM_ALIGN = 65536
+val P4_SEGMENT_HEADER = 8
+
+class ImageSection(val address: int, val data: string, val name: string)
+
+class P4Settings(
+    val minRevFull: int, val maxRevFull: int, val flashMode: int, val sizeFrequency: int, val output: string,
+    val input: string, val error: string
+)
+
+class P4Image(val data: string, val error: string)
+
+fun p4Fail(message: string): P4Image = P4Image("", message)
+
+fun p4IsFlash(address: int): bool = address >= 0x40000000 && address < 0x4C000000
+
+// The ranges of esp32p4.py MEMORY_MAP that contain `address`, as one string (the memory type).
+fun p4MemoryType(address: int): string {
+    var type = ""
+    if (address >= 0x00000000 && address < 0x00010000) type = type + "PADDING "
+    if (address >= 0x40000000 && address < 0x4C000000) type = type + "DROM "
+    if (address >= 0x4FF00000 && address < 0x4FFA0000) type = type + "DRAM BYTE_ACCESSIBLE "
+    if (address >= 0x4FC00000 && address < 0x4FC20000) type = type + "DROM_MASK IROM_MASK "
+    if (address >= 0x40000000 && address < 0x4C000000) type = type + "IROM "
+    if (address >= 0x4FF00000 && address < 0x4FFA0000) type = type + "IRAM "
+    if (address >= 0x50108000 && address < 0x50110000) type = type + "RTC_IRAM RTC_DRAM "
+    if (address >= 0x600FE000 && address < 0x60100000) type = type + "MEM_INTERNAL2 "
+    type
+}
+
+fun p4Zeros(count: int): string = byteEncode(0).repeat(count)
+
+fun p4Xor(data: string, start: int): int {
+    var checksum = start
+    var index = 0
+    while (index < data.size) {
+        checksum = checksum ^ data[index]
+        index = index + 1
+    }
+    checksum
+}
+
+// Section data is padded to a multiple of 4 (ImageSegment.__init__).
+fun p4Aligned(data: string): string = if (data.size % 4 == 0) data else data + p4Zeros(4 - data.size % 4)
+
+// Incremental image: bytes so far, running checksum, number of segments written.
+class P4Writer(var output: string, var checksum: int, var count: int, var error: string) {
+    fun segment(address: int, data: string, withChecksum: bool): void {
+        if (data.size % 4 != 0) {
+            if (this.error == "") this.error = "Invalid segment length ${data.size}. It has to be multiple of 4."
+            return
+        }
+        if (data.size >= 0x1000000) {
+            if (this.error == "") this.error = "Invalid segment length ${data.size}. The 16 MB limit has been exceeded."
+            return
+        }
+        this.output = this.output + elfBytes32(address) + elfBytes32(data.size) + data
+        if (withChecksum) this.checksum = p4Xor(data, this.checksum)
+        this.count = this.count + 1
+    }
+}
+
+fun p4Image(elf: Elf32, settings: P4Settings, elfData: string): P4Image {
+    // The loadable sections: PROGBITS, INIT/FINI/PREINIT arrays with an address and a size.
+    val sections: array<ImageSection> = []
+    for (section in elf.sections) {
+        if (section.address == 0 || section.size == 0) continue
+        val loadable = section.kind == 1 || section.kind == 14 || section.kind == 15 || section.kind == 16
+        if (!loadable) continue
+        if (section.name.contains(".flash.appdesc")) {
+            return p4Fail("section ${section.name}: ESP-IDF application descriptors are not supported (esptool patches and sizes the MMU page from them)")
+        }
+        sections.append(ImageSection(section.address, p4Aligned(elfSlice(elfData, section.offset, section.offset + section.size)), section.name))
+    }
+    // merge_adjacent_segments: touching sections of one memory type become one segment.
+    val merged: array<ImageSection> = []
+    var index = 0
+    while (index < sections.size) {
+        val section = sections[index]
+        if (index > 0) {
+            val previous = sections[index - 1]
+            if (p4MemoryType(previous.address) == p4MemoryType(section.address) &&
+                section.address == previous.address + previous.data.size) {
+                val last = merged[merged.size - 1]
+                merged[merged.size - 1] = ImageSection(last.address, last.data + section.data, last.name)
+                index = index + 1
+                continue
+            }
+        }
+        merged.append(ImageSection(section.address, section.data, section.name))
+        index = index + 1
+    }
+    if (merged.size > 16) return p4Fail("Invalid segment count ${merged.size} (max 16). Usually this indicates a linker script problem.")
+
+    // Stable sort by address, then split into flash-mapped and RAM-loaded segments.
+    val sorted: array<ImageSection> = []
+    for (section in merged) {
+        sorted.append(ImageSection(section.address, section.data, section.name))
+        var at = sorted.size - 1
+        while (at > 0 && sorted[at - 1].address > sorted[at].address) {
+            val moved = sorted[at - 1]
+            sorted[at - 1] = sorted[at]
+            sorted[at] = moved
+            at = at - 1
+        }
+    }
+    val flash: array<ImageSection> = []
+    var ram: array<ImageSection> = []
+    for (section in sorted) {
+        if (p4IsFlash(section.address)) flash.append(section) else ram.append(section)
+    }
+    // ".dram0.bootdesc" goes first among the RAM segments.
+    var bootdesc = -1
+    index = 0
+    while (index < ram.size && bootdesc < 0) {
+        if (ram[index].name == ".dram0.bootdesc") bootdesc = index
+        index = index + 1
+    }
+    if (bootdesc > 0) {
+        val moved = ram[bootdesc]
+        val reordered: array<ImageSection> = [moved]
+        index = 0
+        while (index < ram.size) {
+            if (index != bootdesc) reordered.append(ram[index])
+            index = index + 1
+        }
+        ram = reordered
+    }
+    // Two flash segments inside one 64 KiB mapping window cannot be placed.
+    if (flash.size > 0) {
+        var last = flash[0].address
+        index = 1
+        while (index < flash.size) {
+            if (flash[index].address / P4_IROM_ALIGN == last / P4_IROM_ALIGN) {
+                return p4Fail("Segment loaded at ${flash[index].address} lands in same 64 KB flash mapping as segment loaded at $last. Can't generate binary.")
+            }
+            last = flash[index].address
+            index = index + 1
+        }
+    }
+
+    // Common header (the segment count is patched at the end) and extended header.
+    var header = byteEncode(0xE9) + byteEncode(0) + byteEncode(settings.flashMode) + byteEncode(settings.sizeFrequency & 255) +
+        elfBytes32(elf.entry)
+    header = header + byteEncode(0xEE) + byteEncode(0) + byteEncode(0) + byteEncode(0) + elfBytes16(18) + byteEncode(0) +
+        elfBytes16(settings.minRevFull) + elfBytes16(settings.maxRevFull) + p4Zeros(4) + byteEncode(1)
+    val writer = P4Writer(header, 0xEF, 0, "")
+
+    var flashIndex = 0
+    var ramHead = 0
+    while (flashIndex < flash.size && writer.error == "") {
+        val segment = flash[flashIndex]
+        // Padding needed so that after the next 8-byte header file offset % 64 KiB == address % 64 KiB.
+        val alignPast = segment.address % P4_IROM_ALIGN - P4_SEGMENT_HEADER
+        var padding = (P4_IROM_ALIGN - writer.output.size % P4_IROM_ALIGN) + alignPast
+        if (padding == 0 || padding == P4_IROM_ALIGN) {
+            padding = 0
+        } else {
+            padding = padding - P4_SEGMENT_HEADER
+            if (padding < 0) padding = padding + P4_IROM_ALIGN
+        }
+        if (padding > 0) {
+            if (ramHead < ram.size && padding > P4_SEGMENT_HEADER) {
+                val head = ram[ramHead]
+                val used = if (padding < head.data.size) padding else head.data.size
+                val padAddress = head.address
+                val padData = head.data.slice(0, used)
+                if (used == head.data.size) {
+                    ramHead = ramHead + 1
+                } else {
+                    ram[ramHead] = ImageSection(head.address + used, head.data.slice(used, head.data.size), head.name)
+                }
+                writer.segment(padAddress, padData, true)
+            } else {
+                writer.segment(0, p4Zeros(padding), true)
+            }
+        } else {
+            if ((writer.output.size + 8) % P4_IROM_ALIGN != segment.address % P4_IROM_ALIGN) {
+                return p4Fail("internal error: flash segment misplaced")
+            }
+            writer.segment(segment.address, segment.data, true)
+            flashIndex = flashIndex + 1
+        }
+    }
+    while (ramHead < ram.size && writer.error == "") {
+        writer.segment(ram[ramHead].address, ram[ramHead].data, true)
+        ramHead = ramHead + 1
+    }
+    if (writer.error != "") return p4Fail(writer.error)
+    // The checksum is the last byte of a 16-byte aligned image.
+    var output = writer.output + p4Zeros(15 - writer.output.size % 16) + byteEncode(writer.checksum)
+    // Segment count in the common header, then the SHA-256 of the whole image.
+    output = output.slice(0, 1) + byteEncode(writer.count) + output.slice(2, output.size)
+    P4Image(output + sha256(output), "")
+}
+
+// A non-negative decimal number, -1 for anything else.
+fun p4Number(text: string): int {
+    val value = text.parseInt()
+    if (value == null) -1 else value
+}
+
+fun p4Table(names: array<string>, values: array<int>, key: string): int {
+    var index = 0
+    while (index < names.size) {
+        if (names[index] == key) return values[index]
+        index = index + 1
+    }
+    -1
+}
+
+fun p4Settings(): P4Settings {
+    var minRev = 0
+    var maxRev = 0
+    var mode = ""
+    var frequency = ""
+    var size = ""
+    var output = ""
+    var input = ""
+    var index = 0
+    val count = processArgumentCount()
+    while (index < count) {
+        val flag = processArgument(index)
+        val hasValue = flag.startsWith("--") && index + 1 < count
+        if (!hasValue) {
+            if (flag.startsWith("--") || input != "") return P4Settings(0, 0, 0, 0, "", "", "unexpected argument $flag")
+            input = flag
+            index = index + 1
+            continue
+        }
+        val value = processArgument(index + 1)
+        if (flag == "--min-rev-full") minRev = p4Number(value)
+        else if (flag == "--max-rev-full") maxRev = p4Number(value)
+        else if (flag == "--flash-mode") mode = value
+        else if (flag == "--flash-freq") frequency = value
+        else if (flag == "--flash-size") size = value
+        else if (flag == "--output") output = value
+        else return P4Settings(0, 0, 0, 0, "", "", "unknown option $flag")
+        index = index + 2
+    }
+    if (input == "" || output == "" || mode == "" || frequency == "" || size == "") {
+        return P4Settings(0, 0, 0, 0, "", "", "missing option or input")
+    }
+    val flashMode = p4Table(["qio", "qout", "dio", "dout"], [0, 1, 2, 3], mode)
+    val flashFrequency = p4Table(["80m", "40m", "26m", "20m"], [0xF, 0, 1, 2], frequency)
+    val flashSize = p4Table(["1MB", "2MB", "4MB", "8MB", "16MB", "32MB", "64MB", "128MB"], [0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70], size)
+    if (flashMode < 0) return P4Settings(0, 0, 0, 0, "", "", "unsupported flash mode $mode")
+    if (flashFrequency < 0) return P4Settings(0, 0, 0, 0, "", "", "unsupported flash frequency $frequency")
+    if (flashSize < 0) return P4Settings(0, 0, 0, 0, "", "", "unsupported flash size $size")
+    if (minRev < 0 || maxRev < 0) return P4Settings(0, 0, 0, 0, "", "", "invalid revision")
+    P4Settings(minRev, maxRev, flashMode, flashSize + flashFrequency, output, input, "")
+}
+
+fun main: int {
+    val settings = p4Settings()
+    if (settings.error != "") {
+        eprintln("p4-elf2image: ${settings.error}")
+        eprintln("usage: p4-elf2image --min-rev-full N --max-rev-full N --flash-mode M --flash-freq F --flash-size S --output OUT.bin IN.elf")
+        return 2
+    }
+    val read = Path(settings.input).readTextResult()
+    if (!read.succeeded) {
+        eprintln("cannot read ${settings.input}")
+        return 1
+    }
+    val machine = elfU16(read.text, 18)
+    val elf = elf32Parse(read.text)
+    if (elf.error != "") {
+        eprintln("${settings.input}: ${elf.error}")
+        return 1
+    }
+    if (machine != 0x5E && machine != 0xF3) {
+        eprintln("${settings.input} does not appear to be an Xtensa or an RISCV ELF file. e_machine=$machine")
+        return 1
+    }
+    val image = p4Image(elf, settings, read.text)
+    if (image.error != "") {
+        eprintln("error: ${image.error}")
+        return 1
+    }
+    if (!Path(settings.output).writeText(image.data)) {
+        eprintln("cannot write ${settings.output}")
+        return 1
+    }
+    println("Successfully created esp32p4 image.")
+    0
+}
