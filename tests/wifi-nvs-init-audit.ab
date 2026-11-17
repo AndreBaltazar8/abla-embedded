@@ -1,0 +1,612 @@
+// Bounded executable oracle for the recovered wifi_nvs_cfg_init register model.
+//
+// Runs only that function (the straight-line register model of
+// tests/fixtures/wifi-nvs-init-register-model.ab and the structured source of
+// src/esp32/wifi/nvs_config_init.ab), with modeled allocation/memory/callees, and compares
+// the two over every failure point. Unsupported syntax fails closed. This is
+// translation-audit evidence, not device execution.
+//
+// The two function bodies are read as text and run by a small interpreter for exactly the
+// statements they use (assignments, if/else, return, the modeled calls and + - << | == != !).
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/crypto"
+import "abla/integer"
+import "abla/bytes"
+import "../tools/lib/source_text.ab"
+
+// ---- tokens and expressions ----
+
+class Token(val kind: int, val text: string, val value: int)
+
+val TOKEN_NAME = 0
+val TOKEN_NUMBER = 1
+val TOKEN_PUNCT = 2
+
+fun isNameStart(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+fun isDigitChar(c: int): bool = c >= 48 && c <= 57
+
+// Null-free tokenizer; an unknown character becomes a punctuation token the parser rejects.
+fun tokenize(text: string): array<Token> {
+    val tokens: array<Token> = []
+    var at = 0
+    while (at < text.size) {
+        val c = text[at]
+        if (c == 32 || c == 9) {
+            at = at + 1
+        } else if (isNameStart(c)) {
+            var end = at
+            while (end < text.size && (isNameStart(text[end]) || isDigitChar(text[end]))) end = end + 1
+            tokens.append(Token(TOKEN_NAME, text.slice(at, end), 0))
+            at = end
+        } else if (isDigitChar(c)) {
+            var end = at
+            var value = 0
+            while (end < text.size && isDigitChar(text[end])) {
+                value = value * 10 + text[end] - 48
+                end = end + 1
+            }
+            tokens.append(Token(TOKEN_NUMBER, text.slice(at, end), value))
+            at = end
+        } else if (at + 1 < text.size && (text.slice(at, at + 2) == "<<" || text.slice(at, at + 2) == "==" || text.slice(at, at + 2) == "!=")) {
+            tokens.append(Token(TOKEN_PUNCT, text.slice(at, at + 2), 0))
+            at = at + 2
+        } else {
+            tokens.append(Token(TOKEN_PUNCT, text.slice(at, at + 1), 0))
+            at = at + 1
+        }
+    }
+    tokens
+}
+
+// ---- the modeled machine ----
+
+class Machine(
+    val addresses: Map<string, int>,
+    val descriptorWords: array<int>,
+    val softap: int,         // 0 station only, 1 SoftAP table present, 2 table present with an empty first entry
+    val failAt: int,
+    val allocated: bool,
+    val existing: bool,
+    val memory: Map<int, int>,
+    val variables: Map<string, int>,
+    val trace: array<array<int>>,
+    val events: array<string>,
+    var returned: bool,
+    var returnValue: int,
+    var error: string
+) {
+    fun load(address: int): int {
+        val value = this.memory.get(address)
+        if (value == null) 0 else value
+    }
+
+    fun fail(message: string): int {
+        if (this.error == "") this.error = message
+        0
+    }
+
+    fun item(arguments: array<int>): int {
+        val row: array<int> = []
+        var index = 0
+        while (index < 8) {
+            row.append(if (index < arguments.size) arguments[index] else 0)
+            index = index + 1
+        }
+        this.trace.append(row)
+        if (this.trace.size == this.failAt) 258 else 0
+    }
+
+    fun tail(keys: int, values: int): int {
+        var offset = 0
+        while (offset < this.descriptorWords.size) {
+            val packed = this.descriptorWords[offset]
+            val minimum = this.descriptorWords[offset + 1]
+            val limits = this.descriptorWords[offset + 2]
+            val initial = this.descriptorWords[offset + 3]
+            val result = this.item([
+                keys + (packed & 1023), (packed >> 10) & 127, (packed >> 17) & 7, (packed >> 20) & 1023,
+                minimum, limits & 65535, initial, values + (limits >> 16)
+            ])
+            if (result != 0) return result
+            offset = offset + 4
+        }
+        0
+    }
+
+    fun call(name: string, arguments: array<int>): int {
+        val first = if (arguments.size > 0) arguments[0] else 0
+        val second = if (arguments.size > 1) arguments[1] else 0
+        val third = if (arguments.size > 2) arguments[2] else 0
+        if (name == "u32") return first & 0xFFFFFFFF
+        if (name == "i32") return ((first + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+        if (name == "int" || name == "nativePointerFromAddress") return first
+        if (name == "nativeStackAllocate") return 0x700000
+        if (name == "ablaUnsafeLoadU32" || name == "freestandingLoadWord") return this.load(first)
+        if (name == "ablaUnsafeStoreU32") {
+            this.memory.set(first, second)
+            return 0
+        }
+        if (name == "xtensaMemoryBarrier") return 0
+        if (name == "ablaUnsafeCallI32I32I32I32I32I32I32") {
+            if (first != 0x910000 || second != 4472) return this.fail("allocation call with $first, $second")
+            this.events.append("allocate")
+            return if (this.allocated) 0x800000 else 0
+        }
+        if (name == "freestandingSet") {
+            if (first != 0xA00000 || second != 0 || third != 1316) return this.fail("clear call with $first, $second, $third")
+            this.events.append("clear")
+            return first
+        }
+        if (name == "esp32RecoveredWifiNvsCfgItemInit") return this.item(arguments)
+        if (name == "esp32WifiNvsInitDescriptorTail") return this.tail(first, second)
+        if (name == "esp32WifiLogValue") {
+            this.events.append("log")
+            return 0
+        }
+        this.fail("unknown call $name")
+    }
+}
+
+// Recursive-descent evaluator with Python's precedence: not < comparison < | < << < + - < primary.
+class Evaluator(var machine: Machine, val tokens: array<Token>, var position: int) {
+    fun peekText(): string = if (this.position < this.tokens.size) this.tokens[this.position].text else ""
+
+    fun accept(text: string): bool {
+        if (this.peekText() == text && this.position < this.tokens.size && this.tokens[this.position].kind == TOKEN_PUNCT) {
+            this.position = this.position + 1
+            return true
+        }
+        false
+    }
+
+    fun expression(): int {
+        if (this.accept("!")) return if (this.expression() == 0) 1 else 0
+        var left = this.bitOr()
+        while (true) {
+            if (this.accept("==")) {
+                left = if (left == this.bitOr()) 1 else 0
+            } else if (this.accept("!=")) {
+                left = if (left != this.bitOr()) 1 else 0
+            } else {
+                return left
+            }
+        }
+        left
+    }
+
+    fun bitOr(): int {
+        var left = this.shift()
+        while (this.accept("|")) left = left | this.shift()
+        left
+    }
+
+    fun shift(): int {
+        var left = this.sum()
+        while (this.accept("<<")) left = left << this.sum()
+        left
+    }
+
+    fun sum(): int {
+        var left = this.primary()
+        while (true) {
+            if (this.accept("+")) {
+                left = left + this.primary()
+            } else if (this.accept("-")) {
+                left = left - this.primary()
+            } else {
+                return left
+            }
+        }
+        left
+    }
+
+    fun primary(): int {
+        if (this.position >= this.tokens.size) return this.machine.fail("expression ends early")
+        val token = this.tokens[this.position]
+        this.position = this.position + 1
+        if (token.kind == TOKEN_NUMBER) return token.value
+        if (token.kind == TOKEN_PUNCT) {
+            if (token.text == "(") {
+                val inner = this.expression()
+                if (!this.accept(")")) return this.machine.fail("missing )")
+                return inner
+            }
+            return this.machine.fail("unexpected ${token.text}")
+        }
+        if (this.accept("(")) {
+            val arguments: array<int> = []
+            if (!this.accept(")")) {
+                while (true) {
+                    arguments.append(this.expression())
+                    if (this.accept(")")) break
+                    if (!this.accept(",")) return this.machine.fail("missing , in call of ${token.text}")
+                }
+            }
+            return this.machine.call(token.text, arguments)
+        }
+        val value = this.machine.variables.get(token.text)
+        if (value == null) return this.machine.fail("unknown name ${token.text}")
+        value
+    }
+}
+
+fun evaluate(var machine: Machine, text: string): int {
+    val evaluator = Evaluator(machine, tokenize(text), 0)
+    val value = evaluator.expression()
+    if (evaluator.position != evaluator.tokens.size) return machine.fail("trailing tokens in $text")
+    value
+}
+
+// ---- statements ----
+
+// kind: 0 assignment (name = expression), 1 if, 2 return, 3 expression statement
+class Statement(val kind: int, val name: string, val expression: string, val thenBlock: array<Statement>, val elseBlock: array<Statement>)
+
+class Program(val lines: array<string>, var next: int, var error: string, var closedWithElse: bool)
+
+fun leadingName(line: string): string {
+    var end = 0
+    while (end < line.size && (isNameStart(line[end]) || isDigitChar(line[end]))) end = end + 1
+    line.slice(0, end)
+}
+
+// The statements the register model and the structured source may use; anything else fails closed.
+fun supportedStatement(line: string): bool {
+    val name = leadingName(line)
+    if (line.startsWith("return ")) return true
+    if (line.startsWith("ablaUnsafeStoreU32(") || line.startsWith("xtensaMemoryBarrier(") ||
+        line.startsWith("esp32WifiLogValue(") || line.startsWith("freestandingSet(") ||
+        line.startsWith("esp32WifiNvsInitDescriptorTail(")) return true
+    name != "" && line.slice(name.size, line.size).startsWith(" = ")
+}
+
+// The position of the `)` that closes the `(` at `open`, or -1.
+fun matchingParenthesis(line: string, open: int): int {
+    var depth = 0
+    var at = open
+    while (at < line.size) {
+        if (line[at] == 40) depth = depth + 1
+        if (line[at] == 41) {
+            depth = depth - 1
+            if (depth == 0) return at
+        }
+        at = at + 1
+    }
+    -1
+}
+
+fun stripDeclaration(line: string): string {
+    if (line.startsWith("var ")) return line.slice(4, line.size)
+    if (line.startsWith("val ")) return line.slice(4, line.size)
+    line
+}
+
+fun simpleStatement(var program: Program, rawLine: string): Statement? {
+    var line = stripDeclaration(rawLine)
+    if (!supportedStatement(line)) {
+        if (program.error == "") program.error = "unrecognized statement: $rawLine"
+        return null
+    }
+    if (line.startsWith("return ")) return Statement(2, "", line.slice(7, line.size), [], [])
+    if (line.startsWith("esp32WifiNvsInitDescriptorTail(")) return Statement(2, "", line, [], [])
+    val name = leadingName(line)
+    if (name != "" && line.slice(name.size, line.size).startsWith(" = ")) {
+        return Statement(0, name, line.slice(name.size + 3, line.size), [], [])
+    }
+    Statement(3, "", line, [], [])
+}
+
+// Statements up to the closing `}` (consumed). `} else {` sets closedWithElse.
+fun parseBlock(var program: Program, top: bool): array<Statement> {
+    val block: array<Statement> = []
+    program.closedWithElse = false
+    while (program.next < program.lines.size && program.error == "") {
+        val line = program.lines[program.next]
+        program.next = program.next + 1
+        if (line.startsWith("}")) {
+            program.closedWithElse = !top && line.slice(1, line.size).trim() == "else {"
+            if (top && line.size != 1) program.error = "unbalanced function"
+            return block
+        }
+        if (line.startsWith("if (")) {
+            val close = matchingParenthesis(line, 3)
+            if (close < 0) {
+                program.error = "unbalanced condition: $line"
+                return block
+            }
+            val condition = line.slice(4, close)
+            val suffix = line.slice(close + 1, line.size).trim()
+            var thenBlock: array<Statement> = []
+            var elseBlock: array<Statement> = []
+            if (suffix == "{") {
+                thenBlock = parseBlock(program, false)
+                if (program.closedWithElse) elseBlock = parseBlock(program, false)
+            } else {
+                val single = simpleStatement(program, suffix)
+                if (single != null) thenBlock.append(single)
+            }
+            program.closedWithElse = false
+            block.append(Statement(1, "", condition, thenBlock, elseBlock))
+            continue
+        }
+        val statement = simpleStatement(program, line)
+        if (statement != null) block.append(statement)
+    }
+    if (program.error == "") program.error = "unbalanced function"
+    block
+}
+
+fun execute(var machine: Machine, block: array<Statement>): void {
+    for (statement in block) {
+        if (machine.returned || machine.error != "") return
+        if (statement.kind == 0) {
+            machine.variables.set(statement.name, evaluate(machine, statement.expression))
+        } else if (statement.kind == 1) {
+            if (evaluate(machine, statement.expression) != 0) execute(machine, statement.thenBlock)
+            else execute(machine, statement.elseBlock)
+        } else if (statement.kind == 2) {
+            machine.returnValue = evaluate(machine, statement.expression)
+            machine.returned = true
+        } else {
+            evaluate(machine, statement.expression)
+        }
+    }
+}
+
+// ---- reading the two implementations ----
+
+// The register model: the lines of the function, comments and blanks dropped.
+fun modelLines(body: string): array<string> {
+    val lines: array<string> = []
+    for (raw in body.split("\n")) {
+        val line = raw.trim()
+        if (line == "" || line.startsWith("//")) continue
+        lines.append(line)
+    }
+    lines
+}
+
+// The structured source: comments removed, statements that span lines joined.
+fun structuredLines(text: string): array<string> {
+    val lines: array<string> = []
+    var pending = ""
+    var balance = 0
+    for (raw in text.split("\n")) {
+        val line = raw.split("//")[0].trim()
+        if (line == "") continue
+        pending = pending + " " + line
+        balance = balance + line.split("(").size - line.split(")").size
+        if (balance == 0) {
+            lines.append(pending.trim())
+            pending = ""
+        }
+    }
+    if (pending != "") lines.append("pending: " + pending)
+    lines
+}
+
+class Scenario(val softap: int, val failAt: int, val allocated: bool, val existing: bool)
+
+class RunResult(val result: int, val trace: array<array<int>>, val events: array<string>, val error: string)
+
+fun runsEqual(left: RunResult, right: RunResult): bool {
+    if (left.error != "" || right.error != "" || left.result != right.result) return false
+    if (left.events.size != right.events.size || left.trace.size != right.trace.size) return false
+    var index = 0
+    while (index < left.events.size) {
+        if (left.events[index] != right.events[index]) return false
+        index = index + 1
+    }
+    index = 0
+    while (index < left.trace.size) {
+        var at = 0
+        while (at < 8) {
+            if (left.trace[index][at] != right.trace[index][at]) return false
+            at = at + 1
+        }
+        index = index + 1
+    }
+    true
+}
+
+class Oracle(val addresses: Map<string, int>, val descriptorWords: array<int>, val model: array<Statement>, val structured: array<Statement>)
+
+fun locate(oracle: Oracle, fragment: string, var problems: array<string>): int {
+    var found = -1
+    var matches = 0
+    for (name in oracle.addresses.keys()) {
+        if (name.contains(fragment)) {
+            matches = matches + 1
+            val address = oracle.addresses.get(name)
+            if (address != null) found = address
+        }
+    }
+    if (matches != 1) problems.append("fragment $fragment matches $matches names")
+    found
+}
+
+fun run(oracle: Oracle, scenario: Scenario, useStructured: bool): RunResult {
+    val problems: array<string> = []
+    val memory: Map<int, int> = Map()
+    val variables: Map<string, int> = Map()
+    for (name in oracle.addresses.keys()) {
+        val address = oracle.addresses.get(name)
+        if (address != null) variables.set(name, address)
+    }
+    for (name in ["a2", "a3", "a4", "a5", "a6", "a7", "stack0", "stack1", "stack2", "stack3", "stack4", "stack5", "stack6", "stack7", "stack8", "stack9"]) {
+        variables.set(name, 0)
+    }
+    val configuration = locate(oracle, "bss_g_wifi_nvs_cfg", problems)
+    memory.set(configuration, if (scenario.existing) 0x800000 else 0)
+    memory.set(locate(oracle, "g_osi_funcs_p", problems), 0x900000)
+    memory.set(0x900000 + 376, 0x910000)
+    memory.set(locate(oracle, "esp32Data_g_wifi_nvs_", problems), 0xA00000)
+    memory.set(locate(oracle, "net80211_funcs", problems), if (scenario.softap != 0) 0xB00000 else 0)
+    memory.set(0xB00000, if (scenario.softap == 2) 0 else 1)
+    val machine = Machine(oracle.addresses, oracle.descriptorWords, scenario.softap, scenario.failAt, scenario.allocated,
+        scenario.existing, memory, variables, [], [], false, 0, "")
+    execute(machine, if (useStructured) oracle.structured else oracle.model)
+    if (problems.size > 0) machine.fail(problems[0])
+    // Partial initialization retains ownership; allocation failure leaves null.
+    val expectedState = if (scenario.existing || scenario.allocated) 0x800000 else 0
+    if (machine.load(configuration) != expectedState) machine.fail("configuration pointer ${machine.load(configuration)}, expected $expectedState")
+    if (!machine.returned && machine.error == "") machine.fail("the function does not return")
+    RunResult(machine.returnValue, machine.trace, machine.events, machine.error)
+}
+
+var failures = 0
+
+fun check(ok: bool, label: string): bool {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $label")
+    }
+    ok
+}
+
+fun eventsAre(run: RunResult, expected: array<string>): bool {
+    if (run.events.size != expected.size) return false
+    var index = 0
+    while (index < expected.size) {
+        if (run.events[index] != expected[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+fun tracePrefixEqual(run: RunResult, expected: array<array<int>>, count: int): bool {
+    if (run.trace.size != count) return false
+    var index = 0
+    while (index < count) {
+        var at = 0
+        while (at < 8) {
+            if (run.trace[index][at] != expected[index][at]) return false
+            at = at + 1
+        }
+        index = index + 1
+    }
+    true
+}
+
+fun allScenarios(softap: int): array<Scenario> {
+    val scenarios: array<Scenario> = []
+    var failAt = 0
+    while (failAt < 88) {
+        scenarios.append(Scenario(softap, failAt, true, false))
+        failAt = failAt + 1
+    }
+    scenarios.append(Scenario(softap, 0, false, false))
+    scenarios.append(Scenario(softap, 0, true, true))
+    scenarios
+}
+
+fun describe(scenario: Scenario): string =
+    "softap=${scenario.softap} failAt=${scenario.failAt} allocated=${scenario.allocated} existing=${scenario.existing}"
+
+// The offset of `value` inside the 64 KiB window of the data name it points into, or -1.
+fun offsetInData(oracle: Oracle, value: int): int {
+    for (name in oracle.addresses.keys()) {
+        val base = oracle.addresses.get(name)
+        if (base != null && base <= value && value < base + 65536) return value - base
+    }
+    -1
+}
+
+fun main: int {
+    val source = sourceRead("src/esp32/wifi/nvs_esp32.ab")
+    val fixture = sourceRead("tests/fixtures/wifi-nvs-init-register-model.ab")
+    var body = sourceAfter(fixture, "trusted fun esp32RecoveredWifiNvsCfgInit(")
+    body = sourceBefore(body, "// Original ABI symbol: wifi_nvs_sta_restore")
+    body = sourceAfter(body, "): u32 {").trim()
+    // Addresses: every data name of the model, sorted, 64 KiB apart from 1 MiB.
+    val found: Map<string, bool> = Map()
+    for (match in sourceFindAll("""\besp32Data_\w+""", body)) found.set(match.text0(), true)
+    val sortedNames = sortedStrings(found.keys())
+    val addresses: Map<string, int> = Map()
+    var index = 0
+    while (index < sortedNames.size) {
+        addresses.set(sortedNames[index], 0x100000 + index * 0x10000)
+        index = index + 1
+    }
+
+    val initSource = sourceAfter(sourceRead("src/esp32/wifi/nvs_config_init.ab"), "): u32 {")
+    val tableText = sourceBefore(sourceAfter(sourceRead("src/esp32/wifi/nvs_config_descriptors.ab"), "nativeStaticU32s(["), "])")
+    val descriptorWords: array<int> = []
+    for (match in sourceFindAll("""\d+""", tableText)) {
+        val value = match.text0().parseInt()
+        if (value != null) descriptorWords.append(value)
+    }
+    check(descriptorWords.size == 85 * 4, "descriptor table has ${descriptorWords.size} words, expected 340")
+
+    val modelProgram = Program(modelLines(body), 0, "", false)
+    val model = parseBlock(modelProgram, true)
+    val structuredProgram = Program(structuredLines(initSource), 0, "", false)
+    val structured = parseBlock(structuredProgram, true)
+    if (!check(modelProgram.error == "", "register model: ${modelProgram.error}") ||
+        !check(structuredProgram.error == "", "structured source: ${structuredProgram.error}") ||
+        failures != 0) return 1
+    val oracle = Oracle(addresses, descriptorWords, model, structured)
+
+    // A non-null SoftAP table with a null first entry is also station-only.
+    for (scenario in allScenarios(0)) {
+        val station = run(oracle, scenario, false)
+        check(station.error == "", "model ${describe(scenario)}: ${station.error}")
+        check(runsEqual(run(oracle, Scenario(2, scenario.failAt, scenario.allocated, scenario.existing), false), station),
+            "model with an empty SoftAP table differs from station only: ${describe(scenario)}")
+        check(runsEqual(run(oracle, Scenario(2, scenario.failAt, scenario.allocated, scenario.existing), true), station),
+            "structured source with an empty SoftAP table differs from the station model: ${describe(scenario)}")
+    }
+
+    // Exact selected IDF6 ieee80211_nvs.o REL literal addends in instruction order.
+    // The source blob also matches the original 1000-byte packed key section.
+    val expectedOffsets = [0, 7, 16, 29, 38, 46, 55, 65, 75, 85, 100, 109, 119, 128, 139, 155, 171, 183, 195, 205, 215, 225, 235,
+        245, 256, 268, 280, 288, 298, 305, 313, 325, 335, 347, 360, 368, 377, 388, 397, 406, 418, 428, 439, 449, 462, 475, 490,
+        503, 518, 529, 543, 557, 568, 575, 583, 593, 609, 618, 625, 633, 645, 657, 673, 687, 700, 711, 727, 743, 757, 771, 787,
+        803, 818, 829, 844, 856, 865, 879, 890, 905, 920, 935, 948, 961, 973, 985]
+    var blobSource = sourceAfter(source, "val esp32Data_Labla_recovered_nvs_data_rodata_wifi_nvs_cfg_init_str1_1_f5e9f763cfStorage = nativeStaticBytes(")
+    blobSource = sourceBefore(blobSource, "val esp32Data_")
+    var blob = ""
+    for (byteValue in sourceHexEscapes(blobSource)) blob = blob + byteEncode(byteValue)
+    check(hexEncode(sha256(blob)) == "3c4333493e7370e758b9d39bc8c34543b5bdfb45d0b6f06f5fe2073aa6e76d28", "key blob changed (${blob.size} bytes)")
+
+    for (softap in [0, 1]) {
+        val label = if (softap == 0) "station" else "softap"
+        for (scenario in allScenarios(softap)) {
+            check(runsEqual(run(oracle, scenario, false), run(oracle, scenario, true)),
+                "model and structured source differ: ${describe(scenario)}")
+        }
+        val full = run(oracle, Scenario(softap, 0, true, false), false)
+        check(full.error == "" && full.result == 0 && eventsAre(full, ["allocate", "clear"]),
+            "$label: full run result ${full.result} ${full.error}")
+        var failure = 1
+        while (failure <= full.trace.size) {
+            val partial = run(oracle, Scenario(softap, failure, true, false), false)
+            check(partial.result == 258 && tracePrefixEqual(partial, full.trace, failure), "$label: failure $failure keeps ${partial.trace.size} items")
+            failure = failure + 1
+        }
+        val none = run(oracle, Scenario(softap, 0, false, false), false)
+        check(none.result == 257 && none.trace.size == 0 && eventsAre(none, ["allocate", "log"]), "$label: allocation failure")
+        val again = run(oracle, Scenario(softap, 0, true, true), false)
+        check(again.result == 0 && again.trace.size == 0 && eventsAre(again, ["log"]), "$label: second initialization")
+        // The key offset of every item.
+        val keyOffsets: array<int> = []
+        for (row in full.trace) keyOffsets.append(offsetInData(oracle, row[0]))
+        var expectedCount = expectedOffsets.size + (if (softap == 0) 1 else 0)
+        check(keyOffsets.size == expectedCount, "$label: ${keyOffsets.size} items, expected $expectedCount")
+        var at = 0
+        while (at < keyOffsets.size && at < expectedCount) {
+            val expectedOffset = if (softap == 0) (if (at == 0) 0 else expectedOffsets[at - 1]) else expectedOffsets[at]
+            if (keyOffsets[at] != expectedOffset) {
+                check(false, "$label: item $at key offset ${keyOffsets[at]}, expected $expectedOffset")
+                break
+            }
+            at = at + 1
+        }
+    }
+    if (failures != 0) return 1
+    println("PASS: wifi_nvs_cfg_init register model and structured source agree on every failure point")
+    0
+}
