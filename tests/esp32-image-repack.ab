@@ -1,0 +1,71 @@
+// Page edges, RAM splits, the near-page gap and rejection of damaged images for
+// tools/repack-esp32-image.ab.
+
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/crypto"
+import "../tools/repack-esp32-image.ab"
+
+var failures = 0
+
+fun check(ok: bool, label: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $label")
+    }
+}
+
+// An image like the ones the SDK links: DROM, RAM, IRAM, alignment padding, IROM.
+fun originalImage(dromSize: int, dramSize: int): string {
+    var output = byteEncode(0xE9) + imageZeros(22) + byteEncode(1)
+    output = output.slice(0, 4) + elfBytes32(0x40080000) + output.slice(8, 24)
+    val state = ImageEmitter(output, 0xEF, 0)
+    state.emit(0x3F400020, byteEncode(68).repeat(dromSize))
+    state.emit(0x3FFB0000, byteEncode(82).repeat(dramSize))
+    state.emit(0x40080000, byteEncode(73).repeat(64))
+    if ((state.output.size + 8) % 65536 != 32) state.emit(0, imageZeros(imageModulo(32 - state.output.size - 16, 65536)))
+    state.emit(0x400D0020, byteEncode(70).repeat(128))
+    output = state.output
+    output = output.slice(0, 1) + byteEncode(state.count) + output.slice(2, output.size)
+    output = output + imageZeros(15 - output.size % 16) + byteEncode(state.checksum)
+    output + sha256(output)
+}
+
+fun main: int {
+    // Page edges and RAM splits.
+    for (dromSize in [4, 8, 16, 0xD9CC, 65500, 65504, 65508]) {
+        for (dramSize in [4, 8, 16, 0x2614, 16384]) {
+            val label = "drom=$dromSize dram=$dramSize"
+            val before = originalImage(dromSize, dramSize)
+            val after = imageRepack(before)
+            check(after.error == "", "$label: repack failed (${after.error})")
+            if (after.error != "") continue
+            check(after.data.size <= before.size, "$label: the image grew")
+            check(imageSegmentsEqual(imageParse(before).segments, imageParse(after.data).segments), "$label: load segments changed")
+            val again = imageRepack(after.data)
+            check(again.error == "" && again.data == after.data, "$label: repack is not idempotent")
+        }
+    }
+
+    // The RAM ends at 0x10008: an 8-byte padding payload plus 8-byte header must place
+    // the IROM segment header at 0x10018, not 0x20018.
+    val near = originalImage(0xD9CC, 0x2614)
+    val packed = imageRepack(near)
+    check(packed.error == "", "near-page gap: ${packed.error}")
+    check(elfU32(packed.data, 0x10008) == 0 && elfU32(packed.data, 0x1000C) == 8, "near-page gap: padding segment")
+    check(elfU32(packed.data, 0x10018) == 0x400D0020 && elfU32(packed.data, 0x1001C) == 128, "near-page gap: IROM segment header")
+    check(near.size - packed.data.size > 64000, "near-page gap: saved ${near.size - packed.data.size} bytes")
+
+    // Corruption and trailing signatures are rejected.
+    val valid = originalImage(16, 16)
+    check(imageRepack(valid.slice(0, valid.size - 1)).error != "", "truncated image accepted")
+    check(imageRepack(valid + imageZeros(4096)).error != "", "trailing data accepted")
+    check(imageRepack(imageZeros(64)).error != "", "zero image accepted")
+    for (offset in [0, 12, 23, 40, valid.size - 33, valid.size - 1]) {
+        check(imageRepack(elfWithByte(valid, offset, valid[offset] ^ 1)).error != "", "flipped bit at $offset accepted")
+    }
+    if (failures != 0) return 1
+    println("PASS: page edges, RAM splits, near-page gap and corruption rejection")
+    0
+}
