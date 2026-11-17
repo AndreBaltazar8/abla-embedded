@@ -1,0 +1,2191 @@
+// Turn reducible recovered program-counter graphs into structured Abla.
+//
+// Each eligible dispatcher must have only constant edges, conditional constant
+// edges, or unconditional exits. Immediate post-dominators identify branch joins,
+// and single-entry strongly-connected regions identify natural loops. Nested loop
+// regions are lowered recursively, allowing the pass to emit ordinary sequences,
+// if/else regions, and while loops without retaining a state variable. Anything
+// outside that proof boundary is left unchanged.
+//
+//     tools/abla-tool structurize-acyclic-recovered-functions PATH... [--write] [--verbose]
+//         [--function NAME]...
+//
+// This is the port of the former Python tool of the same name. `transform` is
+// exposed for tests (tests/xtensa-loop-end-provenance.ab): it returns the
+// rewritten text and the number of lowered dispatchers.
+//
+// Set iteration in the Python original followed the hash order of small ints;
+// this port visits sets in ascending order. The result only depends on that
+// order where several irreducible regions compete for node splitting, or where
+// a node that cannot reach an exit has equally sized post-dominator sets.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/exit"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "lib/recfiles.ab"
+
+val stExit = -1
+// Python's None for an optional node number.
+val stNone = -1000000
+
+val kindHardware = 0
+val kindSwitch = 1
+val kindBranch = 2
+val kindJump = 3
+val kindExit = 4
+
+class Block(
+    val statements: array<string>,
+    val kind: int,
+    val condition: string,
+    val targets: array<int>,
+    val count: string,
+    val loopStart: int,
+    val loopEnd: int,
+    val caseValues: array<string>
+)
+
+fun makeBlock(statements: array<string>, kind: int, condition: string, targets: array<int>): Block {
+    val values: array<string> = []
+    Block(statements, kind, condition, targets, "", -1, -1, values)
+}
+
+fun withTargets(block: Block, targets: array<int>): Block =
+    Block(block.statements, block.kind, block.condition, targets, block.count,
+        block.loopStart, block.loopEnd, block.caseValues)
+
+val missingBlock = makeBlock(array<string>(), kindExit, "", array<int>())
+
+// ---- small collections ----
+
+fun intsOf2(a: int, b: int): array<int> {
+    val result: array<int> = []
+    result.append(a)
+    result.append(b)
+    result
+}
+
+fun intsOf1(a: int): array<int> {
+    val result: array<int> = []
+    result.append(a)
+    result
+}
+
+fun appendAll(var destination: array<string>, source: array<string>): void {
+    for (item in source) destination.append(item)
+}
+
+fun linesOf(text: string): array<string> {
+    val result: array<string> = []
+    result.append(text)
+    result
+}
+
+fun concatLines(first: array<string>, second: array<string>): array<string> {
+    val result: array<string> = []
+    for (item in first) result.append(item)
+    for (item in second) result.append(item)
+    result
+}
+
+fun sortInts(values: array<int>): array<int> {
+    if (values.size < 2) {
+        val copy: array<int> = []
+        for (value in values) copy.append(value)
+        return copy
+    }
+    val middle = values.size / 2
+    val left: array<int> = []
+    val right: array<int> = []
+    var index = 0
+    while (index < values.size) {
+        if (index < middle) left.append(values[index]) else right.append(values[index])
+        index = index + 1
+    }
+    val a = sortInts(left)
+    val b = sortInts(right)
+    val result: array<int> = []
+    var i = 0
+    var j = 0
+    while (i < a.size && j < b.size) {
+        if (b[j] < a[i]) {
+            result.append(b[j])
+            j = j + 1
+        } else {
+            result.append(a[i])
+            i = i + 1
+        }
+    }
+    while (i < a.size) {
+        result.append(a[i])
+        i = i + 1
+    }
+    while (j < b.size) {
+        result.append(b[j])
+        j = j + 1
+    }
+    result
+}
+
+fun newSet(): Map<int, bool> {
+    val result: Map<int, bool> = Map()
+    result
+}
+
+fun setAdd(var set: Map<int, bool>, value: int): void { set.set(value, true) }
+
+fun setCopy(set: Map<int, bool>): Map<int, bool> {
+    val result: Map<int, bool> = Map()
+    for (key in set.keys()) result.set(key, true)
+    result
+}
+
+fun setSorted(set: Map<int, bool>): array<int> = sortInts(set.keys())
+
+fun setOfArray(values: array<int>): Map<int, bool> {
+    val result: Map<int, bool> = Map()
+    for (value in values) result.set(value, true)
+    result
+}
+
+fun arrayHas(values: array<int>, wanted: int): bool {
+    for (value in values) if (value == wanted) return true
+    false
+}
+
+fun newBlocks(): Map<int, Block> {
+    val result: Map<int, Block> = Map()
+    result
+}
+
+fun copyBlocks(blocks: Map<int, Block>): Map<int, Block> {
+    val result: Map<int, Block> = Map()
+    for (key in blocks.keys()) result.set(key, blocks.get(key) ?? missingBlock)
+    result
+}
+
+fun blockAt(blocks: Map<int, Block>, number: int): Block = blocks.get(number) ?? missingBlock
+
+fun maxKey(blocks: Map<int, Block>): int {
+    var best = -1
+    var first = true
+    for (key in blocks.keys()) {
+        if (first || key > best) best = key
+        first = false
+    }
+    best
+}
+
+// ---- text helpers ----
+
+fun spaces(count: int): string = " ".repeat(count)
+
+fun parseDigits(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + (byte - 48)
+    value
+}
+
+fun allDigits(text: string): bool {
+    if (text.size == 0) return false
+    for (byte in text) if (!recIsDigit(byte)) return false
+    true
+}
+
+fun isStateName(word: string): bool =
+    word == "programCounter" || word == "loopCounter" || word == "loopStart" ||
+    word == "loopEnd" || word == "loopActive"
+
+// `\b(?:programCounter|loopCounter|loopStart|loopEnd|loopActive)\b`
+fun mentionsState(text: string): bool {
+    var i = 0
+    while (i < text.size) {
+        if (recIsWord(text[i])) {
+            var j = i + 1
+            while (j < text.size && recIsWord(text[j])) j = j + 1
+            if (isStateName(text.slice(i, j))) return true
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    false
+}
+
+fun rstripText(text: string): string {
+    var end = text.size
+    while (end > 0 && recIsSpace(text[end - 1])) end = end - 1
+    text.slice(0, end)
+}
+
+// Starting offset of every line of `text` split on "\n" (one more than the number of "\n").
+fun lineOffsets(text: string): array<int> {
+    val result: array<int> = []
+    result.append(0)
+    var i = 0
+    while (i < text.size) {
+        if (text[i] == 10) result.append(i + 1)
+        i = i + 1
+    }
+    result
+}
+
+// `^ {13,}programCounter = ` on some line.
+fun hasDeepTransition(lines: array<string>): bool {
+    for (line in lines) {
+        var n = 0
+        while (n < line.size && line[n] == 32) n = n + 1
+        if (n >= 13 && recAt(line, n, "programCounter = ")) return true
+    }
+    false
+}
+
+// The `table_jump` regex of parse_block: an indexed code-address load feeding an indirect jump.
+fun tableJumpIn(body: string): bool {
+    var i = 0
+    while (i < body.size) {
+        if (body[i] == 114) {
+            val e1 = recDigitsEnd(body, i + 1)
+            if (e1 > i + 1 && recAt(body, e1, " = (r")) {
+                val e2 = recDigitsEnd(body, e1 + 5)
+                if (e2 > e1 + 5 && recAt(body, e2, " << u32(2)) + r")) {
+                    val e3 = recDigitsEnd(body, e2 + 15)
+                    if (e3 > e2 + 15 && e3 < body.size && body[e3] == 10) {
+                        val entry = body.slice(i, e1)
+                        if (tableJumpAfter(body, e3 + 1, entry)) return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+fun tableJumpAfter(body: string, after: int, entry: string): bool {
+    var p = recSkipSpace(body, after)
+    if (p >= body.size || body[p] != 114) return false
+    val t1 = recDigitsEnd(body, p + 1)
+    if (t1 == p + 1) return false
+    val target = body.slice(p, t1)
+    val marker = " = u32(ablaUnsafeLoadU32("
+    if (!recAt(body, t1, marker)) return false
+    val lineStart = t1 + marker.size
+    var lineEnd = body.indexOf("\n", lineStart)
+    if (lineEnd < 0) return false
+    val needle = "int(" + entry + ")"
+    var found = false
+    var q = lineStart
+    while (q + needle.size <= lineEnd) {
+        if (recAt(body, q, needle) && q > 0 && !recIsWord(body[q - 1])) found = true
+        q = q + 1
+    }
+    if (!found) return false
+    // `(?:.*\n){0,8}?` lazily, then `\s*return u32(ablaUnsafeCall\w*(int(TARGET)`.
+    var position = lineEnd + 1
+    var skipped = 0
+    while (skipped <= 8) {
+        val s = recSkipSpace(body, position)
+        val keyword = "return u32(ablaUnsafeCall"
+        if (recAt(body, s, keyword)) {
+            val w = recIdentEndWord(body, s + keyword.size)
+            if (recAt(body, w, "(int(" + target + ")")) return true
+        }
+        val next = body.indexOf("\n", position)
+        if (next < 0) return false
+        position = next + 1
+        skipped = skipped + 1
+    }
+    false
+}
+
+// `programCounter = if (CONDITION) YES else NO` of one line; null when it does not have that form.
+class IfParts(val condition: string, val yes: int, val no: int)
+
+fun parseIfLine(line: string): IfParts? {
+    val prefix = spaces(12) + "programCounter = if ("
+    if (!line.startsWith(prefix)) return null
+    var j = line.size
+    while (j > 0 && recIsDigit(line[j - 1])) j = j - 1
+    val noStart = j
+    if (noStart >= line.size) return null
+    if (noStart < 6 || !recAt(line, noStart - 6, " else ")) return null
+    val yesEnd = noStart - 6
+    var k = yesEnd
+    while (k > 0 && recIsDigit(line[k - 1])) k = k - 1
+    val yesStart = k
+    if (yesStart >= yesEnd) return null
+    if (yesStart - 2 < prefix.size || !recAt(line, yesStart - 2, ") ")) return null
+    IfParts(line.slice(prefix.size, yesStart - 2), parseDigits(line.slice(yesStart, yesEnd)),
+        parseDigits(line.slice(noStart, line.size)))
+}
+
+// `^            programCounter = (?P<target>[0-9]+)$`
+fun parseJumpLine(line: string): int {
+    val prefix = spaces(12) + "programCounter = "
+    if (!line.startsWith(prefix)) return stNone
+    val digits = line.slice(prefix.size, line.size)
+    if (!allDigits(digits)) return stNone
+    parseDigits(digits)
+}
+
+fun strictInt(text: string): int {
+    // `-?[0-9]+` as an int; stNone when the text is not of that form.
+    if (text.startsWith("-")) {
+        val rest = text.slice(1, text.size)
+        if (!allDigits(rest)) return stNone
+        return 0 - parseDigits(rest)
+    }
+    if (!allDigits(text)) return stNone
+    parseDigits(text)
+}
+
+// `^                (?:-?[0-9]+|else) -> -?[0-9]+$`: the arm's value text, or "" when not an arm line.
+fun switchArmValue(line: string): string {
+    if (!line.startsWith(spaces(16))) return ""
+    val rest = line.slice(16, line.size)
+    val arrow = rest.indexOf(" -> ")
+    if (arrow <= 0) return ""
+    val value = rest.slice(0, arrow)
+    val target = rest.slice(arrow + 4, rest.size)
+    if (value != "else" && strictInt(value) == stNone) return ""
+    if (strictInt(target) == stNone) return ""
+    value
+}
+
+fun switchArmTarget(line: string): int {
+    val rest = line.slice(16, line.size)
+    val arrow = rest.indexOf(" -> ")
+    strictInt(rest.slice(arrow + 4, rest.size))
+}
+
+// A lowered switch at the end of the block, as lines[i..]: the closing line's index, or -1.
+fun switchEndAt(lines: array<string>, i: int): int {
+    val prefix = spaces(12) + "programCounter = when ("
+    val line = lines[i]
+    if (!line.startsWith(prefix) || !line.endsWith(") {") || line.size < prefix.size + 3 + 1) return -1
+    var j = i + 1
+    while (j < lines.size && switchArmValue(lines[j]) != "") j = j + 1
+    if (j == i + 1 || j >= lines.size) return -1
+    if (lines[j] != spaces(12) + "}") return -1
+    j
+}
+
+fun joinRange(lines: array<string>, from: int, to: int): string {
+    val part: array<string> = []
+    var i = from
+    while (i < to) {
+        part.append(lines[i])
+        i = i + 1
+    }
+    part.join("\n")
+}
+
+fun slicedLines(lines: array<string>, from: int, to: int): array<string> {
+    val part: array<string> = []
+    var i = from
+    while (i < to) {
+        part.append(lines[i])
+        i = i + 1
+    }
+    part
+}
+
+// A hardware-loop setup at the end of the block: lines[i..i+4]; true when the five lines match.
+fun hardwareLoopAt(lines: array<string>, i: int): bool {
+    if (i + 4 >= lines.size) return false
+    val p0 = spaces(12) + "loopCounter = "
+    val p1 = spaces(12) + "loopStart = "
+    val p2 = spaces(12) + "loopEnd = "
+    val p3 = spaces(12) + "loopActive = "
+    if (!lines[i].startsWith(p0) || lines[i].size == p0.size) return false
+    if (!lines[i + 1].startsWith(p1) || !allDigits(lines[i + 1].slice(p1.size, lines[i + 1].size))) return false
+    if (!lines[i + 2].startsWith(p2) || !allDigits(lines[i + 2].slice(p2.size, lines[i + 2].size))) return false
+    if (!lines[i + 3].startsWith(p3) || lines[i + 3].size == p3.size) return false
+    val branch = parseIfLine(lines[i + 4])
+    if (branch == null) return false
+    branch.condition.size > 0
+}
+
+fun parseBlock(body: string): Block? {
+    val lines = recSplitLines(body)
+    // A transition nested inside the block (for example a lowered switch
+    // table under a range check) gives it successors this parser cannot see.
+    if (hasDeepTransition(body.split("\n"))) return null
+    if (tableJumpIn(body)) return null
+    val bodyLines = body.split("\n")
+    val stripped = rstripText(body)
+    val strippedLength = stripped.size
+    val offsets = lineOffsets(body)
+    // The first hardware-loop match must end the block.
+    var i = 0
+    while (i < bodyLines.size) {
+        if (hardwareLoopAt(bodyLines, i)) {
+            val endOffset = offsets[i + 4] + bodyLines[i + 4].size
+            if (endOffset == strippedLength) {
+                val p0 = spaces(12) + "loopCounter = "
+                val p1 = spaces(12) + "loopStart = "
+                val p2 = spaces(12) + "loopEnd = "
+                val p3 = spaces(12) + "loopActive = "
+                val count = bodyLines[i].slice(p0.size, bodyLines[i].size)
+                val start = parseDigits(bodyLines[i + 1].slice(p1.size, bodyLines[i + 1].size))
+                val end = parseDigits(bodyLines[i + 2].slice(p2.size, bodyLines[i + 2].size))
+                val active = bodyLines[i + 3].slice(p3.size, bodyLines[i + 3].size)
+                val branch = parseIfLine(bodyLines[i + 4])
+                if (branch == null) return null
+                if (branch.yes != start || branch.no != end || start >= end) return null
+                if (active != branch.condition) return null
+                val statements = recSplitLines(body.slice(0, offsets[i]))
+                return Block(statements, kindHardware, branch.condition, intsOf2(start, end), count,
+                    start, end, array<string>())
+            }
+            break
+        }
+        i = i + 1
+    }
+    var meaningful = -1
+    var m = 0
+    while (m < lines.size) {
+        if (recStrip(lines[m]).size > 0) meaningful = m
+        m = m + 1
+    }
+    if (meaningful < 0) return null
+    val last = meaningful
+    // The first switch match must end the block.
+    val strippedLines = stripped.split("\n")
+    val strippedOffsets = lineOffsets(stripped)
+    var s = 0
+    while (s < strippedLines.size) {
+        val closing = switchEndAt(strippedLines, s)
+        if (closing >= 0) {
+            if (closing == strippedLines.size - 1) {
+                val prefix = spaces(12) + "programCounter = when ("
+                val header = strippedLines[s]
+                val selector = header.slice(prefix.size, header.size - 3)
+                val values: array<string> = []
+                val targets: array<int> = []
+                var a = s + 1
+                while (a < closing) {
+                    values.append(switchArmValue(strippedLines[a]))
+                    val target = switchArmTarget(strippedLines[a])
+                    targets.append(if (target == -1) stExit else target)
+                    a = a + 1
+                }
+                if (values.size == 0 || values[values.size - 1] != "else") return null
+                val statements = recSplitLines(body.slice(0, strippedOffsets[s]))
+                if (mentionsState(statements.join("\n"))) return null
+                return Block(statements, kindSwitch, selector, targets, "", -1, -1, values)
+            }
+            break
+        }
+        s = s + 1
+    }
+    val lastLine = lines[last]
+    val branch = parseIfLine(lastLine)
+    val jump = parseJumpLine(lastLine)
+    if (branch != null) {
+        val statements = concatLines(slicedLines(lines, 0, last), slicedLines(lines, last + 1, lines.size))
+        if (mentionsState(statements.join("\n"))) return null
+        for (line in statements) {
+            if (line.contains("ablaRuntimeTrap()")) {
+                return makeBlock(statements, kindExit, "", intsOf1(stExit))
+            }
+        }
+        return makeBlock(statements, kindBranch, branch.condition, intsOf2(branch.yes, branch.no))
+    }
+    if (jump != stNone) {
+        val statements = concatLines(slicedLines(lines, 0, last), slicedLines(lines, last + 1, lines.size))
+        if (mentionsState(statements.join("\n"))) return null
+        for (line in statements) {
+            if (line.contains("ablaRuntimeTrap()")) {
+                return makeBlock(statements, kindExit, "", intsOf1(stExit))
+            }
+        }
+        return makeBlock(statements, kindJump, "", intsOf1(jump))
+    }
+    val lastText = recStrip(lastLine)
+    if (lastText.startsWith("return") || lastText == "ablaRuntimeTrap()") {
+        if (mentionsState(body)) return null
+        return makeBlock(lines, kindExit, "", intsOf1(stExit))
+    }
+    // `^            return\b` somewhere: the block ends in a multi-line return.
+    var lastReturn = -1
+    var r = 0
+    val returnPrefix = spaces(12) + "return"
+    while (r < bodyLines.size) {
+        val line = bodyLines[r]
+        if (line.startsWith(returnPrefix) && (line.size == returnPrefix.size || !recIsWord(line[returnPrefix.size]))) {
+            lastReturn = r
+        }
+        r = r + 1
+    }
+    if (lastReturn >= 0 && !mentionsState(body.slice(offsets[lastReturn], body.size))) {
+        return makeBlock(lines, kindExit, "", intsOf1(stExit))
+    }
+    null
+}
+
+// ---- graph analysis ----
+
+var reachSet: Map<int, bool> = Map()
+
+fun reachVisit(blocks: Map<int, Block>, number: int): bool {
+    if (number == stExit) return true
+    val block = blocks.get(number)
+    if (block == null) return false
+    if (reachSet.has(number)) return true
+    reachSet.set(number, true)
+    for (target in block.targets) {
+        if (!reachVisit(blocks, target)) return false
+    }
+    true
+}
+
+fun reachable(blocks: Map<int, Block>): Map<int, bool>? {
+    if (!blocks.has(0)) return null
+    reachSet = newSet()
+    if (reachVisit(blocks, 0)) return reachSet
+    null
+}
+
+var sccIndices: Map<int, int> = Map()
+var sccLow: Map<int, int> = Map()
+var sccStack: array<int> = []
+var sccActive: Map<int, bool> = Map()
+var sccOutput: array<Map<int, bool>> = []
+var sccSequence = 0
+
+fun sccVisit(blocks: Map<int, Block>, nodes: Map<int, bool>, cut: int, node: int): void {
+    sccIndices.set(node, sccSequence)
+    sccLow.set(node, sccSequence)
+    sccSequence = sccSequence + 1
+    sccStack.append(node)
+    sccActive.set(node, true)
+    for (target in blockAt(blocks, node).targets) {
+        if (target == stExit || !nodes.has(target) || target == cut) continue
+        if (!sccIndices.has(target)) {
+            sccVisit(blocks, nodes, cut, target)
+            sccLow.set(node, minOf(sccLow.get(node) ?? 0, sccLow.get(target) ?? 0))
+        } else if (sccActive.has(target)) {
+            sccLow.set(node, minOf(sccLow.get(node) ?? 0, sccIndices.get(target) ?? 0))
+        }
+    }
+    if ((sccLow.get(node) ?? 0) != (sccIndices.get(node) ?? 0)) return
+    val component = newSet()
+    while (true) {
+        val current = sccStack.removeLast()
+        sccActive.remove(current)
+        component.set(current, true)
+        if (current == node) break
+    }
+    sccOutput.append(component)
+}
+
+fun minOf(a: int, b: int): int = if (a < b) a else b
+
+fun stronglyConnectedComponents(blocks: Map<int, Block>, nodes: Map<int, bool>, cut: int): array<Map<int, bool>> {
+    sccIndices = Map()
+    sccLow = Map()
+    sccStack = []
+    sccActive = Map()
+    sccOutput = []
+    sccSequence = 0
+    for (node in setSorted(nodes)) {
+        if (!sccIndices.has(node)) sccVisit(blocks, nodes, cut, node)
+    }
+    val result = sccOutput
+    sccOutput = []
+    result
+}
+
+fun cyclicComponent(component: Map<int, bool>, blocks: Map<int, Block>): bool {
+    if (component.size > 1) return true
+    for (node in component.keys()) {
+        if (arrayHas(blockAt(blocks, node).targets, node)) return true
+    }
+    false
+}
+
+// Targets of edges entering `component` from other nodes of `region`.
+fun componentEntries(blocks: Map<int, Block>, region: Map<int, bool>, component: Map<int, bool>): Map<int, bool> {
+    val entries = newSet()
+    for (source in blocks.keys()) {
+        if (!region.has(source) || component.has(source)) continue
+        for (target in blockAt(blocks, source).targets) {
+            if (component.has(target)) entries.set(target, true)
+        }
+    }
+    entries
+}
+
+fun reducibleLoopRegions(blocks: Map<int, Block>, nodes: Map<int, bool>): Map<int, Map<int, bool>>? {
+    val regions: Map<int, Map<int, bool>> = Map()
+    for (component in stronglyConnectedComponents(blocks, nodes, stNone)) {
+        if (!cyclicComponent(component, blocks)) continue
+        val entries = componentEntries(blocks, nodes, component)
+        if (component.has(0)) entries.set(0, true)
+        if (entries.size != 1) return null
+        regions.set(entries.keys()[0], component)
+    }
+    regions
+}
+
+class Split(val blocks: Map<int, Block>, val nodes: Map<int, bool>)
+
+// Copy `component` once per entry after the first, retargeting the edges that entered through it.
+fun cloneComponent(var result: Map<int, Block>, component: Map<int, bool>, entries: array<int>): void {
+    var nextNumber = maxKey(result) + 1
+    val outside: array<int> = []
+    for (number in result.keys()) if (!component.has(number)) outside.append(number)
+    val members = setSorted(component)
+    var e = 1
+    while (e < entries.size) {
+        val entry = entries[e]
+        val mapping: Map<int, int> = Map()
+        var offset = 0
+        for (number in members) {
+            mapping.set(number, nextNumber + offset)
+            offset = offset + 1
+        }
+        nextNumber = nextNumber + members.size
+        for (number in members) {
+            val block = blockAt(result, number)
+            val targets: array<int> = []
+            for (target in block.targets) targets.append(mapping.get(target) ?? target)
+            result.set(mapping.get(number) ?? 0, withTargets(block, targets))
+        }
+        for (source in outside) {
+            val block = blockAt(result, source)
+            if (arrayHas(block.targets, entry)) {
+                val targets: array<int> = []
+                for (target in block.targets) {
+                    targets.append(if (target == entry) (mapping.get(entry) ?? 0) else target)
+                }
+                result.set(source, withTargets(block, targets))
+            }
+        }
+        e = e + 1
+    }
+}
+
+// Split small irreducible SCC entries by cloning their loop bodies (node splitting).
+fun cloneSmallMultiEntryRegions(blocks: Map<int, Block>, startNodes: Map<int, bool>, maximumNewNodes: int): Split? {
+    val result = copyBlocks(blocks)
+    var nodes = startNodes
+    var added = 0
+    while (reducibleLoopRegions(result, nodes) == null) {
+        var found = false
+        var component = newSet()
+        var ordered: array<int> = []
+        for (candidate in stronglyConnectedComponents(result, nodes, stNone)) {
+            if (!cyclicComponent(candidate, result)) continue
+            val entries = componentEntries(result, nodes, candidate)
+            if (candidate.has(0)) entries.set(0, true)
+            if (entries.size > 1) {
+                val sortedEntries = setSorted(entries)
+                val cost = candidate.size * (sortedEntries.size - 1)
+                if (added + cost <= maximumNewNodes) {
+                    component = candidate
+                    ordered = sortedEntries
+                    found = true
+                    break
+                }
+            }
+        }
+        if (!found) return null
+        cloneComponent(result, component, ordered)
+        added = added + component.size
+        val again = reachable(result)
+        if (again == null) return null
+        nodes = again
+    }
+    Split(result, nodes)
+}
+
+class Candidate(val component: Map<int, bool>, val entries: array<int>)
+
+fun findNestedCandidate(result: Map<int, Block>, region: Map<int, bool>, cut: int, entryHint: int): Candidate? {
+    for (component in stronglyConnectedComponents(result, region, cut)) {
+        var cyclic = component.size > 1
+        if (!cyclic) {
+            for (number in component.keys()) {
+                if (number != cut && arrayHas(blockAt(result, number).targets, number)) cyclic = true
+            }
+        }
+        if (!cyclic) continue
+        val entries = componentEntries(result, region, component)
+        if (entryHint != stNone && component.has(entryHint)) entries.set(entryHint, true)
+        if (entries.size > 1) return Candidate(component, setSorted(entries))
+        if (entries.size == 1) {
+            val header = entries.keys()[0]
+            val nested = findNestedCandidate(result, component, header, header)
+            if (nested != null) return nested
+        }
+    }
+    null
+}
+
+// Node-split irreducible loops revealed only after an outer header cut.
+fun cloneSmallNestedMultiEntryRegions(blocks: Map<int, Block>, startNodes: Map<int, bool>, maximumNewNodes: int): Split? {
+    val result = copyBlocks(blocks)
+    var nodes = startNodes
+    var added = 0
+    while (true) {
+        val candidate = findNestedCandidate(result, nodes, stNone, 0)
+        if (candidate == null) return Split(result, nodes)
+        val component = candidate.component
+        for (number in component.keys()) {
+            if (blockAt(result, number).kind == kindHardware) return null
+        }
+        val cost = component.size * (candidate.entries.size - 1)
+        if (added + cost > maximumNewNodes) return null
+        cloneComponent(result, component, candidate.entries)
+        added = added + component.size
+        val again = reachable(result)
+        if (again == null) return null
+        nodes = again
+    }
+    null
+}
+
+// Post-dominator sets as bit sets over [exit] + sorted nodes.
+class PostDom(
+    val ids: Map<int, int>,
+    val members: array<int>,
+    val sets: array<array<int>>,
+    val sizes: array<int>,
+    val immediate: Map<int, int>
+) {
+    fun hasMember(node: int, member: int): bool {
+        val n = ids.get(node) ?? -1
+        val m = ids.get(member) ?? -1
+        if (n < 0 || m < 0) return false
+        (sets[n][m / 64] & (1 << (m % 64))) != 0
+    }
+
+    // max(common post-dominators, key=len(postdom)) of the intersection over `starts`; exit when empty.
+    fun common(starts: array<int>): int {
+        if (starts.size == 0) return stExit
+        var acc: array<int> = []
+        var first = true
+        for (start in starts) {
+            val index = ids.get(start) ?? -1
+            if (index < 0) panic("post-dominator of an unknown node $start")
+            val row = sets[index]
+            if (first) {
+                acc = []
+                for (word in row) acc.append(word)
+                first = false
+            } else {
+                var w = 0
+                while (w < acc.size) {
+                    acc[w] = acc[w] & row[w]
+                    w = w + 1
+                }
+            }
+        }
+        var best = -1
+        var bestSize = -1
+        var i = 0
+        while (i < members.size) {
+            if ((acc[i / 64] & (1 << (i % 64))) != 0 && sizes[i] > bestSize) {
+                best = i
+                bestSize = sizes[i]
+            }
+            i = i + 1
+        }
+        if (best < 0) return stExit
+        members[best]
+    }
+}
+
+fun popCount(value: int): int {
+    var x = value
+    var count = 0
+    while (x != 0) {
+        count = count + (x & 1)
+        x = x >>> 1
+    }
+    count
+}
+
+fun postdominators(blocks: Map<int, Block>, nodes: Map<int, bool>): PostDom {
+    val members: array<int> = []
+    members.append(stExit)
+    for (node in setSorted(nodes)) members.append(node)
+    val ids: Map<int, int> = Map()
+    var i = 0
+    while (i < members.size) {
+        ids.set(members[i], i)
+        i = i + 1
+    }
+    val words = (members.size + 63) / 64
+    val sets: array<array<int>> = []
+    i = 0
+    while (i < members.size) {
+        val row: array<int> = []
+        var w = 0
+        while (w < words) {
+            if (i == 0) row.append(0) else row.append(-1)
+            w = w + 1
+        }
+        if (i == 0) row[0] = 1
+        sets.append(row)
+        i = i + 1
+    }
+    // Clear the unused high bits of the universe so equality and sizes are exact.
+    val extra = members.size % 64
+    if (extra != 0) {
+        var n = 1
+        while (n < members.size) {
+            sets[n][words - 1] = (1 << extra) - 1
+            n = n + 1
+        }
+    }
+    val successors: array<array<int>> = []
+    i = 0
+    while (i < members.size) {
+        val list: array<int> = []
+        if (i > 0) {
+            for (target in blockAt(blocks, members[i]).targets) {
+                val id = ids.get(target)
+                if (id == null) panic("post-dominator target $target is not a node")
+                list.append(id)
+            }
+        }
+        successors.append(list)
+        i = i + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        var n = 1
+        while (n < members.size) {
+            val common: array<int> = []
+            var w = 0
+            while (w < words) {
+                common.append(if (w == words - 1 && extra != 0) ((1 << extra) - 1) else -1)
+                w = w + 1
+            }
+            for (successor in successors[n]) {
+                val row = sets[successor]
+                w = 0
+                while (w < words) {
+                    common[w] = common[w] & row[w]
+                    w = w + 1
+                }
+            }
+            common[n / 64] = common[n / 64] | (1 << (n % 64))
+            val current = sets[n]
+            var different = false
+            w = 0
+            while (w < words) {
+                if (common[w] != current[w]) different = true
+                w = w + 1
+            }
+            if (different) {
+                sets[n] = common
+                changed = true
+            }
+            n = n + 1
+        }
+    }
+    val sizes: array<int> = []
+    i = 0
+    while (i < members.size) {
+        var total = 0
+        for (word in sets[i]) total = total + popCount(word)
+        sizes.append(total)
+        i = i + 1
+    }
+    val immediate: Map<int, int> = Map()
+    i = 1
+    while (i < members.size) {
+        var best = -1
+        var bestSize = -1
+        var m = 0
+        while (m < members.size) {
+            if (m != i && (sets[i][m / 64] & (1 << (m % 64))) != 0 && sizes[m] > bestSize) {
+                best = m
+                bestSize = sizes[m]
+            }
+            m = m + 1
+        }
+        if (best >= 0) immediate.set(members[i], members[best])
+        i = i + 1
+    }
+    PostDom(ids, members, sets, sizes, immediate)
+}
+
+fun normalizedStatements(lines: array<string>, indent: string): array<string> {
+    val output: array<string> = []
+    val twelve = spaces(12)
+    for (line in lines) {
+        val text = if (line.startsWith(twelve)) line.slice(12, line.size) else recLstrip(line)
+        output.append(if (text.size > 0) indent + text else "")
+    }
+    output
+}
+
+// ---- the classic (post-dominator) emitter ----
+
+var gBlocks: Map<int, Block> = Map()
+var gNodes: Map<int, bool> = Map()
+var gLoopRegions: Map<int, Map<int, bool>> = Map()
+var gTerminal: Map<int, bool> = Map()
+var gPostdom: PostDom = postdominators(newBlocks(), newSet())
+var gEmittedSteps = 0
+var gMaximumSteps = 0
+var gLoopSequence = 0
+
+fun loopBoundaries(loopNodes: Map<int, bool>, natural: int): Map<int, bool> {
+    val result = newSet()
+    result.set(natural, true)
+    for (number in loopNodes.keys()) {
+        for (target in blockAt(gBlocks, number).targets) {
+            if (target != stExit && !loopNodes.has(target)) result.set(target, true)
+        }
+    }
+    result
+}
+
+fun hardwareLoopNodes(start: int, end: int): Map<int, bool>? {
+    val candidates = newSet()
+    for (number in gNodes.keys()) if (number >= start && number < end) candidates.set(number, true)
+    if (!candidates.has(start)) return null
+    val result = newSet()
+    val pending: array<int> = []
+    pending.append(start)
+    while (pending.size > 0) {
+        val number = pending.removeLast()
+        if (result.has(number)) continue
+        result.set(number, true)
+        for (target in blockAt(gBlocks, number).targets) {
+            if (candidates.has(target) && !result.has(target)) pending.append(target)
+        }
+    }
+    result
+}
+
+fun loopSequenceName(prefix: string, sequence: int): string = "$prefix$sequence"
+
+// One loop iteration of a region, as emit_loop_iteration's closure state.
+class LoopCtx(
+    val view: Map<int, Block>,
+    val viewPostdom: PostDom,
+    val nested: Map<int, Map<int, bool>>,
+    val loopNodes: Map<int, bool>,
+    val natural: int,
+    val destination: string,
+    val continueTarget: int,
+    val activeLoops: Map<int, bool>,
+    var steps: int
+) {
+    fun boundary(target: int, level: string): array<string> {
+        val result: array<string> = []
+        if (target == natural || target == stExit) return result
+        result.append("$level$destination = $target")
+        result
+    }
+
+    fun inside(target: int): bool = loopNodes.has(target) && target != continueTarget
+
+    // The choice among `ordered` targets after a nested loop, selected on `selector`.
+    fun choice(ordered: array<int>, index: int, level: string, join: int, selector: string): array<string>? {
+        val target = ordered[index]
+        val nestedLevel = level + (if (index + 1 < ordered.size) "    " else "")
+        val lines = if (inside(target)) emit(target, join, nestedLevel) else boundary(target, nestedLevel)
+        if (lines == null) return null
+        if (index + 1 == ordered.size) return lines
+        val tail = choice(ordered, index + 1, level + "    ", join, selector)
+        if (tail == null) return null
+        val selected: array<string> = []
+        selected.append("${level}if ($selector == $target) {")
+        appendAll(selected, lines)
+        selected.append("${level}} else {")
+        appendAll(selected, tail)
+        selected.append("${level}}")
+        selected
+    }
+
+    fun mappedSet(targets: array<int>): array<int> {
+        val result: array<int> = []
+        for (target in targets) result.append(if (inside(target)) target else stExit)
+        result
+    }
+
+    fun emit(startNode: int, stop: int, level: string): array<string>? {
+        val output: array<string> = []
+        var node = startNode
+        val path = newSet()
+        while (node != stop && node != stExit) {
+            steps = steps + 1
+            if (steps > loopNodes.size * 16 + 16 || path.has(node)) return null
+            path.set(node, true)
+            val original = blockAt(gBlocks, node)
+            val block = blockAt(view, node)
+
+            if (nested.has(node)) {
+                val nestedNodes = nested.get(node) ?? newSet()
+                val actual = newSet()
+                for (number in nestedNodes.keys()) {
+                    for (target in blockAt(gBlocks, number).targets) {
+                        if (target == continueTarget || !nestedNodes.has(target)) actual.set(target, true)
+                    }
+                }
+                gLoopSequence = gLoopSequence + 1
+                val nestedDestination = "recoveredLoopDestination$gLoopSequence"
+                if (actual.size > 0) {
+                    output.append("${level}var $nestedDestination = $node")
+                    output.append("${level}while ($nestedDestination == $node) {")
+                } else {
+                    output.append("${level}while (true) {")
+                }
+                val nestedBody = emitLoopIteration(node, nestedNodes, node, nestedDestination,
+                    level + "    ", node, activeLoops)
+                if (nestedBody == null) return null
+                appendAll(output, nestedBody)
+                output.append("$level}")
+                if (actual.size == 0) {
+                    node = stExit
+                    continue
+                }
+                val join = viewPostdom.common(mappedSet(setSorted(actual)))
+                val selected = choice(setSorted(actual), 0, level, join, nestedDestination)
+                if (selected == null) return null
+                appendAll(output, selected)
+                node = join
+                continue
+            }
+
+            appendAll(output, normalizedStatements(block.statements, level))
+            if (block.kind == kindHardware) {
+                val hardwareNodes = hardwareLoopNodes(block.loopStart, block.loopEnd)
+                if (hardwareNodes == null) return null
+                var withinLoop = true
+                for (number in hardwareNodes.keys()) if (!loopNodes.has(number)) withinLoop = false
+                if (!withinLoop || hardwareNodes.has(node)) return null
+                val boundaries = loopBoundaries(hardwareNodes, block.loopEnd)
+                val early: array<int> = []
+                for (target in setSorted(boundaries)) if (target != block.loopEnd) early.append(target)
+                gLoopSequence = gLoopSequence + 1
+                val remaining = "recoveredLoopRemaining$gLoopSequence"
+                val hardwareDestination = "recoveredLoopDestination$gLoopSequence"
+                output.append("${level}var $remaining = ${block.count}")
+                if (early.size > 0) output.append("${level}var $hardwareDestination = ${block.loopEnd}")
+                val condition = block.condition.replace(block.count, remaining)
+                val plainLoop = block.condition == "true"
+                val loopCondition = if (plainLoop) "true" else condition
+                output.append("${level}while ($loopCondition) {")
+                val body = emitLoopIteration(block.loopStart, hardwareNodes, block.loopEnd,
+                    hardwareDestination, level + "    ", stNone, activeLoops)
+                if (body == null) return null
+                appendAll(output, body)
+                if (early.size > 0) {
+                    output.append("$level    if ($hardwareDestination == ${block.loopEnd}) {")
+                    output.append("$level        $remaining = $remaining - u32(1)")
+                    output.append("$level    } else {")
+                    output.append("$level        $remaining = u32(0)")
+                    output.append("$level    }")
+                } else {
+                    output.append("$level    $remaining = $remaining - u32(1)")
+                }
+                if (plainLoop) output.append("$level    if ($remaining == u32(0)) break")
+                output.append("$level}")
+                if (early.size == 0) {
+                    node = block.loopEnd
+                    continue
+                }
+                val continuations = setOfArray(early)
+                continuations.set(block.loopEnd, true)
+                val ordered = setSorted(continuations)
+                val join = viewPostdom.common(mappedSet(ordered))
+                val selected = choice(ordered, 0, level, join, hardwareDestination)
+                if (selected == null) return null
+                appendAll(output, selected)
+                node = join
+                continue
+            }
+
+            if (block.kind == kindExit) {
+                node = stExit
+                continue
+            }
+            if (block.kind == kindJump) {
+                val actual = original.targets[0]
+                if (!loopNodes.has(actual) || actual == continueTarget) {
+                    appendAll(output, boundary(actual, level))
+                    node = stExit
+                } else {
+                    node = actual
+                }
+                continue
+            }
+            if (block.kind == kindSwitch) {
+                val join = viewPostdom.immediate.get(node) ?? stExit
+                val arms: array<array<string>> = []
+                var a = 0
+                while (a < block.caseValues.size) {
+                    val value = block.caseValues[a]
+                    val actual = original.targets[a]
+                    var emitted: array<string> = []
+                    if (!loopNodes.has(actual) || actual == continueTarget) {
+                        emitted = boundary(actual, level + "        ")
+                    } else {
+                        val lines = emit(actual, join, level + "        ")
+                        if (lines == null) return null
+                        emitted = lines
+                    }
+                    if (value == "else" && actual == stExit) emitted.append("$level        ablaRuntimeTrap()")
+                    arms.append(emitted)
+                    a = a + 1
+                }
+                output.append("${level}when (${block.condition}) {")
+                a = 0
+                while (a < block.caseValues.size) {
+                    output.append("$level    ${block.caseValues[a]} -> {")
+                    appendAll(output, arms[a])
+                    output.append("$level    }")
+                    a = a + 1
+                }
+                output.append("$level}")
+                node = join
+                continue
+            }
+
+            val yesActual = original.targets[0]
+            val noActual = original.targets[1]
+            val yesTerminal = gTerminal.has(yesActual) && !activeLoops.has(yesActual)
+            val noTerminal = gTerminal.has(noActual) && !activeLoops.has(noActual)
+            if (yesTerminal || noTerminal) {
+                if (yesTerminal && noTerminal) {
+                    val yesLines = emitRegion(yesActual, stExit, level + "    ", activeLoops)
+                    val noLines = emitRegion(noActual, stExit, level + "    ", activeLoops)
+                    if (yesLines == null || noLines == null) return null
+                    output.append("${level}if (${block.condition}) {")
+                    appendAll(output, yesLines)
+                    output.append("$level} else {")
+                    appendAll(output, noLines)
+                    output.append("$level}")
+                    node = stExit
+                    continue
+                }
+                val terminal = if (yesTerminal) yesActual else noActual
+                val continuation = if (yesTerminal) noActual else yesActual
+                val terminalLines = emitRegion(terminal, stExit, level + "    ", activeLoops)
+                if (terminalLines == null) return null
+                val condition = if (yesTerminal) block.condition else "!(${block.condition})"
+                output.append("${level}if ($condition) {")
+                appendAll(output, terminalLines)
+                output.append("$level}")
+                if (loopNodes.has(continuation) && continuation != continueTarget) {
+                    node = continuation
+                } else {
+                    appendAll(output, boundary(continuation, level))
+                    node = stExit
+                }
+                continue
+            }
+
+            val join = viewPostdom.immediate.get(node) ?? stExit
+            val arms: array<array<string>> = []
+            for (actual in original.targets) {
+                if (!loopNodes.has(actual) || actual == continueTarget) {
+                    arms.append(boundary(actual, level + "    "))
+                } else {
+                    val emitted = emit(actual, join, level + "    ")
+                    if (emitted == null) return null
+                    arms.append(emitted)
+                }
+            }
+            val yesLines = arms[0]
+            val noLines = arms[1]
+            if (yesLines.size > 0 && noLines.size > 0) {
+                output.append("${level}if (${block.condition}) {")
+                appendAll(output, yesLines)
+                output.append("$level} else {")
+                appendAll(output, noLines)
+                output.append("$level}")
+            } else if (yesLines.size > 0) {
+                output.append("${level}if (${block.condition}) {")
+                appendAll(output, yesLines)
+                output.append("$level}")
+            } else if (noLines.size > 0) {
+                output.append("${level}if (!(${block.condition})) {")
+                appendAll(output, noLines)
+                output.append("$level}")
+            }
+            node = join
+        }
+        output
+    }
+}
+
+fun emitLoopIteration(
+    start: int, loopNodes: Map<int, bool>, natural: int, destination: string, indent: string,
+    continueTarget: int, ancestorLoops: Map<int, bool>
+): array<string>? {
+    // Collapse every edge leaving this one-iteration graph to a virtual exit
+    // for post-dominator purposes, while retaining the exact destination in
+    // emitted Abla. Nested ordinary and fixed-count loops recurse here.
+    val view = newBlocks()
+    for (number in loopNodes.keys()) {
+        val block = blockAt(gBlocks, number)
+        val targets: array<int> = []
+        for (target in block.targets) {
+            targets.append(if (loopNodes.has(target) && target != continueTarget) target else stExit)
+        }
+        view.set(number, withTargets(block, targets))
+    }
+    val active = setCopy(ancestorLoops)
+    for (number in loopNodes.keys()) active.set(number, true)
+    val structuralView = newBlocks()
+    for (number in view.keys()) {
+        val block = blockAt(view, number)
+        val original = blockAt(gBlocks, number)
+        val live: array<int> = []
+        if (block.kind == kindBranch || block.kind == kindSwitch) {
+            var a = 0
+            while (a < original.targets.size) {
+                val actual = original.targets[a]
+                if (!gTerminal.has(actual) || loopNodes.has(actual)) live.append(block.targets[a])
+                a = a + 1
+            }
+        }
+        structuralView.set(number, withTargets(block, if (live.size > 0) live else block.targets))
+    }
+    val viewPostdom = postdominators(structuralView, loopNodes)
+    val nested = reducibleLoopRegions(view, loopNodes)
+    if (nested == null) return null
+    val context = LoopCtx(view, viewPostdom, nested, loopNodes, natural, destination, continueTarget, active, 0)
+    context.emit(start, stExit, indent)
+}
+
+// The choice after a loop whose exits are `ordered`, selected on `selector`.
+fun regionChoice(
+    ordered: array<int>, index: int, level: string, join: int, selector: string, activeLoops: Map<int, bool>
+): array<string>? {
+    val target = ordered[index]
+    val lines = emitRegion(target, join, level + (if (index + 1 < ordered.size) "    " else ""), activeLoops)
+    if (lines == null) return null
+    if (index + 1 == ordered.size) return lines
+    val tail = regionChoice(ordered, index + 1, level + "    ", join, selector, activeLoops)
+    if (tail == null) return null
+    val selected: array<string> = []
+    selected.append("${level}if ($selector == $target) {")
+    appendAll(selected, lines)
+    selected.append("$level} else {")
+    appendAll(selected, tail)
+    selected.append("$level}")
+    selected
+}
+
+fun setCommonPostdominator(starts: Map<int, bool>): int = gPostdom.common(setSorted(starts))
+
+fun emitRegion(start: int, stop: int, indent: string, ancestorLoops: Map<int, bool>): array<string>? {
+    val activeLoops = setCopy(ancestorLoops)
+    val output: array<string> = []
+    var node = start
+    val localPath = newSet()
+    while (node != stop && node != stExit) {
+        gEmittedSteps = gEmittedSteps + 1
+        if (gEmittedSteps > gMaximumSteps || localPath.has(node)) return null
+        localPath.set(node, true)
+        val block = blockAt(gBlocks, node)
+
+        if (gLoopRegions.has(node)) {
+            val loopNodes = gLoopRegions.get(node) ?? newSet()
+            val exits = newSet()
+            for (number in loopNodes.keys()) {
+                for (target in blockAt(gBlocks, number).targets) {
+                    if (target != stExit && !loopNodes.has(target)) exits.set(target, true)
+                }
+            }
+            gLoopSequence = gLoopSequence + 1
+            val destination = "recoveredLoopDestination$gLoopSequence"
+            if (exits.size > 0) {
+                output.append("${indent}var $destination = $node")
+                output.append("${indent}while ($destination == $node) {")
+            } else {
+                output.append("${indent}while (true) {")
+            }
+            val body = emitLoopIteration(node, loopNodes, node, destination, indent + "    ", node, activeLoops)
+            if (body == null) return null
+            appendAll(output, body)
+            output.append("$indent}")
+            if (exits.size == 0) {
+                node = stExit
+                continue
+            }
+            val remainingExits = newSet()
+            for (target in setSorted(exits)) {
+                if (gTerminal.has(target)) {
+                    val lines = emitRegion(target, stExit, indent + "    ", activeLoops)
+                    if (lines == null) return null
+                    output.append("${indent}if ($destination == $target) {")
+                    appendAll(output, lines)
+                    output.append("$indent}")
+                } else {
+                    remainingExits.set(target, true)
+                }
+            }
+            if (remainingExits.size == 0) {
+                node = stExit
+                continue
+            }
+            if (remainingExits.size == 1) {
+                node = remainingExits.keys()[0]
+                continue
+            }
+            val join = setCommonPostdominator(remainingExits)
+            val selected = regionChoice(setSorted(remainingExits), 0, indent, join, destination, activeLoops)
+            if (selected == null) return null
+            appendAll(output, selected)
+            node = join
+            continue
+        }
+
+        appendAll(output, normalizedStatements(block.statements, indent))
+
+        if (block.kind == kindHardware) {
+            val loopNodes = hardwareLoopNodes(block.loopStart, block.loopEnd)
+            if (loopNodes == null || loopNodes.has(node)) return null
+            val boundaries = loopBoundaries(loopNodes, block.loopEnd)
+            val early: array<int> = []
+            for (target in setSorted(boundaries)) if (target != block.loopEnd) early.append(target)
+            gLoopSequence = gLoopSequence + 1
+            val remaining = "recoveredLoopRemaining$gLoopSequence"
+            val destination = "recoveredLoopDestination$gLoopSequence"
+            output.append("${indent}var $remaining = ${block.count}")
+            if (early.size > 0) output.append("${indent}var $destination = ${block.loopEnd}")
+            val condition = block.condition.replace(block.count, remaining)
+            val plainLoop = block.condition == "true"
+            val loopCondition = if (plainLoop) "true" else condition
+            output.append("${indent}while ($loopCondition) {")
+            val body = emitLoopIteration(block.loopStart, loopNodes, block.loopEnd, destination,
+                indent + "    ", stNone, activeLoops)
+            if (body == null) return null
+            appendAll(output, body)
+            if (early.size > 0) {
+                output.append("$indent    if ($destination == ${block.loopEnd}) {")
+                output.append("$indent        $remaining = $remaining - u32(1)")
+                output.append("$indent    } else {")
+                output.append("$indent        $remaining = u32(0)")
+                output.append("$indent    }")
+            } else {
+                output.append("$indent    $remaining = $remaining - u32(1)")
+            }
+            if (plainLoop) output.append("$indent    if ($remaining == u32(0)) break")
+            output.append("$indent}")
+            if (early.size == 0) {
+                node = block.loopEnd
+                continue
+            }
+            val continuations = setOfArray(early)
+            continuations.set(block.loopEnd, true)
+            val join = setCommonPostdominator(continuations)
+            // early targets first, then the loop end.
+            val ordered = concatInts(early, intsOf1(block.loopEnd))
+            val selected = regionChoice(ordered, 0, indent, join, destination, activeLoops)
+            if (selected == null) return null
+            appendAll(output, selected)
+            node = join
+            continue
+        }
+
+        if (block.kind == kindExit) {
+            node = stExit
+            continue
+        }
+        if (block.kind == kindJump) {
+            node = block.targets[0]
+            continue
+        }
+
+        if (block.kind == kindSwitch) {
+            val join = gPostdom.immediate.get(node) ?? stExit
+            output.append("${indent}when (${block.condition}) {")
+            var a = 0
+            while (a < block.caseValues.size) {
+                val value = block.caseValues[a]
+                val target = block.targets[a]
+                val lines = emitRegion(target, join, indent + "        ", activeLoops)
+                if (lines == null) return null
+                output.append("$indent    $value -> {")
+                appendAll(output, lines)
+                if (value == "else" && target == stExit) output.append("$indent        ablaRuntimeTrap()")
+                output.append("$indent    }")
+                a = a + 1
+            }
+            output.append("$indent}")
+            node = join
+            continue
+        }
+
+        val yes = block.targets[0]
+        val no = block.targets[1]
+        val yesTerminal = gTerminal.has(yes) && !activeLoops.has(yes)
+        val noTerminal = gTerminal.has(no) && !activeLoops.has(no)
+        if (yesTerminal && noTerminal) {
+            val yesLines = emitRegion(yes, stExit, indent + "    ", activeLoops)
+            val noLines = emitRegion(no, stExit, indent + "    ", activeLoops)
+            if (yesLines == null || noLines == null) return null
+            output.append("${indent}if (${block.condition}) {")
+            appendAll(output, yesLines)
+            output.append("$indent} else {")
+            appendAll(output, noLines)
+            output.append("$indent}")
+            node = stExit
+            continue
+        }
+        if (yesTerminal != noTerminal) {
+            val terminal = if (yesTerminal) yes else no
+            val continuation = if (yesTerminal) no else yes
+            val lines = emitRegion(terminal, stExit, indent + "    ", activeLoops)
+            if (lines == null) return null
+            val condition = if (yesTerminal) block.condition else "!(${block.condition})"
+            output.append("${indent}if ($condition) {")
+            appendAll(output, lines)
+            output.append("$indent}")
+            node = continuation
+            continue
+        }
+
+        val join = gPostdom.immediate.get(node) ?? stExit
+        val yesLines = emitRegion(yes, join, indent + "    ", activeLoops)
+        val noLines = emitRegion(no, join, indent + "    ", activeLoops)
+        if (yesLines == null || noLines == null) return null
+        if (yesLines.size > 0 && noLines.size > 0) {
+            output.append("${indent}if (${block.condition}) {")
+            appendAll(output, yesLines)
+            output.append("$indent} else {")
+            appendAll(output, noLines)
+            output.append("$indent}")
+        } else if (yesLines.size > 0) {
+            output.append("${indent}if (${block.condition}) {")
+            appendAll(output, yesLines)
+            output.append("$indent}")
+        } else if (noLines.size > 0) {
+            output.append("${indent}if (!(${block.condition})) {")
+            appendAll(output, noLines)
+            output.append("$indent}")
+        }
+        node = join
+    }
+    output
+}
+
+fun concatInts(first: array<int>, second: array<int>): array<int> {
+    val result: array<int> = []
+    for (item in first) result.append(item)
+    for (item in second) result.append(item)
+    result
+}
+
+fun emitGraph(blocks: Map<int, Block>, nodes: Map<int, bool>): string? {
+    val regions = reducibleLoopRegions(blocks, nodes)
+    if (regions == null) return null
+    gBlocks = blocks
+    gNodes = nodes
+    gLoopRegions = regions
+    gEmittedSteps = 0
+    gMaximumSteps = nodes.size * 32 + 32
+    gLoopSequence = 0
+
+    // A recovered error path commonly jumps through one or more tiny cleanup
+    // blocks and then returns. Treat such unconditional tails as early exits so
+    // the successful continuation is emitted once instead of copied into every
+    // error branch.
+    val terminal = newSet()
+    for (number in nodes.keys()) {
+        val block = blockAt(blocks, number)
+        if (block.kind == kindExit || (block.targets.size == 1 && block.targets[0] == number)) {
+            terminal.set(number, true)
+        }
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        for (number in setSorted(nodes)) {
+            if (terminal.has(number)) continue
+            val block = blockAt(blocks, number)
+            if (block.kind == kindJump && terminal.has(block.targets[0])) {
+                terminal.set(number, true)
+                changed = true
+            }
+        }
+        for (header in regions.keys()) {
+            val region = regions.get(header) ?? newSet()
+            var anyExit = false
+            var allTerminal = true
+            for (number in region.keys()) {
+                for (target in blockAt(blocks, number).targets) {
+                    if (target != stExit && !region.has(target)) {
+                        anyExit = true
+                        if (!terminal.has(target)) allTerminal = false
+                    }
+                }
+            }
+            if (!terminal.has(header) && (!anyExit || allTerminal)) {
+                terminal.set(header, true)
+                changed = true
+            }
+        }
+    }
+    gTerminal = terminal
+    // Once a terminal arm is emitted as an early return, it no longer
+    // participates in the fallthrough graph. Compute joins from that normalized
+    // view so shared successful tails remain shared instead of being duplicated
+    // into every error-check arm.
+    val structural = newBlocks()
+    for (number in blocks.keys()) {
+        val block = blockAt(blocks, number)
+        val live: array<int> = []
+        if (block.kind == kindBranch || block.kind == kindSwitch) {
+            for (target in block.targets) if (!terminal.has(target)) live.append(target)
+        }
+        structural.set(number, withTargets(block, if (live.size > 0) live else block.targets))
+    }
+    gPostdom = postdominators(structural, nodes)
+    val lines = emitRegion(0, stExit, "    ", newSet())
+    if (lines == null) return null
+    lines.join("\n") + "\n"
+}
+
+// ---- the stackifier ----
+
+var skBlocks: Map<int, Block> = Map()
+var skOrder: array<int> = []
+var skSeen: Map<int, bool> = Map()
+var skRank: Map<int, int> = Map()
+var skMerges: Map<int, bool> = Map()
+var skChildren: Map<int, array<int>> = Map()
+var skSteps = 0
+
+fun skVisit(number: int): void {
+    skSeen.set(number, true)
+    for (target in blockAt(skBlocks, number).targets) {
+        if (target != stExit && !skSeen.has(target)) skVisit(target)
+    }
+    skOrder.append(number)
+}
+
+fun skBranch(source: int, target: int, indent: string, var out: array<string>): bool {
+    if (target == stExit) return false
+    if ((skRank.get(target) ?? 0) <= (skRank.get(source) ?? 0)) {
+        out.append("${indent}continue@l$target")
+        return true
+    }
+    if (skMerges.has(target)) {
+        out.append("${indent}break@b$target")
+        return true
+    }
+    skTree(target, indent, out)
+}
+
+var skHeaders: Map<int, bool> = Map()
+
+fun skTree(number: int, indent: string, var out: array<string>): bool {
+    skSteps = skSteps + 1
+    if (skSteps > skOrder.size * 4 + 16) return false
+    val ys: array<int> = []
+    for (child in skChildren.get(number) ?? array<int>()) if (skMerges.has(child)) ys.append(child)
+    // sorted by rank, highest first
+    val sortedYs: array<int> = []
+    val ranked: array<int> = []
+    for (y in ys) ranked.append(skRank.get(y) ?? 0)
+    val orderedRanks = sortInts(ranked)
+    var r = orderedRanks.size - 1
+    while (r >= 0) {
+        for (y in ys) if ((skRank.get(y) ?? 0) == orderedRanks[r]) sortedYs.append(y)
+        r = r - 1
+    }
+    if (skHeaders.has(number)) {
+        out.append("${indent}l$number@ while (true) {")
+        if (!skWithin(number, sortedYs, 0, indent + "    ", out)) return false
+        out.append("$indent}")
+        return true
+    }
+    skWithin(number, sortedYs, 0, indent, out)
+}
+
+fun skWithin(number: int, ys: array<int>, from: int, indent: string, var out: array<string>): bool {
+    if (from < ys.size) {
+        out.append("${indent}b${ys[from]}@ do {")
+        if (!skWithin(number, ys, from + 1, indent + "    ", out)) return false
+        out.append("$indent} while (false)")
+        return skTree(ys[from], indent, out)
+    }
+    val block = blockAt(skBlocks, number)
+    appendAll(out, normalizedStatements(block.statements, indent))
+    if (block.kind == kindExit) return true
+    if (block.kind == kindJump) return skBranch(number, block.targets[0], indent, out)
+    if (block.kind == kindBranch) {
+        out.append("${indent}if (${block.condition}) {")
+        if (!skBranch(number, block.targets[0], indent + "    ", out)) return false
+        out.append("$indent} else {")
+        if (!skBranch(number, block.targets[1], indent + "    ", out)) return false
+        out.append("$indent}")
+        return true
+    }
+    if (block.kind == kindSwitch) {
+        out.append("${indent}when (${block.condition}) {")
+        var a = 0
+        while (a < block.caseValues.size) {
+            val value = block.caseValues[a]
+            val target = block.targets[a]
+            out.append("$indent    $value -> {")
+            if (value == "else" && target == stExit) {
+                out.append("$indent        ablaRuntimeTrap()")
+            } else if (!skBranch(number, target, indent + "        ", out)) {
+                return false
+            }
+            out.append("$indent    }")
+            a = a + 1
+        }
+        out.append("$indent}")
+        return true
+    }
+    false
+}
+
+// Emit a reducible graph with every block exactly once (Ramsey's "Beyond
+// Relooper", WebAssembly's block/br stackifier).
+//
+// The dominator tree drives emission. A node with two or more forward edges
+// into it (a merge) is placed right after a labeled block
+// `bN@ do { ... } while (false)` that encloses all its predecessors, which
+// reach it with `break@bN`; a loop header opens `lN@ while (true) { ... }`
+// whose back edges are `continue@lN`; every other node has exactly one
+// forward edge into it and is emitted inline there. emitGraph instead
+// copies a join that is not an immediate post-dominator into each arm.
+// Hardware loops and exits it cannot express return null (emitGraph runs).
+fun emitStackified(blocks: Map<int, Block>, nodes: Map<int, bool>): string? {
+    for (number in nodes.keys()) if (blockAt(blocks, number).kind == kindHardware) return null
+    skBlocks = blocks
+    skOrder = []
+    skSeen = newSet()
+    skVisit(0)
+    val order: array<int> = []
+    var o = skOrder.size - 1
+    while (o >= 0) {
+        order.append(skOrder[o])
+        o = o - 1
+    }
+    skOrder = order
+    skRank = Map()
+    var index = 0
+    for (number in order) {
+        skRank.set(number, index)
+        index = index + 1
+    }
+    val predecessors: Map<int, array<int>> = Map()
+    for (number in order) predecessors.set(number, array<int>())
+    for (number in order) {
+        for (target in blockAt(blocks, number).targets) {
+            if (target != stExit) {
+                val list = predecessors.get(target) ?? array<int>()
+                list.append(number)
+            }
+        }
+    }
+    // Cooper-Harvey-Kennedy dominators over reverse postorder.
+    val idom: Map<int, int> = Map()
+    idom.set(0, 0)
+    var changed = true
+    while (changed) {
+        changed = false
+        var k = 1
+        while (k < order.size) {
+            val number = order[k]
+            k = k + 1
+            val done: array<int> = []
+            for (p in predecessors.get(number) ?? array<int>()) if (idom.has(p)) done.append(p)
+            if (done.size == 0) continue
+            var merged = done[0]
+            var d = 1
+            while (d < done.size) {
+                var a = merged
+                var b = done[d]
+                while (a != b) {
+                    while ((skRank.get(a) ?? 0) > (skRank.get(b) ?? 0)) a = idom.get(a) ?? 0
+                    while ((skRank.get(b) ?? 0) > (skRank.get(a) ?? 0)) b = idom.get(b) ?? 0
+                }
+                merged = a
+                d = d + 1
+            }
+            if ((idom.get(number) ?? stNone) != merged) {
+                idom.set(number, merged)
+                changed = true
+            }
+        }
+    }
+    val forwardIn: Map<int, int> = Map()
+    for (number in order) forwardIn.set(number, 0)
+    skHeaders = newSet()
+    for (number in order) {
+        for (target in blockAt(blocks, number).targets) {
+            if (target == stExit) continue
+            if ((skRank.get(target) ?? 0) <= (skRank.get(number) ?? 0)) {
+                // dominates(target, number)
+                var cursor = number
+                var dominated = false
+                while (true) {
+                    if (target == cursor) {
+                        dominated = true
+                        break
+                    }
+                    if (cursor == 0) break
+                    cursor = idom.get(cursor) ?? 0
+                }
+                if (!dominated) return null  // irreducible
+                skHeaders.set(target, true)
+            } else {
+                forwardIn.set(target, (forwardIn.get(target) ?? 0) + 1)
+            }
+        }
+    }
+    skMerges = newSet()
+    for (number in order) if ((forwardIn.get(number) ?? 0) >= 2) skMerges.set(number, true)
+    skChildren = Map()
+    for (number in order) skChildren.set(number, array<int>())
+    var c = 1
+    while (c < order.size) {
+        val children = skChildren.get(idom.get(order[c]) ?? 0) ?? array<int>()
+        children.append(order[c])
+        c = c + 1
+    }
+    skSteps = 0
+    val lines: array<string> = []
+    if (!skTree(0, "    ", lines)) return null
+    lines.join("\n") + "\n"
+}
+
+// ---- hardware loops as ordinary edges ----
+
+class Arm(val number: int, val body: string)
+
+// `^            (?P<number>[0-9]+) -> \{\n` at `at`: the offset after the line, or -1.
+fun armHeadEnd(text: string, at: int): int {
+    if (!recAt(text, at, spaces(12))) return -1
+    val digits = recDigitsEnd(text, at + 12)
+    if (digits == at + 12) return -1
+    if (!recAt(text, digits, " -> {\n")) return -1
+    digits + 6
+}
+
+val armCloser = "        }\n"
+
+// The first line start at or after `from` that is `        }\n`, or -1.
+fun findCloser(text: string, from: int): int {
+    var p = from
+    while (p < text.size) {
+        if (recAt(text, p, armCloser)) return p
+        val newline = text.indexOf("\n", p)
+        if (newline < 0) return -1
+        p = newline + 1
+    }
+    -1
+}
+
+// finditer(ARM) over text: each arm opens with `            N -> {` and ends at the first `        }` line.
+fun findArms(text: string): array<Arm> {
+    val arms: array<Arm> = []
+    var position = 0
+    while (position < text.size) {
+        val head = armHeadEnd(text, position)
+        if (head >= 0) {
+            val closer = findCloser(text, head)
+            if (closer >= 0) {
+                val digitsEnd = recDigitsEnd(text, position + 12)
+                arms.append(Arm(parseDigits(text.slice(position + 12, digitsEnd)), text.slice(head, closer)))
+                position = closer + armCloser.size
+                continue
+            }
+        }
+        val newline = text.indexOf("\n", position)
+        if (newline < 0) break
+        position = newline + 1
+    }
+    arms
+}
+
+// `^            if \((?:\((?P<condition>.*)\) && )?loopEnd == (?P<end>[0-9]+)\) loopActive = false\n`:
+// the loop end, or stNone when the line is not a cancellation.
+fun cancelEnd(line: string): int {
+    val prefix = spaces(12) + "if ("
+    val suffix = ") loopActive = false"
+    if (!line.startsWith(prefix) || !line.endsWith(suffix)) return stNone
+    val inner = line.slice(prefix.size, line.size - suffix.size)
+    var rest = inner
+    if (inner.startsWith("(")) {
+        // `\((.*)\) && loopEnd == N`: the last ") && loopEnd == " with digits after it.
+        val marker = ") && loopEnd == "
+        val at = inner.lastIndexOf(marker)
+        if (at < 0) return stNone
+        rest = inner.slice(at + marker.size, inner.size)
+    } else {
+        if (!inner.startsWith("loopEnd == ")) return stNone
+        rest = inner.slice(11, inner.size)
+    }
+    if (!allDigits(rest)) return stNone
+    parseDigits(rest)
+}
+
+class HardwareGraph(val blocks: Map<int, Block>, val ok: bool)
+
+// Rewrite a dispatcher's Xtensa hardware loops as ordinary graph edges.
+//
+// LOOP sets LCOUNT/LBEG/LEND; reaching LEND by falling through decrements
+// LCOUNT and returns to LBEG until it reaches zero, while a taken branch or
+// jump to LEND leaves the loop (the lifter marks those edges with
+// `loopActive = false`). Here each loop instruction sets `loopCounter` and
+// enters (or, for LOOPNEZ/LOOPGTZ, skips) the body; every fall-through edge
+// into LEND goes to a new latch block that counts down and returns to LBEG
+// or continues at LEND, and marked exits go to LEND directly. Bodies must be
+// the block range [LBEG, LEND) with no other entry and no other exit than
+// LEND or a returning block.
+fun stackifyHardwareLoops(arms: string): HardwareGraph {
+    val failed = HardwareGraph(newBlocks(), false)
+    val bodies: Map<int, string> = Map()
+    val exits: Map<string, bool> = Map()
+    for (arm in findArms(arms)) {
+        val pieces = arm.body.split("\n")
+        val kept: array<string> = []
+        var p = 0
+        while (p < pieces.size) {
+            val piece = pieces[p]
+            // A cancellation line needs its own newline, so the last piece never matches.
+            val end = if (p + 1 < pieces.size) cancelEnd(piece) else stNone
+            if (end != stNone) {
+                exits.set("${arm.number}:$end", true)
+            } else {
+                kept.append(piece)
+            }
+            p = p + 1
+        }
+        bodies.set(arm.number, kept.join("\n"))
+    }
+    val blocks = newBlocks()
+    for (number in bodies.keys()) {
+        val block = parseBlock(bodies.get(number) ?? "")
+        if (block == null || blocks.has(number)) return failed
+        blocks.set(number, block)
+    }
+    val loops: array<int> = []
+    for (number in blocks.keys()) if (blockAt(blocks, number).kind == kindHardware) loops.append(number)
+    if (loops.size == 0) return HardwareGraph(blocks, true)
+    var spare = maxKey(blocks) + 1
+    for (header in loops) {
+        val loop = blockAt(blocks, header)
+        for (other in loops) if (loop.loopStart <= other && other < loop.loopEnd) return failed  // nested hardware loops
+    }
+    for (header in loops) {
+        val loop = blockAt(blocks, header)
+        val start = loop.loopStart
+        val end = loop.loopEnd
+        var number = start
+        while (number < end) {
+            if (!blocks.has(number)) return failed
+            number = number + 1
+        }
+        if (!blocks.has(end)) return failed
+        for (source in blocks.keys()) {
+            if ((source >= start && source < end) || source == header) continue
+            for (target in blockAt(blocks, source).targets) {
+                if (target >= start && target < end && target != start) return failed
+            }
+        }
+        val latch = spare
+        spare = spare + 1
+        number = start
+        while (number < end) {
+            val block = blockAt(blocks, number)
+            val targets: array<int> = []
+            for (target in block.targets) {
+                if (target == end && !exits.has("$number:$end")) {
+                    targets.append(latch)
+                } else {
+                    val targetBlock = blocks.get(target) ?? block
+                    if (target == stExit || (target >= start && target < end) || target == end ||
+                        targetBlock.kind == kindExit) {
+                        targets.append(target)
+                    } else {
+                        return failed
+                    }
+                }
+            }
+            blocks.set(number, withTargets(block, targets))
+            number = number + 1
+        }
+        val latchStatements: array<string> = []
+        latchStatements.append(spaces(12) + "loopCounter = loopCounter - u32(1)")
+        blocks.set(latch, makeBlock(latchStatements, kindBranch, "loopCounter != u32(0)", intsOf2(start, end)))
+        val entry = concatLines(loop.statements, linesOf(spaces(12) + "loopCounter = ${loop.count}"))
+        if (loop.condition == "true") {
+            blocks.set(header, makeBlock(entry, kindJump, "", intsOf1(start)))
+        } else {
+            blocks.set(header, makeBlock(entry, kindBranch, loop.condition, intsOf2(start, end)))
+        }
+    }
+    HardwareGraph(blocks, true)
+}
+
+// ---- dispatchers ----
+
+class Dispatcher(val start: int, val end: int, val hasLoopVars: bool, val arms: string)
+
+val dispatcherStart = "    var programCounter = 0\n"
+val loopVarsText = "    var loopCounter = u32(0)\n    var loopStart = 0\n    var loopEnd = 0\n    var loopActive = false\n"
+val loopHeadText = "        if (loopActive && programCounter == loopEnd) {\n" +
+    "            loopCounter = loopCounter - u32(1)\n" +
+    "            if (loopCounter != u32(0)) programCounter = loopStart\n" +
+    "            if (loopCounter == u32(0)) loopActive = false\n" +
+    "        }\n"
+val dispatcherTail = "            else -> ablaRuntimeTrap()\n        }\n    }\n"
+
+// The offset where `            else -> ablaRuntimeTrap()` begins after the arms from `pos`, or -1.
+fun matchArmsFrom(text: string, pos: int, var memo: Map<int, int>): int {
+    val cached = memo.get(pos)
+    if (cached != null) return cached
+    var result = -1
+    val head = armHeadEnd(text, pos)
+    if (head >= 0) {
+        var from = head
+        while (result < 0) {
+            val closer = findCloser(text, from)
+            if (closer < 0) break
+            val after = closer + armCloser.size
+            val more = matchArmsFrom(text, after, memo)
+            if (more >= 0) {
+                result = more
+            } else if (recAt(text, after, dispatcherTail)) {
+                result = after
+            } else {
+                from = after
+            }
+        }
+    }
+    memo.set(pos, result)
+    result
+}
+
+fun matchDispatcher(text: string, start: int): Dispatcher? {
+    var p = start + dispatcherStart.size
+    var hasLoopVars = false
+    if (recAt(text, p, loopVarsText)) {
+        hasLoopVars = true
+        p = p + loopVarsText.size
+    }
+    val loop = "    while (true) {\n"
+    if (!recAt(text, p, loop)) return null
+    p = p + loop.size
+    if (recAt(text, p, loopHeadText)) p = p + loopHeadText.size
+    val when_ = "        when (programCounter) {\n"
+    if (!recAt(text, p, when_)) return null
+    p = p + when_.size
+    val memo: Map<int, int> = Map()
+    val armsEnd = matchArmsFrom(text, p, memo)
+    if (armsEnd < 0) return null
+    var end = armsEnd + dispatcherTail.size
+    if (recAt(text, end, "    r2\n")) end = end + 7
+    else if (recAt(text, end, "    return\n")) end = end + 11
+    Dispatcher(start, end, hasLoopVars, text.slice(p, armsEnd))
+}
+
+fun findDispatchers(source: string): array<Dispatcher> {
+    val found: array<Dispatcher> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf(dispatcherStart, from)
+        if (at < 0) break
+        if (at > 0 && source[at - 1] != 10) {
+            from = at + 1
+            continue
+        }
+        val match = matchDispatcher(source, at)
+        if (match == null) {
+            from = at + 1
+        } else {
+            found.append(match)
+            from = match.end
+        }
+    }
+    found
+}
+
+// 0: read ABLA_STRUCTURE (default "stackify"); 1: stackify; 2: classic. Tests set it with setStructureMode.
+var structureMode = 0
+
+fun setStructureMode(mode: int): void { structureMode = mode }
+
+fun stackifyMode(): bool =
+    if (structureMode == 1) true
+    else if (structureMode == 2) false
+    else processEnvironmentOr("ABLA_STRUCTURE", "stackify") == "stackify"
+
+fun lowerDispatcher(match: Dispatcher): string? {
+    if (match.hasLoopVars && stackifyMode()) {
+        val converted = stackifyHardwareLoops(match.arms)
+        if (converted.ok) {
+            val loopNodes = reachable(converted.blocks)
+            if (loopNodes != null) {
+                val stackified = emitStackified(converted.blocks, loopNodes)
+                if (stackified != null) return "    var loopCounter = u32(0)\n" + stackified
+            }
+        }
+    }
+    var blocks = newBlocks()
+    for (arm in findArms(match.arms)) {
+        val block = parseBlock(arm.body)
+        if (block == null || blocks.has(arm.number)) return null
+        blocks.set(arm.number, block)
+    }
+    if (blocks.size == 0) return null
+
+    val firstNodes = reachable(blocks)
+    if (firstNodes == null) return null
+    var nodes: Map<int, bool> = firstNodes
+    val nestedSplit = cloneSmallNestedMultiEntryRegions(blocks, nodes, 96)
+    if (nestedSplit == null) return null
+    blocks = nestedSplit.blocks
+    nodes = nestedSplit.nodes
+    if (reducibleLoopRegions(blocks, nodes) == null) {
+        val split = cloneSmallMultiEntryRegions(blocks, nodes, 96)
+        if (split == null) return null
+        blocks = split.blocks
+        nodes = split.nodes
+    }
+    // Labeled blocks (needs ablac's `name@` loops); ABLA_STRUCTURE=classic
+    // keeps the post-dominator emitter, which duplicates non-nested joins.
+    if (stackifyMode()) {
+        val stackified = emitStackified(blocks, nodes)
+        if (stackified != null) return stackified
+    }
+    emitGraph(blocks, nodes)
+}
+
+class Transformed(val text: string, val count: int)
+
+class Replacement(val start: int, val end: int, val text: string)
+
+// The function name of the last `^(?:trusted )?fun ([^(]+)` match before `limit`.
+fun enclosingFunction(source: string, limit: int): string {
+    var name = ""
+    var position = 0
+    while (position < limit) {
+        var after = -1
+        if (recAt(source, position, "trusted fun ")) after = position + 12
+        else if (recAt(source, position, "fun ")) after = position + 4
+        if (after >= 0 && after < limit && source[after] != 40) {
+            var end = after
+            while (end < limit && source[end] != 40) end = end + 1
+            name = source.slice(after, end)
+            position = end
+            // The next match may start at `end` only when it is a line start.
+            if (position > 0 && source[position - 1] != 10) {
+                val newline = source.indexOf("\n", position)
+                if (newline < 0 || newline + 1 > limit) break
+                position = newline + 1
+            }
+            continue
+        }
+        val newline = source.indexOf("\n", position)
+        if (newline < 0) break
+        position = newline + 1
+    }
+    name
+}
+
+fun transformWith(source: string, allowed: array<string>): Transformed {
+    val replacements: array<Replacement> = []
+    for (match in findDispatchers(source)) {
+        if (allowed.size > 0) {
+            val name = enclosingFunction(source, match.start)
+            if (!arrayHasString(allowed, name)) continue
+        }
+        val lowered = lowerDispatcher(match)
+        if (lowered != null) replacements.append(Replacement(match.start, match.end, lowered))
+    }
+    val pieces: array<string> = []
+    var last = 0
+    for (replacement in replacements) {
+        pieces.append(source.slice(last, replacement.start))
+        pieces.append(replacement.text)
+        last = replacement.end
+    }
+    pieces.append(source.slice(last, source.size))
+    Transformed(pieces.join(""), replacements.size)
+}
+
+fun arrayHasString(values: array<string>, wanted: string): bool {
+    for (value in values) if (value == wanted) return true
+    false
+}
+
+fun transform(source: string): Transformed = transformWith(source, array<string>())
+
+// transform with the classic post-dominator emitter (ABLA_STRUCTURE=classic).
+fun transformClassic(source: string): Transformed {
+    val previous = structureMode
+    structureMode = 2
+    val result = transformWith(source, array<string>())
+    structureMode = previous
+    result
+}
+
+fun usageError(message: string): int {
+    eprintln("usage: structurize-acyclic-recovered-functions [-h] [--write] [--verbose] [--function FUNCTION] paths [paths ...]")
+    eprintln("structurize-acyclic-recovered-functions: error: $message")
+    2
+}
+
+fun main: int {
+    var write = false
+    var verbose = false
+    val allowed: array<string> = []
+    val paths: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "--write") write = true
+        else if (argument == "--verbose") verbose = true
+        else if (argument == "--function") {
+            if (index >= processArgumentCount()) return usageError("argument --function: expected one argument")
+            allowed.append(processArgument(index))
+            index = index + 1
+        } else if (argument.startsWith("--function=")) {
+            allowed.append(argument.slice(11, argument.size))
+        } else if (argument.startsWith("-") && argument != "-") {
+            return usageError("unrecognized arguments: $argument")
+        } else {
+            paths.append(recNormalizePath(argument))
+        }
+    }
+    if (paths.size == 0) return usageError("the following arguments are required: paths")
+
+    var changedFiles = 0
+    var loweredFunctions = 0
+    for (path in recInputFiles(paths)) {
+        val read = recRead(path)
+        if (!read.ok) {
+            eprintln("cannot read $path")
+            return 1
+        }
+        val result = transformWith(read.text, allowed)
+        loweredFunctions = loweredFunctions + result.count
+        if (result.text != read.text) {
+            changedFiles = changedFiles + 1
+            if (verbose) println("$path: ${result.count}")
+            if (write) Path(path).writeText(result.text)
+        }
+    }
+    val action = if (write) "structured" else "would structure"
+    println("$action $loweredFunctions acyclic function(s) across $changedFiles file(s)")
+    0
+}
