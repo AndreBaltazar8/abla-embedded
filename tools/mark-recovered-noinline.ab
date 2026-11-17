@@ -1,0 +1,167 @@
+// Keep recovered Xtensa functions out of their callers.
+//
+// Every recovered ABI function stays in the image as its own symbol (raw
+// assembly, the Espressif objects and function tables reach it by name), so
+// inlining a copy into each caller only adds code: with `EXPORTS=all` the
+// eight-archive unit lost 16.6 KB of text when the recovered functions were
+// marked noinline. GCC kept the same calls as calls, so this also restores the
+// original call structure.
+//
+// Functions whose body has at most `--inline-lines` statements stay inlinable
+// (a wrapper or getter can be smaller than its call sequence). The pass only
+// adds the existing `@noinline` annotation, which ablac lowers to the LLVM
+// `noinline` attribute; it changes no behaviour.
+//
+//     tools/abla-tool mark-recovered-noinline ROOT [--write] [--inline-lines N]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process/arguments"
+import "lib/recfiles.ab"
+
+class NoinlineResult(val text: string, val count: int)
+
+// `    var r12 = `, `    var incomingStack3 = `, `    var shiftAmount = `, `    var compareExchangeExpected = `
+fun noinlineDeclaration(line: string): bool {
+    if (!line.startsWith("    var ")) return false
+    val rest = line.slice(8, line.size)
+    if (rest.startsWith("shiftAmount = ") || rest.startsWith("compareExchangeExpected = ")) return true
+    if (rest.startsWith("incomingStack")) {
+        return rest.size >= 17 && recIsDigit(rest[13]) && rest.slice(14, 17) == " = "
+    }
+    if (rest.startsWith("r")) {
+        var index = 1
+        while (index < rest.size && recIsDigit(rest[index])) index = index + 1
+        return index > 1 && rest.slice(index, rest.size).startsWith(" = ")
+    }
+    false
+}
+
+// Statements of the function whose `): T {` follows `start`, or -1.
+fun noinlineBodyStatements(text: string, start: int): int {
+    val begin = text.indexOf("\n): ", start)
+    if (begin < 0) return -1
+    val openBrace = text.indexOf("{\n", begin)
+    if (openBrace < 0) return -1
+    val end = text.indexOf("\n}\n", openBrace)
+    if (end < 0) return -1
+    val body = if (end < openBrace + 2) "" else text.slice(openBrace + 2, end)
+    var count = 0
+    for (line in body.split("\n")) {
+        val stripped = recStrip(line)
+        if (stripped != "" && !noinlineDeclaration(line) && stripped != "}") count = count + 1
+    }
+    count
+}
+
+fun processNoinline(text: string, inlineLines: int): NoinlineResult {
+    val out = byteBuffer()
+    var count = 0
+    var last = 0
+    var search = 0
+    val head = "trusted fun esp32Recovered"
+    while (true) {
+        val at = text.indexOf(head, search)
+        if (at < 0) break
+        search = at + 1
+        if (at > 0 && text[at - 1] != 10) continue
+        val nameEnd = recIdentEnd(text, at + head.size)
+        // `\w+` after esp32Recovered needs at least one word character, then `(`.
+        if (nameEnd == at + head.size || nameEnd >= text.size || text[nameEnd] != 40) continue
+        // The attribute lines directly above: every line beginning with `@`.
+        var attrStart = at
+        while (attrStart > last && attrStart >= 2) {
+            val previousEnd = attrStart - 1
+            var previousBegin = previousEnd
+            while (previousBegin > 0 && text[previousBegin - 1] != 10) previousBegin = previousBegin - 1
+            if (previousBegin < last || text[previousBegin] != 64) break
+            attrStart = previousBegin
+        }
+        search = nameEnd
+        val attrs = text.slice(attrStart, at)
+        if (attrs.contains("@noinline") || attrs.contains("@naked") || attrs.contains("@inline")) continue
+        val statements = noinlineBodyStatements(text, nameEnd + 1)
+        if (statements < 0 || statements <= inlineLines) continue
+        out.appendText(text.slice(last, at))
+        out.appendText("@noinline\n")
+        last = at
+        count = count + 1
+    }
+    out.appendText(text.slice(last, text.size))
+    NoinlineResult(out.toText(), count)
+}
+
+fun main: int {
+    var write = false
+    var inlineLines = 0
+    var root = ""
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "--write") write = true
+        else if (argument == "--inline-lines" || argument.startsWith("--inline-lines=")) {
+            var value = ""
+            if (argument == "--inline-lines") {
+                if (index >= processArgumentCount()) {
+                    eprintln("mark-recovered-noinline: error: argument --inline-lines: expected one argument")
+                    return 2
+                }
+                value = processArgument(index)
+                index = index + 1
+            } else value = argument.slice(15, argument.size)
+            val parsed = noinlineParseInt(value)
+            if (parsed.error) {
+                eprintln("mark-recovered-noinline: error: argument --inline-lines: invalid int value: '$value'")
+                return 2
+            }
+            inlineLines = parsed.value
+        } else if (argument.startsWith("-") && argument != "-") {
+            eprintln("mark-recovered-noinline: error: unrecognized arguments: $argument")
+            return 2
+        } else if (root == "") root = argument
+        else {
+            eprintln("mark-recovered-noinline: error: unrecognized arguments: $argument")
+            return 2
+        }
+    }
+    if (root == "") {
+        eprintln("usage: mark-recovered-noinline [-h] [--write] [--inline-lines INLINE_LINES] root")
+        return 2
+    }
+    var total = 0
+    for (path in recRglobAb(recNormalizePath(root))) {
+        val read = recRead(path)
+        if (!read.ok) {
+            eprintln("cannot read $path")
+            return 1
+        }
+        val result = processNoinline(read.text, inlineLines)
+        total = total + result.count
+        if (result.count > 0 && write) Path(path).writeText(result.text)
+    }
+    println("${if (write) "marked" else "would mark"} $total function(s) noinline")
+    0
+}
+
+class NoinlineInt(val value: int, val error: bool)
+
+fun noinlineParseInt(text: string): NoinlineInt {
+    val stripped = recStrip(text)
+    var index = 0
+    var negative = false
+    if (index < stripped.size && (stripped[index] == 45 || stripped[index] == 43)) {
+        negative = stripped[index] == 45
+        index = index + 1
+    }
+    if (index >= stripped.size) return NoinlineInt(0, true)
+    var value = 0
+    while (index < stripped.size) {
+        if (!recIsDigit(stripped[index])) return NoinlineInt(0, true)
+        value = value * 10 + stripped[index] - 48
+        index = index + 1
+    }
+    NoinlineInt(if (negative) -value else value, false)
+}

@@ -1,0 +1,372 @@
+// Restore only architecture-required store delay slots from raw Xtensa lifts.
+//
+//     tools/abla-tool restore-recovered-store-delays RAW_DIR TARGET_DIR [--write] STEM...
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process/arguments"
+import "lib/recfiles.ab"
+
+val storeNop = "xtensaNoOperation()"
+
+class StoreSite(val name: string, val store: string)
+
+class StorePatterns(val sites: array<StoreSite>, val error: string)
+
+class StoreText(val text: string, val error: string)
+
+class StoreInt(val value: int, val ok: bool)
+
+class StoreFound(val begin: int, val end: int)
+
+class StoreRestore(val text: string, val sites: int, val error: string)
+
+fun storeWidth(opcode: string): string =
+    if (opcode == "s8i") "U8"
+    else if (opcode == "s16i") "U16"
+    else if (opcode == "s32i" || opcode == "s32i.n") "U32"
+    else ""
+
+fun storeHexValue(byte: int): int =
+    if (byte >= 48 && byte <= 57) byte - 48
+    else if (byte >= 65 && byte <= 70) byte - 55
+    else if (byte >= 97 && byte <= 102) byte - 87
+    else -1
+
+// ast.literal_eval of one double-quoted Python string literal (`literal` includes the quotes).
+fun storeDecodeLiteral(literal: string): StoreText {
+    val out = byteBuffer()
+    var i = 1
+    val end = literal.size - 1
+    while (i < end) {
+        val c = literal[i]
+        if (c == 10) return StoreText("", "unterminated string literal")
+        if (c != 92) {
+            out.appendByteValue(c)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+        val e = literal[i]
+        i = i + 1
+        if (e == 10) continue
+        if (e == 92 || e == 39 || e == 34) out.appendByteValue(e)
+        else if (e == 97) out.appendByteValue(7)
+        else if (e == 98) out.appendByteValue(8)
+        else if (e == 102) out.appendByteValue(12)
+        else if (e == 110) out.appendByteValue(10)
+        else if (e == 114) out.appendByteValue(13)
+        else if (e == 116) out.appendByteValue(9)
+        else if (e == 118) out.appendByteValue(11)
+        else if (e >= 48 && e <= 55) {
+            var value = e - 48
+            var digits = 1
+            while (digits < 3 && i < end && literal[i] >= 48 && literal[i] <= 55) {
+                value = value * 8 + literal[i] - 48
+                i = i + 1
+                digits = digits + 1
+            }
+            out.appendText(utf8Encode(value))
+        } else if (e == 120 || e == 117 || e == 85) {
+            val count = if (e == 120) 2 else if (e == 117) 4 else 8
+            var value = 0
+            var k = 0
+            while (k < count) {
+                if (i >= end || storeHexValue(literal[i]) < 0) return StoreText("", "invalid escape in string literal")
+                value = value * 16 + storeHexValue(literal[i])
+                i = i + 1
+                k = k + 1
+            }
+            out.appendText(utf8Encode(value))
+        } else {
+            out.appendByteValue(92)
+            out.appendByteValue(e)
+        }
+    }
+    StoreText(out.toText(), "")
+}
+
+// The first `xtensaAssembly(Void|ReadU32)(\n\s*"literal"` at or after `from`.
+fun storeFindLiteral(source: string, from: int): StoreFound {
+    var p = from
+    while (true) {
+        val a = source.indexOf("xtensaAssemblyVoid(", p)
+        val b = source.indexOf("xtensaAssemblyReadU32(", p)
+        val candidate = if (a < 0) b else if (b < 0) a else if (a < b) a else b
+        if (candidate < 0) return StoreFound(-1, -1)
+        p = candidate + 1
+        val open = candidate + (if (candidate == a) 19 else 22)
+        if (!recAt(source, open, "\n")) continue
+        val q = recSkipSpace(source, open + 1)
+        if (!recAt(source, q, "\"")) continue
+        var j = q + 1
+        while (j < source.size) {
+            if (source[j] == 92) {
+                if (j + 1 >= source.size) break
+                j = j + 2
+            } else if (source[j] == 34) {
+                return StoreFound(q, j + 1)
+            } else j = j + 1
+        }
+    }
+    StoreFound(-1, -1)
+}
+
+fun storeIsSeparator(byte: int): bool = byte == 44 || recIsSpace(byte)
+
+// re.split(r"[\s,]+", text): empty strings appear at a leading or trailing separator.
+fun storeFields(text: string): array<string> {
+    val fields: array<string> = []
+    var begin = 0
+    var i = 0
+    while (i < text.size) {
+        if (storeIsSeparator(text[i])) {
+            fields.append(text.slice(begin, i))
+            while (i < text.size && storeIsSeparator(text[i])) i = i + 1
+            begin = i
+        } else i = i + 1
+    }
+    fields.append(text.slice(begin, text.size))
+    fields
+}
+
+// The first whitespace-separated word of `text`, or "".
+fun storeFirstWord(text: string): string {
+    val stripped = recLstrip(text)
+    var end = 0
+    while (end < stripped.size && !recIsSpace(stripped[end])) end = end + 1
+    stripped.slice(0, end)
+}
+
+// The line breaks str.splitlines() honours inside the decoded assembly text.
+fun storeSplitInstructions(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var i = 0
+    while (i < text.size) {
+        val b = text[i]
+        if (b == 10 || b == 13 || b == 11 || b == 12 || (b >= 28 && b <= 30)) {
+            lines.append(text.slice(begin, i))
+            if (b == 13 && i + 1 < text.size && text[i + 1] == 10) i = i + 1
+            begin = i + 1
+        }
+        i = i + 1
+    }
+    if (begin < text.size) lines.append(text.slice(begin, text.size))
+    lines
+}
+
+// int(text, 0) without underscores.
+fun storeParseInt(text: string): StoreInt {
+    var i = 0
+    var negative = false
+    if (i < text.size && (text[i] == 45 || text[i] == 43)) {
+        negative = text[i] == 45
+        i = i + 1
+    }
+    var base = 10
+    if (i + 1 < text.size && text[i] == 48) {
+        val p = text[i + 1]
+        if (p == 120 || p == 88) base = 16
+        else if (p == 111 || p == 79) base = 8
+        else if (p == 98 || p == 66) base = 2
+        if (base != 10) i = i + 2
+    }
+    if (i >= text.size) return StoreInt(0, false)
+    val digitsBegin = i
+    var value = 0
+    while (i < text.size) {
+        val d = storeHexValue(text[i])
+        if (d < 0 || d >= base) return StoreInt(0, false)
+        value = value * base + d
+        i = i + 1
+    }
+    if (base == 10 && text[digitsBegin] == 48 && value != 0) return StoreInt(0, false)
+    StoreInt(if (negative) -value else value, true)
+}
+
+fun delayedStorePatterns(raw: string): StorePatterns {
+    val sites: array<StoreSite> = []
+    val seen = Map<string, bool>()
+    var pos = 0
+    while (true) {
+        val at = raw.indexOf("trusted fun", pos)
+        if (at < 0) break
+        pos = at + 1
+        val q = recSkipSpace(raw, at + 11)
+        if (q == at + 11) continue
+        val nameEnd = recIdentEndWord(raw, q)
+        if (nameEnd == q) continue
+        val found = storeFindLiteral(raw, nameEnd)
+        if (found.begin < 0) break
+        pos = found.end
+        val name = raw.slice(q, nameEnd)
+        val decoded = storeDecodeLiteral(raw.slice(found.begin, found.end))
+        if (decoded.error != "") return StorePatterns(sites, decoded.error)
+        val instructions = storeSplitInstructions(decoded.text)
+        var index = 0
+        while (index < instructions.size) {
+            val fields = storeFields(recStrip(instructions[index]))
+            index = index + 1
+            if (fields.size < 4 || storeWidth(fields[0]) == "") continue
+            var cursor = index
+            while (cursor < instructions.size) {
+                val word = storeFirstWord(instructions[cursor])
+                if (word != "memw" && word != "rsync" && word != "esync") break
+                cursor = cursor + 1
+            }
+            var delay = 0
+            while (cursor < instructions.size) {
+                val word = storeFirstWord(instructions[cursor])
+                if (word != "nop" && word != "nop.n") break
+                delay = delay + 1
+                cursor = cursor + 1
+            }
+            if (delay != 4) continue
+            val value = "r" + fields[1].slice(1, fields[1].size)
+            val base = "r" + fields[2].slice(1, fields[2].size)
+            val amount = storeParseInt(fields[3])
+            if (!amount.ok) return StorePatterns(sites, "invalid literal for int() with base 0: '${fields[3]}'")
+            val address = if (amount.value == 0) base else "($base + u32(${amount.value}))"
+            val store = "ablaUnsafeStore${storeWidth(fields[0])}(nativePointerFromAddress(int($address)), int($value))"
+            val key = name + "\n" + store
+            if (!seen.has(key)) {
+                seen.set(key, true)
+                sites.append(StoreSite(name, store))
+            }
+        }
+    }
+    StorePatterns(sites, "")
+}
+
+// `\bfun\s+NAME\s*\(` then the braces' extent: (begin, end), (-1, -1) when the function is absent,
+// (-2, -2) when it is unterminated.
+fun storeFunctionExtent(source: string, name: string): StoreFound {
+    var p = 0
+    var headerEnd = -1
+    while (true) {
+        val at = source.indexOf("fun", p)
+        if (at < 0) break
+        p = at + 1
+        if (at > 0 && recIsWord(source[at - 1])) continue
+        val q = recSkipSpace(source, at + 3)
+        if (q == at + 3 || !recAt(source, q, name)) continue
+        val r = recSkipSpace(source, q + name.size)
+        if (!recAt(source, r, "(")) continue
+        headerEnd = r + 1
+        break
+    }
+    if (headerEnd < 0) return StoreFound(-1, -1)
+    val begin = source.indexOf("{", headerEnd)
+    if (begin < 0) return StoreFound(-2, -2)
+    var depth = 0
+    var i = begin
+    while (i < source.size) {
+        if (source[i] == 123) depth = depth + 1
+        else if (source[i] == 125) {
+            depth = depth - 1
+            if (depth == 0) return StoreFound(begin, i + 1)
+        }
+        i = i + 1
+    }
+    StoreFound(-2, -2)
+}
+
+// A line that is exactly `[ \t]*STORE[ \t]*`: its indent, or -1.
+fun storeLineIndent(line: string, store: string): int {
+    var i = 0
+    while (i < line.size && (line[i] == 32 || line[i] == 9)) i = i + 1
+    if (!recAt(line, i, store)) return -1
+    var j = i + store.size
+    while (j < line.size && (line[j] == 32 || line[j] == 9)) j = j + 1
+    if (j != line.size) return -1
+    i
+}
+
+fun restoreStoreDelays(raw: string, target: string): StoreRestore {
+    val hadNewline = target.endsWith("\n")
+    val kept: array<string> = []
+    for (line in recSplitLines(target)) if (recStrip(line) != storeNop) kept.append(line)
+    var source = kept.join("\n")
+    var sites = 0
+    val patterns = delayedStorePatterns(raw)
+    if (patterns.error != "") return StoreRestore("", 0, patterns.error)
+    for (site in patterns.sites) {
+        val extent = storeFunctionExtent(source, site.name)
+        if (extent.begin == -2) return StoreRestore("", 0, "unterminated function ${site.name}")
+        if (extent.begin < 0) continue
+        val body = source.slice(extent.begin, extent.end)
+        val lines = body.split("\n")
+        val out: array<string> = []
+        var count = 0
+        for (line in lines) {
+            out.append(line)
+            val indent = storeLineIndent(line, site.store)
+            if (indent >= 0) {
+                val pad = line.slice(0, indent)
+                out.append(storeNopLines(pad, 4))
+                count = count + 1
+            }
+        }
+        if (count > 0) {
+            source = source.slice(0, extent.begin) + out.join("\n") + source.slice(extent.end, source.size)
+            sites = sites + count
+        }
+    }
+    if (hadNewline) source = source + "\n"
+    StoreRestore(source, sites, "")
+}
+
+fun storeNopLines(indent: string, count: int): string {
+    val lines: array<string> = []
+    var i = 0
+    while (i < count) {
+        lines.append(indent + storeNop)
+        i = i + 1
+    }
+    lines.join("\n")
+}
+
+fun main: int {
+    var write = false
+    val positional: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "--write") write = true
+        else if (argument.startsWith("-") && argument != "-") {
+            eprintln("restore-recovered-store-delays: error: unrecognized arguments: $argument")
+            return 2
+        } else positional.append(argument)
+    }
+    if (positional.size < 3) {
+        eprintln("usage: restore-recovered-store-delays [-h] [--write] raw_directory target_directory stems [stems ...]")
+        return 2
+    }
+    val rawDirectory = recNormalizePath(positional[0])
+    val targetDirectory = recNormalizePath(positional[1])
+    var p = 2
+    while (p < positional.size) {
+        val stem = positional[p]
+        p = p + 1
+        val raw = recRead(recJoinPath(rawDirectory, stem + ".ab"))
+        val targetPath = recJoinPath(targetDirectory, stem + ".ab")
+        val target = recRead(targetPath)
+        if (!raw.ok || !target.ok) {
+            eprintln("cannot read ${if (!raw.ok) recJoinPath(rawDirectory, stem + ".ab") else targetPath}")
+            return 1
+        }
+        val result = restoreStoreDelays(raw.text, target.text)
+        if (result.error != "") {
+            eprintln("restore-recovered-store-delays: $stem: ${result.error}")
+            return 1
+        }
+        if (write) Path(targetPath).writeText(result.text)
+        val action = if (write) "restored" else "would restore"
+        println("$stem: $action ${result.sites} store sites, ${result.sites * 4} NOPs")
+    }
+    0
+}
