@@ -1,0 +1,298 @@
+// Synchronize recovered Xtensa NOPs after source CFG restructuring.
+//
+// The reference and target are expected to contain the same mechanically lifted
+// functions.  Only gaps bounded by two consecutive, text-identical non-NOP
+// lines are touched, so semantic edits and unmatched control-flow regions remain
+// unchanged.  Re-running after other mechanical lowering passes converges more
+// sites without guessing.
+//
+//     tools/abla-tool synchronize-recovered-nops REFERENCE TARGET [--write]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process/arguments"
+import "lib/recfiles.ab"
+
+val nopText = "xtensaNoOperation()"
+
+class NopLine(val text: string, val index: int)
+
+class NopSync(val text: string, val inserted: int, val removed: int)
+
+// difflib.SequenceMatcher(None, a, b, autojunk=False) with lines interned as integers.
+class SequenceMatch(
+    val a: array<int>,
+    val b2j: array<array<int>>,
+    var lengthEven: array<int>,
+    var tagEven: array<int>,
+    var lengthOdd: array<int>,
+    var tagOdd: array<int>,
+    var stamp: int,
+    var bestI: int,
+    var bestJ: int,
+    var bestSize: int
+)
+
+fun findLongestMatch(var m: SequenceMatch, alo: int, ahi: int, blo: int, bhi: int): void {
+    m.bestI = alo
+    m.bestJ = blo
+    m.bestSize = 0
+    var previousStamp = -1
+    var i = alo
+    while (i < ahi) {
+        val current = m.stamp
+        m.stamp = m.stamp + 1
+        val parity = (i - alo) % 2
+        val positions = m.b2j[m.a[i]]
+        var p = 0
+        while (p < positions.size) {
+            val j = positions[p]
+            p = p + 1
+            if (j < blo) continue
+            if (j >= bhi) break
+            var length = 1
+            if (j > 0) {
+                if (parity == 0) {
+                    if (m.tagOdd[j - 1] == previousStamp) length = m.lengthOdd[j - 1] + 1
+                } else {
+                    if (m.tagEven[j - 1] == previousStamp) length = m.lengthEven[j - 1] + 1
+                }
+            }
+            if (parity == 0) {
+                m.lengthEven[j] = length
+                m.tagEven[j] = current
+            } else {
+                m.lengthOdd[j] = length
+                m.tagOdd[j] = current
+            }
+            if (length > m.bestSize) {
+                m.bestI = i - length + 1
+                m.bestJ = j - length + 1
+                m.bestSize = length
+            }
+        }
+        previousStamp = current
+        i = i + 1
+    }
+}
+
+// matches[i] = j for every line i of `a` in a matching block (-1 elsewhere).
+fun matchingBlocks(a: array<int>, b: array<int>, symbols: int): array<int> {
+    val b2j: array<array<int>> = []
+    var s = 0
+    while (s < symbols) {
+        val empty: array<int> = []
+        b2j.append(empty)
+        s = s + 1
+    }
+    var j = 0
+    while (j < b.size) {
+        b2j[b[j]].append(j)
+        j = j + 1
+    }
+    val matches = filledArray(a.size, -1)
+    val m = SequenceMatch(a, b2j, filledArray(b.size + 1, 0), filledArray(b.size + 1, -2),
+        filledArray(b.size + 1, 0), filledArray(b.size + 1, -2), 0, 0, 0, 0)
+    // The work stack of (alo, ahi, blo, bhi) ranges, four ints each.
+    val stack: array<int> = [0, a.size, 0, b.size]
+    while (stack.size > 0) {
+        val top = stack.size - 4
+        val alo = stack[top]
+        val ahi = stack[top + 1]
+        val blo = stack[top + 2]
+        val bhi = stack[top + 3]
+        stack.truncate(top)
+        findLongestMatch(m, alo, ahi, blo, bhi)
+        val i = m.bestI
+        val jj = m.bestJ
+        val k = m.bestSize
+        if (k > 0) {
+            var offset = 0
+            while (offset < k) {
+                matches[i + offset] = jj + offset
+                offset = offset + 1
+            }
+            if (alo < i && blo < jj) {
+                stack.append(alo)
+                stack.append(i)
+                stack.append(blo)
+                stack.append(jj)
+            }
+            if (i + k < ahi && jj + k < bhi) {
+                stack.append(i + k)
+                stack.append(ahi)
+                stack.append(jj + k)
+                stack.append(bhi)
+            }
+        }
+    }
+    matches
+}
+
+fun nopIndent(line: string): string {
+    var end = 0
+    while (end < line.size && recIsSpace(line[end])) end = end + 1
+    line.slice(0, end)
+}
+
+fun synchronizeNops(referenceText: string, targetText: string): NopSync {
+    val referenceLines = recSplitLines(referenceText)
+    val targetLines = recSplitLines(targetText)
+    val referenceNon: array<NopLine> = []
+    val targetNon: array<NopLine> = []
+    val ids = Map<string, int>()
+    val referenceIds: array<int> = []
+    val targetIds: array<int> = []
+    var index = 0
+    while (index < referenceLines.size) {
+        val stripped = recStrip(referenceLines[index])
+        if (stripped != nopText) {
+            referenceNon.append(NopLine(stripped, index))
+            var id = ids.get(stripped) ?? -1
+            if (id < 0) {
+                id = ids.size
+                ids.set(stripped, id)
+            }
+            referenceIds.append(id)
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < targetLines.size) {
+        val stripped = recStrip(targetLines[index])
+        if (stripped != nopText) {
+            targetNon.append(NopLine(stripped, index))
+            var id = ids.get(stripped) ?? -1
+            if (id < 0) {
+                id = ids.size
+                ids.set(stripped, id)
+            }
+            targetIds.append(id)
+        }
+        index = index + 1
+    }
+    val matches = matchingBlocks(referenceIds, targetIds, ids.size)
+    // Replacements as (begin, end, count) triples in ascending order.
+    val replacements: array<int> = []
+    val indents: array<string> = []
+    var inserted = 0
+    var removed = 0
+    var left = 0
+    while (left + 1 < matches.size) {
+        val right = left + 1
+        val targetLeft = matches[left]
+        val targetRight = matches[right]
+        if (targetLeft < 0 || targetRight != targetLeft + 1) {
+            left = left + 1
+            continue
+        }
+        val referenceBegin = referenceNon[left].index + 1
+        val referenceEnd = referenceNon[right].index
+        val targetBegin = targetNon[targetLeft].index + 1
+        val targetEnd = targetNon[targetRight].index
+        var referenceCount = 0
+        var i = referenceBegin
+        while (i < referenceEnd) {
+            if (recStrip(referenceLines[i]) == nopText) referenceCount = referenceCount + 1
+            i = i + 1
+        }
+        var targetCount = 0
+        i = targetBegin
+        while (i < targetEnd) {
+            if (recStrip(targetLines[i]) == nopText) targetCount = targetCount + 1
+            i = i + 1
+        }
+        if (referenceCount != targetCount) {
+            val nextLine = targetLines[targetNon[targetRight].index]
+            val previousLine = targetLines[targetNon[targetLeft].index]
+            val anchor = if (!recStrip(nextLine).startsWith("}")) nextLine else previousLine
+            replacements.append(targetBegin)
+            replacements.append(targetEnd)
+            replacements.append(referenceCount)
+            indents.append(nopIndent(anchor))
+            if (referenceCount > targetCount) inserted = inserted + referenceCount - targetCount
+            else removed = removed + targetCount - referenceCount
+        }
+        left = left + 1
+    }
+    val out: array<string> = []
+    var cursor = 0
+    var r = 0
+    while (r < indents.size) {
+        val begin = replacements[r * 3]
+        val end = replacements[r * 3 + 1]
+        val count = replacements[r * 3 + 2]
+        while (cursor < begin) {
+            out.append(targetLines[cursor])
+            cursor = cursor + 1
+        }
+        var k = 0
+        while (k < count) {
+            out.append(indents[r] + nopText)
+            k = k + 1
+        }
+        cursor = end
+        r = r + 1
+    }
+    while (cursor < targetLines.size) {
+        out.append(targetLines[cursor])
+        cursor = cursor + 1
+    }
+    val suffix = if (targetText.endsWith("\n")) "\n" else ""
+    NopSync(out.join("\n") + suffix, inserted, removed)
+}
+
+fun main: int {
+    var write = false
+    val positional: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "--write") write = true
+        else if (argument.startsWith("-") && argument != "-") {
+            eprintln("synchronize-recovered-nops: error: unrecognized arguments: $argument")
+            return 2
+        } else positional.append(argument)
+    }
+    if (positional.size != 2) {
+        eprintln("usage: synchronize-recovered-nops [-h] [--write] reference target")
+        return 2
+    }
+    val reference = recNormalizePath(positional[0])
+    val target = recNormalizePath(positional[1])
+    var inserted = 0
+    var removed = 0
+    var changed = 0
+    val referenceFiles: array<string> = []
+    if (recIsDirectory(reference)) {
+        val names: array<string> = []
+        for (entry in Path(reference).entries()) {
+            val name = entry.name()
+            if (name.endsWith(".ab") && !Path(recJoinPath(reference, name)).info().isDirectory()) names.append(name)
+        }
+        for (name in recSortStrings(names)) referenceFiles.append(recJoinPath(reference, name))
+    } else referenceFiles.append(reference)
+    for (referencePath in referenceFiles) {
+        val targetPath = if (recIsDirectory(target)) recJoinPath(target, Path(referencePath).name()) else target
+        if (!Path(targetPath).exists()) continue
+        val referenceRead = recRead(referencePath)
+        val targetRead = recRead(targetPath)
+        if (!referenceRead.ok || !targetRead.ok) {
+            eprintln("cannot read ${if (!referenceRead.ok) referencePath else targetPath}")
+            return 1
+        }
+        val result = synchronizeNops(referenceRead.text, targetRead.text)
+        inserted = inserted + result.inserted
+        removed = removed + result.removed
+        if (result.text != targetRead.text) {
+            changed = changed + 1
+            if (write) Path(targetPath).writeText(result.text)
+        }
+    }
+    val action = if (write) "synchronized" else "would synchronize"
+    println("$action $changed file(s): add $inserted NOP(s), remove $removed misplaced NOP(s)")
+    0
+}
