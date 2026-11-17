@@ -1,0 +1,583 @@
+// Normalize recovered Xtensa symbolic address loads in Abla sources.
+//
+//     tools/abla-tool normalize-recovered-symbol-addends SOURCE.ab [...]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/array"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+// `movi[.n] aN, SYMBOL+0xHEX`.
+val addendLoad = regexCompile("""movi(?:\.n)?[\t ]+(a(?:[0-9]|1[0-5])),[\t ]+([.$A-Za-z_][.$A-Za-z0-9_\\]*)\+0x([0-9A-Fa-f]+)""")
+val tlsBlock = regexCompile("""\.pushsection \.(?:tbss|tdata)(?:.|\n)*?\\n\.popsection""")
+val tlsObject = regexCompile("""(\.type[\t ]+\S+,[\t ]+)@object""")
+val textSectionTarget = regexCompile("""\.text\.((?:[.$A-Za-z0-9_]|\\\$)+)(?:\+0x([0-9A-Fa-f]+))?""")
+
+// Opposite sense of each Xtensa conditional branch.
+fun branchInverse(op: string): string {
+    if (op == "ball") return "bnall"
+    if (op == "bnall") return "ball"
+    if (op == "bany") return "bnone"
+    if (op == "bnone") return "bany"
+    if (op == "bbc") return "bbs"
+    if (op == "bbs") return "bbc"
+    if (op == "bbci") return "bbsi"
+    if (op == "bbsi") return "bbci"
+    if (op == "beq") return "bne"
+    if (op == "bne") return "beq"
+    if (op == "beqi") return "bnei"
+    if (op == "bnei") return "beqi"
+    if (op == "beqz") return "bnez"
+    if (op == "bnez") return "beqz"
+    if (op == "beqz.n") return "bnez.n"
+    if (op == "bnez.n") return "beqz.n"
+    if (op == "bf") return "bt"
+    if (op == "bt") return "bf"
+    if (op == "bge") return "blt"
+    if (op == "blt") return "bge"
+    if (op == "bgei") return "blti"
+    if (op == "blti") return "bgei"
+    if (op == "bgeu") return "bltu"
+    if (op == "bltu") return "bgeu"
+    if (op == "bgeui") return "bltui"
+    if (op == "bltui") return "bgeui"
+    if (op == "bgez") return "bltz"
+    if (op == "bltz") return "bgez"
+    ""
+}
+
+fun isBranchOp(op: string): bool = branchInverse(op) != ""
+
+class AddendSplit(val high: int, val low: int, val ok: bool)
+
+// The `addmi` and `addi` immediates for a symbol addend of the given hex digits.
+fun splitAddend(digits: string): AddendSplit {
+    var significant = digits
+    while (significant.size > 1 && significant[0] == 48) significant = significant.slice(1, significant.size)
+    // Anything beyond four hex digits is outside 0x7f7f whatever its value.
+    if (significant.size > 4) return AddendSplit(0, 0, false)
+    val addend = hexNumber(significant)
+    val high = ((addend + 128) / 256) * 256
+    val low = addend - high
+    if (high < -32768 || high > 32512 || low < -128 || low > 127) return AddendSplit(0, 0, false)
+    AddendSplit(high, low, true)
+}
+
+// `movi REG, SYMBOL` followed by the `addmi`/`addi` that add the addend, as escaped assembly lines.
+fun addendLines(register: string, symbol: string, split: AddendSplit): string {
+    val lines: array<string> = ["movi ${register}, ${symbol}"]
+    if (split.high != 0) lines.append("addmi ${register}, ${register}, ${split.high}")
+    if (split.low != 0) lines.append("addi ${register}, ${register}, ${split.low}")
+    lines.join("\\n")
+}
+
+// The hex digits as Python prints int(digits, 16) with format "x".
+fun normalizedHex(digits: string): string {
+    var start = 0
+    while (start < digits.size - 1 && digits[start] == 48) start = start + 1
+    digits.slice(start, digits.size).lowercase()
+}
+
+class NormalizeState(var text: string, var count: int, var error: string)
+
+fun normalizeLoads(source: string, var state: NormalizeState): void {
+    val parts: array<string> = []
+    var last = 0
+    for (found in addendLoad.regex.findAll(source)) {
+        val register = found.group(1) ?? ""
+        val symbol = found.group(2) ?? ""
+        val digits = found.group(3) ?? ""
+        val split = splitAddend(digits)
+        if (!split.ok) {
+            state.error = "symbol addend is outside Xtensa immediates: ${symbol}+0x${digits}"
+            return
+        }
+        parts.append(source.slice(last, found.start()))
+        parts.append(addendLines(register, symbol, split))
+        last = found.end()
+        state.count = state.count + 1
+    }
+    parts.append(source.slice(last, source.size))
+    state.text = parts.join("")
+}
+
+class TlsResult(val text: string, val count: int)
+
+fun normalizeTls(source: string): TlsResult {
+    val parts: array<string> = []
+    var last = 0
+    var count = 0
+    for (block in tlsBlock.regex.findAll(source)) {
+        val value = block.text0()
+        val inner: array<string> = []
+        var innerLast = 0
+        for (typed in tlsObject.regex.findAll(value)) {
+            inner.append(value.slice(innerLast, typed.start()))
+            inner.append((typed.group(1) ?? "") + "@tls_object")
+            innerLast = typed.end()
+            count = count + 1
+        }
+        inner.append(value.slice(innerLast, value.size))
+        parts.append(source.slice(last, block.start()))
+        parts.append(inner.join(""))
+        last = block.end()
+    }
+    parts.append(source.slice(last, source.size))
+    TlsResult(parts.join(""), count)
+}
+
+// Rewrite a `.text.NAME[+0xHEX]` use as the entry label, recovered label or ABI symbol that it names.
+fun normalizeTextTargets(source: string, var state: NormalizeState): void {
+    val abiSymbols = linesWithPrefix(source, "// Original ABI symbol: ")
+    val parts: array<string> = []
+    var last = 0
+    for (found in textSectionTarget.regex.findAll(source)) {
+        val begin = found.start()
+        val end = found.end()
+        val rawName = found.group(1) ?? ""
+        val encoded = found.group(2)
+        parts.append(source.slice(last, begin))
+        last = end
+        val original = source.slice(begin, end)
+        // This expression matcher also sees assembler definitions. A section symbol is only
+        // normalized at a use site; changing just part of `.local`/`.type`/`.size` creates two
+        // symbols and makes the size expression cross-section. Keep every defining directive intact.
+        val lineStart = maxOf(rfindBefore(source, "\\n", begin) + 2, rfindBefore(source, "\n", begin) + 1)
+        val prefix = pyLeftStrip(source.slice(lineStart, begin))
+        val suffix = if (end < source.size) source.slice(end, end + 1) else ""
+        if (prefix.startsWith(".local ") || prefix.startsWith(".type ") || prefix.startsWith(".size ") ||
+            suffix == ":") {
+            parts.append(original)
+            continue
+        }
+        var replacement = original
+        // A reconstructed local function already carries its final label; the old `.text.`
+        // prefix was only an input-section symbol.
+        if (rawName.startsWith(".Labla_recovered_")) {
+            if (source.contains(rawName + ":")) {
+                state.count = state.count + 1
+                replacement = rawName
+            }
+        } else if (encoded != null) {
+            // Jump tables target instruction offsets within a recovered body; the reconstruction
+            // labels every such destination explicitly.
+            val candidate = ".Labla_recovered_${safeIdentifier(rawName)}_${normalizedHex(encoded)}"
+            if (source.contains(candidate + ":")) {
+                state.count = state.count + 1
+                replacement = candidate
+            }
+        } else {
+            // A zero-addend section relocation denotes the function entry.
+            var isAbi = false
+            for (symbol in abiSymbols) {
+                if (symbol == rawName) isAbi = true
+            }
+            if (isAbi || source.contains(".global ${rawName}")) {
+                state.count = state.count + 1
+                replacement = rawName
+            }
+        }
+        parts.append(replacement)
+    }
+    parts.append(source.slice(last, source.size))
+    state.text = parts.join("")
+}
+
+fun maxOf(a: int, b: int): int = if (a > b) a else b
+
+// A `.literal LABEL, SYMBOL+0xHEX` definition whose value is followed by an escaped newline or a quote.
+class LiteralDefinition(val label: string, val symbol: string, val digits: string)
+
+// The `(?=\\n|")` lookahead of the literal patterns: an escaped newline or a quote follows.
+fun literalEnds(text: string, at: int): bool = at < text.size && (text[at] == 34 || hasAt(text, at, "\\n"))
+
+// LITERAL, searched left to right without overlap:
+// `\.literal[\t ]+(\S+),[\t ]*(SYMBOL)\+0x(HEX+)(?=\\n|")` with `\S+` giving back characters (it may
+// swallow commas) until the rest fits.
+fun literalDefinitions(source: string): array<LiteralDefinition> {
+    val found: array<LiteralDefinition> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf(".literal", from)
+        if (at < 0) break
+        from = at + 1
+        var cursor = at + 8
+        while (cursor < source.size && (source[cursor] == 32 || source[cursor] == 9)) cursor = cursor + 1
+        if (cursor == at + 8) continue
+        var tokenEnd = cursor
+        while (tokenEnd < source.size && !isSpace(source[tokenEnd])) tokenEnd = tokenEnd + 1
+        var length = tokenEnd - cursor - 1
+        var matched = false
+        while (length >= 1 && !matched) {
+            val comma = cursor + length
+            if (source[comma] == 44) {
+                var symbolBegin = comma + 1
+                while (symbolBegin < source.size && (source[symbolBegin] == 32 || source[symbolBegin] == 9)) symbolBegin = symbolBegin + 1
+                if (symbolBegin < source.size) {
+                    val first = source[symbolBegin]
+                    if (first == 46 || first == 36 || first == 95 || (isAlnum(first) && !(first >= 48 && first <= 57))) {
+                        var symbolEnd = symbolBegin + 1
+                        while (symbolEnd < source.size && isByteIn(source[symbolEnd], ".$\\")) symbolEnd = symbolEnd + 1
+                        if (hasAt(source, symbolEnd, "+0x")) {
+                            var digitsEnd = symbolEnd + 3
+                            while (digitsEnd < source.size && hexNumber(source.slice(digitsEnd, digitsEnd + 1)) >= 0) digitsEnd = digitsEnd + 1
+                            if (digitsEnd > symbolEnd + 3 && literalEnds(source, digitsEnd)) {
+                                found.append(LiteralDefinition(source.slice(cursor, comma),
+                                    source.slice(symbolBegin, symbolEnd), source.slice(symbolEnd + 3, digitsEnd)))
+                                from = digitsEnd
+                                matched = true
+                            }
+                        }
+                    }
+                }
+            }
+            length = length - 1
+        }
+    }
+    found
+}
+
+class LiteralRewrite(val text: string, val count: int, val error: string)
+
+// Rewrite the exact definitions `.literal LABEL, SYMBOL+0xHEX` to `.literal LABEL, SYMBOL`.
+fun rewriteLiteralDefinitions(source: string, label: string, symbol: string, replacement: string): LiteralRewrite {
+    val parts: array<string> = []
+    var last = 0
+    var count = 0
+    var from = 0
+    val needle = "+0x"
+    while (true) {
+        val at = source.indexOf(".literal", from)
+        if (at < 0) break
+        from = at + 1
+        var cursor = at + 8
+        while (cursor < source.size && (source[cursor] == 32 || source[cursor] == 9)) cursor = cursor + 1
+        if (cursor == at + 8) continue
+        if (!hasAt(source, cursor, label + ",")) continue
+        cursor = cursor + label.size + 1
+        while (cursor < source.size && (source[cursor] == 32 || source[cursor] == 9)) cursor = cursor + 1
+        if (!hasAt(source, cursor, symbol + needle)) continue
+        var digitsEnd = cursor + symbol.size + 3
+        while (digitsEnd < source.size && hexNumber(source.slice(digitsEnd, digitsEnd + 1)) >= 0) digitsEnd = digitsEnd + 1
+        if (digitsEnd == cursor + symbol.size + 3 || !literalEnds(source, digitsEnd)) continue
+        parts.append(source.slice(last, at))
+        parts.append(replacement)
+        last = digitsEnd
+        from = digitsEnd
+        count = count + 1
+    }
+    parts.append(source.slice(last, source.size))
+    LiteralRewrite(parts.join(""), count, "")
+}
+
+// `l32r aN, LABEL` where the label is followed by an escaped newline or a quote.
+fun expandLiteralLoads(source: string, label: string, split: AddendSplit): LiteralRewrite {
+    val parts: array<string> = []
+    var last = 0
+    var count = 0
+    var from = 0
+    while (true) {
+        val at = source.indexOf("l32r", from)
+        if (at < 0) break
+        from = at + 1
+        var cursor = at + 4
+        while (cursor < source.size && (source[cursor] == 32 || source[cursor] == 9)) cursor = cursor + 1
+        if (cursor == at + 4) continue
+        // `a(?:[0-9]|1[0-5])` followed by a comma.
+        if (cursor >= source.size || source[cursor] != 97) continue
+        var registerEnd = -1
+        if (cursor + 2 < source.size && source[cursor + 1] >= 48 && source[cursor + 1] <= 57 && source[cursor + 2] == 44) {
+            registerEnd = cursor + 2
+        } else if (cursor + 3 < source.size && source[cursor + 1] == 49 && source[cursor + 2] >= 48 &&
+            source[cursor + 2] <= 53 && source[cursor + 3] == 44) {
+            registerEnd = cursor + 3
+        }
+        if (registerEnd < 0) continue
+        val register = source.slice(cursor, registerEnd)
+        cursor = registerEnd + 1
+        while (cursor < source.size && (source[cursor] == 32 || source[cursor] == 9)) cursor = cursor + 1
+        if (!hasAt(source, cursor, label)) continue
+        val end = cursor + label.size
+        if (!literalEnds(source, end)) continue
+        val lines: array<string> = [source.slice(at, end)]
+        if (split.high != 0) lines.append("addmi ${register}, ${register}, ${split.high}")
+        if (split.low != 0) lines.append("addi ${register}, ${register}, ${split.low}")
+        parts.append(source.slice(last, at))
+        parts.append(lines.join("\\n"))
+        last = end
+        from = end
+        count = count + 1
+    }
+    parts.append(source.slice(last, source.size))
+    LiteralRewrite(parts.join(""), count, "")
+}
+
+fun normalizeLiterals(source: string, var state: NormalizeState): void {
+    var text = source
+    for (literal in literalDefinitions(source)) {
+        val split = splitAddend(literal.digits)
+        if (!split.ok) {
+            state.error = "literal addend is outside Xtensa immediates: ${literal.symbol}+0x${literal.digits}"
+            return
+        }
+        val template = pyReplacementTemplate(".literal ${literal.label}, ${literal.symbol}")
+        if (template.error != "") {
+            state.error = template.error
+            return
+        }
+        val definitions = rewriteLiteralDefinitions(text, literal.label, literal.symbol, template.text)
+        text = definitions.text
+        val loads = expandLiteralLoads(text, literal.label, split)
+        text = loads.text
+        if (definitions.count > 0 && loads.count == 0) {
+            state.error = "literal has no recovered load: ${literal.label}"
+            return
+        }
+        state.count = state.count + definitions.count
+    }
+    state.text = text
+}
+
+// ---- branch islands ----
+
+class BranchParts(val ok: bool, val op: string, val middle: string, val target: string)
+
+// BRANCH.fullmatch: `^(\S+)\s+(.+,\s*)([^,\s]+)$` over the whole piece (`.` is any byte but a newline).
+fun parseBranch(piece: string): BranchParts {
+    val none = BranchParts(false, "", "", "")
+    var tokenEnd = 0
+    while (tokenEnd < piece.size && !isSpace(piece[tokenEnd])) tokenEnd = tokenEnd + 1
+    if (tokenEnd == 0 || tokenEnd >= piece.size) return none
+    var spaceEnd = tokenEnd
+    while (spaceEnd < piece.size && isSpace(piece[spaceEnd])) spaceEnd = spaceEnd + 1
+    val comma = piece.lastIndexOf(",")
+    if (comma < 0) return none
+    // After the last comma: optional whitespace and one token of non-comma, non-space bytes.
+    var targetBegin = comma + 1
+    while (targetBegin < piece.size && isSpace(piece[targetBegin])) targetBegin = targetBegin + 1
+    if (targetBegin >= piece.size) return none
+    var cursor = targetBegin
+    while (cursor < piece.size) {
+        if (isSpace(piece[cursor]) || piece[cursor] == 44) return none
+        cursor = cursor + 1
+    }
+    // `\s+` takes as much whitespace as it can and gives back whitespace that `.+` may use.
+    var begin = spaceEnd
+    while (begin > tokenEnd) {
+        if (comma - begin >= 1 && !piece.slice(begin, comma).contains("\n")) {
+            return BranchParts(true, piece.slice(0, tokenEnd), piece.slice(begin, targetBegin), piece.slice(targetBegin, piece.size))
+        }
+        begin = begin - 1
+    }
+    none
+}
+
+// re.sub(r"[+-](?:0x[0-9A-Fa-f]+|[0-9]+)$", "", target)
+fun stripTargetAddend(target: string): string {
+    var at = 0
+    while (at < target.size) {
+        val c = target[at]
+        if (c == 43 || c == 45) {
+            val rest = target.slice(at + 1, target.size)
+            var valid = false
+            if (rest.startsWith("0x") && rest.size > 2 && hexNumber(rest.slice(2, rest.size)) >= 0) valid = true
+            if (!valid && rest.size > 0) {
+                valid = true
+                for (d in rest) {
+                    if (!(d >= 48 && d <= 57)) valid = false
+                }
+            }
+            if (valid) return target.slice(0, at)
+        }
+        at = at + 1
+    }
+    target
+}
+
+// re.fullmatch(r"j\s+(\S+)", piece): the jump target, or "" when the piece is not a plain jump.
+fun jumpTarget(piece: string): string {
+    if (!piece.startsWith("j")) return ""
+    var cursor = 1
+    while (cursor < piece.size && isSpace(piece[cursor])) cursor = cursor + 1
+    if (cursor == 1 || cursor >= piece.size) return ""
+    var end = cursor
+    while (end < piece.size && !isSpace(piece[end])) end = end + 1
+    if (end != piece.size) return ""
+    piece.slice(cursor, end)
+}
+
+// A label defined as `.Labla_recovered_NAME_far_branch_N` (re.fullmatch of the far-branch pattern).
+fun isFarBranchLabel(text: string): bool {
+    if (!text.startsWith(".Labla_recovered_")) return false
+    val rest = text.slice(17, text.size)
+    for (c in rest) {
+        if (!(isAlnum(c) || c == 95)) return false
+    }
+    val at = rest.lastIndexOf("_far_branch_")
+    if (at < 1) return false
+    val digits = rest.slice(at + 12, rest.size)
+    if (digits.size == 0) return false
+    for (c in digits) {
+        if (!(c >= 48 && c <= 57)) return false
+    }
+    true
+}
+
+fun stripColon(text: string): string = if (text.endsWith(":")) text.slice(0, text.size - 1) else text
+
+// The `.local NAME` names (re.findall(r"\.local\s+(\S+?)(?=\\n|\")", text)).
+fun localSymbols(source: string): array<string> {
+    val names: array<string> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf(".local", from)
+        if (at < 0) break
+        from = at + 1
+        var cursor = at + 6
+        while (cursor < source.size && isSpace(source[cursor])) cursor = cursor + 1
+        if (cursor == at + 6) continue
+        var end = cursor
+        var matched = false
+        while (end < source.size && !isSpace(source[end]) && !matched) {
+            end = end + 1
+            if (literalEnds(source, end)) matched = true
+        }
+        if (matched) {
+            names.append(source.slice(cursor, end))
+            from = end
+        }
+    }
+    names
+}
+
+fun listHas(values: array<string>, wanted: string): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}
+
+fun normalizeBranches(source: string, path: string, branchStart: int): BranchResult {
+    var pieces = source.split("\\n")
+    var branchCount = branchStart
+    var identity = pyPath(path)
+    val marker = identity.lastIndexOf("/src/")
+    if (marker >= 0) identity = identity.slice(marker + 1, identity.size)
+    val namespace = safeIdentifier(identity)
+    val locals = localSymbols(source)
+    // Undo islands created by older normalization rules when their final target is actually a label
+    // in the same recovered function.
+    var index = 0
+    while (index + 2 < pieces.size) {
+        val branch = parseBranch(pieces[index])
+        val jump = jumpTarget(pieces[index + 1])
+        val definition = stripColon(pieces[index + 2])
+        if (branch.ok && jump != "" && definition.contains("_far_branch_") && branch.target == definition) {
+            if (!isBranchOp(branch.op)) return BranchResult("", 0, "KeyError: '${branch.op}'")
+            val base = stripTargetAddend(jump)
+            val required = listHas(locals, base) || !jump.startsWith(".Labla_recovered_")
+            if (!required) {
+                pieces[index] = "${branchInverse(branch.op)} ${branch.middle}${jump}"
+                pieces.removeAt(index + 1)
+                pieces.removeAt(index + 1)
+                branchCount = branchCount + 1
+                continue
+            }
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < pieces.size) {
+        val match = parseBranch(pieces[index])
+        if (match.ok && isBranchOp(match.op)) {
+            val target = match.target
+            val base = stripTargetAddend(target)
+            val crossLocal = listHas(locals, base)
+            val external = !target.startsWith(".Labla_recovered_")
+            if (!target.contains("_far_branch_") && (crossLocal || external)) {
+                val label = ".Labla_recovered_${namespace}_far_branch_${branchCount}"
+                pieces[index] = ["${branchInverse(match.op)} ${match.middle}${label}", "j ${target}", "${label}:"].join("\\n")
+                branchCount = branchCount + 1
+            }
+        }
+        index = index + 1
+    }
+    var text = source
+    if (branchCount > 0) text = pieces.join("\\n")
+    // Re-number all previously and newly generated branch islands across the complete source file.
+    // This makes repeated normalization idempotent even when a later pass discovers another branch shape.
+    pieces = text.split("\\n")
+    var renumbered = 0
+    index = 0
+    while (index + 2 < pieces.size) {
+        val definition = pieces[index + 2]
+        if (isFarBranchLabel(stripColon(definition))) {
+            val old = definition.slice(0, maxOf(definition.size - 1, 0))
+            val match = parseBranch(pieces[index])
+            if (match.ok && match.target == old) {
+                val new = ".Labla_recovered_${namespace}_far_branch_${renumbered}"
+                pieces[index] = "${match.op} ${match.middle}${new}"
+                pieces[index + 2] = "${new}:"
+                if (new != old) branchCount = branchCount + 1
+                renumbered = renumbered + 1
+                index = index + 3
+                continue
+            }
+        }
+        index = index + 1
+    }
+    BranchResult(pieces.join("\\n"), branchCount, "")
+}
+
+class BranchResult(val text: string, val count: int, val error: string)
+
+fun main: int {
+    if (processArgumentCount() < 1) {
+        eprintln("usage: normalize-recovered-symbol-addends SOURCE.ab [...]")
+        return 2
+    }
+    var changed = 0
+    var index = 0
+    while (index < processArgumentCount()) {
+        val path = processArgument(index)
+        index = index + 1
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val state = NormalizeState(read.text, 0, "")
+        normalizeLoads(read.text, state)
+        if (state.error != "") {
+            eprintln("ValueError: ${state.error}")
+            return 1
+        }
+        val loadCount = state.count
+        val tls = normalizeTls(state.text)
+        state.text = tls.text
+        state.count = 0
+        normalizeTextTargets(state.text, state)
+        val sectionTargetCount = state.count
+        state.count = 0
+        normalizeLiterals(state.text, state)
+        if (state.error != "") {
+            eprintln("ValueError: ${state.error}")
+            return 1
+        }
+        val literalCount = state.count
+        val branches = normalizeBranches(state.text, path, 0)
+        if (branches.error != "") {
+            eprintln(branches.error)
+            return 1
+        }
+        if (loadCount + tls.count + sectionTargetCount + literalCount + branches.count > 0) {
+            Path(path).writeText(branches.text)
+            changed = changed + loadCount + tls.count + sectionTargetCount + literalCount + branches.count
+        }
+    }
+    println("normalized ${changed} symbolic Xtensa address expression(s)")
+    0
+}

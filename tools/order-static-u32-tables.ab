@@ -1,0 +1,283 @@
+// Place native word tables before module-value users and after dependencies.
+//
+// Abla functions may refer to later module values, but module-value initializers are checked in
+// declaration order. Recovered sources contain both aliases of a table (which must follow it) and
+// tables containing addresses of other tables (which must follow those dependencies). This pass
+// reconstructs that ordering instead of moving every table blindly to the end of the module.
+//
+//     tools/abla-tool order-static-u32-tables [--write] PATH [...]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+class StaticTable(val begin: int, val end: int, val base: string)
+
+class OrderedSource(val text: string, val tables: int, val error: string)
+
+private val tableHeaders: array<string> = [" = nativeStaticU32s([\n", " = nativeStaticMutableU32s([\n"]
+
+// The tables `val BASEStorage = nativeStatic(Mutable)?U32s([\n ... \n])\nval BASEInitialized = BASEStorage\n
+// val BASE = u32(BASEInitialized)`, searched left to right without overlap, the way the pattern's
+// lazy body runs on to the first matching tail.
+fun findStaticTables(source: string): array<StaticTable> {
+    val found: array<StaticTable> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf("val ", from)
+        if (at < 0) break
+        from = at + 1
+        // `val ` then an identifier ending in `Storage`, leaving a base that starts like one.
+        var identEnd = at + 4
+        if (identEnd >= source.size || !(isAlnum(source[identEnd]) || source[identEnd] == 95) ||
+            (source[identEnd] >= 48 && source[identEnd] <= 57)) continue
+        while (identEnd < source.size && isByteIn(source[identEnd], "")) identEnd = identEnd + 1
+        val ident = source.slice(at + 4, identEnd)
+        if (!ident.endsWith("Storage") || ident.size <= 7) continue
+        val base = ident.slice(0, ident.size - 7)
+        var headerEnd = -1
+        for (header in tableHeaders) {
+            val start = identEnd
+            if (hasAt(source, start, header)) headerEnd = start + header.size
+        }
+        // `(?:Mutable)?` is optional: only the matching header applies; the plain one wins when both fit.
+        if (headerEnd < 0) continue
+        val tail = "\n])\nval ${base}Initialized = ${base}Storage\nval ${base} = u32(${base}Initialized)"
+        val tailAt = source.indexOf(tail, headerEnd)
+        if (tailAt < 0) continue
+        found.append(StaticTable(at, tailAt + tail.size, base))
+        from = tailAt + tail.size
+    }
+    found
+}
+
+// First top-level line that mentions the table through another `val`: `^val (?!BASE...\b).*\bBASE...\b`.
+fun staticTableAnchor(lines: array<string>, base: string): int {
+    var index = 0
+    while (index < lines.size) {
+        val line = lines[index]
+        if (line.startsWith("val ")) {
+            val rest = line.slice(4, line.size)
+            val own = rest.startsWith(base) && (wordBoundaryAt(rest, base.size) ||
+                (hasAt(rest, base.size, "Storage") && wordBoundaryAt(rest, base.size + 7)) ||
+                (hasAt(rest, base.size, "Initialized") && wordBoundaryAt(rest, base.size + 11)))
+            if (!own && containsWordFrom(line, 4, base)) return index
+        }
+        index = index + 1
+    }
+    lines.size
+}
+
+// containsWordWithSuffix restricted to matches starting at or after `from`.
+fun containsWordFrom(text: string, from: int, name: string): bool {
+    var start = from
+    while (start <= text.size - name.size) {
+        val at = text.indexOf(name, start)
+        if (at < 0) return false
+        if (wordBoundaryAt(text, at)) {
+            val end = at + name.size
+            if (wordBoundaryAt(text, end)) return true
+            if (hasAt(text, end, "Storage") && wordBoundaryAt(text, end + 7)) return true
+            if (hasAt(text, end, "Initialized") && wordBoundaryAt(text, end + 11)) return true
+        }
+        start = at + 1
+    }
+    false
+}
+
+fun orderStaticSource(source: string): OrderedSource {
+    val matches = findStaticTables(source)
+    if (matches.size == 0) return OrderedSource(source, 0, "")
+    val blocks: array<string> = []
+    val bases: array<string> = []
+    val kept: array<string> = []
+    var last = 0
+    for (table in matches) {
+        blocks.append(source.slice(table.begin, table.end))
+        bases.append(table.base)
+        kept.append(source.slice(last, table.begin))
+        last = table.end
+    }
+    kept.append(source.slice(last, source.size))
+    val body = pyRightStrip(kept.join(""))
+    val bodyLines = pySplitLines(body)
+
+    val anchors: array<int> = []
+    for (base in bases) anchors.append(staticTableAnchor(bodyLines, base))
+
+    val count = blocks.size
+    val dependencies: array<array<int>> = []
+    val dependents: array<array<int>> = []
+    var index = 0
+    while (index < count) {
+        val none: array<int> = []
+        dependencies.append(none)
+        val none2: array<int> = []
+        dependents.append(none2)
+        index = index + 1
+    }
+    var consumer = 0
+    while (consumer < count) {
+        var dependency = 0
+        while (dependency < count) {
+            if (consumer != dependency &&
+                containsWordWithSuffix(blocks[consumer], bases[dependency], ["Storage", "Initialized"])) {
+                dependencies[consumer].append(dependency)
+                dependents[dependency].append(consumer)
+            }
+            dependency = dependency + 1
+        }
+        consumer = consumer + 1
+    }
+
+    var changed = true
+    while (changed) {
+        changed = false
+        consumer = 0
+        while (consumer < count) {
+            for (dependency in dependencies[consumer]) {
+                if (anchors[dependency] > anchors[consumer]) {
+                    anchors[dependency] = anchors[consumer]
+                    changed = true
+                }
+            }
+            consumer = consumer + 1
+        }
+    }
+
+    val indegree: array<int> = []
+    index = 0
+    while (index < count) {
+        indegree.append(dependencies[index].size)
+        index = index + 1
+    }
+    // The ready set is a min-heap on (anchor, table); a linear scan picks the same minimum.
+    val ready: array<int> = []
+    index = 0
+    while (index < count) {
+        if (indegree[index] == 0) ready.append(index)
+        index = index + 1
+    }
+    val ordered: array<int> = []
+    while (ready.size > 0) {
+        var best = 0
+        var scan = 1
+        while (scan < ready.size) {
+            val a = ready[scan]
+            val b = ready[best]
+            if (anchors[a] < anchors[b] || (anchors[a] == anchors[b] && a < b)) best = scan
+            scan = scan + 1
+        }
+        val table = ready[best]
+        ready.removeAt(best)
+        ordered.append(table)
+        for (dependent in dependents[table]) {
+            indegree[dependent] = indegree[dependent] - 1
+            if (indegree[dependent] == 0) ready.append(dependent)
+        }
+    }
+    if (ordered.size != count) {
+        return OrderedSource(source, 0, "cycle between native static u32 table initializers")
+    }
+
+    // insertions[line] holds the tables placed before body line `line`.
+    val insertionLines: array<int> = []
+    val insertionTables: array<array<int>> = []
+    for (table in ordered) {
+        var slot = -1
+        var scan = 0
+        while (scan < insertionLines.size) {
+            if (insertionLines[scan] == anchors[table]) slot = scan
+            scan = scan + 1
+        }
+        if (slot < 0) {
+            insertionLines.append(anchors[table])
+            val list: array<int> = []
+            insertionTables.append(list)
+            slot = insertionLines.size - 1
+        }
+        insertionTables[slot].append(table)
+    }
+
+    val output: array<string> = []
+    var lineIndex = 0
+    while (lineIndex <= bodyLines.size) {
+        var slot = -1
+        var scan = 0
+        while (scan < insertionLines.size) {
+            if (insertionLines[scan] == lineIndex) slot = scan
+            scan = scan + 1
+        }
+        if (slot >= 0) {
+            while (output.size > 0 && output[output.size - 1] == "") output.truncate(output.size - 1)
+            if (output.size > 0) output.append("")
+            val parts: array<string> = []
+            for (table in insertionTables[slot]) parts.append(blocks[table])
+            for (line in pySplitLines(parts.join("\n\n"))) output.append(line)
+            output.append("")
+        }
+        if (lineIndex < bodyLines.size) output.append(bodyLines[lineIndex])
+        lineIndex = lineIndex + 1
+    }
+    val text = pyRightStrip(output.join("\n")) + "\n"
+    OrderedSource(text, if (text != source) count else 0, "")
+}
+
+fun main: int {
+    var write = false
+    val paths: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument.size > 2 && argument.startsWith("--") && "--write".startsWith(argument)) {
+            write = true
+        } else if (argument == "-h" || argument == "--help") {
+            println("usage: order-static-u32-tables [-h] [--write] paths [paths ...]")
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln("usage: order-static-u32-tables [-h] [--write] paths [paths ...]")
+            eprintln("order-static-u32-tables: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            paths.append(argument)
+        }
+        index = index + 1
+    }
+    if (paths.size == 0) {
+        eprintln("usage: order-static-u32-tables [-h] [--write] paths [paths ...]")
+        eprintln("order-static-u32-tables: error: the following arguments are required: paths")
+        return 2
+    }
+    val files: array<string> = []
+    for (path in paths) {
+        if (Path(path).info().isDirectory()) {
+            for (file in recursiveFiles(path, ".ab")) files.append(file)
+        } else if (hasSuffix(Path(path).name(), ".ab")) {
+            files.append(path)
+        }
+    }
+    var changedFiles = 0
+    var tables = 0
+    for (path in files) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = orderStaticSource(read.text)
+        if (result.error != "") {
+            eprintln("ValueError: ${result.error}")
+            return 1
+        }
+        if (result.text == read.text) continue
+        changedFiles = changedFiles + 1
+        tables = tables + result.tables
+        if (write) Path(path).writeText(result.text)
+    }
+    val action = if (write) "ordered" else "would order"
+    println("${action} ${tables} static u32 table(s) in ${changedFiles} file(s)")
+    0
+}

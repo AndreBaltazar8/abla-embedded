@@ -1,0 +1,439 @@
+// Move cyclic zero-initialized ESP32 data into a cycle-free Abla module.
+//
+//     tools/abla-tool centralize-abla-owned-storage [--write] [--initialized-constants] ROOT SHARED.ab
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+val addressPattern = regexCompile("""\$xtensa\s+address\s+\{\{?\s*([^{}\s]+)\s*\}\}?""")
+
+val dataPrefix = "esp32Data_"
+
+// The hex digits of `sha1(symbol)[:10]`.
+fun symbolDigest(symbol: string): string {
+    val digest = sha1(symbol)
+    val hex = if (digest.size == 20) digestHex(digest) else digest
+    hex.slice(0, 10)
+}
+
+private fun digestHex(bytes: string): string {
+    val parts: array<string> = []
+    for (b in bytes) {
+        val high = b >> 4
+        val low = b & 15
+        parts.append(byteEncode(if (high < 10) 48 + high else 87 + high))
+        parts.append(byteEncode(if (low < 10) 48 + low else 87 + low))
+    }
+    parts.join("")
+}
+
+// esp32Data_READABLE_DIGEST for a symbol referenced by `$xtensa address`.
+fun dataIdentifier(symbol: string): string {
+    val readable: array<string> = []
+    var pendingUnderscore = false
+    for (c in symbol) {
+        if (isAlnum(c)) {
+            if (pendingUnderscore && readable.size > 0) readable.append("_")
+            pendingUnderscore = false
+            readable.append(byteEncode(c))
+        } else if ((c & 0xc0) != 0x80) {
+            pendingUnderscore = true
+        }
+    }
+    // `re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")`: separators only between kept characters.
+    var text = readable.join("")
+    if (text == "" || (text[0] >= 48 && text[0] <= 57)) text = "data_" + text
+    "esp32Data_${text}_${symbolDigest(symbol)}"
+}
+
+fun identEnd(text: string, at: int): int {
+    var end = at
+    while (end < text.size && (isAlnum(text[end]) || text[end] == 95)) end = end + 1
+    end
+}
+
+fun skipSpaces(text: string, at: int): int {
+    var end = at
+    while (end < text.size && isSpace(text[end])) end = end + 1
+    end
+}
+
+fun isLineStart(text: string, at: int): bool = at == 0 || text[at - 1] == 10
+
+class DataBlock(val begin: int, val end: int, val storage: string, val size: string, val value: string,
+    val initialize: string, val initialized: string)
+
+// `val STORAGE = nativeStaticAllocate(SIZE)` at a line start; -1 as the end when it does not match.
+class StorageHead(val end: int, val storage: string, val size: string)
+
+fun storageHead(text: string, at: int): StorageHead {
+    val none = StorageHead(-1, "", "")
+    if (!hasAt(text, at, "val")) return none
+    val nameBegin = skipSpaces(text, at + 3)
+    if (nameBegin == at + 3) return none
+    val nameEnd = identEnd(text, nameBegin)
+    val storage = text.slice(nameBegin, nameEnd)
+    if (!storage.startsWith(dataPrefix) || !storage.endsWith("Storage") || storage.size < 18) return none
+    var cursor = skipSpaces(text, nameEnd)
+    if (cursor >= text.size || text[cursor] != 61) return none
+    cursor = skipSpaces(text, cursor + 1)
+    if (!hasAt(text, cursor, "nativeStaticAllocate(")) return none
+    cursor = cursor + 21
+    val digitsBegin = cursor
+    while (cursor < text.size && text[cursor] >= 48 && text[cursor] <= 57) cursor = cursor + 1
+    if (cursor == digitsBegin || cursor >= text.size || text[cursor] != 41) return none
+    StorageHead(cursor + 1, storage, text.slice(digitsBegin, cursor))
+}
+
+// `val NAME = u32(ARGUMENT)` at `at`; the end after `)` (without the optional newline), or -1.
+fun u32Alias(text: string, at: int, argument: string): StorageHead {
+    val none = StorageHead(-1, "", "")
+    if (!hasAt(text, at, "val")) return none
+    val nameBegin = skipSpaces(text, at + 3)
+    if (nameBegin == at + 3) return none
+    val nameEnd = identEnd(text, nameBegin)
+    val name = text.slice(nameBegin, nameEnd)
+    if (!name.startsWith(dataPrefix) || name.size < 11) return none
+    var cursor = skipSpaces(text, nameEnd)
+    if (cursor >= text.size || text[cursor] != 61) return none
+    cursor = skipSpaces(text, cursor + 1)
+    val call = "u32(${argument})"
+    if (!hasAt(text, cursor, call)) return none
+    StorageHead(cursor + call.size, name, "")
+}
+
+// PAIR: the zero-initialized storage and its u32 alias on the next line (and the newline after it).
+fun findStoragePairs(source: string): array<DataBlock> {
+    val found: array<DataBlock> = []
+    var at = 0
+    while (at < source.size) {
+        if (isLineStart(source, at) && hasAt(source, at, "val")) {
+            val head = storageHead(source, at)
+            if (head.end >= 0 && head.end < source.size && source[head.end] == 10) {
+                val alias = u32Alias(source, head.end + 1, head.storage)
+                if (alias.end >= 0) {
+                    var end = alias.end
+                    if (end < source.size && source[end] == 10) end = end + 1
+                    found.append(DataBlock(at, end, head.storage, head.size, alias.storage, "", ""))
+                    at = end
+                    continue
+                }
+            }
+        }
+        at = nextLineStart(source, at)
+    }
+    found
+}
+
+fun nextLineStart(text: string, at: int): int {
+    val newline = text.indexOf("\n", at)
+    if (newline < 0) text.size else newline + 1
+}
+
+// INITIALIZED: the storage, its `trusted fun ...Initialize(): int { ... }` body, the initialized
+// alias and the u32 alias. The body runs to the first `}` line that the rest of the pattern fits.
+fun findInitializedBlocks(source: string): array<DataBlock> {
+    val found: array<DataBlock> = []
+    var at = 0
+    while (at < source.size) {
+        if (isLineStart(source, at) && hasAt(source, at, "val")) {
+            val block = initializedBlockAt(source, at)
+            if (block != null) {
+                found.append(block)
+                at = block.end
+                continue
+            }
+        }
+        at = nextLineStart(source, at)
+    }
+    found
+}
+
+fun initializedBlockAt(source: string, at: int): DataBlock? {
+    val head = storageHead(source, at)
+    if (head.end < 0 || head.end >= source.size || source[head.end] != 10) return null
+    var cursor = head.end + 1
+    if (!hasAt(source, cursor, "trusted")) return null
+    cursor = skipSpaces(source, cursor + 7)
+    if (!hasAt(source, cursor, "fun")) return null
+    val nameBegin = skipSpaces(source, cursor + 3)
+    if (nameBegin == cursor + 3) return null
+    val nameEnd = identEnd(source, nameBegin)
+    val initialize = source.slice(nameBegin, nameEnd)
+    if (!initialize.startsWith(dataPrefix) || !initialize.endsWith("Initialize") || initialize.size < 21) return null
+    if (!hasAt(source, nameEnd, "():")) return null
+    cursor = skipSpaces(source, nameEnd + 3)
+    if (!hasAt(source, cursor, "int")) return null
+    cursor = skipSpaces(source, cursor + 3)
+    if (cursor >= source.size || source[cursor] != 123 || cursor + 1 >= source.size || source[cursor + 1] != 10) return null
+    var candidate = cursor + 2
+    while (candidate <= source.size) {
+        if (isLineStart(source, candidate) && hasAt(source, candidate, "}\n")) {
+            val tail = initializedTail(source, candidate + 2, initialize)
+            if (tail != null) {
+                return DataBlock(at, tail.end, head.storage, head.size, tail.value, initialize, tail.initialized)
+            }
+        }
+        if (candidate >= source.size) break
+        candidate = nextLineStart(source, candidate)
+    }
+    null
+}
+
+class InitializedTail(val end: int, val initialized: string, val value: string)
+
+// `val INITIALIZED = INITIALIZE()\nval VALUE = u32(INITIALIZED)` and an optional newline.
+fun initializedTail(source: string, at: int, initialize: string): InitializedTail? {
+    if (!hasAt(source, at, "val")) return null
+    val nameBegin = skipSpaces(source, at + 3)
+    if (nameBegin == at + 3) return null
+    val nameEnd = identEnd(source, nameBegin)
+    val initialized = source.slice(nameBegin, nameEnd)
+    if (!initialized.startsWith(dataPrefix) || !initialized.endsWith("Initialized") || initialized.size < 22) return null
+    var cursor = skipSpaces(source, nameEnd)
+    if (cursor >= source.size || source[cursor] != 61) return null
+    cursor = skipSpaces(source, cursor + 1)
+    val call = initialize + "()"
+    if (!hasAt(source, cursor, call)) return null
+    cursor = cursor + call.size
+    if (cursor >= source.size || source[cursor] != 10) return null
+    val alias = u32Alias(source, cursor + 1, initialized)
+    if (alias.end < 0) return null
+    var end = alias.end
+    if (end < source.size && source[end] == 10) end = end + 1
+    InitializedTail(end, initialized, alias.storage)
+}
+
+// re.findall(r"esp32Data_[A-Za-z0-9_]+", text) as a set of names.
+fun dataNames(text: string): array<string> {
+    val names: array<string> = []
+    var from = 0
+    while (true) {
+        val at = text.indexOf(dataPrefix, from)
+        if (at < 0) break
+        val end = identEnd(text, at + 10)
+        if (end > at + 10) {
+            names.append(text.slice(at, end))
+            from = end
+        } else {
+            from = at + 1
+        }
+    }
+    names
+}
+
+fun hasName(values: array<string>, wanted: string): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}
+
+fun relativeImport(caller: string, owner: string): string {
+    var value = pyRelativePath(owner, pyParent(caller))
+    if (!value.startsWith(".")) value = "./" + value
+    pyPath(value)
+}
+
+// Insert `import "IMPORTED"` after the leading import lines unless the source has it already.
+fun ensureImport(source: string, imported: string): string {
+    val statement = "import \"${imported}\""
+    if (source.contains(statement)) return source
+    val lines = pySplitLinesKeepEnds(source)
+    var insertion = 0
+    while (insertion < lines.size && lines[insertion].startsWith("import ")) insertion = insertion + 1
+    val parts: array<string> = []
+    var index = 0
+    while (index < lines.size) {
+        if (index == insertion) parts.append(statement + "\n")
+        parts.append(lines[index])
+        index = index + 1
+    }
+    if (insertion >= lines.size) parts.append(statement + "\n")
+    parts.join("")
+}
+
+fun main: int {
+    var write = false
+    var initializedConstants = false
+    val positional: array<string> = []
+    val usage = "usage: centralize-abla-owned-storage [-h] [--write] [--initialized-constants] root shared"
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument.size > 2 && argument.startsWith("--") && "--write".startsWith(argument)) {
+            write = true
+        } else if (argument.size > 2 && argument.startsWith("--") && "--initialized-constants".startsWith(argument)) {
+            initializedConstants = true
+        } else if (argument == "-h" || argument == "--help") {
+            println(usage)
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln(usage)
+            eprintln("centralize-abla-owned-storage: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            positional.append(argument)
+        }
+        index = index + 1
+    }
+    if (positional.size != 2) {
+        eprintln(usage)
+        eprintln("centralize-abla-owned-storage: error: ${if (positional.size < 2) "the following arguments are required: root, shared" else "unrecognized arguments"}")
+        return 2
+    }
+    val root = positional[0]
+    val shared = positional[1]
+    val paths = recursiveFiles(root, ".ab")
+    val sharedResolved = pyResolve(shared)
+    val texts: array<string> = []
+    val unresolved: array<string> = []
+    val skip: array<bool> = []
+    for (path in paths) {
+        val isShared = pyResolve(path) == sharedResolved
+        skip.append(isShared)
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        texts.append(read.text)
+        if (isShared) continue
+        for (found in addressPattern.regex.findAll(read.text)) {
+            val identifier = dataIdentifier(found.group(1) ?? "")
+            if (!hasName(unresolved, identifier)) unresolved.append(identifier)
+        }
+    }
+
+    val movedStorage: array<string> = []
+    val movedValue: array<string> = []
+    val movedSize: array<string> = []
+    val blockValues: array<string> = []
+    val blockTexts: array<string> = []
+    val changedPaths: array<string> = []
+    val changedTexts: array<string> = []
+    var which = 0
+    while (which < paths.size) {
+        val path = paths[which]
+        val source = texts[which]
+        which = which + 1
+        if (skip[which - 1]) continue
+        val pieces: array<string> = []
+        var last = 0
+        for (pair in findStoragePairs(source)) {
+            if (!hasName(unresolved, pair.value)) continue
+            movedStorage.append(pair.storage)
+            movedValue.append(pair.value)
+            movedSize.append(pair.size)
+            pieces.append(source.slice(last, pair.begin))
+            last = pair.end
+        }
+        pieces.append(source.slice(last, source.size))
+        var lowered = pieces.join("")
+        if (initializedConstants) {
+            val kept: array<string> = []
+            var position = 0
+            for (block in findInitializedBlocks(lowered)) {
+                if (!hasName(unresolved, block.value)) continue
+                val whole = lowered.slice(block.begin, block.end)
+                var dependencies = false
+                for (name in dataNames(whole)) {
+                    if (name != block.storage && name != block.initialize && name != block.initialized && name != block.value) {
+                        dependencies = true
+                    }
+                }
+                if (dependencies) continue
+                setBlock(blockValues, blockTexts, block.value, pyRightStrip(whole))
+                kept.append(lowered.slice(position, block.begin))
+                position = block.end
+            }
+            kept.append(lowered.slice(position, lowered.size))
+            lowered = kept.join("")
+        }
+        if (lowered != source) {
+            lowered = ensureImport(lowered, relativeImport(path, shared))
+            changedPaths.append(path)
+            changedTexts.append(lowered)
+        }
+    }
+
+    val uniqueValues: array<string> = []
+    val uniqueStorage: array<string> = []
+    val uniqueSize: array<string> = []
+    var m = 0
+    while (m < movedValue.size) {
+        var at = -1
+        var scan = 0
+        while (scan < uniqueValues.size) {
+            if (uniqueValues[scan] == movedValue[m]) at = scan
+            scan = scan + 1
+        }
+        if (at >= 0) {
+            if (uniqueStorage[at] != movedStorage[m] || uniqueSize[at] != movedSize[m]) {
+                eprintln("ValueError: conflicting storage declarations for ${movedValue[m]}")
+                return 1
+            }
+        } else {
+            uniqueValues.append(movedValue[m])
+            uniqueStorage.append(movedStorage[m])
+            uniqueSize.append(movedSize[m])
+        }
+        m = m + 1
+    }
+
+    val action = if (write) "centralized" else "would centralize"
+    println("${action} ${uniqueValues.size} zero-initialized and ${blockValues.size} constant-initialized values from ${changedPaths.size} modules")
+    if (!write || (uniqueValues.size == 0 && blockValues.size == 0)) return 0
+    var c = 0
+    while (c < changedPaths.size) {
+        Path(changedPaths[c]).writeText(changedTexts[c])
+        c = c + 1
+    }
+    val sharedRead = recoveredRead(shared)
+    if (sharedRead.error != "") {
+        eprintln(sharedRead.error)
+        return 1
+    }
+    val out: array<string> = [pyRightStrip(sharedRead.text) + "\n\n"]
+    for (value in sortedUnique(uniqueValues)) {
+        var at = 0
+        var scan = 0
+        while (scan < uniqueValues.size) {
+            if (uniqueValues[scan] == value) at = scan
+            scan = scan + 1
+        }
+        out.append("val ${uniqueStorage[at]} = nativeStaticAllocate(${uniqueSize[at]})\nval ${value} = u32(${uniqueStorage[at]})\n\n")
+    }
+    for (value in sortedUnique(blockValues)) {
+        var at = 0
+        var scan = 0
+        while (scan < blockValues.size) {
+            if (blockValues[scan] == value) at = scan
+            scan = scan + 1
+        }
+        out.append(blockTexts[at] + "\n\n")
+    }
+    Path(shared).writeText(pyRightStrip(out.join("")) + "\n")
+    0
+}
+
+// blocks[value] = text, keeping the first insertion position.
+fun setBlock(var values: array<string>, var texts: array<string>, value: string, text: string): void {
+    var index = 0
+    while (index < values.size) {
+        if (values[index] == value) {
+            texts[index] = text
+            return
+        }
+        index = index + 1
+    }
+    values.append(value)
+    texts.append(text)
+}
+

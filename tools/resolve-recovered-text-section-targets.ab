@@ -1,0 +1,262 @@
+// Rebase recovered `.text.function+offset` data into one assembly unit.
+//
+//     tools/abla-tool resolve-recovered-text-section-targets --archives DIR SOURCE.ab [...]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/recovered.ab"
+
+// One `.text.FUNCTION+0xHEX` reference: where it lies and what it names.
+class TextTarget(val begin: int, val end: int, val function: string, val digits: string)
+
+// TEXT_TARGET = r"\.text\.([.$A-Za-z_][.$A-Za-z0-9_\\]*?)\+0x([0-9A-Fa-f]+)", searched left to right
+// without overlap. The lazy name can only end at the first byte outside its alphabet, which has to
+// be the `+`.
+fun textTargets(source: string): array<TextTarget> {
+    val found: array<TextTarget> = []
+    var from = 0
+    while (true) {
+        val at = source.indexOf(".text.", from)
+        if (at < 0) break
+        from = at + 1
+        val nameBegin = at + 6
+        if (nameBegin >= source.size) continue
+        val first = source[nameBegin]
+        if (!(first == 46 || first == 36 || first == 95 || isAlnum(first)) || (first >= 48 && first <= 57)) continue
+        var nameEnd = nameBegin + 1
+        while (nameEnd < source.size && isByteIn(source[nameEnd], ".$\\")) nameEnd = nameEnd + 1
+        if (!hasAt(source, nameEnd, "+0x")) continue
+        var digitsEnd = nameEnd + 3
+        while (digitsEnd < source.size && hexNumber(source.slice(digitsEnd, digitsEnd + 1)) >= 0) digitsEnd = digitsEnd + 1
+        if (digitsEnd == nameEnd + 3) continue
+        found.append(TextTarget(at, digitsEnd, source.slice(nameBegin, nameEnd), source.slice(nameEnd + 3, digitsEnd)))
+        from = digitsEnd
+    }
+    found
+}
+
+// sorted(set(findall)): the (function, hex digits) pairs in string order, without repeats.
+fun textTargetPairs(targets: array<TextTarget>): array<TextTarget> {
+    val sorted: array<TextTarget> = []
+    for (target in targets) {
+        var at = 0
+        var duplicate = false
+        while (at < sorted.size) {
+            val other = sorted[at]
+            if (other.function == target.function && other.digits == target.digits) duplicate = true
+            at = at + 1
+        }
+        if (duplicate) continue
+        var place = sorted.size
+        while (place > 0 && textTargetLess(target, sorted[place - 1])) place = place - 1
+        sorted.append(target)
+        var index = sorted.size - 1
+        while (index > place) {
+            sorted[index] = sorted[index - 1]
+            index = index - 1
+        }
+        sorted[place] = target
+    }
+    sorted
+}
+
+fun textTargetLess(a: TextTarget, b: TextTarget): bool =
+    if (a.function != b.function) a.function < b.function else a.digits < b.digits
+
+// The function's section start in each object of each owning member; a function is placed in its
+// own `.text.NAME` section by the compiler.
+fun textSectionStarts(owner: ArchiveMember, function: string): array<int> {
+    val starts: array<int> = []
+    val objects = memberObjects(owner.archive, owner.member)
+    if (objects.error != "") {
+        starts.append(-1)
+        return starts
+    }
+    for (data in objects.objects) {
+        var found = -1
+        for (symbol in objectSymbols(data)) {
+            // readelf prints one row per symbol; a later row of the same name replaces an earlier one.
+            if (symbol.kind == 2 && symbol.sectionIndex > 0 && symbol.sectionIndex < 0xff00 && symbol.name == function) {
+                found = if (symbol.section == ".text.${function}") symbol.value else -2
+            }
+        }
+        if (found >= 0) starts.append(found)
+    }
+    starts
+}
+
+class EntryLabelResult(val text: string, val error: string)
+
+// Define `label` at the `entry` instruction of the recovered function's assembly string.
+fun textEntryLabel(source: string, function: string, label: string): EntryLabelResult {
+    val marker = "// Original ABI symbol: ${function}\n"
+    val begin = source.indexOf(marker)
+    if (begin < 0) return EntryLabelResult(source, "source does not implement ${function}")
+    val opening = "xtensaAssemblyVoid(\n    \""
+    var stringBegin = source.indexOf(opening, begin)
+    if (stringBegin < 0) return EntryLabelResult(source, "${function} has no recovered assembly body")
+    stringBegin = stringBegin + opening.size
+    val stringEnd = source.indexOf("\",\n    \"~{memory}\"", stringBegin)
+    if (stringEnd < 0) return EntryLabelResult(source, "${function} has no bounded assembly string")
+    val body = source.slice(stringBegin, stringEnd)
+    val entry = body.lastIndexOf("\\nentry")
+    var insertion = -1
+    if (entry >= 0) insertion = stringBegin + entry + 2
+    else if (body.startsWith("entry")) insertion = stringBegin
+    else return EntryLabelResult(source, "cannot find the entry instruction for ${function}")
+    val definition = "${label}:\\n"
+    if (!body.contains(definition)) {
+        return EntryLabelResult(source.slice(0, insertion) + definition + source.slice(insertion, source.size), "")
+    }
+    EntryLabelResult(source, "")
+}
+
+class TextResolution(val text: string, val count: int, val error: string)
+
+fun resolveTextSource(path: string, source: string, index: Map<string, array<ArchiveMember>>): TextResolution {
+    val pairs = textTargetPairs(textTargets(source))
+    if (pairs.size == 0) return TextResolution(source, 0, "")
+    val functions: array<string> = []
+    val startValues: array<int> = []
+    for (pair in pairs) {
+        var done = false
+        for (name in functions) {
+            if (name == pair.function) done = true
+        }
+        if (done) continue
+        val candidates: array<int> = []
+        val owners = index.get(pair.function)
+        if (owners != null) {
+            for (owner in owners) {
+                for (start in textSectionStarts(owner, pair.function)) {
+                    if (start == -1) return TextResolution(source, 0, "cannot read ${owner.archive}:${owner.member}")
+                    if (start >= 0 && !containsInt(candidates, start)) candidates.append(start)
+                }
+            }
+        }
+        if (candidates.size != 1) {
+            return TextResolution(source, 0,
+                "${path}: no unique section start for ${pair.function}: ${intListText(sortedInts(candidates))}")
+        }
+        functions.append(pair.function)
+        startValues.append(candidates[0])
+    }
+    var text = source
+    var resolved = 0
+    val namespace = safeIdentifier(pyPath(path))
+    var which = 0
+    while (which < functions.size) {
+        val function = functions[which]
+        val start = startValues[which]
+        val label = ".Labla_recovered_${namespace}_${safeIdentifier(function)}_section_entry"
+        val labelled = textEntryLabel(text, function, label)
+        if (labelled.error != "") return TextResolution(source, 0, labelled.error)
+        text = labelled.text
+        val parts: array<string> = []
+        var last = 0
+        for (target in textTargets(text)) {
+            if (target.function != function) continue
+            val delta = hexNumber(target.digits) - start
+            resolved = resolved + 1
+            parts.append(text.slice(last, target.begin))
+            if (delta == 0) parts.append(label)
+            else if (delta > 0) parts.append("${label}+0x${hexText(delta)}")
+            else parts.append("${label}-0x${hexText(-delta)}")
+            last = target.end
+        }
+        parts.append(text.slice(last, text.size))
+        text = parts.join("")
+        which = which + 1
+    }
+    TextResolution(text, resolved, "")
+}
+
+fun containsInt(values: array<int>, wanted: int): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}
+
+fun sortedInts(values: array<int>): array<int> {
+    val sorted: array<int> = []
+    for (value in values) {
+        var place = sorted.size
+        while (place > 0 && value < sorted[place - 1]) place = place - 1
+        sorted.append(value)
+        var index = sorted.size - 1
+        while (index > place) {
+            sorted[index] = sorted[index - 1]
+            index = index - 1
+        }
+        sorted[place] = value
+    }
+    sorted
+}
+
+fun main: int {
+    var archives = ""
+    val sources: array<string> = []
+    var index = 0
+    val usage = "usage: resolve-recovered-text-section-targets [-h] --archives ARCHIVES sources [sources ...]"
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--archives" && index + 1 < processArgumentCount()) {
+            archives = processArgument(index + 1)
+            index = index + 1
+        } else if (argument.startsWith("--archives=")) {
+            archives = argument.slice(11, argument.size)
+        } else if (argument == "-h" || argument == "--help") {
+            println(usage)
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            eprintln(usage)
+            eprintln("resolve-recovered-text-section-targets: error: unrecognized arguments: ${argument}")
+            return 2
+        } else {
+            sources.append(argument)
+        }
+        index = index + 1
+    }
+    if (archives == "" || sources.size == 0) {
+        eprintln(usage)
+        eprintln("resolve-recovered-text-section-targets: error: the following arguments are required: --archives, sources")
+        return 2
+    }
+    val wanted: Map<string, int> = Map()
+    for (path in sources) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        for (target in textTargets(read.text)) wanted.set(target.function, 1)
+    }
+    val found = archiveSymbolIndex(recursiveFiles(archives, ".a"), wanted)
+    if (found.error != "") {
+        eprintln(found.error)
+        return 1
+    }
+    var total = 0
+    for (path in sources) {
+        val read = recoveredRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val result = resolveTextSource(path, read.text, found.owners)
+        if (result.error != "") {
+            eprintln("ValueError: ${result.error}")
+            return 1
+        }
+        if (result.count > 0 || result.text != read.text) {
+            Path(path).writeText(result.text)
+            println("${pyPath(path)}: rebased ${result.count} text-section target(s)")
+        }
+        total = total + result.count
+    }
+    println("rebased ${total} recovered text-section target(s)")
+    0
+}
