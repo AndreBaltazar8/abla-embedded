@@ -1,0 +1,76 @@
+// Fixtures for tools/place-internal-closure.ab: transitive calls/tables/cycles,
+// literal placement, unused pruning, unresolved refusal and the exact linker
+// boundary opt-in.
+
+import "abla/io"
+import "abla/text"
+import "../tools/place-internal-closure.ab"
+
+var failures = 0
+
+fun check(ok: bool, label: string): void {
+    if (!ok) {
+        println("FAIL $label")
+        failures = failures + 1
+    }
+}
+
+fun renamedTo(plan: PlacementPlan, from: string): string {
+    for (rename in plan.renames) if (rename.from == from) return rename.to
+    ""
+}
+
+fun boundaryObject(name: string): string {
+    val names = elfNul() + ".iram1.root" + elfNul() + ".rela.root" + elfNul() + ".symtab" + elfNul() +
+        ".strtab" + elfNul() + ".shstrtab" + elfNul()
+    val strings = elfNul() + name + elfNul()
+    val file = elfFixture()
+    // 1 .iram1.root, 2 .rela.root (link 3, info 1), 3 .symtab (link 4), 4 .strtab, 5 .shstrtab
+    file.add(elfNameOffset(names, ".iram1.root"), 1, 6, elfZeros(4), 0, 0, 0)
+    file.add(elfNameOffset(names, ".rela.root"), 4, 0, elfBytes32(0) + elfBytes32(257) + elfBytes32(0), 3, 1, 12)
+    file.add(elfNameOffset(names, ".symtab"), 2, 0,
+        elfZeros(16) + elfBytes32(1) + elfBytes32(0) + elfBytes32(0) + elfByte(16) + elfByte(0) + elfBytes16(0), 4, 0, 16)
+    file.add(elfNameOffset(names, ".strtab"), 3, 0, strings, 0, 0, 0)
+    file.add(elfNameOffset(names, ".shstrtab"), 3, 0, names, 0, 0, 0)
+    file.finish(5)
+}
+
+fun boundaryAccepted(name: string, allowed: array<string>): bool {
+    val input = inspectPlacement(boundaryObject(name), allowed)
+    if (input.error != "") return false
+    planInternalClosure(input.sections, input.edges).error == ""
+}
+
+fun main: int {
+    val sections = [PlacementSection("", 0, 0), PlacementSection(".iram1.root", 6, 16),
+        PlacementSection(".text.helper", 6, 20), PlacementSection(".literal.helper", 2, 4),
+        PlacementSection(".rodata.table", 2, 16), PlacementSection(".text.callback", 6, 24),
+        PlacementSection(".bss.state", 3, 4), PlacementSection(".text.unused", 6, 40)]
+    val edges = [[], [2], [3], [4], [5, 6], [2], [], []]
+    val plan = planInternalClosure(sections, edges)
+    check(plan.error == "", "closure plan error: ${plan.error}")
+    check(plan.renames.size == 5, "5 renames, got ${plan.renames.size}")
+    check(renamedTo(plan, ".literal.helper").startsWith(".iram1."), "literal in IRAM")
+    check(renamedTo(plan, ".rodata.table").startsWith(".dram1."), "table in DRAM")
+    check(renamedTo(plan, ".bss.state").startsWith(".dram1."), "bss in DRAM")
+    check(renamedTo(plan, ".text.unused") == "", "unused section pruned")
+    check(renamedTo(plan, ".text.helper") == ".iram1.abla.closure.text.helper", "exact IRAM name")
+    for (broken in [[[], [0], [], [], [], [], [], []], [[], [99], [], [], [], [], [], []]]) {
+        check(planInternalClosure(sections, broken).error != "", "invalid target accepted")
+    }
+    val whole = planInternalClosure([PlacementSection("", 0, 0), PlacementSection(".iram1.code", 6, 4),
+        PlacementSection(".dram1.data", 2, 4)], [[], [2], []])
+    check(whole.error == "" && whole.renames.size == 0, "whole internal closure needs no renames")
+    if (failures != 0) return 1
+    println("PASS: transitive calls/tables/cycles, literal placement, unused pruning, unresolved refusal")
+
+    // Minimal ELF with one internal root relocation to an undefined linker name.
+    // Allowing that exact name must not permit an unrelated undefined symbol.
+    val none: array<string> = []
+    check(!boundaryAccepted("__stack", none), "undefined boundary accepted by default")
+    check(boundaryAccepted("__stack", ["__stack"]), "exact linker boundary refused")
+    check(!boundaryAccepted("libc_fn", ["__stack"]), "unrelated external accepted")
+    if (failures != 0) return 1
+    println("PASS: exact linker boundary opt-in; default and unrelated externals rejected")
+    0
+}

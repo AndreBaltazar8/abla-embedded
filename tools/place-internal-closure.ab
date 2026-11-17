@@ -1,0 +1,268 @@
+// Place the transitive relocation closure of IRAM/DRAM roots in internal sections.
+//
+// Post-codegen placement only: no instruction, data, symbol or linkage changes.
+// Preserves monolithic LLVM optimization. Does NOT prove computed pointers,
+// stack placement, final linker addresses/capacity, or hardware correctness.
+// Xtensa literal pools stay in IRAM for l32r reach, not remote DRAM.
+//
+//     tools/abla-tool place-internal-closure [--objcopy PROGRAM] [--linker-symbol NAME]... SOURCE OUTPUT
+
+import "abla/array"
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "abla/process/command"
+import "lib/elf.ab"
+
+fun placementInternal(name: string): bool =
+    name == ".iram1" || name == ".dram1" || name.startsWith(".iram1.") || name.startsWith(".dram1.")
+
+class PlacementSection(val name: string, val flags: int, val size: int)
+
+fun placementTruncated(section: Elf32Section, data: string): bool =
+    section.offset + section.size > data.size
+
+// The sections of an object and the relocation edges between them: edges[i]
+// lists the section indexes section i's relocations point at (possibly with
+// repeats). `error` is "" on success.
+class PlacementInput(val sections: array<PlacementSection>, val edges: array<array<int>>, val error: string)
+
+class PlacementRename(val from: string, val to: string)
+
+class PlacementPlan(val renames: array<PlacementRename>, val error: string)
+
+fun placementFail(message: string): PlacementPlan {
+    val none: array<PlacementRename> = []
+    PlacementPlan(none, message)
+}
+
+fun placementContains(items: array<int>, value: int): bool {
+    for (item in items) if (item == value) return true
+    false
+}
+
+// Sections: (name, flags, size); edges include code, data and function tables.
+fun planInternalClosure(sections: array<PlacementSection>, edges: array<array<int>>): PlacementPlan {
+    val pending: array<int> = []
+    var index = 0
+    while (index < sections.size) {
+        if (placementInternal(sections[index].name) && (sections[index].flags & 2) != 0) pending.append(index)
+        index = index + 1
+    }
+    if (pending.size == 0) return placementFail("no allocated internal roots")
+    val seen: array<bool> = []
+    index = 0
+    while (index < sections.size) {
+        seen.append(false)
+        index = index + 1
+    }
+    while (pending.size > 0) {
+        val current = pending[pending.size - 1]
+        pending.removeLast()
+        if (current >= 0 && current < sections.size && seen[current]) continue
+        if (current < 0 || current >= sections.size || (sections[current].flags & 2) == 0) {
+            return placementFail("internal closure references unresolved or non-allocated storage")
+        }
+        seen[current] = true
+        if (current < edges.size) {
+            for (target in edges[current]) pending.append(target)
+        }
+    }
+    val renames: array<PlacementRename> = []
+    index = 0
+    while (index < sections.size) {
+        if (!seen[index]) {
+            index = index + 1
+            continue
+        }
+        val section = sections[index]
+        index = index + 1
+        if (placementInternal(section.name)) continue
+        val name = section.name
+        if (name == "" || name.contains("=") || name.contains(",") || name.contains("\n") || name.contains("\r")) {
+            return placementFail("unsupported section name")
+        }
+        val code = (section.flags & 4) != 0 || name == ".literal" || name.startsWith(".literal.")
+        val renamed = (if (code) ".iram1." else ".dram1.") + "abla.closure" + name
+        for (other in sections) {
+            if (other.name == renamed) return placementFail("placement name collision")
+        }
+        renames.append(PlacementRename(name, renamed))
+    }
+    PlacementPlan(renames, "")
+}
+
+fun placementInputFail(message: string): PlacementInput {
+    val none: array<PlacementSection> = []
+    val noEdges: array<array<int>> = []
+    PlacementInput(none, noEdges, message)
+}
+
+// Parses an object's sections and relocation edges. `linkerSymbols` are exact
+// caller-declared boundary names that may stay undefined.
+fun inspectPlacement(data: string, linkerSymbols: array<string>): PlacementInput {
+    if (data.size < 52 || elfU8(data, 0) != 0x7f || elfU8(data, 1) != 0x45 || elfU8(data, 2) != 0x4c ||
+        elfU8(data, 3) != 0x46 || elfU8(data, 4) != 1 || elfU8(data, 5) != 1) {
+        return placementInputFail("expected little-endian ELF32")
+    }
+    val offset = elfU32(data, 32)
+    val stride = elfU16(data, 46)
+    val count = elfU16(data, 48)
+    val namesIndex = elfU16(data, 50)
+    if (stride != 40 || count == 0 || namesIndex >= count || offset + count * 40 > data.size) {
+        return placementInputFail("invalid section table")
+    }
+    val elf = elf32Parse(data)
+    if (elf.error != "") return placementInputFail("invalid section table")
+    if (placementTruncated(elf.sections[namesIndex], data)) return placementInputFail("truncated section")
+    val names = elf.sectionBytes(elf.sections[namesIndex])
+    val sections: array<PlacementSection> = []
+    for (section in elf.sections) {
+        if (section.nameOffset >= names.size || names.indexOf(elfNul(), section.nameOffset) < 0) {
+            return placementInputFail("invalid section name")
+        }
+        sections.append(PlacementSection(section.name, section.flags, section.size))
+    }
+    var first = 0
+    while (first < sections.size) {
+        var second = first + 1
+        while (second < sections.size) {
+            if (sections[first].name == sections[second].name) {
+                return placementInputFail("ambiguous duplicate section names")
+            }
+            second = second + 1
+        }
+        first = first + 1
+    }
+    val edges: array<array<int>> = []
+    var index = 0
+    while (index < count) {
+        val none: array<int> = []
+        edges.append(none)
+        index = index + 1
+    }
+    index = 0
+    while (index < count) {
+        val section = elf.sections[index]
+        index = index + 1
+        if (section.kind != ELF_SHT_RELA && section.kind != ELF_SHT_REL) continue
+        if (section.info >= count || section.link >= count) return placementInputFail("invalid relocation links")
+        val symbols = elf.sections[section.link]
+        val width = if (section.kind == ELF_SHT_RELA) 12 else 8
+        if (section.entrySize != width || symbols.entrySize != 16 || section.size % width != 0) {
+            return placementInputFail("invalid relocation/symbol stride")
+        }
+        if (placementTruncated(symbols, data) || placementTruncated(section, data)) return placementInputFail("truncated section")
+        val table = elf.sectionBytes(symbols)
+        for (relocation in elf.relocations(index - 1)) {
+            if (relocation.kind == 0) continue
+            val symbol = relocation.symbol
+            if ((symbol + 1) * 16 > table.size) return placementInputFail("invalid relocation symbol")
+            val target = elfU16(table, symbol * 16 + 14)
+            if (target == 0 && linkerSymbols.size > 0) {
+                if (symbols.link >= count) return placementInputFail("invalid symbol string table")
+                if (placementTruncated(elf.sections[symbols.link], data)) return placementInputFail("truncated section")
+                val strings = elf.sectionBytes(elf.sections[symbols.link])
+                val nameOffset = elfU32(table, symbol * 16)
+                if (nameOffset >= strings.size || strings.indexOf(elfNul(), nameOffset) < 0) {
+                    return placementInputFail("invalid symbol name")
+                }
+                var allowed = false
+                val symbolName = elfCString(strings, nameOffset)
+                for (linkerSymbol in linkerSymbols) if (linkerSymbol == symbolName) allowed = true
+                if (allowed) continue // Exact caller-declared boundary; final link must resolve it.
+            }
+            if (target == ELF_SHN_ABS) continue // absolute ROM/hardware boundary
+            if (!placementContains(edges[section.info], target)) edges[section.info].append(target)
+        }
+    }
+    PlacementInput(sections, edges, "")
+}
+
+// Per allocated section: name -> (kind, flags, size, payload) as one string.
+fun placementContents(data: string, labels: array<PlacementSection>, renames: array<PlacementRename>): array<string> {
+    val elf = elf32Parse(data)
+    val result: array<string> = []
+    var index = 0
+    while (index < labels.size) {
+        val label = labels[index]
+        if ((label.flags & 2) != 0) {
+            val section = elf.sections[index]
+            val payload = if (section.kind == 8) "<nobits>" else elf.sectionBytes(section).slice(0, label.size)
+            var name = label.name
+            for (rename in renames) if (rename.from == name) name = rename.to
+            result.append("$name${elfByte(1)}${section.kind}${elfByte(1)}${label.flags}${elfByte(1)}${label.size}${elfByte(1)}$payload")
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun placementFailMain(message: string): int {
+    eprintln(message)
+    1
+}
+
+fun main: int {
+    var objcopy = "llvm-objcopy"
+    val linkerSymbols: array<string> = []
+    val files: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--objcopy" && index + 1 < processArgumentCount()) {
+            objcopy = processArgument(index + 1)
+            index = index + 1
+        } else if (argument == "--linker-symbol" && index + 1 < processArgumentCount()) {
+            linkerSymbols.append(processArgument(index + 1))
+            index = index + 1
+        } else {
+            files.append(argument)
+        }
+        index = index + 1
+    }
+    if (files.size != 2) {
+        eprintln("usage: place-internal-closure [--objcopy PROGRAM] [--linker-symbol NAME]... SOURCE OUTPUT")
+        return 2
+    }
+    val source = Path(files[0])
+    val output = Path(files[1])
+    if (source.text == output.text) return placementFailMain("preserve the input object; use a distinct output")
+    val read = source.readTextResult()
+    if (!read.succeeded) return placementFailMain("cannot read ${files[0]}")
+    val original = read.text
+    val before = inspectPlacement(original, linkerSymbols)
+    if (before.error != "") return placementFailMain(before.error)
+    val plan = planInternalClosure(before.sections, before.edges)
+    if (plan.error != "") return placementFailMain(plan.error)
+    val objcopyCommand = command(objcopy)
+    for (rename in plan.renames) {
+        objcopyCommand.argument("--rename-section")
+        objcopyCommand.argument(rename.from + "=" + rename.to)
+    }
+    objcopyCommand.argument(files[0])
+    objcopyCommand.argument(files[1])
+    val status = objcopyCommand.run()
+    if (status != 0) return placementFailMain("$objcopy failed with status $status")
+    val written = output.readTextResult()
+    if (!written.succeeded) return placementFailMain("cannot read ${files[1]}")
+    val after = inspectPlacement(written.text, linkerSymbols)
+    if (after.error != "") return placementFailMain(after.error)
+    val remaining = planInternalClosure(after.sections, after.edges)
+    if (remaining.error != "") return placementFailMain(remaining.error)
+    if (remaining.renames.size > 0) return placementFailMain("internal closure remains incomplete")
+    // Expected: the original contents with the renamed sections' names.
+    val none: array<PlacementRename> = []
+    val expected = placementContents(original, before.sections, plan.renames)
+    val actual = placementContents(written.text, after.sections, none)
+    var same = expected.size == actual.size
+    for (entry in expected) {
+        var found = false
+        for (candidate in actual) if (candidate == entry) found = true
+        if (!found) same = false
+    }
+    if (!same) return placementFailMain("placement changed allocated bytes, flags, sizes or section types")
+    println("PASS: placed ${plan.renames.size} sections; original monolithic object preserved; not final-link/hardware proof")
+    0
+}
