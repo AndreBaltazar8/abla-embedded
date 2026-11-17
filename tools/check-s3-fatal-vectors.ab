@@ -1,0 +1,280 @@
+// Model linked kernel/double fatal capture instructions; not hardware proof.
+//
+//     tools/abla-tool check-s3-fatal-vectors LINKED.elf
+//
+// Disassembles the fatal vector sections with the S3 GNU objdump (ABLA_ESP_S3_OBJDUMP, else
+// xtensa-esp32s3-elf-objdump on PATH, else the PlatformIO copy; under steam-run when installed)
+// and executes the 64-byte vectors on a small register/special-register model.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+class FatalMachine(
+    val regs: array<int>,
+    val special: Map<string, int>,
+    val memory: Map<int, int>,
+    val writes: array<int>,
+    var fences: int,
+    var error: string
+) {
+    fun fail(message: string): void {
+        if (this.error == "") this.error = message
+    }
+    fun index(arg: string): int {
+        val parsed = if (arg.size >= 2 && arg[0] == 97) arg.slice(1, arg.size).parseInt() else null
+        if (parsed == null || parsed < 0 || parsed > 15) {
+            this.fail("bad register $arg")
+            return 0
+        }
+        parsed
+    }
+    fun get(arg: string): int = this.regs[this.index(arg)]
+    fun put(arg: string, value: int): void {
+        this.regs[this.index(arg)] = value & 0xffffffff
+    }
+    fun number(text: string): int {
+        val parsed = parseNumber(text)
+        if (parsed == null) {
+            this.fail("bad number $text")
+            return 0
+        }
+        parsed
+    }
+    fun hex(text: string): int {
+        val parsed = parseHex(text)
+        if (parsed < 0) {
+            this.fail("bad address $text")
+            return 0
+        }
+        parsed
+    }
+    fun readSpecial(name: string): int {
+        val value = this.special.get(name)
+        if (value == null) {
+            this.fail("unknown special register $name")
+            return 0
+        }
+        value
+    }
+}
+
+class FatalProfile(val reason: int, val name: string)
+
+fun fatalFields(): array<string> =
+    ["epc1", "ps", "exccause", "excvaddr", "sar", "lbeg", "lend", "lcount", "excsave1", "cpenable", "depc"]
+
+fun fatalFieldOffsets(): array<int> = [8, 12, 16, 20, 88, 92, 96, 100, 104, 108, 112]
+
+// Instruction at `pc`, decoded on demand: GNU linear disassembly can consume branch-alignment
+// zero padding as the prefix of the next instruction, so decode at the reached destination.
+fun fatalInstructionAt(path: string, var code: Map<int, Insn>, pc: int): Insn? {
+    val known = code.get(pc)
+    if (known != null) return known
+    val listing = runS3Objdump(["-d", "--start-address=$pc", "--stop-address=${pc + 3}", path])
+    if (listing.status != 0) return null
+    for (line in listing.output.split("\n")) {
+        val parsed = parseDisasmInsn(line)
+        if (parsed != null && parsed.address == pc) {
+            code.set(pc, parsed)
+            return parsed
+        }
+    }
+    null
+}
+
+fun checkFatalVectors(path: string, data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "" || elf.kind != 2) return "expected linked ELF32"
+    val windowIndex = elfLastSection(elf, ".iram1.abla.s3WindowVectors")
+    val recordsIndex = elfLastSection(elf, ".dram1.abla.s3FatalRecords")
+    if (windowIndex < 0 || recordsIndex < 0) return "missing window or fatal record section"
+    val vecbase = elf.sections[windowIndex].address
+    val records = elf.sections[recordsIndex]
+    if (records.size != 256 || (records.address & 15) != 0) return "fatal record section misplaced"
+    val selected: array<string> = [".iram1.abla.s3KernelVector", ".iram1.abla.s3DoubleVector", ".iram1.abla.s3FatalEntry"]
+    val profiles: array<FatalProfile> = [FatalProfile(1, selected[0]), FatalProfile(2, selected[1])]
+    val offsets: array<int> = [0x300, 0x3c0]
+    for (level in 4..7) {
+        val name = ".iram1.abla.s3Level${level}Vector"
+        selected.append(name)
+        profiles.append(FatalProfile(level, name))
+        offsets.append(0x200 + (level - 4) * 64)
+    }
+    for (name in selected) {
+        if (elfLastSection(elf, name) < 0) return "missing section $name"
+    }
+    var which = 0
+    while (which < profiles.size) {
+        val section = elf.sections[elfLastSection(elf, profiles[which].name)]
+        if (section.address != vecbase + offsets[which] || section.size != 64) {
+            return "${profiles[which].name} misplaced"
+        }
+        which = which + 1
+    }
+    val arguments: array<string> = ["-d"]
+    for (name in selected) {
+        arguments.append("-j")
+        arguments.append(name)
+    }
+    arguments.append(path)
+    val listing = runS3Objdump(arguments)
+    if (listing.status != 0) return "objdump failed"
+    val code: Map<int, Insn> = Map()
+    for (line in listing.output.split("\n")) {
+        val parsed = parseDisasmInsn(line)
+        if (parsed != null) code.set(parsed.address, parsed)
+    }
+    val fields = fatalFields()
+    val fieldOffsets = fatalFieldOffsets()
+    var seed = 0
+    while (seed < 64) {
+        var core = 0
+        while (core < 2) {
+            for (profile in profiles) {
+                val reason = profile.reason
+                val regs: array<int> = []
+                var i = 0
+                while (i < 16) {
+                    regs.append(0xA0000000 + seed * 256 + i)
+                    i = i + 1
+                }
+                val original: array<int> = []
+                for (value in regs) original.append(value)
+                val special: Map<string, int> = Map()
+                i = 0
+                while (i < fields.size) {
+                    special.set(fields[i], 0x12340000 + seed * 32 + i)
+                    i = i + 1
+                }
+                for (level in 4..7) {
+                    special.set("epc$level", 0x42004000 + seed * 128 + level * 4)
+                    special.set("eps$level", 0x40000 + seed * 128 + level)
+                }
+                special.set("debugcause", seed + 64)
+                special.set("prid", core << 13)
+                val saved: Map<string, int> = Map()
+                for (key in special.keys()) saved.set(key, special.get(key) ?? 0)
+                val base = records.address + core * 128
+                val m = FatalMachine(regs, special, Map(), [], 0, "")
+                var pc = elf.sections[elfLastSection(elf, profile.name)].address
+                var halted = false
+                var step = 0
+                while (step < 120 && !halted) {
+                    step = step + 1
+                    val insn = fatalInstructionAt(path, code, pc)
+                    if (insn == null) return "cannot decode reached instruction 0x${hexText(pc)}"
+                    val op = insn.op
+                    val args = insn.args
+                    var following = pc + insn.width
+                    if (op.startsWith("wsr.")) {
+                        m.special.set(op.slice(4, op.size), m.get(args[0]))
+                    } else if (op.startsWith("rsr.")) {
+                        m.put(args[0], m.readSpecial(op.slice(4, op.size)))
+                    } else if (op == "movi") {
+                        m.put(args[0], m.number(args[1]))
+                    } else if (op == "l32r") {
+                        val literal = elfReadLoaded(elf, m.hex(args[1]), 4)
+                        if (!literal.ok) return "literal outside linked image"
+                        m.put(args[0], elfU32(literal.bytes, 0))
+                    } else if (op == "extui") {
+                        m.put(args[0], (m.get(args[1]) >> m.number(args[2])) & ((1 << m.number(args[3])) - 1))
+                    } else if (op == "slli") {
+                        m.put(args[0], m.get(args[1]) << m.number(args[2]))
+                    } else if (op == "addi") {
+                        m.put(args[0], m.get(args[1]) + m.number(args[2]))
+                    } else if (op == "add") {
+                        m.put(args[0], m.get(args[1]) + m.get(args[2]))
+                    } else if (op == "sub") {
+                        m.put(args[0], m.get(args[1]) - m.get(args[2]))
+                    } else if (op == "s32i") {
+                        val address = m.get(args[1]) + m.number(args[2])
+                        if (address < base || address >= base + 128 || (address & 3) != 0) {
+                            return "write outside own record/uses interrupted stack"
+                        }
+                        m.memory.set(address, m.get(args[0]))
+                        m.writes.append(address)
+                        if (m.get(args[0]) == 1178686513 && (address != base || m.fences != 1)) {
+                            return "fatal magic is not the single committing store after the first fence"
+                        }
+                    } else if (op == "rsil") {
+                        val ps = m.readSpecial("ps")
+                        m.put(args[0], ps)
+                        m.special.set("ps", (ps & ~15) | m.number(args[1]))
+                    } else if (op == "memw") {
+                        m.fences = m.fences + 1
+                    } else if (op == "l32i") {
+                        val loaded = m.memory.get(m.get(args[1]) + m.number(args[2]))
+                        if (loaded == null) return "load from an address the vector never wrote"
+                        m.put(args[0], loaded)
+                    } else if (op == "bnei") {
+                        if (m.get(args[0]) != m.number(args[1])) following = m.hex(args[2])
+                    } else if (op == "j") {
+                        following = m.hex(args[0])
+                        if (following == pc) halted = true
+                    } else {
+                        return "unexpected instruction 0x${hexText(pc)} $op ${args.join(",")}"
+                    }
+                    if (m.error != "") return m.error
+                    pc = following
+                }
+                if (!halted) return "did not halt"
+                if (m.writes.size == 0 || m.writes[0] != base || m.writes[m.writes.size - 1] != base || m.fences != 2) {
+                    return "fatal record must be opened and published last, between two fences"
+                }
+                if ((m.memory.get(base) ?? -1) != 1178686513 || (m.memory.get(base + 4) ?? -1) != reason) {
+                    return "fatal record header is wrong"
+                }
+                var ok = ((m.special.get("ps") ?? 0) & 15) == 15
+                i = 2
+                while (i < 16) {
+                    if (regs[i] != original[i]) ok = false
+                    i = i + 1
+                }
+                if (!ok) return "fatal vector must raise PS.INTLEVEL and leave a2..a15 alone"
+                i = 0
+                while (i < 16) {
+                    if ((m.memory.get(base + 24 + i * 4) ?? -1) != original[i]) return "register a$i not captured"
+                    i = i + 1
+                }
+                i = 0
+                while (i < fields.size) {
+                    if ((m.memory.get(base + fieldOffsets[i]) ?? -1) != (saved.get(fields[i]) ?? -2)) {
+                        return "${fields[i]} not captured"
+                    }
+                    i = i + 1
+                }
+                val epcName = if (reason == 1) "epc1" else if (reason == 2) "depc" else "epc$reason"
+                val psName = if (reason < 4) "ps" else "eps$reason"
+                if ((m.memory.get(base + 116) ?? -1) != (saved.get(epcName) ?? -2)) return "wrong EPC captured"
+                if ((m.memory.get(base + 120) ?? -1) != (saved.get(psName) ?? -2)) return "wrong PS captured"
+                if ((m.memory.get(base + 124) ?? -1) != (saved.get("debugcause") ?? -2)) return "debugcause not captured"
+            }
+            core = core + 1
+        }
+        seed = seed + 1
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-fatal-vectors LINKED.elf")
+        return 2
+    }
+    val path = processArgument(0)
+    val file = readBinaryFile(path)
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkFatalVectors(path, file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS:768 linked fatal vector profiles, visible registers, correct EPC/EPS/DEPC, own-core record, publish-last, stackless halt; not hardware proof")
+    0
+}

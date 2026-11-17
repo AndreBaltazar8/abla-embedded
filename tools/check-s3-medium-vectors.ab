@@ -1,0 +1,146 @@
+// Validate final linked medium vector positions and actual J destinations.
+//
+//     tools/abla-tool check-s3-medium-vectors LINKED.elf
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+// PASS lines to print (in order) before the verdict, then the first error ("" when none).
+class VectorReport(val lines: array<string>, val error: string)
+
+fun mediumFail(lines: array<string>, error: string): VectorReport = VectorReport(lines, error)
+
+fun checkMediumVectors(data: string): VectorReport {
+    val lines: array<string> = []
+    val elf = elf32Parse(data)
+    if (elf.error != "" || elf.kind != 2) return mediumFail(lines, "expected linked ELF32")
+    val irqIndex = elfLastSection(elf, ".iram1.abla.s3IrqEntries")
+    val windowIndex = elfLastSection(elf, ".iram1.abla.s3WindowVectors")
+    if (irqIndex < 0 || windowIndex < 0) return mediumFail(lines, "missing IRQ or window section")
+    val irq = elf.sections[irqIndex]
+    val irqFunctions = elfFunctionsIn(elf, irqIndex, true)
+    if (irqFunctions.error != "") return mediumFail(lines, irqFunctions.error)
+    val functions = irqFunctions.addresses
+    if (functions.size != 1) return mediumFail(lines, "IRQ section must define exactly one function")
+    val irqBase = functions[0] // excludes any literal pool before the function
+    val window = elf.sections[windowIndex]
+    val vecbase = window.address
+    if ((vecbase & 1023) != 0 || window.size != 384) return mediumFail(lines, "window region misplaced")
+    for (level in [2, 3]) {
+        val index = elfLastSection(elf, ".iram1.abla.s3Level${level}Vector")
+        if (index < 0) return mediumFail(lines, "missing level $level vector")
+        val vector = elf.sections[index]
+        if (vector.address != vecbase + 0x180 + (level - 2) * 64 || vector.size != 64) {
+            return mediumFail(lines, "level $level vector misplaced")
+        }
+        val code = elf.sectionBytes(vector)
+        val instruction = xtensaWord(code, 0)
+        if ((instruction & 63) != 6 || !isZero(elfSlice(code, 3, code.size))) {
+            return mediumFail(lines, "vector must be only J, with no register clobber/prologue")
+        }
+        val target = vector.address + 4 + xtensaDisplacement18(instruction)
+        if (target != irqBase + (level - 1) * 512) return mediumFail(lines, "wrong linked IRQ destination")
+        val offset = irq.offset + target - irq.address
+        if (elfSlice(data, offset, offset + 3) != byteCodes3(0, 0xD0 + level, 0x13)) {
+            return mediumFail(lines, "destination must first preserve a0 in EXCSAVEn")
+        }
+    }
+    lines.append("PASS: final VECBASE offsets,J destinations and a0 preservation for levels2/3; partial table only")
+
+    val userIndex = elfLastSection(elf, ".iram1.abla.s3UserVector")
+    if (userIndex < 0) return VectorReport(lines, "")
+    val user = elf.sections[userIndex]
+    if (user.address != vecbase + 0x340 || user.size != 64) return mediumFail(lines, "user vector misplaced")
+    val faultIndex = elfLastSection(elf, ".iram1.abla.s3ExceptionEntry")
+    if (faultIndex < 0) return mediumFail(lines, "missing exception entry section")
+    val faultFunctions = elfFunctionsIn(elf, faultIndex, true)
+    if (faultFunctions.error != "") return mediumFail(lines, faultFunctions.error)
+    val faults = faultFunctions.addresses
+    if (faults.size != 1) return mediumFail(lines, "exception entry must define exactly one function")
+    val faultSection = elf.sections[faultIndex]
+    // Check the cross-section CALL0 relocations after linking, not the zero displacement
+    // placeholders in the object. Both must use the shared ABI.
+    val relatives = [30, 139]
+    val destinations = [irqBase + 1536, irqBase + 1792]
+    var pair = 0
+    while (pair < 2) {
+        val address = faults[0] + relatives[pair]
+        val offset = faultSection.offset + address - faultSection.address
+        val instruction = xtensaWord(data, offset)
+        if ((instruction & 63) != 5) return mediumFail(lines, "exception context boundary must use CALL0")
+        val displacement = xtensaDisplacement18(instruction)
+        if ((address & ~3) + 4 + displacement * 4 != destinations[pair]) {
+            return mediumFail(lines, "exception context call target mismatch")
+        }
+        pair = pair + 1
+    }
+    val code = elfSlice(data, user.offset, user.offset + 64)
+    var seed = 0
+    while (seed < 4) {
+        var cause = 0
+        while (cause < 64) {
+            val original = 0xABC00000 + seed * 64 + cause
+            var a0 = original
+            var excsave = 0
+            var pc = 0
+            var destination = -1
+            var step = 0
+            while (step < 12) {
+                step = step + 1
+                val first = elfU8(code, pc)
+                val second = elfU8(code, pc + 1)
+                val word = xtensaWord(code, pc)
+                if (word == 0x13d100) {
+                    excsave = a0
+                    pc = pc + 3
+                } else if (word == 0x03e800) {
+                    a0 = cause
+                    pc = pc + 3
+                } else if (word == 0x03d100) {
+                    a0 = excsave
+                    pc = pc + 3
+                } else if (first == 0x66 && (second == 0x40 || second == 0x50)) {
+                    val last = elfU8(code, pc + 2)
+                    val immediate = if (last < 128) last else last - 256
+                    pc = if (a0 != (second >> 4)) pc + 4 + immediate else pc + 3
+                } else {
+                    if ((word & 63) != 6) {
+                        return mediumFail(lines, "unexpected user vector instruction/register write")
+                    }
+                    destination = user.address + pc + 4 + xtensaDisplacement18(word)
+                    break
+                }
+            }
+            val expected = if (cause == 4) irqBase else if (cause == 5) vecbase + 0x50 else faults[0]
+            if (destination != expected) return mediumFail(lines, "user vector reaches the wrong destination")
+            if (excsave != original) return mediumFail(lines, "user vector did not preserve a0 in EXCSAVE")
+            if (cause == 4 && a0 != original) return mediumFail(lines, "IRQ1 route did not restore a0")
+            cause = cause + 1
+        }
+        seed = seed + 1
+    }
+    lines.append("PASS:256 linked user-router cases preserve a0 and reach IRQ1/MOVSP/fault entries; not hardware proof")
+    VectorReport(lines, "")
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-medium-vectors LINKED.elf")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val report = checkMediumVectors(file.data)
+    for (line in report.lines) println(line)
+    if (report.error != "") {
+        eprintln(report.error)
+        return 1
+    }
+    0
+}

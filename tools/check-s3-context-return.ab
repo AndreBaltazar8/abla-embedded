@@ -1,0 +1,98 @@
+// Validate complete emitted level1..3 return tails and shared context restore.
+//
+// ELF32 relocatable or final linked ELF; not exception/hardware execution proof.
+//
+//     tools/abla-tool check-s3-context-return OBJECT.o|LINKED.elf
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+fun checkContextReturn(data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return elf.error
+    val index = elf.sectionIndex(".iram1.abla.s3ContextReturns")
+    if (index < 0) return "missing .iram1.abla.s3ContextReturns"
+    val section = elf.sections[index]
+    val code = elf.sectionBytes(section)
+    val functions = elfFunctionsIn(elf, index, true)
+    if (functions.error != "") return functions.error
+    if (functions.addresses.size != 1) return "context returns must define exactly one function"
+    val base = functions.addresses[0] - section.address
+    val size = functions.sizes[0]
+    for (level in [1, 2, 3]) {
+        val pc = base + (level - 1) * 64
+        // CALL0 is expanded by the target assembly adapter to L32R/CALLX0.
+        if (elfU8(code, pc) == 1) {
+            if (elfSlice(code, pc + 3, pc + 6) != elfHex("c00000")) return "level $level: L32R must be followed by CALLX0 a0"
+            val immediate = signExtend(elfU16(code, pc + 1), 16)
+            val literal = ((pc + 3) & ~3) + immediate * 4
+            if (literal < 0 || literal > code.size - 4) return "level $level: literal outside the section"
+            if (elfU32(code, literal) != section.address + base + 192) return "level $level: wrong shared-restore literal"
+        } else {
+            // Link relaxation preserves slot size: OR a1,a1,a1 then direct CALL0.
+            if (elfSlice(code, pc, pc + 3) != elfHex("101120")) return "level $level: expected OR a1,a1,a1 before CALL0"
+            val instruction = xtensaWord(code, pc + 3)
+            if ((instruction & 63) != 5) return "level $level: expected a direct CALL0"
+            if (((pc + 3) & ~3) + 4 + xtensaDisplacement18(instruction) * 4 != base + 192) {
+                return "level $level: CALL0 does not reach the shared restore"
+            }
+        }
+        var expected = elfHex("0821")
+        expected = expected + byteCodes3(0, if (level == 1) 0xE6 else 0xC0 + level, 0x13)
+        expected = expected + elfHex("0811") + byteCodes3(0, 0xB0 + level, 0x13)
+        expected = expected + elfHex("0831 1841 102000")
+        expected = expected + (if (level == 1) elfHex("003000") else byteCodes3(0x10, 0x30 + level, 0))
+        if (elfSlice(code, pc + 6, pc + 6 + expected.size) != expected) return "incorrect PS/PC/A0/SP return order"
+        if (!isZero(elfSlice(code, pc + 6 + expected.size, base + level * 64))) {
+            return "unexpected instructions in slot padding"
+        }
+    }
+    // Independent S3 frame layout and register encodings for shared restore.
+    var expected = ""
+    val special = [-1, 16, 17, 4, 12, 32, 33, 34, 35]
+    var i = 0
+    while (i < special.size) {
+        expected = expected + byteCodes3(0x32, 0x21, 28 + i) // L32I a3,a1,112+4*i
+        expected = expected + (if (special[i] < 0) elfHex("30e7f3") else byteCodes3(0x30, special[i], 0x13))
+        i = i + 1
+    }
+    val slots = [22, 23, 24, 19]
+    i = 0
+    while (i < 4) {
+        expected = expected + byteCodes3(0x32, 0x21, slots[i]) + byteCodes3(0x30, i, 0x13)
+        i = i + 1
+    }
+    var reg = 2
+    while (reg < 16) {
+        val slot = 3 + reg
+        expected = expected + (if (slot < 16) elfByte((reg << 4) | 8) + elfByte((slot << 4) | 1)
+            else byteCodes3((reg << 4) | 2, 0x21, slot))
+        reg = reg + 1
+    }
+    expected = expected + elfHex("102000 0df0")
+    if (elfSlice(code, base + 192, code.size) != expected || size != 192 + expected.size) {
+        return "shared restore encoding/frame layout mismatch"
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-context-return OBJECT.o|LINKED.elf")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkContextReturn(file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: three return paths reach shared restore, exact frame/register/return encodings; not hardware proof")
+    0
+}

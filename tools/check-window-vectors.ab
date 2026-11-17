@@ -1,0 +1,140 @@
+// Validate S3 window vector offsets and simulate emitted spill/fill opcodes.
+//
+// Hardware window rotation/exception entry still needs device verification.
+//
+//     tools/abla-tool check-window-vectors OBJECT.o
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+// The window vector region's code: the rotated register file of one simulated slot run.
+class WindowRun(val regs: array<int>, val memory: Map<int, int>, val written: Map<int, int>) {
+    // Executes the 3-byte opcodes of a 64-byte slot at `offset` until `returnOpcode` (3 bytes).
+    fun execute(code: string, offset: int, returnOpcode: string): string {
+        var pc = offset
+        while (pc < offset + 64) {
+            val a = elfU8(code, pc)
+            val b = elfU8(code, pc + 1)
+            val op = elfU8(code, pc + 2)
+            val isReturn = pc + 3 <= code.size && elfSlice(code, pc, pc + 3) == returnOpcode
+            pc = pc + 3
+            if (isReturn) return ""
+            if ((a & 15) != 0 || (op != 9 && op != 73)) return "unexpected window opcode/prologue"
+            val register = a >> 4
+            val base = b & 15
+            // L32E/S32E use a negative-only offset: encoded 0..15 means -64..-4, not a
+            // signed four-bit immediate.
+            val displacement = (b >> 4) - 16
+            val address = this.regs[base] + displacement * 4
+            if (op == 73) {
+                this.memory.set(address, this.regs[register])
+                this.written.set(address, 1)
+            } else {
+                val loaded = this.memory.get(address)
+                if (loaded == null) return "window fill from an address never spilled: $address"
+                this.regs[register] = loaded
+            }
+        }
+        "window return missing in64byte slot"
+    }
+}
+
+fun checkWindowVectors(data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return elf.error
+    var index = -1
+    var matches = 0
+    var at = 0
+    while (at < elf.sections.size) {
+        if (elf.sections[at].name == ".iram1.abla.s3WindowVectors") {
+            matches = matches + 1
+            index = at
+        }
+        at = at + 1
+    }
+    if (matches != 1 || elf.sections[index].size != 384) return "window region must be exactly384bytes"
+    val code = elf.sectionBytes(elf.sections[index])
+    // S3 PS.OWB is bits8..11. Fixed alloca branches target40/c0/140.
+    val expectedAlloca = elfHex("004803 f08040 20e603 203834 403330 40d103 803311 302230 20e613 102000 f774ce f08040 e77848 f08040 863000")
+    if (elfSlice(code, 0x50, 0x7d) != expectedAlloca) return "MOVSP recovery differs"
+    val starts = [0, 0x80, 0x100]
+    val counts = [4, 8, 12]
+    var slot = 0
+    while (slot < 3) {
+        val n = counts[slot]
+        val start = starts[slot]
+        var seed = 0
+        while (seed < 64) {
+            val regs: array<int> = []
+            var i = 0
+            while (i < 16) {
+                regs.append(0x10000 + seed * 64 + i)
+                i = i + 1
+            }
+            regs[1] = 0x2000
+            regs[n + 1] = 0x3000
+            val original: array<int> = []
+            for (value in regs) original.append(value)
+            val run = WindowRun(regs, Map(), Map())
+            run.memory.set(0x2000 - 12, 0x4000)
+            val overflow = run.execute(code, start, elfHex("003400"))
+            if (overflow != "") return overflow
+            // Four words below the new frame, then n-4 words of the caller's save area.
+            var expectedWrites = 0
+            var ok = true
+            i = 0
+            while (i < 4) {
+                if (run.written.has(0x3000 - 16 + i * 4)) expectedWrites = expectedWrites + 1 else ok = false
+                i = i + 1
+            }
+            i = 0
+            while (i < n - 4) {
+                if (run.written.has(0x4000 - n * 4 + i * 4)) expectedWrites = expectedWrites + 1 else ok = false
+                i = i + 1
+            }
+            i = n
+            while (i < 16) {
+                if (regs[i] != original[i]) ok = false
+                i = i + 1
+            }
+            if (!ok || run.written.size != expectedWrites) return "overflow clobbers caller or wrong frame"
+            i = 0
+            while (i < n) {
+                regs[i] = 0xdead0000 + i
+                i = i + 1
+            }
+            val underflow = run.execute(code, start + 64, elfHex("003500"))
+            if (underflow != "") return underflow
+            i = 0
+            while (i < 16) {
+                if (regs[i] != original[i]) return "underflow failed register roundtrip"
+                i = i + 1
+            }
+            seed = seed + 1
+        }
+        slot = slot + 1
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-window-vectors OBJECT.o")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkWindowVectors(file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: six window slots, MOVSP bytes,192 emitted-opcode frame roundtrips (not hardware proof)")
+    0
+}

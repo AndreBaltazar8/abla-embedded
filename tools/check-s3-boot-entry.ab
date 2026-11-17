@@ -1,0 +1,151 @@
+// Check linked boot-entry ABI fixture, not a bootable firmware image.
+//
+//     tools/abla-tool check-s3-boot-entry LINKED.elf
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+class BootCheck(val elf: Elf32, val code: string, val entry: int, var pc: int, var error: string) {
+    fun fail(message: string): void {
+        if (this.error == "") this.error = message
+    }
+    fun read(address: int, size: int): string {
+        val loaded = elfReadLoaded(this.elf, address, size)
+        if (!loaded.ok) {
+            this.fail("read outside loaded segments")
+            return ""
+        }
+        loaded.bytes
+    }
+    // The J at `address`: its destination; -1 when it is not a J.
+    fun jump(address: int): int {
+        val word = xtensaWord(this.read(address, 3), 0)
+        if ((word & 63) != 6) {
+            this.fail("expected a J at 0x${hexText(address)}")
+            return -1
+        }
+        address + 4 + xtensaDisplacement18(word)
+    }
+    // The next instruction in the entry code must be one of the alternatives (words written
+    // most-significant byte first).
+    fun expect(first: string, second: string): void {
+        val alternatives = if (second == "") [first] else [first, second]
+        for (encoding in alternatives) {
+            val value = xtensaInsns(encoding)
+            if (this.pc + value.size <= this.code.size && elfSlice(this.code, this.pc, this.pc + value.size) == value) {
+                this.pc = this.pc + value.size
+                return
+            }
+        }
+        this.fail("unexpected entry opcode at ${this.pc}")
+    }
+    // An L32R of `register` whose literal holds `value`.
+    fun literal(register: int, value: int): void {
+        val word = xtensaWord(this.code, this.pc)
+        if ((word & 255) != ((register << 4) | 1)) {
+            this.fail("expected an L32R into a$register at ${this.pc}")
+            return
+        }
+        val immediate = signExtend(word >> 8, 16)
+        val target = ((this.entry + this.pc + 3) & ~3) + immediate * 4
+        if (elfU32(this.read(target, 4), 0) != value) this.fail("wrong literal at 0x${hexText(target)}")
+        this.pc = this.pc + 3
+    }
+}
+
+fun checkBootEntry(data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "" || elf.kind != 2) return "expected linked ELF32"
+    val named = elfNamedSymbols(elf)
+    if (named.error != "") return named.error
+    val symbols = named.symbols
+    for (name in ["abla_boot_entry", "abla_boot_main", "__abla_boot_stack_low", "__abla_boot_stack_top"]) {
+        if (!symbols.has(name)) return "missing symbol $name"
+    }
+    val entrySymbol = symbols.get("abla_boot_entry")
+    val mainSymbol = symbols.get("abla_boot_main")
+    val lowSymbol = symbols.get("__abla_boot_stack_low")
+    val topSymbol = symbols.get("__abla_boot_stack_top")
+    if (entrySymbol == null || mainSymbol == null || lowSymbol == null || topSymbol == null) return "missing symbol"
+    val entry = entrySymbol.value
+    val size = entrySymbol.size
+    val main = mainSymbol.value
+    if (elfU32(data, 24) != entry) return "ELF entry is not abla_boot_entry"
+    val low = lowSymbol.value
+    val top = topSymbol.value
+    if (!(0x3FC88000 <= low && low < top && top <= 0x3FD00000 && top - low >= 256 && (top & 15) == 0)) {
+        return "boot stack misplaced"
+    }
+    val vectorsIndex = elfLastSection(elf, ".iram1.abla.s3BootVectors")
+    if (vectorsIndex < 0) return "missing .iram1.abla.s3BootVectors"
+    val vectors = elf.sections[vectorsIndex].address
+    if ((vectors & 1023) != 0 || elf.sections[vectorsIndex].size != 1024) return "boot vectors misplaced"
+    val loaded = elfReadLoaded(elf, entry, size)
+    if (!loaded.ok) return "read outside loaded segments"
+    val c = BootCheck(elf, loaded.bytes, entry, 0, "")
+    c.expect("006f00 f00c 13e600 002010 000c 13e400 13e000 134800 002010 100c 134900 002010", "")
+    c.literal(1, top)
+    c.expect("e0c112", "")
+    c.expect("000c", "00a002")
+    for (pair in [["0109", "006102"], ["1109", "016102"], ["2109", "026102"], ["3109", "036102"]]) {
+        c.expect(pair[0], pair[1])
+    }
+    c.expect("49c100 49d100", "")
+    c.literal(0, vectors)
+    c.expect("13e700 002010", "")
+    c.literal(0, 0x4002f)
+    c.expect("13e600 002010", "")
+    c.expect("000c", "00a002")
+    if (c.error != "") return c.error
+    val word = xtensaWord(c.code, c.pc)
+    if ((word & 63) != 21 || ((entry + c.pc) & ~3) + 4 + xtensaDisplacement18(word) * 4 != main) {
+        return "boot entry does not CALL0 abla_boot_main"
+    }
+    c.pc = c.pc + 3
+    c.expect("006f00 ffff06", "")
+    if (c.error != "") return c.error
+    if (c.pc != size || (xtensaWord(c.read(main, 3), 0) & 0xfff) != 0x136) return "boot entry size or main prologue differs"
+    val window = c.jump(vectors)
+    if (c.error != "") return c.error
+    if (!(0x40378000 <= window && window <= 0x403e0000 - 384)) return "window vectors outside IRAM"
+    for (offset in [0, 64, 128, 192, 256, 320]) {
+        if (c.jump(vectors + offset) != window + offset) return "window vector slot $offset misplaced"
+    }
+    val fatal = c.jump(vectors + 384)
+    if (c.error != "") return c.error
+    if (!(vectors + 387 <= fatal && fatal <= vectors + 388)) return "fatal halt not placed right after the vectors"
+    if (c.read(fatal, 3) != xtensaInsns("006f00") || c.jump(fatal + 3) != fatal) return "fatal halt is not a stackless spin"
+    var offset = 384
+    while (offset < 1024) {
+        if (offset != 832 && c.jump(vectors + offset) != fatal) return "vector slot $offset does not reach the fatal halt"
+        offset = offset + 64
+    }
+    // User exception5 must preserve original a0 in EXCSAVE1 before MOVSP recovery.
+    val user = vectors + 832
+    if (c.read(user, 6) != xtensaInsns("13d100 03e800")) return "user vector does not preserve a0 first"
+    if (c.read(user + 6, 3) != xtensaInsns("025026")) return "user vector branch differs"
+    if (c.jump(user + 9) != fatal) return "user vector fallback is not the fatal halt"
+    if (c.jump(user + 12) != window + 80) return "user vector does not reach MOVSP recovery"
+    c.error
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-boot-entry LINKED.elf")
+        return 2
+    }
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkBootEntry(file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: entry installs private early vectors before WOE/CALL4; exact window jumps, MOVSP recovery and stackless fatal slots; not hardware proof")
+    0
+}

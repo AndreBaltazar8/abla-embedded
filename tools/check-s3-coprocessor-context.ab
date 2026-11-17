@@ -1,0 +1,110 @@
+// Check every emitted CP0/CP3 save/restore instruction and frame offset.
+//
+// Instruction encodings checked against S3 GNU assembler and IDF tie-asm.h;
+// does not prove hardware state switching or lazy ownership integration.
+//
+//     tools/abla-tool check-s3-coprocessor-context OBJECT.o [--save-only]
+//
+// --save-only: the closure must hold no restore leaf (the program never restores).
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+fun coprocessorAccess(register: int, restore: bool): string =
+    if (restore) byteCodes3(0x30, register, 0xF3)
+    else byteCodes3((register & 15) << 4, 0x30 | (register >> 4), 0xE3)
+
+fun coprocessorMemoryWord(slot: int, restore: bool): string =
+    if (slot < 16) elfByte(if (restore) 0x38 else 0x39) + elfByte((slot << 4) | 2)
+    else byteCodes3(0x32, if (restore) 0x22 else 0x62, slot)
+
+// The exact instruction bytes of the CPn save or restore leaf (CALL0 form).
+fun coprocessorExpected(cp: int, restore: bool): string {
+    var expected = ""
+    var registers: array<int> = []
+    var first = 0
+    if (cp == 0) {
+        for (reg in 0..15) {
+            expected = expected + byteCodes3((reg << 4) | 3, if (restore) 2 else 0x42, reg)
+        }
+        registers = [232, 233]
+        first = 16
+    } else {
+        registers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18]
+        first = 0
+    }
+    var index = 0
+    while (index < registers.size) {
+        val memory = coprocessorMemoryWord(first + index, restore)
+        val access = coprocessorAccess(registers[index], restore)
+        expected = expected + (if (restore) memory + access else access + memory)
+        index = index + 1
+    }
+    if (cp == 3) {
+        for (reg in 0..7) {
+            if (reg == 3) expected = expected + elfHex("22d201 22c280") // pointer +=128
+            val slot = if (reg < 3) 5 + reg else reg - 3
+            expected = expected + byteCodes3(0x24, (if (restore) 0x20 else 0x60) | ((reg & 1) << 7) | slot,
+                0xCD + (reg >> 1) * 16)
+        }
+        expected = expected + elfHex("22c280") // pointer restored; padding72..79 untouched
+    }
+    if (restore) expected = expected + elfHex("102000")
+    expected + elfHex("0df0") // CALL0 return, no compiler/window prologue
+}
+
+fun checkCoprocessorContext(data: string, saveOnly: bool): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return elf.error
+    for (cp in [0, 3]) {
+        for (restore in [false, true]) {
+            val name = ".iram1.abla.s3Cp$cp" + (if (restore) "Restore" else "Save")
+            if (restore && saveOnly) {
+                if (elfLastSection(elf, name) >= 0 || elfLastSection(elf, name + "Windowed") >= 0) {
+                    return "save-only closure retained unused restore"
+                }
+                continue
+            }
+            val expected = coprocessorExpected(cp, restore)
+            val index = elfLastSection(elf, name)
+            if (index >= 0) {
+                if (elf.sectionBytes(elf.sections[index]) != expected) return "$name: register/offset/ABI encoding mismatch"
+            } else {
+                // Windowed bridge uses exactly one ENTRY32 and RETW, same state instructions and
+                // offsets in between. No compiler-added wrapper.
+                val windowed = name + "Windowed"
+                val windowedIndex = elfLastSection(elf, windowed)
+                if (windowedIndex < 0) return "missing section $name"
+                val expectedWindowed = elfHex("364100") + elfSlice(expected, 0, expected.size - 2) + elfHex("1df0")
+                if (elf.sectionBytes(elf.sections[windowedIndex]) != expectedWindowed) {
+                    return "$windowed: windowed ABI/context mismatch"
+                }
+            }
+        }
+    }
+    ""
+}
+
+fun main: int {
+    val count = processArgumentCount()
+    if (count != 1 && !(count == 2 && processArgument(1) == "--save-only")) {
+        eprintln("usage: check-s3-coprocessor-context OBJECT.o [--save-only]")
+        return 2
+    }
+    val saveOnly = count == 2
+    val file = readBinaryFile(processArgument(0))
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkCoprocessorContext(file.data, saveOnly)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS: CP0(72byte)/CP3(208byte) " + (if (saveOnly) "save-only" else "save/restore") +
+        " encodings,pointer preservation,CALL0 or windowed ABI; not hardware proof")
+    0
+}
