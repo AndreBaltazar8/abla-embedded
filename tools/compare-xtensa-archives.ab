@@ -1,0 +1,160 @@
+// Classify functions shared by two chips' copies of an Espressif archive.
+//
+// Espressif builds the same Wi-Fi/radio sources for every Xtensa chip, so an
+// ESP32-S3 member often matches its classic ESP32 counterpart function by
+// function. This tool tells a new-chip recovery which already-recovered Abla can
+// be reused: each function present in both archives is disassembled with
+// relocations and normalized before comparison:
+//
+// - Code Density forms are widened (mov.n a,b == or a,b,b; x.n == x);
+// - `memw` is dropped (the classic ESP32 compiler inserts it as an errata
+//   workaround; it does not exist on later chips);
+// - l32r operands become the literal they load (relocated symbol or constant),
+//   calls become their callee, branch targets become instruction indexes.
+//
+// Classes: `identical` (same normalized sequence), `reordered` (same
+// instructions, different schedule), `layout` (same once load/store offsets and
+// branch indexes are ignored: the logic matches but structure layouts differ,
+// e.g. ESP-IDF's wifi_osi_funcs_t table is 8 bytes shorter on the S3), and
+// `different`, plus functions only on one side. Run per archive, e.g.
+//
+//     tools/abla-tool compare-xtensa-archives esp_wifi/lib/esp32/libpp.a \
+//         esp_wifi/lib/esp32s3/libpp.a --objdump-a A --objdump-b B
+//
+// Options: --objdump-a CMD (default xtensa-esp32-elf-objdump), --objdump-b CMD
+// (default xtensa-esp32s3-elf-objdump), --details (list every function and class).
+// The recovery pipeline imports compareFunctions and compareCoarse.
+
+import "abla/io"
+import "abla/bytes"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/environment"
+import "abla/process/exit"
+
+import "lib/compare-xtensa.ab"
+
+fun compareUsage(): string =
+    "usage: compare-xtensa-archives [-h] [--objdump-a OBJDUMP_A] [--objdump-b OBJDUMP_B] [--details]\n" +
+        "                               archive_a archive_b"
+
+fun main: int {
+    var archiveA = ""
+    var archiveB = ""
+    var objdumpA = "xtensa-esp32-elf-objdump"
+    var objdumpB = "xtensa-esp32s3-elf-objdump"
+    var details = false
+    var positionals = 0
+    var index = 0
+    val count = processArgumentCount()
+    while (index < count) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "-h" || argument == "--help") {
+            println(compareUsage())
+            return 0
+        } else if (argument == "--details") {
+            details = true
+        } else if (argument == "--objdump-a" || argument == "--objdump-b" ||
+            argument.startsWith("--objdump-a=") || argument.startsWith("--objdump-b=")) {
+            val equals = argument.indexOf("=")
+            var value = ""
+            val name = if (equals < 0) argument else argument.slice(0, equals)
+            if (equals >= 0) {
+                value = argument.slice(equals + 1, argument.size)
+            } else {
+                if (index >= count) {
+                    eprintln(compareUsage())
+                    eprintln("compare-xtensa-archives: error: argument $name: expected one argument")
+                    return 2
+                }
+                value = processArgument(index)
+                index = index + 1
+            }
+            if (name == "--objdump-a") objdumpA = value else objdumpB = value
+        } else if (argument.startsWith("--")) {
+            eprintln(compareUsage())
+            eprintln("compare-xtensa-archives: error: unrecognized arguments: $argument")
+            return 2
+        } else if (positionals == 0) {
+            archiveA = argument
+            positionals = 1
+        } else if (positionals == 1) {
+            archiveB = argument
+            positionals = 2
+        } else {
+            eprintln(compareUsage())
+            eprintln("compare-xtensa-archives: error: unrecognized arguments: $argument")
+            return 2
+        }
+    }
+    if (positionals < 2) {
+        eprintln(compareUsage())
+        eprintln("compare-xtensa-archives: error: the following arguments are required: archive_a, archive_b")
+        return 2
+    }
+    val runner = compareRunner()
+    val totals: Map<string, int> = Map()
+    val scratch = currentDirectory().text + "/compare-xtensa-archives.tmp${linuxProcessId()}"
+    val root = Path(scratch)
+    val membersA = compareMembers(archiveA, scratch + "/a")
+    val membersB = compareMembers(archiveB, scratch + "/b")
+    if (membersA.error != "" || membersB.error != "") {
+        eprintln(if (membersA.error != "") membersA.error else membersB.error)
+        root.removeTree()
+        return 1
+    }
+    val all: array<string> = []
+    for (name in membersA.names) all.append(name)
+    for (name in membersB.names) {
+        if (!compareContainsName(membersA.names, name)) all.append(name)
+    }
+    var status = 0
+    for (member in sortedStrings(all)) {
+        val inA = compareContainsName(membersA.names, member)
+        val inB = compareContainsName(membersB.names, member)
+        if (!inA || !inB) {
+            val key = "member-only-" + (if (inA) "a" else "b")
+            totals.set(key, (totals.get(key) ?? 0) + 1)
+            continue
+        }
+        val a = compareFunctions(compareCommand(runner, objdumpA), scratch + "/a/" + member)
+        val b = compareFunctions(compareCommand(runner, objdumpB), scratch + "/b/" + member)
+        if (a.error != "" || b.error != "") {
+            eprintln(if (a.error != "") a.error else b.error)
+            status = 1
+            break
+        }
+        val counts: Map<string, int> = Map()
+        val names: array<string> = []
+        for (name in a.functions.keys()) names.append(name)
+        for (name in b.functions.keys()) {
+            if (!a.functions.has(name)) names.append(name)
+        }
+        for (name in sortedStrings(names)) {
+            val kind = compareKind(a.functions, b.functions, name)
+            counts.set(kind, (counts.get(kind) ?? 0) + 1)
+            if (details) println("$member\t$name\t$kind")
+        }
+        for (kind in counts.keys()) totals.set(kind, (totals.get(kind) ?? 0) + (counts.get(kind) ?? 0))
+        if (!details) {
+            val fields: array<string> = []
+            for (kind in ["identical", "reordered", "layout", "different", "only-a", "only-b"]) {
+                val value = counts.get(kind) ?? 0
+                if (value != 0) fields.append("$kind=$value")
+            }
+            println(comparePad(member, 40) + " " + fields.join(" "))
+        }
+    }
+    root.removeTree()
+    if (status != 0) return status
+    val totalFields: array<string> = []
+    for (kind in sortedStrings(totals.keys())) totalFields.append("$kind=${totals.get(kind) ?? 0}")
+    println("TOTAL " + totalFields.join(" "))
+    0
+}
+

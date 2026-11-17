@@ -1,0 +1,452 @@
+// Normalizing and classifying the functions of two Xtensa archives; shared by
+// tools/compare-xtensa-archives.ab and tools/recover-member.ab (no main here).
+
+import "abla/io"
+import "abla/bytes"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/sys/linux"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/environment"
+import "abla/process/exit"
+
+fun compareRegex(pattern: string): Regex {
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) panic("bad regular expression $pattern: ${compiled.error.message}")
+    compiled.regex
+}
+
+val COMPARE_INSN = compareRegex("""^\s*([0-9a-f]+):\s+(\S+)(?:\s+(.*?))?\s*$""")
+val COMPARE_RELOC = compareRegex("""^\s*([0-9a-f]+):\s+(R_XTENSA_\w+)\s+(\S+)\s*$""")
+val COMPARE_FUNC = compareRegex("""^([0-9a-f]+) <([^>]+)>:\s*$""")
+val COMPARE_SECTION = compareRegex("""^Disassembly of section (\S+):\s*$""")
+val COMPARE_RECORDS = compareRegex("""^RELOCATION RECORDS FOR \[(.+)\]:""")
+val COMPARE_DATA_ROW = compareRegex("""^ [0-9a-f]+ """)
+val COMPARE_BRANCHES = compareRegex("""^(b\w*|j|loop\w*)$""")
+val COMPARE_MEMORY_OP = compareRegex("""^(l|s)(8|16|32)\w*$""")
+val COMPARE_TARGET = compareRegex("""\b([0-9a-f]+) <""")
+val COMPARE_TARGET_ALL = compareRegex("""\b[0-9a-f]+ <[^>]*>""")
+val COMPARE_TRAILING_OFFSET = compareRegex(""",-?\d+$""")
+val COMPARE_INDEX = compareRegex("""@\d+""")
+
+fun compareNarrowKept(op: string): bool =
+    op == "retw.n" || op == "ret.n" || op == "nop.n" || op == "break.n" || op == "beqz.n" || op == "bnez.n"
+
+fun compareIsSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+fun compareIsHex(c: int): bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+
+fun compareHexValue(c: int): int = if (c >= 97) c - 87 else c - 48
+
+fun compareParseHex(text: string): int {
+    var value = 0
+    for (c in text) {
+        if (compareIsHex(c)) value = value * 16 + compareHexValue(c)
+    }
+    value
+}
+
+fun compareHex(value: int): string {
+    if (value == 0) return "0"
+    val digits = "0123456789abcdef"
+    var out = ""
+    var rest = value
+    while (rest > 0) {
+        out = digits.slice(rest & 15, (rest & 15) + 1) + out
+        rest = rest >> 4
+    }
+    out
+}
+
+fun compareFields(text: string): array<string> {
+    val fields: array<string> = []
+    var index = 0
+    while (index < text.size) {
+        while (index < text.size && compareIsSpace(text[index])) index = index + 1
+        if (index >= text.size) break
+        val begin = index
+        while (index < text.size && !compareIsSpace(text[index])) index = index + 1
+        fields.append(text.slice(begin, index))
+    }
+    fields
+}
+
+fun compareSplitLines(text: string): array<string> {
+    val lines = text.split("\n")
+    if (lines.size > 0 && lines[lines.size - 1] == "") lines.truncate(lines.size - 1)
+    lines
+}
+
+class CompareRun(val output: string, val error: string)
+
+// Runs `words` plus `extra` and returns its standard output.
+fun compareRun(words: array<string>, extra: array<string>): CompareRun {
+    if (words.size == 0) return CompareRun("", "empty command")
+    val process = command(words[0])
+    var index = 1
+    while (index < words.size) {
+        process.argument(words[index])
+        index = index + 1
+    }
+    for (argument in extra) process.argument(argument)
+    val result = process.capture()
+    if (result.status != 0) {
+        return CompareRun("", "Command '${words[0]}' returned non-zero exit status ${result.status}")
+    }
+    CompareRun(result.output, "")
+}
+
+class CompareSections(val words: Map<string, string>, val error: string)
+
+fun compareSectionWords(objdump: array<string>, obj: string): CompareSections {
+    val data: Map<string, array<string>> = Map()
+    val result: Map<string, string> = Map()
+    val run = compareRun(objdump, ["-s", obj])
+    if (run.error != "") return CompareSections(result, run.error)
+    var current = ""
+    var inSection = false
+    for (line in compareSplitLines(run.output)) {
+        if (line.startsWith("Contents of section ")) {
+            var name = line.slice("Contents of section ".size, line.size)
+            while (name.endsWith(":")) name = name.slice(0, name.size - 1)
+            current = name
+            inSection = true
+            val fresh: array<string> = []
+            data.set(current, fresh)
+        } else if (inSection && COMPARE_DATA_ROW.find(line) != null) {
+            // fields = line[1:].split("  ")[0].split()[1:]
+            val body = line.slice(1, line.size)
+            val cut = body.indexOf("  ")
+            val head = if (cut < 0) body else body.slice(0, cut)
+            val fields = compareFields(head)
+            val chunk: array<string> = []
+            var field = 1
+            while (field < fields.size) {
+                chunk.append(fields[field])
+                field = field + 1
+            }
+            val list = data.get(current) ?? []
+            list.append(chunk.join(""))
+        }
+    }
+    for (name in data.keys()) {
+        // bytes.fromhex of the joined digits
+        val digits = (data.get(name) ?? []).join("")
+        val bytes: array<string> = []
+        var high = -1
+        for (c in digits) {
+            val digit = compareHexValue(c)
+            if (high < 0) {
+                high = digit
+            } else {
+                bytes.append(compareByte(high * 16 + digit))
+                high = -1
+            }
+        }
+        result.set(name, bytes.join(""))
+    }
+    CompareSections(result, "")
+}
+
+fun compareByte(value: int): string = byteEncode(value)
+
+class CompareRelocations(val relocations: Map<string, Map<int, string>>, val error: string)
+
+fun compareSectionRelocations(objdump: array<string>, obj: string): CompareRelocations {
+    val relocations: Map<string, Map<int, string>> = Map()
+    val run = compareRun(objdump, ["-r", obj])
+    if (run.error != "") return CompareRelocations(relocations, run.error)
+    var current = ""
+    var inSection = false
+    for (line in compareSplitLines(run.output)) {
+        val header = COMPARE_RECORDS.find(line)
+        if (header != null && header.start() == 0) {
+            current = header.group(1) ?? ""
+            inSection = true
+            continue
+        }
+        val parts = compareFields(line)
+        if (inSection && parts.size == 3 && compareAllHex(parts[0]) && parts[1] == "R_XTENSA_32") {
+            if (!relocations.has(current)) {
+                val fresh: Map<int, string> = Map()
+                relocations.set(current, fresh)
+            }
+            val section = relocations.get(current)
+            if (section != null) section.set(compareParseHex(parts[0]), parts[2])
+        }
+    }
+    CompareRelocations(relocations, "")
+}
+
+fun compareAllHex(text: string): bool {
+    if (text.size == 0) return false
+    for (c in text) {
+        if (!compareIsHex(c)) return false
+    }
+    true
+}
+
+class CompareRaw(val address: int, val op: string, val args: string, val relocs: array<CompareReloc>)
+
+class CompareReloc(val kind: string, val target: string)
+
+// `args` with every whitespace run removed.
+fun compareStripSpace(text: string): string {
+    val parts: array<string> = []
+    var index = 0
+    while (index < text.size) {
+        if (!compareIsSpace(text[index])) parts.append(text.slice(index, index + 1))
+        index = index + 1
+    }
+    parts.join("")
+}
+
+// op.rstrip(".n")
+fun compareStripNarrowSuffix(op: string): string {
+    var end = op.size
+    while (end > 0 && (op[end - 1] == 46 || op[end - 1] == 110)) end = end - 1
+    op.slice(0, end)
+}
+
+// Python `bytes.hex` of a little-endian word as `hex(int.from_bytes(.., "little"))`.
+fun compareWordText(words: string, offset: int): string {
+    val value = words[offset] | (words[offset + 1] << 8) | (words[offset + 2] << 16) | (words[offset + 3] << 24)
+    "0x" + compareHex(value)
+}
+
+fun compareFinish(
+    raw: array<CompareRaw>,
+    words: Map<string, string>,
+    dataRelocs: Map<string, Map<int, string>>
+): array<string> {
+    val index: Map<int, int> = Map()
+    var position = 0
+    while (position < raw.size) {
+        index.set(raw[position].address, position)
+        position = position + 1
+    }
+    val normalized: array<string> = []
+    for (item in raw) {
+        var op = item.op
+        var args = item.args
+        var expand = ""
+        var hasExpand = false
+        var slot = ""
+        var hasSlot = false
+        for (relocation in item.relocs) {
+            if (!hasExpand && relocation.kind == "R_XTENSA_ASM_EXPAND") {
+                expand = relocation.target
+                hasExpand = true
+            }
+            if (!hasSlot && relocation.kind == "R_XTENSA_SLOT0_OP") {
+                slot = relocation.target
+                hasSlot = true
+            }
+        }
+        if (op == "memw") continue
+        if (op == "mov.n") {
+            val operands = args.split(",")
+            val first = if (operands.size > 0) operands[0].trim() else ""
+            val second = if (operands.size > 1) operands[1].trim() else ""
+            op = "or"
+            args = "$first, $second, $second"
+        } else if (op.endsWith(".n") && !compareNarrowKept(op)) {
+            op = op.slice(0, op.size - 2)
+        }
+        if (op == "l32r") {
+            val comma = args.indexOf(",")
+            val register = if (comma < 0) args else args.slice(0, comma)
+            var literal = ""
+            var found = false
+            if (hasExpand && expand != "") {
+                literal = expand
+                found = true
+            }
+            if (!found && hasSlot && slot != "") {
+                val plus = slot.indexOf("+")
+                val section = if (plus < 0) slot else slot.slice(0, plus)
+                val offsetText = if (plus < 0) "" else slot.slice(plus + 1, slot.size)
+                val offset = if (offsetText != "") compareParseHex(offsetText) else 0
+                val relocationsOfSection = dataRelocs.get(section)
+                val relocated = if (relocationsOfSection == null) null else relocationsOfSection.get(offset)
+                if (relocated != null && relocated != "") {
+                    literal = relocated
+                    found = true
+                } else {
+                    val content = words.get(section)
+                    if (content != null && offset + 4 <= content.size) {
+                        literal = compareWordText(content, offset)
+                        found = true
+                    }
+                }
+            }
+            normalized.append("l32r $register, =" + (if (found) literal else "None"))
+            continue
+        }
+        if (op.startsWith("call") && !hasExpand && hasSlot && slot != "") {
+            normalized.append("$op $slot")
+            continue
+        }
+        if (COMPARE_BRANCHES.matches(compareStripNarrowSuffix(op))) {
+            val target = COMPARE_TARGET.find(args)
+            if (target != null) {
+                val destination = index.get(compareParseHex(target.group(1) ?? ""))
+                if (destination != null) args = COMPARE_TARGET_ALL.replace(args, "@$destination")
+            }
+        }
+        normalized.append(op + " " + compareStripSpace(args))
+    }
+    normalized
+}
+
+class CompareFunctions(val functions: Map<string, array<string>>, val error: string)
+
+// Every `.text` function of `obj` as its normalized instruction sequence.
+fun compareFunctions(objdump: array<string>, obj: string): CompareFunctions {
+    val out: Map<string, array<string>> = Map()
+    val sections = compareSectionWords(objdump, obj)
+    if (sections.error != "") return CompareFunctions(out, sections.error)
+    val relocationTable = compareSectionRelocations(objdump, obj)
+    if (relocationTable.error != "") return CompareFunctions(out, relocationTable.error)
+    val run = compareRun(objdump, ["-dr", "--no-show-raw-insn", obj])
+    if (run.error != "") return CompareFunctions(out, run.error)
+    var section = ""
+    var name = ""
+    var raw: array<CompareRaw> = []
+    for (line in compareSplitLines(run.output)) {
+        val sectionMatch = COMPARE_SECTION.matchFull(line)
+        if (sectionMatch != null) {
+            if (name != "") out.set(name, compareFinish(raw, sections.words, relocationTable.relocations))
+            section = sectionMatch.group(1) ?? ""
+            name = ""
+            raw = []
+            continue
+        }
+        val funcMatch = COMPARE_FUNC.matchFull(line)
+        if (funcMatch != null) {
+            if (name != "") out.set(name, compareFinish(raw, sections.words, relocationTable.relocations))
+            val candidate = funcMatch.group(2) ?? ""
+            name = if (section != "" && section.startsWith(".text") && !candidate.contains("+") &&
+                !candidate.contains("-")) candidate else ""
+            raw = []
+            continue
+        }
+        if (name == "") continue
+        val relocation = COMPARE_RELOC.matchFull(line)
+        if (relocation != null) {
+            if (raw.size > 0) raw[raw.size - 1].relocs.append(CompareReloc(relocation.group(2) ?? "", relocation.group(3) ?? ""))
+            continue
+        }
+        val instruction = COMPARE_INSN.matchFull(line)
+        if (instruction != null) {
+            val none: array<CompareReloc> = []
+            raw.append(CompareRaw(compareParseHex(instruction.group(1) ?? ""), instruction.group(2) ?? "",
+                instruction.group(3) ?? "", none))
+        }
+    }
+    if (name != "") out.set(name, compareFinish(raw, sections.words, relocationTable.relocations))
+    CompareFunctions(out, "")
+}
+
+// Memory offsets and branch indexes forgotten (layout-only differences), as a count per line.
+fun compareCoarse(sequence: array<string>): Map<string, int> {
+    val counts: Map<string, int> = Map()
+    for (line in sequence) {
+        val space = line.indexOf(" ")
+        val op = if (space < 0) line else line.slice(0, space)
+        var args = if (space < 0) "" else line.slice(space + 1, line.size)
+        if (COMPARE_MEMORY_OP.matches(op) || op == "addi" || op == "addmi") {
+            args = COMPARE_TRAILING_OFFSET.replace(args, ",#")
+        }
+        args = COMPARE_INDEX.replace(args, "@")
+        val key = op + " " + args
+        counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    counts
+}
+
+fun compareSameCounts(left: Map<string, int>, right: Map<string, int>): bool {
+    if (left.size != right.size) return false
+    for (key in left.keys()) {
+        if ((right.get(key) ?? 0) != (left.get(key) ?? 0)) return false
+    }
+    true
+}
+
+fun compareSameSequence(left: array<string>, right: array<string>): bool {
+    if (left.size != right.size) return false
+    var index = 0
+    while (index < left.size) {
+        if (left[index] != right[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+// Counter(a) == Counter(b) for plain sequences.
+fun compareReordered(left: array<string>, right: array<string>): bool {
+    val a: Map<string, int> = Map()
+    for (line in left) a.set(line, (a.get(line) ?? 0) + 1)
+    val b: Map<string, int> = Map()
+    for (line in right) b.set(line, (b.get(line) ?? 0) + 1)
+    compareSameCounts(a, b)
+}
+
+fun compareMembers(archive: string, directory: string): CompareMembers {
+    val path = Path(directory)
+    path.createDirectories()
+    var absolute = archive
+    if (!archive.startsWith("/")) absolute = currentDirectory().text + "/" + archive
+    val extract = command("ar").argument("x").argument(absolute).directory(directory)
+    val status = extract.run()
+    val names: array<string> = []
+    if (status != 0) return CompareMembers(names, "Command 'ar' returned non-zero exit status $status")
+    for (entry in path.entries()) {
+        val name = entry.name()
+        if (name.endsWith(".o")) names.append(name)
+    }
+    CompareMembers(sortedStrings(names), "")
+}
+
+class CompareMembers(val names: array<string>, val error: string)
+
+// Is `steam-run` on PATH (and not disabled)?
+fun compareRunner(): array<string> {
+    val runner: array<string> = []
+    if ((processEnvironment("ABLA_NO_STEAM_RUN") ?? "") == "1") return runner
+    for (directory in (processEnvironment("PATH") ?? "").split(":")) {
+        if (directory != "" && Path(directory + "/steam-run").exists()) {
+            runner.append("steam-run")
+            return runner
+        }
+    }
+    runner
+}
+
+fun compareCommand(runner: array<string>, objdump: string): array<string> {
+    val words: array<string> = []
+    for (word in runner) words.append(word)
+    words.append(objdump)
+    words
+}
+
+fun compareKind(a: Map<string, array<string>>, b: Map<string, array<string>>, name: string): string {
+    val left = a.get(name)
+    val right = b.get(name)
+    if (left == null || right == null) return if (left != null) "only-a" else "only-b"
+    if (compareSameSequence(left, right)) return "identical"
+    if (compareReordered(left, right)) return "reordered"
+    if (compareSameCounts(compareCoarse(left), compareCoarse(right))) return "layout"
+    "different"
+}
+
+fun comparePad(text: string, width: int): string = text.padEnd(width)
+
+fun compareContainsName(values: array<string>, wanted: string): bool {
+    for (value in values) {
+        if (value == wanted) return true
+    }
+    false
+}

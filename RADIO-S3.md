@@ -8,7 +8,7 @@ of a one-off.
 
 ## What the S3 shares with the classic ESP32
 
-`tools/compare-xtensa-archives` disassembles both chips' archives with
+`tools/abla-tool compare-xtensa-archives` disassembles both chips' archives with
 relocations and normalizes encodings (Code Density widened, the classic
 `memw` errata workaround dropped, literals resolved to what they load, branch
 targets as instruction indexes). Functions present in both builds:
@@ -139,7 +139,7 @@ script (`esp32s3.rom.ld`, ~127 Wi-Fi/PP/PHY entries) is the interface list.
 ## What the existing tooling already does on S3 input
 
 Trial (build/s3-recovery-trial, `ieee80211_action_vendor.o` from the S3
-`libnet80211.a`): `reconstruct-xtensa-object` works unchanged with
+`libnet80211.a`): `tools/abla-tool reconstruct-xtensa-object` works unchanged with
 `--objdump xtensa-esp32s3-elf-objdump`; migrate + `lift-xtensa-leaves-to-abla`
 + `lower-xtensa-boundaries-to-abla` + `structurize-acyclic-recovered-functions`
 lifted 8 of 12 functions to typed Abla with no tool changes. The remaining 4
