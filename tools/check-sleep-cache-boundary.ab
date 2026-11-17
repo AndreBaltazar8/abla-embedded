@@ -1,0 +1,142 @@
+// Check the cache-off function survives monolithic optimization in IRAM.
+//
+// Unlike an all-IRAM fixture, the timed caller intentionally lives in flash.
+// This checks optimized LLVM, not final addresses, indirect calls or hardware.
+//
+//     tools/abla-tool check-sleep-cache-boundary optimized.bc|.ll
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/arguments"
+import "lib/llvm_ir.ab"
+import "lib/source_text.ab"
+
+class SleepBoundary(val retained: int, val error: string)
+
+fun sleepBoundaryFail(message: string): SleepBoundary = SleepBoundary(0, message)
+
+// The attribute group of `#N = { ... }` lines: the text inside the braces, by number.
+fun sleepAttributeGroups(source: string): Map<string, string> {
+    val groups: Map<string, string> = Map()
+    for (line in source.split("\n")) {
+        if (!line.startsWith("attributes #")) continue
+        val number = irDigitsAt(line, 12)
+        val rest = line.slice(12 + number.size, line.size)
+        if (number == "" || !rest.startsWith(" = {")) continue
+        val close = rest.lastIndexOf("}")
+        if (close >= 4) groups.set(number, rest.slice(4, close))
+    }
+    groups
+}
+
+// The first `#N` of a define line (N digits), "" when it has none.
+fun sleepFirstGroup(header: string): string {
+    var at = header.indexOf("#")
+    while (at >= 0) {
+        val number = irDigitsAt(header, at + 1)
+        if (number != "") return number
+        at = header.indexOf("#", at + 1)
+    }
+    ""
+}
+
+// The text of the first `section "..."` of a define line, "" when it has none.
+fun sleepSection(header: string): string {
+    val marker = header.indexOf("section \"")
+    if (marker < 0) return ""
+    val begin = marker + 9
+    val end = header.indexOf("\"", begin)
+    if (end <= begin) return ""
+    header.slice(begin, end)
+}
+
+fun sleepHasWord(text: string, word: string): bool {
+    var at = text.indexOf(word)
+    while (at >= 0) {
+        val before = at > 0 && irIsNameChar(text[at - 1]) && text[at - 1] != 46 && text[at - 1] != 36
+        val after = at + word.size < text.size && irIsNameChar(text[at + word.size]) && text[at + word.size] != 46 && text[at + word.size] != 36
+        if (!before && !after) return true
+        at = text.indexOf(word, at + 1)
+    }
+    false
+}
+
+class SleepFunction(val section: string, val body: string)
+
+fun validateSleepCacheBoundary(source: string): SleepBoundary {
+    val groups = sleepAttributeGroups(source)
+    val functions: Map<string, SleepFunction> = Map()
+    val names: array<string> = []
+    val roots: array<string> = []
+    for (function in irFunctions(source)) {
+        val section = sleepSection(function.header)
+        val group = sleepFirstGroup(function.header)
+        var attributes = ""
+        if (group != "" && groups.has(group)) {
+            val found = groups.get(group)
+            if (found != null) attributes = found
+        }
+        if (!functions.has(function.name)) names.append(function.name)
+        functions.set(function.name, SleepFunction(section, function.block))
+        if (section == ".iram1.abla.s3LightSleepSuspended") {
+            if (sourceNameIndex(roots, function.name) < 0) roots.append(function.name)
+            if (!sleepHasWord(attributes, "noinline")) {
+                return sleepBoundaryFail("cache-off boundary is not protected against inlining")
+            }
+        }
+    }
+    if (roots.size == 0) return sleepBoundaryFail("cache-off boundary vanished: potentially inlined into flash caller")
+    val seen: Map<string, bool> = Map()
+    val pending: array<string> = []
+    for (root in roots) pending.append(root)
+    var retained = 0
+    while (pending.size > 0) {
+        val name = pending[pending.size - 1]
+        pending.removeLast()
+        if (seen.has(name)) continue
+        seen.set(name, true)
+        retained = retained + 1
+        val function = functions.get(name)
+        if (function == null) continue
+        if (!function.section.startsWith(".iram1.")) {
+            return sleepBoundaryFail("cache-off closure references non-IRAM function: $name")
+        }
+        for (reference in irReferences(function.body)) {
+            if (functions.has(reference) && !seen.has(reference)) pending.append(reference)
+        }
+    }
+    SleepBoundary(retained, "")
+}
+
+fun main: int {
+    if (processArgumentCount() < 1) {
+        eprintln("usage: check-sleep-cache-boundary optimized.bc|.ll")
+        return 1
+    }
+    val path = processArgument(0)
+    var source = ""
+    if (path.endsWith(".bc")) {
+        val disassembly = irDisassemble(path)
+        if (disassembly.error != "") {
+            eprintln(disassembly.error)
+            return 1
+        }
+        source = disassembly.text
+    } else {
+        val read = Path(path).readTextResult()
+        if (!read.succeeded) {
+            eprintln("cannot read $path")
+            return 1
+        }
+        source = read.text
+    }
+    val result = validateSleepCacheBoundary(source)
+    if (result.error != "") {
+        eprintln(result.error)
+        return 1
+    }
+    println("PASS: non-inline cache-off boundary and ${result.retained} retained IRAM functions (LLVM-level only)")
+    0
+}

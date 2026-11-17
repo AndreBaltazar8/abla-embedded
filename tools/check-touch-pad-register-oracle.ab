@@ -1,0 +1,150 @@
+// Compare compiled Abla pad planning with independent pinned IDF headers.
+//
+// Host test only. Reads literal shift/width definitions, never executes header
+// text or modifies firmware/device. No generated mirror of production masks.
+//
+//     tools/abla-tool check-touch-pad-register-oracle PINNED_IDF_ROOT
+//
+// The production planning functions are called directly (the module is imported, not
+// a copy of its masks); the two functions below stand in for the touch controller's
+// register access, which the planning functions never reach.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/regex"
+import "abla/process/arguments"
+import "../src/esp32/touch/pad_esp32_sequence.ab"
+
+fun touchScanRead(address: int): u32 = u32(0)
+fun touchScanWrite(address: int, value: u32): void { return }
+
+// The `#define NAME LITERAL` lines of the register header (numbers only, later lines win).
+class HeaderLiterals(val names: array<string>, val values: array<int>, val offsetLines: array<string>)
+
+fun parseNumber(text: string): int {
+    var value = 0
+    if (text.startsWith("0x") || text.startsWith("0X")) {
+        var index = 2
+        while (index < text.size) {
+            val c = text[index]
+            val digit = if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else c - 55
+            value = value * 16 + digit
+            index = index + 1
+        }
+        return value
+    }
+    var index = 0
+    while (index < text.size) {
+        value = value * 10 + text[index] - 48
+        index = index + 1
+    }
+    value
+}
+
+var problems = 0
+
+fun problem(message: string): void {
+    problems = problems + 1
+    eprintln(message)
+}
+
+fun readHeader(path: string): HeaderLiterals {
+    val result = Path(path).readTextResult()
+    val literals = HeaderLiterals([], [], [])
+    if (!result.succeeded) {
+        problem("cannot read $path")
+        return literals
+    }
+    val definition = regexCompile("""^#define\s+(\w+)\s+(0x[0-9a-fA-F]+|[0-9]+)\s*$""").regex
+    for (line in result.text.split("\n")) {
+        if (!line.startsWith("#define")) continue
+        literals.offsetLines.append(line)
+        val found = definition.matchFull(line)
+        if (found == null) continue
+        val name = found.text.slice(found.groupStart(1), found.groupEnd(1))
+        val value = parseNumber(found.text.slice(found.groupStart(2), found.groupEnd(2)))
+        var existing = -1
+        var index = 0
+        while (index < literals.names.size) {
+            if (literals.names[index] == name) existing = index
+            index = index + 1
+        }
+        if (existing >= 0) {
+            literals.values[existing] = value
+        } else {
+            literals.names.append(name)
+            literals.values.append(value)
+        }
+    }
+    literals
+}
+
+fun number(header: HeaderLiterals, name: string): int {
+    var index = 0
+    while (index < header.names.size) {
+        if (header.names[index] == name) return header.values[index]
+        index = index + 1
+    }
+    problem("header has no literal $name")
+    0
+}
+
+fun bit(header: HeaderLiterals, name: string): int = 1 << number(header, name + "_S")
+
+// The address of `#define NAME (DR_REG_RTCIO_BASE + 0xNN)`.
+fun offset(header: HeaderLiterals, name: string): int {
+    val pattern = regexCompile("^#define\\s+" + name + "\\s+\\(DR_REG_RTCIO_BASE\\s*\\+\\s*(0x[0-9a-fA-F]+)\\)").regex
+    for (line in header.offsetLines) {
+        val found = pattern.find(line)
+        if (found != null) return 0x3FF48400 + parseNumber(found.text.slice(found.groupStart(1), found.groupEnd(1)))
+    }
+    problem("header has no register offset $name")
+    0
+}
+
+// Field `index` of the production plan for `channel` (the former Python oracle loaded this
+// mapping from a shared library built by tests/touch-pad-register-oracle.ab).
+fun abla(index: int, channel: int): int {
+    if (channel < 0 || channel > 9) return -1
+    if (index == 0) return esp32TouchPadMuxAddress(channel)
+    if (index == 1) return int(esp32TouchPadMuxMask(channel))
+    if (index == 2) return int(esp32TouchPadMuxSelect(channel))
+    if (index == 3) return int(esp32TouchPadHoldMask(channel))
+    if (index == 4) return int(esp32TouchPadOutputMask(channel))
+    if (index == 5) return esp32TouchPadChargeAddress(channel)
+    -1
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-touch-pad-register-oracle PINNED_IDF_ROOT")
+        return 2
+    }
+    val header = readHeader(processArgument(0) + "/components/soc/esp32/register/soc/rtc_io_reg.h")
+    var channel = 0
+    while (channel < 10) {
+        val prefix = if (channel < 8) "RTC_IO_TOUCH_PAD$channel" else if (channel == 8) "RTC_IO_X32N" else "RTC_IO_X32P"
+        val func = number(header, prefix + "_FUN_SEL_V") << number(header, prefix + "_FUN_SEL_S")
+        val mask = func | bit(header, prefix + "_MUX_SEL") | bit(header, prefix + "_FUN_IE") | bit(header, prefix + "_RUE") | bit(header, prefix + "_RDE")
+        // rtc_io_periph.c maps touch0..7 to RTCIO10..17, touch8/9 to 8/9.
+        val rtc = if (channel < 8) channel + 10 else channel
+        // touch_sensor_ll.h explicitly swaps 8/9 for init charge voltage only.
+        val charge = if (channel == 8) 9 else if (channel == 9) 8 else channel
+        val expected = [
+            if (channel < 8) offset(header, prefix + "_REG") else offset(header, "RTC_IO_XTAL_32K_PAD_REG"),
+            mask, bit(header, prefix + "_MUX_SEL"), bit(header, prefix + "_HOLD"),
+            1 << (rtc + number(header, "RTC_GPIO_ENABLE_S")), offset(header, "RTC_IO_TOUCH_PAD${charge}_REG")
+        ]
+        var index = 0
+        while (index < expected.size) {
+            val actual = abla(index, channel)
+            if (actual != expected[index]) problem("channel=$channel field=$index: Abla=$actual IDF=${expected[index]}")
+            index = index + 1
+        }
+        channel = channel + 1
+    }
+    if (problems != 0) return 1
+    println("PASS: compiled Abla vs IDF register headers, 60 pad fields")
+    0
+}
