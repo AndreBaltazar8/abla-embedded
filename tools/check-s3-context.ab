@@ -1,0 +1,297 @@
+// Model emitted context code from a target object using GNU objdump.
+//
+// Window spill is an explicitly checked primitive, not a simulated processor:
+// validate its instruction sequence, preconditions and preserved live registers.
+// Physical window exceptions, nesting and coprocessors remain unverified.
+//
+//     tools/abla-tool check-s3-context OBJECT.o
+//
+// Disassembles the save/restore leaves with the S3 GNU objdump (see check-s3-fatal-vectors).
+
+import "abla/io"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/xtensa-check.ab"
+
+class ContextMachine(
+    val regs: array<int>,
+    val special: Map<string, int>,
+    val memory: Map<int, int>,
+    val written: Map<int, int>,
+    val original: array<int>,
+    val savedPs: int,
+    val frame: int,
+    var spilled: bool,
+    var error: string
+) {
+    fun fail(message: string): void {
+        if (this.error == "") this.error = message
+    }
+    fun index(arg: string): int {
+        val parsed = if (arg.size >= 2 && arg[0] == 97) arg.slice(1, arg.size).parseInt() else null
+        if (parsed == null || parsed < 0 || parsed > 15) {
+            this.fail("bad register $arg")
+            return 0
+        }
+        parsed
+    }
+    fun get(arg: string): int = this.regs[this.index(arg)]
+    fun put(arg: string, value: int): void {
+        this.regs[this.index(arg)] = value & 0xFFFFFFFF
+    }
+    fun number(text: string): int {
+        val parsed = parseNumber(text)
+        if (parsed == null) {
+            this.fail("bad number $text")
+            return 0
+        }
+        parsed
+    }
+    fun readSpecial(name: string): int {
+        val value = this.special.get(name)
+        if (value == null) {
+            this.fail("unknown special register $name")
+            return 0
+        }
+        value
+    }
+    fun load(address: int): int {
+        val value = this.memory.get(address)
+        if (value == null) {
+            this.fail("load from unwritten address $address")
+            return 0
+        }
+        value
+    }
+
+    // Runs one leaf to its `ret`; "" when it ended correctly.
+    fun execute(code: array<Insn>, saving: bool): string {
+        var addresses: Map<int, int> = Map()
+        var n = 0
+        while (n < code.size) {
+            addresses.set(code[n].address, n)
+            n = n + 1
+        }
+        var i = 0
+        while (i < code.size && this.error == "") {
+            val insn = code[i]
+            val op = insn.op
+            val args = insn.args
+            i = i + 1
+            if (op == "and" && args.join(",") == "a12,a12,a12") {
+                if (!saving || this.spilled) return "unexpected window spill"
+                // Five AND a12,a12,a12 + ROTW pairs: 3,3,3,3,4.
+                var k = 0
+                while (k < 5) {
+                    val and = i - 1 + k * 2
+                    val rotate = and + 1
+                    val amount = if (k == 4) "4" else "3"
+                    if (rotate >= code.size || code[and].op != "and" || code[and].args.join(",") != "a12,a12,a12" ||
+                        code[rotate].op != "rotw" || code[rotate].args.join(",") != amount) {
+                        return "window spill sequence differs"
+                    }
+                    k = k + 1
+                }
+                var live = this.regs[1] == this.original[1]
+                var r = 4
+                while (r < 16) {
+                    if (this.regs[r] != this.original[r]) live = false
+                    r = r + 1
+                }
+                if (!live) return "live ancestor registers clobbered before spill"
+                val ps = this.readSpecial("ps")
+                val expectedPs = 0x40020 | (if ((this.savedPs & 15) > 3) this.savedPs & 15 else 3)
+                if (ps != expectedPs) return "unsafe spill PS"
+                // Model the specified spill primitive preserving registers but changing EPC1
+                // through its nested window exception.
+                this.special.set("epc1", 0xDEADBEEC)
+                this.spilled = true
+                i = i + 9
+            } else if (op == "s32i") {
+                val address = this.get(args[1]) + this.number(args[2])
+                if (address < this.frame || address >= this.frame + 148) return "store outside the context frame"
+                this.memory.set(address, this.get(args[0]))
+                this.written.set(address, 1)
+            } else if (op == "l32i") {
+                this.put(args[0], this.load(this.get(args[1]) + this.number(args[2])))
+            } else if (op.startsWith("rsr.") || op.startsWith("rur.")) {
+                this.put(args[0], this.readSpecial(op.slice(4, op.size)))
+            } else if (op.startsWith("wsr.") || op.startsWith("wur.")) {
+                this.special.set(op.slice(4, op.size), this.get(args[0]))
+            } else if (op == "movi") {
+                this.put(args[0], this.number(args[1]))
+            } else if (op == "l32r") {
+                // Only literal in this leaf: PS_UM|PS_WOE, at section0. Its actual bytes were
+                // checked in the ELF above.
+                if (args.join(",") != "a0,0") return "unexpected literal load"
+                this.put("a0", 0x40020)
+            } else if (op == "addi" || op == "addmi") {
+                this.put(args[0], this.get(args[1]) + this.number(args[2]))
+            } else if (op == "and") {
+                this.put(args[0], this.get(args[1]) & this.get(args[2]))
+            } else if (op == "or") {
+                this.put(args[0], this.get(args[1]) | this.get(args[2]))
+            } else if (op == "bgeui") {
+                if (this.get(args[0]) >= this.number(args[1])) {
+                    val target = addresses.get(parseHex(args[2]))
+                    if (target == null) return "branch to an unknown address"
+                    i = target
+                }
+            } else if (op == "rsync") {
+                i = i + 0
+            } else if (op == "ret") {
+                if (i != code.size) return "instructions after CALL0 return"
+                return this.error
+            } else {
+                return "unexpected instruction $op ${args.join(",")}"
+            }
+        }
+        if (this.error != "") return this.error
+        "missing CALL0 return"
+    }
+}
+
+fun contextLeaf(listing: string, name: string): array<Insn> {
+    val result: array<Insn> = []
+    var current = ""
+    for (line in listing.split("\n")) {
+        val section = disassemblySection(line)
+        if (section != "") current = section
+        val parsed = parseDisasmInsn(line)
+        if (parsed != null && current == name) result.append(parsed)
+    }
+    result
+}
+
+fun contextEqual(left: Map<string, int>, right: Map<string, int>): bool {
+    if (left.size != right.size) return false
+    for (key in left.keys()) {
+        if (left.get(key) != right.get(key)) return false
+    }
+    true
+}
+
+fun checkContext(path: string, data: string): string {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return elf.error
+    val saveIndex = elf.sectionIndex(".iram1.abla.s3ContextSave")
+    if (saveIndex < 0) return "missing .iram1.abla.s3ContextSave"
+    val saveHeader = elf.sections[saveIndex]
+    if (elfSlice(data, saveHeader.offset, saveHeader.offset + 4) != elfHex("20000400")) {
+        return "incorrect spill PS literal"
+    }
+    val listing = runS3Objdump(["-d", "-j", ".iram1.abla.s3ContextSave", "-j", ".iram1.abla.s3ContextRestore", path])
+    if (listing.status != 0) return "objdump failed"
+    val save = contextLeaf(listing.output, ".iram1.abla.s3ContextSave")
+    val restore = contextLeaf(listing.output, ".iram1.abla.s3ContextRestore")
+    if (save.size == 0 || restore.size == 0) return "missing context save or restore disassembly"
+    val extra = ["threadptr", "acclo", "acchi", "br", "scompare1", "m0", "m1", "m2", "m3"]
+    val names: array<string> = ["sar", "lbeg", "lend", "lcount"]
+    val offsets: array<int> = [76, 88, 92, 96]
+    var e = 0
+    while (e < extra.size) {
+        names.append(extra[e])
+        offsets.append(112 + e * 4)
+        e = e + 1
+    }
+    var seed = 0
+    while (seed < 64) {
+        val original: array<int> = []
+        var i = 0
+        while (i < 16) {
+            original.append(0xABC00000 + seed * 256 + i)
+            i = i + 1
+        }
+        val frame = 0x1000
+        original[1] = frame + 192
+        val regs: array<int> = []
+        for (value in original) regs.append(value)
+        regs[0] = 0x40379000
+        regs[1] = frame
+        regs[12] = 0x12345678
+        regs[13] = 0x87654321
+        val incoming: array<int> = []
+        for (value in regs) incoming.append(value)
+        val specials: Map<string, int> = Map()
+        i = 0
+        while (i < names.size) {
+            specials.set(names[i], 0x10203000 + seed * 32 + i)
+            i = i + 1
+        }
+        specials.set("ps", 0x40030 | (seed & 15))
+        specials.set("epc1", 0x42000000 + seed * 4)
+        val savedSpecials: Map<string, int> = Map()
+        for (key in specials.keys()) savedSpecials.set(key, specials.get(key) ?? 0)
+        val memory: Map<int, int> = Map()
+        for (slot in [0, 1, 12, 13]) memory.set(frame + 12 + slot * 4, original[slot])
+        val m = ContextMachine(regs, specials, memory, Map(), original, savedSpecials.get("ps") ?? 0, frame, false, "")
+        val saved = m.execute(save, true)
+        if (saved != "") return saved
+        if (!m.spilled || !contextEqual(specials, savedSpecials)) return "save did not spill or did not restore the special registers"
+        for (slot in [0, 1, 12, 13]) {
+            if (regs[slot] != incoming[slot]) return "save changed a$slot"
+        }
+        i = 2
+        while (i < 16) {
+            if ((memory.get(frame + 12 + i * 4) ?? -1) != original[i]) return "register a$i not saved"
+            i = i + 1
+        }
+        i = 0
+        while (i < names.size) {
+            if ((memory.get(frame + offsets[i]) ?? -1) != (savedSpecials.get(names[i]) ?? -2)) return "${names[i]} not saved"
+            i = i + 1
+        }
+        // The exact set of frame words written by the save leaf.
+        val expectedWords: Map<int, int> = Map()
+        i = 2
+        while (i < 16) {
+            if (i != 12 && i != 13) expectedWords.set(frame + 12 + i * 4, 1)
+            i = i + 1
+        }
+        for (offset in offsets) expectedWords.set(frame + offset, 1)
+        for (offset in [100, 104, 108]) expectedWords.set(frame + offset, 1)
+        if (m.written.size != expectedWords.size) return "unexpected frame words written"
+        for (key in expectedWords.keys()) {
+            if (!m.written.has(key)) return "unexpected frame words written"
+        }
+        i = 0
+        while (i < 16) {
+            regs[i] = 0xDEAD0000 + i
+            i = i + 1
+        }
+        regs[0] = 0x4037A000
+        regs[1] = frame
+        for (name in names) specials.set(name, 0)
+        val restored = m.execute(restore, false)
+        if (restored != "") return restored
+        i = 2
+        while (i < 16) {
+            if (regs[i] != original[i]) return "restore did not reload a$i"
+            i = i + 1
+        }
+        if (regs[0] != 0x4037A000 || regs[1] != frame) return "restore changed a0/a1"
+        if (!contextEqual(specials, savedSpecials)) return "restore did not rebuild the special registers"
+        seed = seed + 1
+    }
+    ""
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-s3-context OBJECT.o")
+        return 2
+    }
+    val path = processArgument(0)
+    val file = readBinaryFile(path)
+    if (file.error != "") {
+        eprintln(file.error)
+        return 1
+    }
+    val error = checkContext(path, file.data)
+    if (error != "") {
+        eprintln(error)
+        return 1
+    }
+    println("PASS:64 emitted context save/restore profiles; spill primitive checked, not hardware simulated")
+    0
+}
