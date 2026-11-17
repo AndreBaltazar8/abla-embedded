@@ -1,0 +1,702 @@
+// Replace a committed function whose switch was left as a code-address table by
+// the freshly lifted version (jump table already lowered to `when` by
+// lower-recovered-jump-tables --discover), converting raw boundary calls and
+// address pseudo-operations into the committed direct-call/data names.
+//
+// usage: tools/abla-tool transplant-lifted-function LIFTED.ab TARGET.ab ABLA_FUNCTION MODULE_TAG [--write]
+// MODULE_TAG: the committed module tag used in local names, e.g. nan_discovery
+//
+// LIFTED.ab comes from tools/recover-member (build/recovery/<chip>/<archive>/<member>/
+// lifted.ab); only functions it lifted (not `naked`) can be transplanted.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/process/arguments"
+
+class Resolved(val value: string, val error: string)
+
+// Where a function sits in a text: [begin, end) of `[@annotation\n]trusted fun NAME(...\n}\n`.
+class Located(val begin: int, val end: int, val found: bool)
+
+// What the committed sources define, read once.
+class SourceIndex(
+    val abi: Map<string, array<string>>,
+    val stems: Map<string, array<string>>,
+    val recovered: Map<string, int>
+)
+
+val recoveredDataPrefix = "esp32Data_Labla_recovered_"
+
+private fun isDigit(byte: int): bool = byte >= 48 && byte <= 57
+
+private fun isWord(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+private fun isHex(byte: int): bool = (byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)
+
+private fun isSpace(byte: int): bool = byte == 32 || (byte >= 9 && byte <= 13)
+
+private fun wordEnd(text: string, from: int): int {
+    var index = from
+    while (index < text.size && isWord(text[index])) index = index + 1
+    index
+}
+
+// pathlib/Python `sorted(list)` repr of strings that hold no quotes.
+private fun pythonList(values: array<string>): string {
+    val parts: array<string> = []
+    for (value in sortedStrings(values)) parts.append("'$value'")
+    "[" + parts.join(", ") + "]"
+}
+
+private fun addUnique(var map: Map<string, array<string>>, key: string, value: string): void {
+    val present = map.get(key)
+    if (present == null) {
+        val fresh: array<string> = [value]
+        map.set(key, fresh)
+        return
+    }
+    for (seen in present) if (seen == value) return
+    present.append(value)
+}
+
+class Scan(val text: string, var pos: int)
+
+private fun scanLiteral(var scan: Scan, literal: string): bool {
+    if (scan.pos + literal.size > scan.text.size) return false
+    var index = 0
+    while (index < literal.size) {
+        if (scan.text[scan.pos + index] != literal[index]) return false
+        index = index + 1
+    }
+    scan.pos = scan.pos + literal.size
+    true
+}
+
+private fun scanSpaces(var scan: Scan): void {
+    while (scan.pos < scan.text.size && scan.text[scan.pos] == 32) scan.pos = scan.pos + 1
+}
+
+private fun scanWhitespace(var scan: Scan): void {
+    while (scan.pos < scan.text.size && isSpace(scan.text[scan.pos])) scan.pos = scan.pos + 1
+}
+
+private fun scanDigits(var scan: Scan): bool {
+    val begin = scan.pos
+    while (scan.pos < scan.text.size && isDigit(scan.text[scan.pos])) scan.pos = scan.pos + 1
+    scan.pos > begin
+}
+
+// ---- locating a function ----------------------------------------------------------
+
+// `^(?:@\w+\n)?trusted fun NAME\(.*?^}\n`: the first such span.
+fun locateFunction(text: string, name: string): Located {
+    val head = "trusted fun $name("
+    var from = 0
+    while (true) {
+        val found = text.indexOf(head, from)
+        if (found < 0) return Located(0, 0, false)
+        from = found + 1
+        if (found > 0 && text[found - 1] != 10) continue
+        val close = text.indexOf("\n}\n", found)
+        if (close < 0) continue
+        var begin = found
+        if (found > 0) {
+            var previous = found - 1
+            while (previous > 0 && text[previous - 1] != 10) previous = previous - 1
+            val line = text.slice(previous, found - 1)
+            if (line.size >= 2 && line[0] == 64 && wordEnd(line, 1) == line.size) begin = previous
+        }
+        return Located(begin, close + 3, true)
+    }
+    Located(0, 0, false)
+}
+
+// ---- what the committed sources define --------------------------------------------
+
+private fun newIndex(): SourceIndex {
+    val abi: Map<string, array<string>> = Map()
+    val stems: Map<string, array<string>> = Map()
+    val recovered: Map<string, int> = Map()
+    SourceIndex(abi, stems, recovered)
+}
+
+private fun indexAbiComments(var index: SourceIndex, text: string): void {
+    val marker = "// Original ABI symbol: "
+    var from = 0
+    while (true) {
+        val found = text.indexOf(marker, from)
+        if (found < 0) break
+        from = found + marker.size
+        val newline = text.indexOf("\n", from)
+        if (newline < 0) break
+        val symbol = text.slice(from, newline)
+        var cursor = newline + 1
+        if (cursor < text.size && text[cursor] == 64) {
+            val end = wordEnd(text, cursor + 1)
+            if (end > cursor + 1 && end < text.size && text[end] == 10) cursor = end + 1
+        }
+        val scan = Scan(text, cursor)
+        if (!scanLiteral(scan, "trusted fun ")) continue
+        val end = wordEnd(text, scan.pos)
+        if (end == scan.pos || end >= text.size || text[end] != 40) continue
+        addUnique(index.abi, symbol, text.slice(scan.pos, end))
+    }
+}
+
+private fun indexInternalSelectors(var index: SourceIndex, text: string): void {
+    val marker = "internalFunction(\""
+    var from = 0
+    while (true) {
+        val found = text.indexOf(marker, from)
+        if (found < 0) break
+        from = found + marker.size
+        val end = wordEnd(text, from)
+        if (end == from) continue
+        val scan = Scan(text, end)
+        if (!scanLiteral(scan, "\", \"")) continue
+        val close = text.indexOf("\"", scan.pos)
+        if (close < 0) break
+        if (close + 1 >= text.size || text[close + 1] != 41) continue
+        addUnique(index.abi, text.slice(scan.pos, close), text.slice(from, end))
+    }
+}
+
+// Every `^val esp32Data_... = u32(` token (stem keyed without its `_<10 hex>` tail).
+private fun indexDataValues(var index: SourceIndex, text: string): void {
+    val marker = "val esp32Data_"
+    var from = 0
+    while (true) {
+        val found = text.indexOf(marker, from)
+        if (found < 0) break
+        from = found + 1
+        if (found > 0 && text[found - 1] != 10) continue
+        val begin = found + 4
+        val end = wordEnd(text, begin)
+        val scan = Scan(text, end)
+        if (!scanLiteral(scan, " = u32(")) continue
+        val token = text.slice(begin, end)
+        if (token.size < 11 + 10 || token[token.size - 11] != 95) continue
+        var hex = true
+        var at = token.size - 10
+        while (at < token.size) {
+            if (!isHex(token[at])) hex = false
+            at = at + 1
+        }
+        if (!hex) continue
+        addUnique(index.stems, token.slice(0, token.size - 11), token)
+        if (token.startsWith(recoveredDataPrefix)) index.recovered.set(token, 1)
+    }
+}
+
+// `val NAME =` definitions at a line start.
+private fun definedValues(text: string): Map<string, int> {
+    val names: Map<string, int> = Map()
+    for (line in text.split("\n")) {
+        if (!line.startsWith("val ")) continue
+        val end = wordEnd(line, 4)
+        if (end > 4 && line.slice(end, line.size).startsWith(" =")) names.set(line.slice(4, end), 1)
+    }
+    names
+}
+
+private fun collectSources(directory: string, var files: array<string>): void {
+    for (entry in Path(directory).entries()) {
+        val info = entry.info()
+        if (info.isDirectory()) collectSources(entry.text, files)
+        else if (info.isFile() && entry.text.endsWith(".ab")) files.append(entry.text)
+    }
+}
+
+// The tokens `esp32Data_Labla_recovered_<P>_data_<rest>_<10 hex>` among `tokens`.
+private fun recoveredMatches(tokens: array<string>, rest: string): array<string> {
+    val found: array<string> = []
+    val tail = "_data_$rest"
+    for (token in tokens) {
+        if (token.size < recoveredDataPrefix.size + 1 + tail.size + 11) continue
+        val stem = token.slice(0, token.size - 11)
+        if (!stem.endsWith(tail)) continue
+        if (stem.size - tail.size - recoveredDataPrefix.size < 1) continue
+        found.append(token)
+    }
+    found
+}
+
+fun dataSymbol(sym: string, index: SourceIndex): Resolved {
+    val head = ".Labla_recovered_"
+    if (sym.startsWith(head)) {
+        var from = head.size + 1
+        while (true) {
+            val at = sym.indexOf("_data__", from)
+            if (at < 0) break
+            from = at + 1
+            val rest = sym.slice(at + 7, sym.size)
+            if (rest.size == 0 || wordEnd(rest, 0) != rest.size) continue
+            if (wordEnd(sym, head.size) < at) continue
+            val found = recoveredMatches(index.recovered.keys(), rest)
+            if (found.size != 1) {
+                return Resolved("", "cannot resolve data label $sym: ${pythonList(found)}")
+            }
+            return Resolved(found[0], "")
+        }
+    }
+    val tokens = index.stems.get("esp32Data_$sym")
+    val found: array<string> = if (tokens == null) [] else tokens
+    if (found.size != 1) return Resolved("", "cannot resolve data $sym: ${pythonList(found)}")
+    Resolved(found[0], "")
+}
+
+fun abiFunction(sym: string, index: SourceIndex): Resolved {
+    val names = index.abi.get(sym)
+    val found: array<string> = if (names == null) [] else names
+    if (found.size != 1) return Resolved("", "cannot resolve ABI function $sym: ${pythonList(found)}")
+    Resolved(found[0], "")
+}
+
+// `trusted fun esp32Internal_Labla_recovered_TAG_local_text_NAME_<10 hex>(` in the target.
+fun localFunction(name: string, tag: string, target: string): Resolved {
+    val head = "trusted fun esp32Internal_Labla_recovered_${tag}_local_text_${name}_"
+    val found: array<string> = []
+    var from = 0
+    while (true) {
+        val at = target.indexOf(head, from)
+        if (at < 0) break
+        from = at + 1
+        val begin = at + 12
+        val tailBegin = at + head.size
+        if (tailBegin + 11 > target.size) continue
+        var hex = true
+        var offset = 0
+        while (offset < 10) {
+            if (!isHex(target[tailBegin + offset])) hex = false
+            offset = offset + 1
+        }
+        if (!hex || target[tailBegin + 10] != 40) continue
+        val value = target.slice(begin, tailBegin + 10)
+        var present = false
+        for (seen in found) if (seen == value) present = true
+        if (!present) found.append(value)
+    }
+    if (found.size != 1) return Resolved("", "cannot resolve local function $name: ${pythonList(found)}")
+    Resolved(found[0], "")
+}
+
+// `sym.split("_local__text_")[1]`
+private fun afterLocalMarker(sym: string): string {
+    val marker = "_local__text_"
+    val first = sym.indexOf(marker)
+    val begin = first + marker.size
+    val second = sym.indexOf(marker, begin)
+    sym.slice(begin, if (second < 0) sym.size else second)
+}
+
+// The committed spelling of an address: a data value, else the function's address.
+fun addressValue(sym: string, index: SourceIndex, target: string, tag: string): Resolved {
+    val data = dataSymbol(sym, index)
+    if (data.error == "") return data
+    val function = if (sym.contains("_local__text_")) localFunction(afterLocalMarker(sym), tag, target)
+        else abiFunction(sym, index)
+    if (function.error != "") return function
+    Resolved("u32(nativeFunctionAddress(${function.value}))", "")
+}
+
+// ---- line matching -----------------------------------------------------------------
+
+private fun trimmedNewline(line: string): string = line
+
+// `(\s*)val callResult(\d+) = \$xtensa callWide \{([^}]+)\}\(((?:r1[0-5](?:, )?)*)\)$`:
+// [indent, number, symbol, arguments] or empty.
+private fun parseCallLine(line: string): array<string> {
+    val none: array<string> = []
+    val scan = Scan(line, 0)
+    scanWhitespace(scan)
+    val indent = line.slice(0, scan.pos)
+    if (!scanLiteral(scan, "val callResult")) return none
+    val numberBegin = scan.pos
+    if (!scanDigits(scan)) return none
+    val number = line.slice(numberBegin, scan.pos)
+    if (!scanLiteral(scan, " = \$xtensa callWide {")) return none
+    val symbolBegin = scan.pos
+    val close = line.indexOf("}", symbolBegin)
+    if (close <= symbolBegin) return none
+    scan.pos = close + 1
+    if (!scanLiteral(scan, "(")) return none
+    if (line.size == 0 || line[line.size - 1] != 41 || scan.pos > line.size - 1) return none
+    val arguments = line.slice(scan.pos, line.size - 1)
+    var at = 0
+    while (at < arguments.size) {
+        if (at + 3 > arguments.size || arguments[at] != 114 || arguments[at + 1] != 49) return none
+        if (arguments[at + 2] < 48 || arguments[at + 2] > 53) return none
+        at = at + 3
+        if (at + 2 <= arguments.size && arguments[at] == 44 && arguments[at + 1] == 32) at = at + 2
+    }
+    [indent, number, line.slice(symbolBegin, close), arguments]
+}
+
+// `(\s*)(r\d+) = \$xtensa address \{([^}]+)\}$`: [indent, register, symbol] or empty.
+private fun parseAddressLine(line: string): array<string> {
+    val none: array<string> = []
+    val scan = Scan(line, 0)
+    scanWhitespace(scan)
+    val indent = line.slice(0, scan.pos)
+    val registerBegin = scan.pos
+    if (!scanLiteral(scan, "r")) return none
+    if (!scanDigits(scan)) return none
+    val register = line.slice(registerBegin, scan.pos)
+    if (!scanLiteral(scan, " = \$xtensa address {")) return none
+    val symbolBegin = scan.pos
+    val close = line.indexOf("}", symbolBegin)
+    if (close <= symbolBegin || close != line.size - 1) return none
+    [indent, register, line.slice(symbolBegin, close)]
+}
+
+// `\s*r1[01] = u32\(callResultN( >>> u64\(32\))?\)$`
+private fun isCallResultCopy(line: string, number: string): bool {
+    val scan = Scan(line, 0)
+    scanWhitespace(scan)
+    if (!scanLiteral(scan, "r1")) return false
+    if (scan.pos >= line.size || (line[scan.pos] != 48 && line[scan.pos] != 49)) return false
+    scan.pos = scan.pos + 1
+    if (!scanLiteral(scan, " = u32(callResult$number")) return false
+    if (scan.pos + 1 == line.size) return line[scan.pos] == 41
+    if (!scanLiteral(scan, " >>> u64(32)")) return false
+    scanLiteral(scan, ")") && scan.pos == line.size
+}
+
+// `\s*r\d+ = (\(r\d+ << u32\(2\)\) \+ r\d+|u32\(ablaUnsafeLoadU32\(nativePointerFromAddress\(int\(r\d+\)\)\)\))$`
+private fun isTableAccess(line: string): bool {
+    val scan = Scan(line, 0)
+    scanWhitespace(scan)
+    if (!scanLiteral(scan, "r") || !scanDigits(scan) || !scanLiteral(scan, " = ")) return false
+    val alternative = scan.pos
+    if (scanLiteral(scan, "(r") && scanDigits(scan) && scanLiteral(scan, " << u32(2)) + r") && scanDigits(scan) &&
+        scan.pos == line.size) return true
+    scan.pos = alternative
+    scanLiteral(scan, "u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r") && scanDigits(scan) &&
+        scanLiteral(scan, "))))") && scan.pos == line.size
+}
+
+// `[ ]*r\d+ = [^\n]+\n([ ]*val jumpTableIndex\d+ = r\d+\n)[ ]*r\d+ = \(r\d+ << u32\(2\)\) \+ r\d+\n
+//  [ ]*r\d+ = u32\(ablaUnsafeLoadU32\(nativePointerFromAddress\(int\(r\d+\)\)\)\)\n` at `from`:
+// [end, group begin, group end] or empty.
+private fun deadTableMatch(text: string, from: int): array<int> {
+    val none: array<int> = []
+    val scan = Scan(text, from)
+    scanSpaces(scan)
+    if (!scanLiteral(scan, "r") || !scanDigits(scan) || !scanLiteral(scan, " = ")) return none
+    val restBegin = scan.pos
+    while (scan.pos < text.size && text[scan.pos] != 10) scan.pos = scan.pos + 1
+    if (scan.pos == restBegin || scan.pos >= text.size) return none
+    scan.pos = scan.pos + 1
+    val groupBegin = scan.pos
+    scanSpaces(scan)
+    if (!scanLiteral(scan, "val jumpTableIndex") || !scanDigits(scan) || !scanLiteral(scan, " = r") ||
+        !scanDigits(scan) || !scanLiteral(scan, "\n")) return none
+    val groupEnd = scan.pos
+    scanSpaces(scan)
+    if (!scanLiteral(scan, "r") || !scanDigits(scan) || !scanLiteral(scan, " = (r") || !scanDigits(scan) ||
+        !scanLiteral(scan, " << u32(2)) + r") || !scanDigits(scan) || !scanLiteral(scan, "\n")) return none
+    scanSpaces(scan)
+    if (!scanLiteral(scan, "r") || !scanDigits(scan) ||
+        !scanLiteral(scan, " = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r") || !scanDigits(scan) ||
+        !scanLiteral(scan, "))))\n")) return none
+    [scan.pos, groupBegin, groupEnd]
+}
+
+// The committed spelling of every `$xtensa address {sym}` inside `line` (re.sub).
+private fun inlineAddresses(line: string, index: SourceIndex, target: string, tag: string): Resolved {
+    val marker = "\$xtensa address {"
+    val buffer = byteBuffer()
+    var copied = 0
+    var from = 0
+    while (true) {
+        val at = line.indexOf(marker, from)
+        if (at < 0) break
+        val symbolBegin = at + marker.size
+        val close = line.indexOf("}", symbolBegin)
+        if (close < 0) break
+        if (close == symbolBegin) {
+            from = at + 1
+            continue
+        }
+        val value = addressValue(line.slice(symbolBegin, close), index, target, tag)
+        if (value.error != "") return value
+        buffer.appendText(line.slice(copied, at))
+        buffer.appendText(value.value)
+        copied = close + 1
+        from = close + 1
+    }
+    buffer.appendText(line.slice(copied, line.size))
+    Resolved(buffer.toText(), "")
+}
+
+// `esp32Data_Labla_recovered_\w+?_data_(\w+?)_[0-9a-f]{10}\b`, remapped onto the target's own names.
+private fun remapData(text: string, target: string, defined: Map<string, int>, targetIndex: SourceIndex): Resolved {
+    val buffer = byteBuffer()
+    var copied = 0
+    var from = 0
+    while (true) {
+        val at = text.indexOf(recoveredDataPrefix, from)
+        if (at < 0) break
+        from = at + 1
+        val end = wordEnd(text, at)
+        val run = text.slice(at, end)
+        var rest = ""
+        var matched = false
+        var search = recoveredDataPrefix.size + 1
+        while (!matched) {
+            val marker = run.indexOf("_data_", search)
+            if (marker < 0) break
+            search = marker + 1
+            val remainder = run.slice(marker + 6, run.size)
+            if (remainder.size < 12 || remainder[remainder.size - 11] != 95) continue
+            var hex = true
+            var position = remainder.size - 10
+            while (position < remainder.size) {
+                if (!isHex(remainder[position])) hex = false
+                position = position + 1
+            }
+            if (!hex) continue
+            rest = remainder.slice(0, remainder.size - 11)
+            matched = true
+        }
+        if (!matched) continue
+        var replacement = run
+        if (defined.get(run) == null) {
+            val found = recoveredMatches(targetIndex.recovered.keys(), rest)
+            if (found.size != 1) return Resolved("", "cannot remap data $run -> ${pythonList(found)}")
+            replacement = found[0]
+        }
+        buffer.appendText(text.slice(copied, at))
+        buffer.appendText(replacement)
+        copied = end
+        from = end
+    }
+    buffer.appendText(text.slice(copied, text.size))
+    Resolved(buffer.toText(), "")
+}
+
+// `val (esp32Data_\w+)Storage = nativeStaticU32s\(\[\n(?:    int\(\(u32\(nativeFunctionAddress\(F\)\) \+ u32\(\d+\)\)\),?\n)+\]\)\n
+//  val \1Initialized = [^\n]*\nval \1 = [^\n]*\n\n?`: the end of the match at `from`, or -1.
+private fun tableTrioEnd(text: string, from: int, function: string): int {
+    if (!text.slice(from, from + 14).startsWith("val esp32Data_")) return -1
+    val nameBegin = from + 4
+    val nameEnd = wordEnd(text, nameBegin)
+    val name = text.slice(nameBegin, nameEnd)
+    if (!name.endsWith("Storage") || name.size < 10 + 1 + 7) return -1
+    val group = name.slice(0, name.size - 7)
+    val scan = Scan(text, nameEnd)
+    if (!scanLiteral(scan, " = nativeStaticU32s([\n")) return -1
+    var entries = 0
+    while (true) {
+        val save = scan.pos
+        if (!scanLiteral(scan, "    int((u32(nativeFunctionAddress($function)) + u32(") || !scanDigits(scan) ||
+            !scanLiteral(scan, ")))")) {
+            scan.pos = save
+            break
+        }
+        scanLiteral(scan, ",")
+        if (!scanLiteral(scan, "\n")) {
+            scan.pos = save
+            break
+        }
+        entries = entries + 1
+    }
+    if (entries == 0) return -1
+    if (!scanLiteral(scan, "])\n")) return -1
+    for (head in ["val ${group}Initialized = ", "val $group = "]) {
+        if (!scanLiteral(scan, head)) return -1
+        while (scan.pos < text.size && text[scan.pos] != 10) scan.pos = scan.pos + 1
+        if (!scanLiteral(scan, "\n")) return -1
+    }
+    scanLiteral(scan, "\n")
+    scan.pos
+}
+
+private fun fail(message: string): int {
+    eprintln(message)
+    1
+}
+
+private fun projectRoot(): string {
+    val executable = processExecutable()
+    val marker = "/build/abla-tools/"
+    val at = executable.indexOf(marker)
+    if (at >= 0) executable.slice(0, at) else "."
+}
+
+fun main: int {
+    val positional: array<string> = []
+    var write = false
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--write") write = true
+        else positional.append(argument)
+        index = index + 1
+    }
+    if (positional.size < 4) {
+        eprintln("usage: transplant-lifted-function LIFTED.ab TARGET.ab ABLA_FUNCTION MODULE_TAG [--write]")
+        return 1
+    }
+    val liftedPath = positional[0]
+    val targetPath = positional[1]
+    val function = positional[2]
+    val tag = positional[3]
+    val liftedRead = Path(liftedPath).readTextResult()
+    val targetRead = Path(targetPath).readTextResult()
+    if (!liftedRead.succeeded) return fail("cannot read $liftedPath")
+    if (!targetRead.succeeded) return fail("cannot read $targetPath")
+    val lifted = liftedRead.text
+    val target = targetRead.text
+
+    val liftedSpan = locateFunction(lifted, function)
+    if (!liftedSpan.found) return fail("function $function not found")
+    val targetSpan = locateFunction(target, function)
+    if (!targetSpan.found) return fail("function $function not found")
+    val body = lifted.slice(liftedSpan.begin, liftedSpan.end)
+
+    val sources: array<string> = []
+    collectSources(projectRoot() + "/src", sources)
+    val sourceIndex = newIndex()
+    for (file in sources) {
+        val text = Path(file).readText()
+        indexAbiComments(sourceIndex, text)
+        indexInternalSelectors(sourceIndex, text)
+        indexDataValues(sourceIndex, text)
+    }
+
+    val special: Map<string, string> = Map()
+    special.set("memcpy", "freestandingCopy")
+    special.set("memmove", "freestandingMove")
+    special.set("memset", "freestandingSet")
+
+    val output: array<string> = []
+    val lines = body.split("\n")
+    var tables = 0
+    var at = 0
+    while (at < lines.size) {
+        val line = lines[at]
+        val call = parseCallLine(line)
+        if (call.size == 4) {
+            val indent = call[0]
+            val number = call[1]
+            val sym = call[2]
+            val given: array<string> = []
+            for (piece in call[3].split(", ")) if (piece != "") given.append(piece)
+            val builtin = special.get(sym)
+            if (builtin != null) {
+                val used: array<string> = []
+                var position = 0
+                while (position < 3 && position < given.size) {
+                    used.append(given[position])
+                    position = position + 1
+                }
+                if (sym == "memset") {
+                    if (used.size < 2) return fail("IndexError: list index out of range")
+                    used[1] = "i32(${used[1]})"
+                }
+                output.append("$indent" + "r10 = $builtin(${used.join(", ")})")
+            } else {
+                val name = if (sym.startsWith(".Labla_recovered_") && sym.contains("_local__text_"))
+                    localFunction(afterLocalMarker(sym), tag, target)
+                    else abiFunction(sym, sourceIndex)
+                if (name.error != "") return fail(name.error)
+                val filled: array<string> = []
+                for (argument in given) filled.append(argument)
+                while (filled.size < 16) filled.append("u32(0)")
+                output.append("${indent}r10 = ${name.value}(${filled.join(", ")})")
+            }
+            at = at + 1
+            while (at < lines.size && isCallResultCopy(lines[at], number)) at = at + 1
+            continue
+        }
+        val address = parseAddressLine(line)
+        if (address.size == 3) {
+            if (at + 3 < lines.size && lines[at + 1].contains("jumpTableIndex")) {
+                tables = tables + 1
+                output.append(lines[at + 1])
+                at = at + 2
+                while (at < lines.size && isTableAccess(lines[at])) at = at + 1
+                continue
+            }
+            val value = addressValue(address[2], sourceIndex, target, tag)
+            if (value.error != "") return fail(value.error)
+            output.append("${address[0]}${address[1]} = ${value.value}")
+            at = at + 1
+            continue
+        }
+        val converted = inlineAddresses(line, sourceIndex, target, tag)
+        if (converted.error != "") return fail(converted.error)
+        output.append(converted.value)
+        at = at + 1
+    }
+
+    // Dead table-base loads left behind by a lowered jump table.
+    val joined = output.join("\n")
+    val pieces = byteBuffer()
+    var copied = 0
+    var cursor = 0
+    var dead = 0
+    while (cursor < joined.size) {
+        val first = joined[cursor]
+        if (first == 32 || first == 114) {
+            val match = deadTableMatch(joined, cursor)
+            if (match.size == 3) {
+                pieces.appendText(joined.slice(copied, cursor))
+                pieces.appendText(joined.slice(match[1], match[2]))
+                copied = match[0]
+                cursor = match[0]
+                dead = dead + 1
+                continue
+            }
+        }
+        cursor = cursor + 1
+    }
+    pieces.appendText(joined.slice(copied, joined.size))
+    tables = tables + dead
+    val withoutDead = pieces.toText()
+
+    val defined = definedValues(target)
+    val targetIndex = newIndex()
+    indexDataValues(targetIndex, target)
+    val remapped = remapData(withoutDead, target, defined, targetIndex)
+    if (remapped.error != "") return fail(remapped.error)
+    val converted = remapped.value
+    if (converted.contains("\$xtensa")) {
+        val bad: array<string> = []
+        for (line in converted.split("\n")) {
+            if (line.contains("\$xtensa") && bad.size < 5) bad.append(line)
+        }
+        return fail("unconverted lines in $function:\n${bad.join("\n")}")
+    }
+
+    val result = target.slice(0, targetSpan.begin) + converted + target.slice(targetSpan.end, target.size)
+    // Remove the committed table trio(s) that fed this function's computed jump.
+    val trimmed = byteBuffer()
+    var kept = 0
+    var removed = 0
+    var scanAt = 0
+    while (scanAt < result.size) {
+        if (result[scanAt] == 118) {
+            val end = tableTrioEnd(result, scanAt, function)
+            if (end >= 0) {
+                trimmed.appendText(result.slice(kept, scanAt))
+                kept = end
+                scanAt = end
+                removed = removed + 1
+                continue
+            }
+        }
+        scanAt = scanAt + 1
+    }
+    trimmed.appendText(result.slice(kept, result.size))
+    val finalText = trimmed.toText()
+    var newlines = 0
+    for (byte in converted) if (byte == 10) newlines = newlines + 1
+    println("$function: $removed table(s) removed, $tables jump-table label(s) dropped, $newlines lines")
+    if (write) Path(targetPath).writeText(finalText)
+    0
+}
