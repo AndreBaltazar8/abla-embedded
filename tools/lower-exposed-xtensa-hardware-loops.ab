@@ -1,0 +1,150 @@
+// Replace exposed Xtensa zero-overhead loop markers with Abla while loops.
+//
+// The recovered dispatcher models an Xtensa `loop` instruction with three
+// variables and a prologue that repeats the block range. Once an acyclic CFG is
+// structured, that hidden repetition appears as a marker triple followed by the
+// single visible iteration. This pass restores the exact count as an ordinary
+// Abla loop and removes the target-specific synthetic state.
+//
+//     tools/abla-tool lower-exposed-xtensa-hardware-loops [--write] [--verbose] PATHS...
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/abfiles.ab"
+
+class HardwareLoops(val text: string, val count: int)
+
+class SourceEdit(val begin: int, val end: int, val text: string)
+
+private fun isDigit(byte: int): bool = byte >= 48 && byte <= 57
+
+private fun allDigits(text: string): bool {
+    if (text.size == 0) return false
+    for (byte in text) if (!isDigit(byte)) return false
+    true
+}
+
+private fun editLess(left: SourceEdit, right: SourceEdit): bool {
+    if (left.begin != right.begin) return left.begin < right.begin
+    if (left.end != right.end) return left.end < right.end
+    left.text < right.text
+}
+
+fun lowerHardwareLoops(source: string): HardwareLoops {
+    // Lines with their start offsets; `terminated` tells whether a newline ends it.
+    val lines = source.split("\n")
+    val starts: array<int> = []
+    var offset = 0
+    for (line in lines) {
+        starts.append(offset)
+        offset = offset + line.size + 1
+    }
+    // The last element has no newline of its own (it is "" after a final one).
+    val lastTerminated = lines.size - 1
+    val edits: array<SourceEdit> = []
+    var sequence = 0
+    var index = 0
+    while (index + 3 < lines.size) {
+        // Lines index .. index+3 must all end with a newline.
+        if (index + 3 >= lastTerminated) break
+        val first = lines[index]
+        var indentSize = 0
+        while (indentSize < first.size && first[indentSize] == 32) indentSize = indentSize + 1
+        val indent = first.slice(0, indentSize)
+        val counterHead = "${indent}loopCounter = "
+        val startHead = "${indent}loopStart = "
+        val endHead = "${indent}loopEnd = "
+        val ifHead = "${indent}if ("
+        val condition = lines[index + 3]
+        if (!first.startsWith(counterHead) || first.size == counterHead.size ||
+            !lines[index + 1].startsWith(startHead) ||
+            !allDigits(lines[index + 1].slice(startHead.size, lines[index + 1].size)) ||
+            !lines[index + 2].startsWith(endHead) ||
+            !allDigits(lines[index + 2].slice(endHead.size, lines[index + 2].size)) ||
+            !condition.startsWith(ifHead) || !condition.endsWith(") {") ||
+            condition.size <= ifHead.size + 3) {
+            index = index + 1
+            continue
+        }
+        val count = first.slice(counterHead.size, first.size)
+        val conditionText = condition.slice(ifHead.size, condition.size - 3)
+        val matchBegin = starts[index]
+        val matchEnd = starts[index + 4]
+        // The first later line that is exactly `INDENT}` and ends with a newline.
+        var close = -1
+        var probe = index + 4
+        while (probe < lastTerminated) {
+            if (lines[probe] == "$indent}") {
+                close = probe
+                break
+            }
+            probe = probe + 1
+        }
+        index = index + 4
+        if (close < 0) continue
+        sequence = sequence + 1
+        val counter = "recoveredHardwareLoopRemaining$sequence"
+        val loopCondition = if (conditionText == "true") "true" else "$counter != u32(0)"
+        val header = "${indent}var $counter = $count\n${indent}while ($loopCondition) {\n"
+        var decrement = "$indent    $counter = $counter - u32(1)\n"
+        if (conditionText == "true") decrement = "$decrement$indent    if ($counter == u32(0)) break\n"
+        edits.append(SourceEdit(matchBegin, matchEnd, header))
+        edits.append(SourceEdit(starts[close], starts[close], decrement))
+    }
+    // Apply from the highest position down, as the Python did.
+    val order: array<SourceEdit> = []
+    for (edit in edits) {
+        order.append(edit)
+        var at = order.size - 1
+        while (at > 0 && editLess(order[at - 1], edit)) {
+            order[at] = order[at - 1]
+            at = at - 1
+        }
+        order[at] = edit
+    }
+    var transformed = source
+    for (edit in order) {
+        transformed = transformed.slice(0, edit.begin) + edit.text + transformed.slice(edit.end, transformed.size)
+    }
+    HardwareLoops(transformed, sequence)
+}
+
+fun main: int {
+    var write = false
+    var verbose = false
+    val arguments: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--write") write = true
+        else if (argument == "--verbose") verbose = true
+        else arguments.append(argument)
+        index = index + 1
+    }
+    if (arguments.size == 0) {
+        eprintln("usage: lower-exposed-xtensa-hardware-loops [--write] [--verbose] PATHS...")
+        return 2
+    }
+    val found: array<string> = []
+    for (argument in arguments) {
+        if (Path(argument).info().isDirectory()) rglobAb(argument, found)
+        else if (argument.endsWith(".ab")) found.append(argument)
+    }
+    var changedFiles = 0
+    var lowered = 0
+    for (file in found) {
+        val source = Path(file).readText()
+        val result = lowerHardwareLoops(source)
+        lowered = lowered + result.count
+        if (result.text != source) {
+            changedFiles = changedFiles + 1
+            if (verbose) println("$file: ${result.count}")
+            if (write) Path(file).writeText(result.text)
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("$action $lowered exposed hardware loop(s) across $changedFiles file(s)")
+    0
+}
