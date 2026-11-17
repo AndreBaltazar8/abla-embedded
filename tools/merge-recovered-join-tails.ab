@@ -1,0 +1,838 @@
+// Merge join tails the structurizer copied into every branch.
+//
+// When a branch has no common post-dominator inside the function, the
+// structurizer emits the shared continuation once per arm:
+//
+//     when (index) { 0 -> { A0; TAIL } 1 -> { A1; TAIL } ... }
+//     if (c) { B; TAIL } else { C; TAIL }
+//
+// LLVM does not merge these again (the copies end in returns, so there is no
+// join block to hoist into), and the image carries one copy per arm. This pass
+// hoists the longest suffix of statements that every non-terminating arm of an
+// `if`/`else` or `when` ends with to just after the branch:
+//
+//     when (index) { 0 -> { A0 } 1 -> { A1 } ... }; TAIL
+//
+// Equivalence: an arm that ends with TAIL runs its prefix and then TAIL; after
+// the rewrite it runs its prefix, leaves the branch, and runs TAIL. Arms that
+// terminate (return/trap) never reach the code after the branch in either form.
+// The pass refuses a merge when TAIL mentions a name declared in an arm prefix
+// (scoping), when a name TAIL declares is also declared elsewhere in the
+// function (the single remaining copy would clash), or when an arm would become
+// empty. The rewrite repeats bottom-up until nothing changes, so nested
+// branches whose tails become equal after the inner merge are merged too.
+//
+//     tools/abla-tool merge-recovered-join-tails ROOT [--write]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process/arguments"
+import "lib/recfiles.ab"
+
+// Statement kinds.
+val kindSimple = 0
+val kindRaw = 1
+val kindLoop = 2
+val kindIf = 3
+val kindWhen = 4
+
+// The statement tree of one function lives in flat arenas addressed by integer ids, so blocks
+// can be shared and edited in place (the merge rewrites arm lists where they stand).
+//
+// A block is a list of statement ids. Statements: kind; `lines` (Simple/Raw, relative
+// indentation); `head` (Loop/If/When header text); `body` (Loop body, If then: block id);
+// `other` (If else block id, -1 when absent); `arms` (When: arm ids). An arm has a label and
+// a body block id (-1 for a one-line arm).
+var blockItems: array<array<int>> = []
+var stmtKind: array<int> = []
+var stmtLines: array<array<string>> = []
+var stmtHead: array<string> = []
+var stmtBody: array<int> = []
+var stmtOther: array<int> = []
+var stmtArms: array<array<int>> = []
+var armLabel: array<string> = []
+var armBody: array<int> = []
+
+fun resetArena(): void {
+    blockItems.clear()
+    stmtKind.clear()
+    stmtLines.clear()
+    stmtHead.clear()
+    stmtBody.clear()
+    stmtOther.clear()
+    stmtArms.clear()
+    armLabel.clear()
+    armBody.clear()
+}
+
+fun newBlock(): int {
+    val items: array<int> = []
+    blockItems.append(items)
+    blockItems.size - 1
+}
+
+fun newStmt(kind: int, lines: array<string>, head: string, body: int, other: int, arms: array<int>): int {
+    stmtKind.append(kind)
+    stmtLines.append(lines)
+    stmtHead.append(head)
+    stmtBody.append(body)
+    stmtOther.append(other)
+    stmtArms.append(arms)
+    stmtKind.size - 1
+}
+
+fun newArm(label: string, body: int): int {
+    armLabel.append(label)
+    armBody.append(body)
+    armLabel.size - 1
+}
+
+fun simpleStmt(kind: int, lines: array<string>): int {
+    val noArms: array<int> = []
+    newStmt(kind, lines, "", -1, -1, noArms)
+}
+
+fun leadingSpaces(line: string): int {
+    var count = 0
+    while (count < line.size && line[count] == 32) count = count + 1
+    count
+}
+
+// ---- Parsing (a Bail sets parseFailed) ----
+
+var parseLines: array<string> = []
+var parsePosition = 0
+var parseFailed = false
+
+fun ifHead(text: string): bool = text.size >= 7 && text.startsWith("if (") && text.endsWith(") {")
+
+fun whenHead(text: string): bool = text.size >= 9 && text.startsWith("when (") && text.endsWith(") {")
+
+fun loopHead(text: string): bool = text.size >= 10 && text.startsWith("while (") && text.endsWith(") {")
+
+// `^(?:[0-9]+|else) -> \{$`
+fun armHead(text: string): bool {
+    if (!text.endsWith(" -> {")) return false
+    val label = text.slice(0, text.size - 5)
+    if (label == "else") return true
+    if (label.size == 0) return false
+    for (b in label) if (!recIsDigit(b)) return false
+    true
+}
+
+// `^(?:[0-9]+|else) -> \S.*[^{]$`
+fun armLineText(text: string): bool {
+    var p = 0
+    if (text.startsWith("else")) p = 4
+    else {
+        p = recDigitsEnd(text, 0)
+        if (p == 0) return false
+    }
+    if (!recAt(text, p, " -> ")) return false
+    val rest = p + 4
+    // \S then .* then [^{]: at least two characters, the first not whitespace, the last not `{`.
+    if (text.size - rest < 2) return false
+    if (recIsSpace(text[rest])) return false
+    text[text.size - 1] != 123
+}
+
+fun bail(): int {
+    parseFailed = true
+    -1
+}
+
+fun parseBlock(indent: int): int {
+    val block = newBlock()
+    while (parsePosition < parseLines.size) {
+        val line = parseLines[parsePosition]
+        if (recStrip(line) == "") return bail()
+        val level = leadingSpaces(line)
+        if (level < indent) break
+        if (level != indent) return bail()
+        val text = recStrip(line)
+        if (text.startsWith("}")) break
+        val statement = parseStatement(indent, text)
+        if (parseFailed) return -1
+        blockItems[block].append(statement)
+    }
+    block
+}
+
+fun parseRaw(indent: int): int {
+    val start = parsePosition
+    parsePosition = parsePosition + 1
+    var closed = false
+    while (parsePosition < parseLines.size) {
+        val line = parseLines[parsePosition]
+        parsePosition = parsePosition + 1
+        if (leadingSpaces(line) == indent && recStrip(line) == "}") {
+            closed = true
+            break
+        }
+    }
+    if (!closed) return bail()
+    val lines: array<string> = []
+    var i = start
+    while (i < parsePosition) {
+        val line = parseLines[i]
+        lines.append(if (indent >= line.size) "" else line.slice(indent, line.size))
+        i = i + 1
+    }
+    simpleStmt(kindRaw, lines)
+}
+
+fun expectLine(indent: int, text: string): void {
+    if (parsePosition >= parseLines.size || leadingSpaces(parseLines[parsePosition]) != indent ||
+        recStrip(parseLines[parsePosition]) != text) {
+        parseFailed = true
+        return
+    }
+    parsePosition = parsePosition + 1
+}
+
+fun parseStatement(indent: int, text: string): int {
+    if (ifHead(text)) return parseIf(indent, text)
+    if (whenHead(text)) return parseWhen(indent, text)
+    if (loopHead(text)) {
+        parsePosition = parsePosition + 1
+        val body = parseBlock(indent + 4)
+        if (parseFailed) return -1
+        expectLine(indent, "}")
+        if (parseFailed) return -1
+        val noArms: array<int> = []
+        return newStmt(kindLoop, [], text, body, -1, noArms)
+    }
+    if (text.endsWith("{")) return parseRaw(indent)
+    parsePosition = parsePosition + 1
+    simpleStmt(kindSimple, [text])
+}
+
+fun parseIf(indent: int, text: string): int {
+    parsePosition = parsePosition + 1
+    val then = parseBlock(indent + 4)
+    if (parseFailed) return -1
+    if (parsePosition >= parseLines.size) return bail()
+    val closer = parseLines[parsePosition]
+    if (leadingSpaces(closer) != indent) return bail()
+    val stripped = recStrip(closer)
+    val noArms: array<int> = []
+    if (stripped == "}") {
+        parsePosition = parsePosition + 1
+        return newStmt(kindIf, [], text, then, -1, noArms)
+    }
+    if (stripped == "} else {") {
+        parsePosition = parsePosition + 1
+        val other = parseBlock(indent + 4)
+        if (parseFailed) return -1
+        expectLine(indent, "}")
+        if (parseFailed) return -1
+        return newStmt(kindIf, [], text, then, other, noArms)
+    }
+    bail()
+}
+
+fun parseWhen(indent: int, text: string): int {
+    parsePosition = parsePosition + 1
+    val arms: array<int> = []
+    while (true) {
+        if (parsePosition >= parseLines.size) return bail()
+        val line = parseLines[parsePosition]
+        if (leadingSpaces(line) == indent && recStrip(line) == "}") {
+            parsePosition = parsePosition + 1
+            break
+        }
+        if (leadingSpaces(line) != indent + 4) return bail()
+        val label = recStrip(line)
+        if (armHead(label)) {
+            parsePosition = parsePosition + 1
+            val body = parseBlock(indent + 8)
+            if (parseFailed) return -1
+            expectLine(indent + 4, "}")
+            if (parseFailed) return -1
+            arms.append(newArm(label, body))
+        } else if (armLineText(label)) {
+            parsePosition = parsePosition + 1
+            arms.append(newArm(label, -1))
+        } else return bail()
+    }
+    newStmt(kindWhen, [], text, -1, -1, arms)
+}
+
+// ---- Emitting ----
+
+fun emitBlock(block: int, indent: int, var out: array<string>): void {
+    for (statement in blockItems[block]) emitStatement(statement, indent, out)
+}
+
+fun spaces(count: int): string = " ".repeat(count)
+
+fun emitStatement(statement: int, indent: int, var out: array<string>): void {
+    val pad = spaces(indent)
+    val kind = stmtKind[statement]
+    if (kind == kindSimple || kind == kindRaw) {
+        for (line in stmtLines[statement]) out.append(if (recStrip(line) != "") pad + line else line)
+    } else if (kind == kindLoop) {
+        out.append(pad + stmtHead[statement])
+        emitBlock(stmtBody[statement], indent + 4, out)
+        out.append(pad + "}")
+    } else if (kind == kindIf) {
+        out.append(pad + stmtHead[statement])
+        emitBlock(stmtBody[statement], indent + 4, out)
+        if (stmtOther[statement] >= 0) {
+            out.append(pad + "} else {")
+            emitBlock(stmtOther[statement], indent + 4, out)
+        }
+        out.append(pad + "}")
+    } else {
+        out.append(pad + stmtHead[statement])
+        for (arm in stmtArms[statement]) {
+            out.append(pad + "    " + armLabel[arm])
+            if (armBody[arm] >= 0) {
+                emitBlock(armBody[arm], indent + 8, out)
+                out.append(pad + "    }")
+            }
+        }
+        out.append(pad + "}")
+    }
+}
+
+fun renderLines(statement: int): array<string> {
+    val out: array<string> = []
+    emitStatement(statement, 0, out)
+    out
+}
+
+// Scans the identifiers `callResult\d+` / `jumpTableIndex\d+` (whole words) and renames them.
+fun canonicalText(text: string): string {
+    val out = byteBuffer()
+    var last = 0
+    var i = 0
+    while (i < text.size) {
+        val b = text[i]
+        if ((b == 99 || b == 106) && (i == 0 || !recIsWord(text[i - 1]))) {
+            val nameLength = if (recAt(text, i, "callResult")) 10 else if (recAt(text, i, "jumpTableIndex")) 14 else 0
+            if (nameLength > 0) {
+                val end = recDigitsEnd(text, i + nameLength)
+                if (end > i + nameLength && (end >= text.size || !recIsWord(text[end]))) {
+                    out.appendText(text.slice(last, i + nameLength))
+                    out.appendText("#")
+                    last = end
+                    i = end
+                    continue
+                }
+            }
+        }
+        i = i + 1
+    }
+    out.appendText(text.slice(last, text.size))
+    out.toText()
+}
+
+
+fun canonical(statement: int): string = canonicalText(renderLines(statement).join("\n"))
+
+// ---- Termination ----
+
+fun terminatesLabel(label: string): bool = label.endsWith("ablaRuntimeTrap()") || label.contains(" -> return")
+
+fun blockTerminates(block: int): bool {
+    val items = blockItems[block]
+    items.size > 0 && terminates(items[items.size - 1])
+}
+
+fun terminates(statement: int): bool {
+    val kind = stmtKind[statement]
+    if (kind == kindSimple) {
+        val text = stmtLines[statement][0]
+        return text == "return" || text.startsWith("return ") || text == "ablaRuntimeTrap()"
+    }
+    if (kind == kindIf) {
+        return stmtOther[statement] >= 0 && blockTerminates(stmtBody[statement]) &&
+            blockTerminates(stmtOther[statement])
+    }
+    if (kind == kindWhen) {
+        var hasElse = false
+        for (arm in stmtArms[statement]) if (armLabel[arm].startsWith("else ->")) hasElse = true
+        if (!hasElse) return false
+        for (arm in stmtArms[statement]) {
+            val ok = if (armBody[arm] < 0) armLabel[arm].endsWith("ablaRuntimeTrap()") else blockTerminates(armBody[arm])
+            if (!ok) return false
+        }
+        return true
+    }
+    false
+}
+
+// ---- Names ----
+
+// `\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)` over each line, appended in order.
+fun declaredNames(lines: array<string>, var names: array<string>): void {
+    for (line in lines) {
+        var i = 0
+        while (i + 3 < line.size) {
+            if ((recAt(line, i, "val") || recAt(line, i, "var")) && (i == 0 || !recIsWord(line[i - 1]))) {
+                val q = recSkipSpace(line, i + 3)
+                if (q > i + 3 && q < line.size && recIsIdentStart(line[q])) {
+                    val end = recIdentEnd(line, q)
+                    names.append(line.slice(q, end))
+                    i = end
+                    continue
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+fun identifierSet(text: string): Map<string, bool> {
+    val words = Map<string, bool>()
+    var i = 0
+    while (i < text.size) {
+        if (recIsIdentStart(text[i])) {
+            val end = recIdentEnd(text, i)
+            words.set(text.slice(i, end), true)
+            i = end
+        } else i = i + 1
+    }
+    words
+}
+
+fun wordBoundaryBefore(text: string, i: int): bool = i == 0 || !recIsWord(text[i - 1])
+
+// Matches of CALL (ablaUnsafeCall\w*\(, $xtensa call..., esp32Recovered|freestanding\w*\().
+fun countCalls(text: string): int {
+    var count = 0
+    var i = 0
+    while (i < text.size) {
+        val b = text[i]
+        var end = -1
+        if (b == 97 && wordBoundaryBefore(text, i) && recAt(text, i, "ablaUnsafeCall")) {
+            val e = recIdentEndWord(text, i + 14)
+            if (recAt(text, e, "(")) end = e + 1
+        } else if (b == 36 && recAt(text, i, "\$xtensa call")) {
+            val base = i + 12
+            // (?:Wide|x\w*|Address(?:Wide)?)? then \b: try the alternatives in regex order.
+            var options: array<int> = []
+            if (recAt(text, base, "Wide")) options.append(base + 4)
+            if (recAt(text, base, "x")) options.append(recIdentEndWord(text, base + 1))
+            if (recAt(text, base, "Address")) {
+                if (recAt(text, base + 7, "Wide")) options.append(base + 11)
+                options.append(base + 7)
+            }
+            options.append(base)
+            for (candidate in options) {
+                // \b after a word character (the last char is one): next must not be a word character.
+                if (candidate >= text.size || !recIsWord(text[candidate])) {
+                    end = candidate
+                    break
+                }
+            }
+        } else if ((b == 101 || b == 102) && wordBoundaryBefore(text, i)) {
+            val prefix = if (recAt(text, i, "esp32Recovered")) 14 else if (recAt(text, i, "freestanding")) 12 else 0
+            if (prefix > 0) {
+                val e = recIdentEndWord(text, i + prefix)
+                if (recAt(text, e, "(")) end = e + 1
+            }
+        }
+        if (end >= 0) {
+            count = count + 1
+            i = if (end > i) end else i + 1
+        } else i = i + 1
+    }
+    count
+}
+
+
+// ---- Merging ----
+
+class Leaves(val ok: bool, val blocks: array<int>)
+
+fun leavesFailed(): Leaves {
+    val none: array<int> = []
+    Leaves(false, none)
+}
+
+// Leaf statement lists a branch tree ends in: a block that is exactly one if/else or `when` is a
+// branch tree itself, so its leaves can be merged as one set of arms.
+fun leaves(block: int): Leaves {
+    val result: array<int> = []
+    val items = blockItems[block]
+    if (items.size == 1 && stmtKind[items[0]] == kindIf && stmtOther[items[0]] >= 0) {
+        val first = leaves(stmtBody[items[0]])
+        val second = leaves(stmtOther[items[0]])
+        if (!first.ok || !second.ok) return leavesFailed()
+        for (leaf in first.blocks) result.append(leaf)
+        for (leaf in second.blocks) result.append(leaf)
+        return Leaves(true, result)
+    }
+    if (items.size == 1 && stmtKind[items[0]] == kindWhen) {
+        for (arm in stmtArms[items[0]]) {
+            if (armBody[arm] < 0) {
+                if (terminatesLabel(armLabel[arm])) continue
+                return leavesFailed()
+            }
+            val inner = leaves(armBody[arm])
+            if (!inner.ok) return leavesFailed()
+            for (leaf in inner.blocks) result.append(leaf)
+        }
+        return Leaves(true, result)
+    }
+    result.append(block)
+    Leaves(true, result)
+}
+
+// The merger's counters and the per-function declaration counts.
+var declarations = Map<string, int>()
+var mergedCount = 0
+var removedStatements = 0
+var removedCalls = 0
+
+fun countDeclarations(lines: array<string>): void {
+    declarations = Map<string, int>()
+    val names: array<string> = []
+    declaredNames(lines, names)
+    for (name in names) declarations.set(name, (declarations.get(name) ?? 0) + 1)
+}
+
+fun copyDeclarations(): Map<string, int> {
+    val copy = Map<string, int>()
+    for (key in declarations.keys()) copy.set(key, declarations.get(key) ?? 0)
+    copy
+}
+
+fun renderedLines(statements: array<int>, from: int, to: int): array<string> {
+    val lines: array<string> = []
+    var i = from
+    while (i < to) {
+        for (line in renderLines(statements[i])) lines.append(line)
+        i = i + 1
+    }
+    lines
+}
+
+fun countName(names: array<string>, name: string): int {
+    var count = 0
+    for (candidate in names) if (candidate == name) count = count + 1
+    count
+}
+
+// Hoists the tail shared by the arms that fall through to it; returns it (taken from the first
+// such arm; the arms are edited in place), or [] when nothing can be merged.
+fun mergeArms(armBlocks: array<int>): array<int> {
+    val none: array<int> = []
+    val arms: array<int> = []
+    for (body in armBlocks) {
+        val inner = leaves(body)
+        if (!inner.ok) return none
+        for (leaf in inner.blocks) arms.append(leaf)
+    }
+    val keys: array<array<string>> = []
+    for (body in arms) {
+        val key: array<string> = []
+        for (item in blockItems[body]) key.append(canonical(item))
+        keys.append(key)
+    }
+    val groupIndex = Map<string, int>()
+    val groups: array<array<int>> = []
+    var index = 0
+    while (index < keys.size) {
+        val key = keys[index]
+        if (key.size > 0) {
+            val last = key[key.size - 1]
+            var group = groupIndex.get(last) ?? -1
+            if (group < 0) {
+                group = groups.size
+                groupIndex.set(last, group)
+                val fresh: array<int> = []
+                groups.append(fresh)
+            }
+            groups[group].append(index)
+        }
+        index = index + 1
+    }
+    if (groups.size == 0) return none
+    var best = 0
+    var g = 1
+    while (g < groups.size) {
+        if (groups[g].size > groups[best].size) best = g
+        g = g + 1
+    }
+    val members = groups[best]
+    if (members.size < 2) return none
+    val isMember = filledArray(arms.size, false)
+    for (member in members) isMember[member] = true
+    index = 0
+    while (index < arms.size) {
+        if (!isMember[index] && !blockTerminates(arms[index])) return none
+        index = index + 1
+    }
+    val active: array<int> = []
+    val activeKeys: array<array<string>> = []
+    for (member in members) {
+        active.append(arms[member])
+        activeKeys.append(keys[member])
+    }
+    var depth = 0
+    while (true) {
+        var longEnough = true
+        for (key in activeKeys) if (key.size <= depth + 1) longEnough = false
+        if (!longEnough) break
+        val reference = activeKeys[0][activeKeys[0].size - 1 - depth]
+        var same = true
+        for (key in activeKeys) if (key[key.size - 1 - depth] != reference) same = false
+        if (!same) break
+        depth = depth + 1
+    }
+    if (depth == 0) return none
+    // A bare `return` shared by every arm is not worth hoisting.
+    val firstItems = blockItems[active[0]]
+    var allBare = true
+    var t = firstItems.size - depth
+    while (t < firstItems.size) {
+        val item = firstItems[t]
+        if (!(stmtKind[item] == kindSimple && terminates(item))) allBare = false
+        t = t + 1
+    }
+    if (allBare) return none
+    val tailLines: array<array<string>> = []
+    val tailNames: array<array<string>> = []
+    for (body in active) {
+        val items = blockItems[body]
+        val lines = renderedLines(items, items.size - depth, items.size)
+        tailLines.append(lines)
+        val names: array<string> = []
+        declaredNames(lines, names)
+        tailNames.append(names)
+    }
+    val prefixNames: array<string> = []
+    for (body in active) {
+        val items = blockItems[body]
+        declaredNames(renderedLines(items, 0, items.size - depth), prefixNames)
+    }
+    val words = identifierSet(tailLines[0].join("\n"))
+    for (name in prefixNames) if (words.has(name)) return none
+    // Names the kept copy declares must not be declared anywhere else.
+    val checked = Map<string, bool>()
+    for (name in tailNames[0]) {
+        if (checked.has(name)) continue
+        checked.set(name, true)
+        var total = 0
+        for (names in tailNames) total = total + countName(names, name)
+        if ((declarations.get(name) ?? 0) != total) return none
+    }
+    var n = 1
+    while (n < tailNames.size) {
+        for (name in tailNames[n]) declarations.set(name, (declarations.get(name) ?? 0) - 1)
+        n = n + 1
+    }
+    n = 1
+    while (n < tailLines.size) {
+        removedCalls = removedCalls + countCalls(tailLines[n].join("\n"))
+        n = n + 1
+    }
+    val tail: array<int> = []
+    var k = firstItems.size - depth
+    while (k < firstItems.size) {
+        tail.append(firstItems[k])
+        k = k + 1
+    }
+    for (body in active) blockItems[body].truncate(blockItems[body].size - depth)
+    mergedCount = mergedCount + 1
+    removedStatements = removedStatements + (active.size - 1) * depth
+    tail
+}
+
+// Folds `if (c) { X; tail }` + rest into if/else when that merges a tail.
+fun guard(block: int, index: int): bool {
+    val statement = blockItems[block][index]
+    if (stmtKind[statement] != kindIf || stmtOther[statement] >= 0 || !blockTerminates(stmtBody[statement])) {
+        return false
+    }
+    val rest = newBlock()
+    var i = index + 1
+    while (i < blockItems[block].size) {
+        blockItems[rest].append(blockItems[block][i])
+        i = i + 1
+    }
+    if (blockItems[rest].size == 0) return false
+    val saved = copyDeclarations()
+    val tail = mergeArms([stmtBody[statement], rest])
+    if (tail.size == 0) {
+        declarations = saved
+        return false
+    }
+    // An empty rest would be the whole shared tail: the else branch is then absent.
+    if (blockItems[rest].size == 0) stmtOther[statement] = -1 else stmtOther[statement] = rest
+    blockItems[block].truncate(index + 1)
+    for (item in tail) blockItems[block].append(item)
+    true
+}
+
+// The arms of a branch statement, or `ok` false when it is not one that can be merged.
+class BranchArms(val ok: bool, val arms: array<int>)
+
+fun branchArms(statement: int): BranchArms {
+    val arms: array<int> = []
+    val kind = stmtKind[statement]
+    if (kind == kindIf && stmtOther[statement] >= 0) {
+        arms.append(stmtBody[statement])
+        arms.append(stmtOther[statement])
+        return BranchArms(true, arms)
+    }
+    if (kind == kindWhen) {
+        for (arm in stmtArms[statement]) {
+            if (armBody[arm] < 0) {
+                if (terminatesLabel(armLabel[arm])) continue
+                return BranchArms(false, arms)
+            }
+            arms.append(armBody[arm])
+        }
+        return BranchArms(true, arms)
+    }
+    BranchArms(false, arms)
+}
+
+// Each branch statement followed by the tail hoisted out of its arms.
+fun mergeAfter(statements: int): int {
+    val out = newBlock()
+    for (statement in blockItems[statements]) {
+        blockItems[out].append(statement)
+        val branch = branchArms(statement)
+        if (branch.ok && branch.arms.size > 0) {
+            for (item in mergeArms(branch.arms)) blockItems[out].append(item)
+        }
+    }
+    out
+}
+
+fun applyNested(input: int): int {
+    val block = mergeAfter(input)
+    for (statement in blockItems[block]) {
+        val kind = stmtKind[statement]
+        if (kind == kindLoop) {
+            stmtBody[statement] = applyNested(stmtBody[statement])
+        } else if (kind == kindIf) {
+            stmtBody[statement] = applyNested(stmtBody[statement])
+            if (stmtOther[statement] >= 0) stmtOther[statement] = applyNested(stmtOther[statement])
+        } else if (kind == kindWhen) {
+            for (arm in stmtArms[statement]) {
+                if (armBody[arm] >= 0) armBody[arm] = applyNested(armBody[arm])
+            }
+        }
+    }
+    val result = mergeAfter(block)
+    var index = blockItems[result].size - 1
+    while (index >= 0) {
+        guard(result, index)
+        index = index - 1
+    }
+    result
+}
+
+fun splice(input: int): int {
+    var block = input
+    while (true) {
+        val before = mergedCount
+        block = applyNested(block)
+        if (mergedCount == before) return block
+    }
+    block
+}
+
+class FunctionResult(val lines: array<string>, val merged: int, val removed: int)
+
+fun processFunction(bodyLines: array<string>): FunctionResult {
+    resetArena()
+    parseLines = bodyLines
+    parsePosition = 0
+    parseFailed = false
+    val block = parseBlock(4)
+    if (parseFailed || parsePosition != bodyLines.size) return FunctionResult(bodyLines, 0, 0)
+    mergedCount = 0
+    removedStatements = 0
+    removedCalls = 0
+    countDeclarations(bodyLines)
+    val merged = splice(block)
+    if (mergedCount == 0) return FunctionResult(bodyLines, 0, 0)
+    val out: array<string> = []
+    if (removedCalls > 0) out.append("    // abla-merged-calls: $removedCalls")
+    emitBlock(merged, 4, out)
+    FunctionResult(out, mergedCount, removedStatements)
+}
+
+class TailResult(val text: string, val merged: int, val removed: int)
+
+// process_text: the merged text and counts.
+fun processText(text: string): TailResult {
+    val lines = text.split("\n")
+    val out: array<string> = []
+    var merged = 0
+    var removed = 0
+    var index = 0
+    while (index < lines.size) {
+        val line = lines[index]
+        out.append(line)
+        index = index + 1
+        // A recovered function: `): u32 {` at column 0 ends its signature.
+        if (line.startsWith("): ") && line.endsWith("{")) {
+            val start = index
+            while (index < lines.size && lines[index] != "}") index = index + 1
+            val body: array<string> = []
+            var b = start
+            while (b < index) {
+                body.append(lines[b])
+                b = b + 1
+            }
+            val result = processFunction(body)
+            for (item in result.lines) out.append(item)
+            merged = merged + result.merged
+            removed = removed + result.removed
+        }
+    }
+    TailResult(out.join("\n"), merged, removed)
+}
+
+fun main: int {
+    var write = false
+    var root = ""
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        index = index + 1
+        if (argument == "--write") write = true
+        else if (argument.startsWith("-") && argument != "-") {
+            eprintln("merge-recovered-join-tails: error: unrecognized arguments: $argument")
+            return 2
+        } else if (root == "") root = argument
+        else {
+            eprintln("merge-recovered-join-tails: error: unrecognized arguments: $argument")
+            return 2
+        }
+    }
+    if (root == "") {
+        eprintln("usage: merge-recovered-join-tails [-h] [--write] root")
+        return 2
+    }
+    var changed = 0
+    var merged = 0
+    var removed = 0
+    for (path in recRglobAb(recNormalizePath(root))) {
+        val read = recRead(path)
+        if (!read.ok) {
+            eprintln("cannot read $path")
+            return 1
+        }
+        val result = processText(read.text)
+        if (result.merged > 0) {
+            changed = changed + 1
+            merged = merged + result.merged
+            removed = removed + result.removed
+            if (write) Path(path).writeText(result.text)
+        }
+    }
+    val verb = if (write) "merged" else "would merge"
+    println("$verb $merged join tail(s) in $changed file(s), removing $removed duplicated statement(s)")
+    0
+}
