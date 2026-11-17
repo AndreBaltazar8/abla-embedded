@@ -1,0 +1,1444 @@
+// Recover one Espressif archive member to Abla for a chip profile.
+//
+//     tools/abla-tool recover-member esp32s3 libnet80211 ieee80211_action_vendor.o
+//
+// The chip profile (tools/recovery/<chip>.toml) names the objdump, the ESP-IDF
+// archives, the ROM linker scripts and, for a new chip, the already recovered
+// reference chip. The driver:
+//
+// 1. extracts the member into build/recovery/<chip>/<archive>/<member>/;
+// 2. classifies every function: `rom` (the chip's ROM provides it), the
+//    compare-xtensa-archives classes against the reference chip (`identical`,
+//    `reordered`, `layout`, `different`, `new`), and where the reference's
+//    recovered Abla lives under src/; identical/reordered functions with Abla
+//    are reusable as is;
+// 3. reconstructs the member (reconstruct-xtensa-object) and runs the lifting
+//    passes (migrate, lift leaves, lower boundaries, structurize) until a round
+//    changes nothing;
+// 4. writes reuse.tsv and status.tsv and prints a summary.
+//
+// The output is a starting point for review, not a finished module: later
+// passes (direct calls, data lowering, jump tables) still run per corpus.
+//
+// Usage: recover-member CHIP ARCHIVE MEMBER [--work DIR] [--namespace NAME]
+//        [--rounds N] [--classify-only] [--compile]
+// MEMBER is an object file inside the archive (e.g. wl_chm.o) or `all`.
+// The stage tools are run as `tools/abla-tool NAME ARGS` (tools/NAME.ab).
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/regex"
+import "abla/process/arguments"
+import "abla/process/exit"
+import "lib/recovery.ab"
+import "lib/compare-xtensa.ab"
+
+val RM_CLASSES = ["rom", "identical", "reordered", "layout", "different", "new"]
+
+val RM_ROM_PROVIDE = recoveryMustRegex("PROVIDE\\s*\\(\\s*([A-Za-z_]\\w*)\\s*=")
+val RM_SELECTOR = recoveryMustRegex("(?:internal|export)Function\\(\"(\\w+)\",\\s*\"([^\"]+)\"\\)")
+val RM_ABLA_FUNCTION = recoveryMustRegex("^(?:@\\w+(?:\\([^)]*\\))?\\s*)*trusted fun (\\w+)\\(")
+val RM_ACCESS = recoveryMustRegex("ablaUnsafe(Load|Store)U(8|16|32)\\(nativePointerFromAddress\\(")
+val RM_ARITHMETIC = recoveryMustRegex("^\\s*(?:var |val )?r\\d+ = [^{}]*$")
+val RM_ADDEND = recoveryMustRegex("^(movi\\s+a\\d+,\\s*|\\.literal\\s+\\S+,\\s*)([.\$A-Za-z_][\\w.\$]*[+-]0x[0-9A-Fa-f]+)\\s*$")
+val RM_CALL_RESULT_DECL = recoveryMustRegex("^(\\s*)val (callResult\\d+)\\b")
+val RM_CALL_RESULT = recoveryMustRegex("\\bcallResult\\d+\\b")
+val RM_U32_HEADER_A = recoveryMustRegex("^\\)?(?:.*\\))?: u32 \\{$")
+val RM_U32_HEADER_B = recoveryMustRegex("^trusted fun \\w+\\(.*\\): u32 \\{$")
+val RM_FALLTHROUGH_PREVIOUS = recoveryMustRegex("^    (return\\b|ablaRuntimeTrap\\(\\))")
+val RM_LOCAL_SELECTION = recoveryMustRegex("Function\\(\"(\\w+)\",\\s*\"\\.Labla_recovered_[^\"]*_local_[^\"]*\"\\)")
+val RM_MERGEABLE = recoveryMustRegex("(\\.pushsection [^,\\n]+),\"aMS?\",@progbits,\\d+")
+
+fun recoveryMustRegex(pattern: string): Regex {
+    val compiled = regexCompile(pattern)
+    if (!compiled.succeeded) panic("recover-member: bad regex $pattern: ${compiled.error.message}")
+    compiled.regex
+}
+
+fun fatal(message: string): never {
+    eprintln(message)
+    exit(1)
+}
+
+// ------------------------------------------------------------ profile and processes
+
+fun loadProfileOrExit(root: string, chip: string): RecoveryProfile {
+    val loaded = recoveryLoadProfile(root, chip)
+    if (loaded.error != "") fatal("recover-member: ${loaded.error}")
+    loaded.profile
+}
+
+// A command's standard output, or exit 1 when it fails (subprocess.run(check=True)).
+fun runChecked(words: array<string>, directory: string): string {
+    val none: array<string> = []
+    val run = recoveryCapture(words, directory, none, none)
+    if (run.launchError != "" || run.status != 0) {
+        fatal("recover-member: command failed (exit ${run.status}): ${words.join(" ")}")
+    }
+    run.output
+}
+
+fun withArguments(base: array<string>, more: array<string>): array<string> {
+    val words: array<string> = []
+    for (word in base) words.append(word)
+    for (word in more) words.append(word)
+    words
+}
+
+fun archiveMembers(archive: string): array<string> =
+    recoverySplitWhitespace(runChecked(["ar", "t", archive], ""))
+
+// Extracts `member` of `archive` into `directory`; "" when the archive has no such member.
+fun extractMember(archive: string, member: string, directory: string): string {
+    Path(directory).createDirectories()
+    var found = false
+    for (name in archiveMembers(archive)) if (name == member) found = true
+    if (!found) return ""
+    runChecked(["ar", "x", archive, member], directory)
+    directory + "/" + member
+}
+
+// ------------------------------------------------------------ ROM linker scripts
+
+// Text with the /* ... */ comments removed (re.sub(r"/\*.*?\*/", "", text, flags=DOTALL)).
+fun stripLinkerComments(text: string): string {
+    val out = byteBuffer()
+    var pos = 0
+    while (pos < text.size) {
+        val open = text.indexOf("/*", pos)
+        if (open < 0) break
+        val close = text.indexOf("*/", open + 2)
+        if (close < 0) break
+        out.appendText(text.slice(pos, open))
+        pos = close + 2
+    }
+    out.appendText(text.slice(pos, text.size))
+    out.toText()
+}
+
+fun isIdentifierStart(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+// `(?m)^\s*([A-Za-z_]\w*)\s*=\s*0x[0-9A-Fa-f]+\s*;` : (name, value) of each match.
+fun romAssignments(text: string, var names: array<string>, var values: array<string>): void {
+    var pos = 0
+    while (pos < text.size) {
+        var p = pos
+        if (p > 0 && text[p - 1] != 10) {
+            val newline = text.indexOf("\n", p)
+            if (newline < 0) break
+            p = newline + 1
+        }
+        if (p >= text.size) break
+        var q = p
+        while (q < text.size && recoveryIsSpace(text[q])) q = q + 1
+        var matched = false
+        var end = p + 1
+        if (q < text.size && isIdentifierStart(text[q])) {
+            var r = q + 1
+            while (r < text.size && recoveryIsWord(text[r])) r = r + 1
+            val name = text.slice(q, r)
+            while (r < text.size && recoveryIsSpace(text[r])) r = r + 1
+            if (r < text.size && text[r] == 61) {
+                r = r + 1
+                while (r < text.size && recoveryIsSpace(text[r])) r = r + 1
+                if (r + 2 < text.size && text[r] == 48 && text[r + 1] == 120 && recoveryIsHex(text[r + 2])) {
+                    val digits = r + 2
+                    r = digits
+                    while (r < text.size && recoveryIsHex(text[r])) r = r + 1
+                    val value = text.slice(digits - 2, r)
+                    while (r < text.size && recoveryIsSpace(text[r])) r = r + 1
+                    if (r < text.size && text[r] == 59) {
+                        names.append(name)
+                        values.append(value)
+                        matched = true
+                        end = r + 1
+                    }
+                }
+            }
+        }
+        pos = if (matched) end else p + 1
+    }
+}
+
+// Names the chip's ROM linker scripts define (PROVIDE and plain assignments): the Wi-Fi/PHY ROM
+// entry points. A script assignment overrides an object's definition, so the image calls the
+// ROM copy; entries ESP-IDF patches in flash are commented out and stripped with the comments.
+fun romSymbols(profile: RecoveryProfile): Map<string, bool> {
+    val names: Map<string, bool> = Map()
+    for (script in profile.romLinkerScripts) {
+        val text = stripLinkerComments(recoveryReadText(Path(script)))
+        for (m in RM_ROM_PROVIDE.findAll(text)) names.set(m.group(1) ?? "", true)
+        val found: array<string> = []
+        val values: array<string> = []
+        romAssignments(text, found, values)
+        for (name in found) names.set(name, true)
+    }
+    names
+}
+
+// ------------------------------------------------------------ objdump symbol tables
+
+class SymbolLine(val ok: bool, val address: int, val flags: string, val section: string, val name: string)
+
+fun codePointWidth(lead: int): int {
+    if (lead >= 0xf0) return 4
+    if (lead >= 0xe0) return 3
+    if (lead >= 0xc0) return 2
+    1
+}
+
+fun hexDigitValue(c: int): int = if (c <= 57) c - 48 else c - 87
+
+// `^([0-9a-f]+) (.{7}) (\S+)\s+[0-9a-f]+ (\S+)$` on an `objdump -t` line (tabs read as spaces).
+fun parseSymbolLine(raw: string): SymbolLine {
+    val none = SymbolLine(false, 0, "", "", "")
+    val line = raw.replace("\t", " ")
+    var i = 0
+    var address = 0
+    while (i < line.size && recoveryIsHexLower(line[i])) {
+        address = address * 16 + hexDigitValue(line[i])
+        i = i + 1
+    }
+    if (i == 0 || i >= line.size || line[i] != 32) return none
+    i = i + 1
+    val flagsStart = i
+    var count = 0
+    while (count < 7) {
+        if (i >= line.size || line[i] == 10) return none
+        i = i + codePointWidth(line[i])
+        count = count + 1
+    }
+    if (i > line.size) return none
+    val flags = line.slice(flagsStart, i)
+    if (i >= line.size || line[i] != 32) return none
+    i = i + 1
+    val sectionStart = i
+    while (i < line.size && !recoveryIsSpace(line[i])) i = i + 1
+    if (i == sectionStart) return none
+    val section = line.slice(sectionStart, i)
+    val gap = i
+    while (i < line.size && recoveryIsSpace(line[i])) i = i + 1
+    if (i == gap) return none
+    val sizeStart = i
+    while (i < line.size && recoveryIsHexLower(line[i])) i = i + 1
+    if (i == sizeStart || i >= line.size || line[i] != 32) return none
+    i = i + 1
+    val nameStart = i
+    while (i < line.size && !recoveryIsSpace(line[i])) i = i + 1
+    if (i == nameStart || i != line.size) return none
+    SymbolLine(true, address, flags, section, line.slice(nameStart, i))
+}
+
+class FunctionSymbols(val names: array<string>, val global: Map<string, bool>)
+
+// Executable function symbols mapped to whether they are global (or weak).
+fun objectFunctions(objdump: array<string>, obj: string): FunctionSymbols {
+    val names: array<string> = []
+    val global: Map<string, bool> = Map()
+    val text = runChecked(withArguments(objdump, ["-t", obj]), "")
+    for (line in recoverySplitLines(text)) {
+        val m = parseSymbolLine(line)
+        if (m.ok && m.flags.indexOf("F") >= 0) {
+            if (!global.has(m.name)) names.append(m.name)
+            global.set(m.name, m.flags.indexOf("g") >= 0 || m.flags.indexOf("w") >= 0)
+        }
+    }
+    FunctionSymbols(names, global)
+}
+
+fun weakFunctions(objdump: array<string>, obj: string): array<string> {
+    val found: array<string> = []
+    val text = runChecked(withArguments(objdump, ["-t", obj]), "")
+    for (line in recoverySplitLines(text)) {
+        val m = parseSymbolLine(line)
+        if (m.ok && m.flags.indexOf("F") >= 0 && m.flags.indexOf("w") >= 0) found.append(m.name)
+    }
+    sortedStrings(uniqueStrings(found))
+}
+
+fun uniqueStrings(values: array<string>): array<string> {
+    val seen: Map<string, bool> = Map()
+    val out: array<string> = []
+    for (value in values) {
+        if (!seen.has(value)) {
+            seen.set(value, true)
+            out.append(value)
+        }
+    }
+    out
+}
+
+class DataSymbols(val names: array<string>, val options: Map<string, string>)
+
+// Global and weak data objects the member defines -> reconstruct option.
+fun objectData(objdump: array<string>, obj: string, common: bool): DataSymbols {
+    val names: array<string> = []
+    val options: Map<string, string> = Map()
+    val text = runChecked(withArguments(objdump, ["-t", obj]), "")
+    for (line in recoverySplitLines(text)) {
+        val m = parseSymbolLine(line)
+        if (!m.ok) continue
+        var option = ""
+        if (common && m.section == "*COM*") {
+            // Common symbols are linker-allocated; the unit must own them.
+            option = "--global-data"
+        } else if (m.flags.indexOf("O") >= 0 && m.section != "*UND*") {
+            if (m.flags.indexOf("w") >= 0) option = "--weak-data"
+            else if (m.flags.indexOf("g") >= 0) option = "--global-data"
+        }
+        if (option != "") {
+            if (!options.has(m.name)) names.append(m.name)
+            options.set(m.name, option)
+        }
+    }
+    DataSymbols(names, options)
+}
+
+// Code sections holding a static function that has no symbol of its own (GCC keeps only the
+// section symbol for some static helpers and `$constprop`/`$isra` clones); their entry follows
+// the in-section literal pool. reconstruct-xtensa-object recovers them as standalone locals.
+fun symbollessCodeSections(objdump: array<string>, obj: string): array<string> {
+    val headers = runChecked(withArguments(objdump, ["-h", obj]), "")
+    val lines = recoverySplitLines(headers)
+    val code: array<string> = []
+    var number = 0
+    while (number < lines.size) {
+        val fields = recoverySplitWhitespace(lines[number])
+        if (fields.size >= 7 && allDigits(fields[0]) && number + 1 < lines.size &&
+            lines[number + 1].indexOf("CODE") >= 0) {
+            if (parseHexNumber(fields[2]) != 0) code.append(fields[1])
+        }
+        number = number + 1
+    }
+    val table = runChecked(withArguments(objdump, ["-t", obj]), "")
+    val owned: Map<string, bool> = Map()
+    for (line in recoverySplitLines(table)) {
+        val m = parseSymbolLine(line)
+        // the sections that hold a function symbol (group 2 of the symbol regex)
+        if (m.ok && m.flags.indexOf("F") >= 0) owned.set(m.section, true)
+    }
+    val out: array<string> = []
+    for (section in code) if (!owned.has(section)) out.append(section)
+    out
+}
+
+fun allDigits(text: string): bool {
+    if (text.size == 0) return false
+    for (c in text) if (c < 48 || c > 57) return false
+    true
+}
+
+fun parseHexNumber(text: string): int {
+    var value = 0
+    for (c in text) {
+        if (!recoveryIsHex(c)) return 0
+        value = value * 16 + hexDigitValue(if (c >= 65 && c <= 70) c + 32 else c)
+    }
+    value
+}
+
+fun hexString(value: int): string {
+    if (value == 0) return "0"
+    val digits = "0123456789abcdef"
+    var text = ""
+    var rest = value
+    while (rest > 0) {
+        text = digits.slice(rest & 15, (rest & 15) + 1) + text
+        rest = rest >> 4
+    }
+    text
+}
+
+// ------------------------------------------------------------ text rewrites of the lifted module
+
+// The `.long function+0xOFFSET` code-offset table rewrite: returns the entries without a label.
+// Switch tables of functions that stay raw assembly hold absolute offsets into the original
+// code. Reassembly changes the layout (calls recovered as `movi`+`callx8`, relaxed branches), so
+// an offset would land mid-function; the reconstruction's `.Labla_recovered_<function>_<offset>`
+// labels keep the target exact.
+fun labelCodeOffsetTables(module: string, objdump: array<string>, obj: string): array<string> {
+    val text = runChecked(withArguments(objdump, ["-t", obj]), "")
+    val starts: Map<string, int> = Map()
+    for (line in recoverySplitLines(text)) {
+        val m = parseSymbolLine(line)
+        if (m.ok && m.flags.indexOf("F") >= 0) starts.set(m.name, m.address)
+    }
+    val source = recoveryReadText(Path(module))
+    val missing: array<string> = []
+    val out = byteBuffer()
+    var changed = false
+    var copied = 0
+    var from = 0
+    while (true) {
+        val at = source.indexOf(".long ", from)
+        if (at < 0) break
+        // [A-Za-z_][\w$.]*\+0x([0-9a-f]+)\b
+        var i = at + 6
+        var matched = false
+        var name = ""
+        var offset = 0
+        var end = 0
+        if (i < source.size && isIdentifierStart(source[i])) {
+            val nameStart = i
+            i = i + 1
+            while (i < source.size && (recoveryIsWord(source[i]) || source[i] == 36 || source[i] == 46)) i = i + 1
+            if (i + 2 < source.size && source[i] == 43 && source[i + 1] == 48 && source[i + 2] == 120) {
+                val digits = i + 3
+                var j = digits
+                while (j < source.size && recoveryIsHexLower(source[j])) j = j + 1
+                if (j > digits && (j >= source.size || !recoveryIsWord(source[j]))) {
+                    matched = true
+                    name = source.slice(nameStart, i)
+                    offset = parseHexNumber(source.slice(digits, j))
+                    end = j
+                }
+            }
+        }
+        if (!matched) {
+            from = at + 1
+            continue
+        }
+        from = end
+        val start = starts.get(name)
+        if (start == null) continue
+        val safe = recoverySanitize(name)
+        val label = ".Labla_recovered_${safe}_${hexString(start + offset)}"
+        if (source.indexOf("\n$label:") < 0) {
+            // No labels at all: the function was lifted and its switch lowered to `when`,
+            // leaving this table unused.
+            if (source.indexOf("\n.Labla_recovered_${safe}_") >= 0) missing.append("$name+0x${hexString(offset)}")
+            continue
+        }
+        out.appendText(source.slice(copied, at))
+        out.appendText(".long $label")
+        copied = end
+        changed = true
+    }
+    if (changed) {
+        out.appendText(source.slice(copied, source.size))
+        Path(module).writeText(out.toText())
+    }
+    missing
+}
+
+// Whether a lifted function still jumps through a loaded code-address table: the pattern
+// `(rA << u32(2)) + rB\n` `rC = u32(ablaUnsafeLoadU32(...\n` then, within 8 more lines,
+// `return u32(ablaUnsafeCall...(int(rC`.
+fun bodyJumpsThroughTable(body: string): bool {
+    var from = 0
+    while (true) {
+        val at = body.indexOf("(r", from)
+        if (at < 0) return false
+        from = at + 1
+        var i = at + 2
+        val digits = i
+        while (i < body.size && recoveryIsDigit(body[i])) i = i + 1
+        if (i == digits) continue
+        val middle = " << u32(2)) + r"
+        if (!(body.slice(i, if (i + middle.size > body.size) body.size else i + middle.size) == middle)) continue
+        i = i + middle.size
+        val second = i
+        while (i < body.size && recoveryIsDigit(body[i])) i = i + 1
+        if (i == second || i >= body.size || body[i] != 10) continue
+        i = i + 1
+        while (i < body.size && recoveryIsSpace(body[i])) i = i + 1
+        if (i >= body.size || body[i] != 114) continue
+        val registerStart = i
+        i = i + 1
+        val registerDigits = i
+        while (i < body.size && recoveryIsDigit(body[i])) i = i + 1
+        if (i == registerDigits) continue
+        val register = body.slice(registerStart, i)
+        val loadPart = " = u32(ablaUnsafeLoadU32("
+        if (!(body.slice(i, if (i + loadPart.size > body.size) body.size else i + loadPart.size) == loadPart)) continue
+        i = i + loadPart.size
+        val lineEnd = body.indexOf("\n", i)
+        if (lineEnd < 0) continue
+        val afterLoad = lineEnd + 1
+        var skipped = 0
+        while (skipped <= 8) {
+            // skip `skipped` whole lines, then \s*return u32(ablaUnsafeCall\w*(int(<register>
+            var p = afterLoad
+            var ok = true
+            var n = 0
+            while (n < skipped) {
+                val nl = body.indexOf("\n", p)
+                if (nl < 0) {
+                    ok = false
+                    break
+                }
+                p = nl + 1
+                n = n + 1
+            }
+            if (!ok) break
+            while (p < body.size && recoveryIsSpace(body[p])) p = p + 1
+            val call = "return u32(ablaUnsafeCall"
+            if (body.slice(p, if (p + call.size > body.size) body.size else p + call.size) == call) {
+                p = p + call.size
+                while (p < body.size && recoveryIsWord(body[p])) p = p + 1
+                val tail = "(int(" + register + ")"
+                if (body.slice(p, if (p + tail.size > body.size) body.size else p + tail.size) == tail) return true
+            }
+            skipped = skipped + 1
+        }
+    }
+    false
+}
+
+// Lifted functions that still jump through a loaded code-address table. Such a jump treats an
+// intra-function target as a call target and lands mid-function at run time;
+// lower-recovered-jump-tables must handle it.
+fun unloweredTableJumps(module: string): array<string> {
+    val found: array<string> = []
+    val text = recoveryReadText(Path(module))
+    // Line starts that begin "trusted fun ": a function body runs to the next one.
+    val starts: array<int> = []
+    var at = 0
+    while (at <= text.size) {
+        val isStart = at == 0 || text[at - 1] == 10
+        if (isStart && text.slice(at, if (at + 12 > text.size) text.size else at + 12) == "trusted fun ") starts.append(at)
+        val next = text.indexOf("\n", at)
+        if (next < 0) break
+        at = next + 1
+    }
+    var index = 0
+    while (index < starts.size) {
+        val start = starts[index]
+        val end = if (index + 1 < starts.size) starts[index + 1] else text.size
+        // `trusted fun (\w+)\(` : the name must be word characters up to `(`
+        var i = start + 12
+        while (i < end && recoveryIsWord(text[i])) i = i + 1
+        if (i > start + 12 && i < end && text[i] == 40) {
+            val body = text.slice(start, end)
+            val firstLineEnd = body.indexOf("\n")
+            val firstLine = if (firstLineEnd < 0) body else body.slice(0, firstLineEnd)
+            if (firstLine.indexOf("\$xtensa instructions") < 0 && bodyJumpsThroughTable(body)) {
+                found.append(text.slice(start + 12, i))
+            }
+        }
+        index = index + 1
+    }
+    found
+}
+
+// Index just past the parenthesized call whose `(` is at text[start]; -1 when unbalanced.
+fun callSpan(text: string, start: int): int {
+    var depth = 0
+    var index = start
+    while (index < text.size) {
+        if (text[index] == 40) {
+            depth = depth + 1
+        } else if (text[index] == 41) {
+            depth = depth - 1
+            if (depth == 0) return index + 1
+        }
+        index = index + 1
+    }
+    -1
+}
+
+fun hasPrefixAt(text: string, at: int, prefix: string): bool =
+    at >= 0 && at + prefix.size <= text.size && text.slice(at, at + prefix.size) == prefix
+
+// Makes the memory access that follows each `memw` volatile.
+//
+// GCC's Xtensa back end emits MEMW right before every volatile access, which is how ESP-IDF
+// reaches peripheral registers. Lifted plain loads let LLVM narrow or merge them (a masked
+// 32-bit register read became a 16-bit `l16ui` that the S3 MAC does not support); volatile
+// accesses keep the exact width, count and order. LLVM's Xtensa back end itself puts a MEMW
+// right before every volatile access, so the barrier is dropped when only plain register
+// arithmetic separates it from the (sole) access of the line: the emitted code is then GCC's
+// `memw; access` instead of `memw; memw; access`.
+fun volatileAfterMemoryBarriers(module: string): int {
+    val lines = recoverySplitLines(recoveryReadText(Path(module)))
+    var pending = false
+    var barrier = -1
+    var plainSinceBarrier = false
+    val drop: Map<int, bool> = Map()
+    var changed = 0
+    var index = 0
+    while (index < lines.size) {
+        val line = lines[index]
+        val stripped = recoveryStrip(line)
+        if (stripped == "xtensaMemoryBarrier()") {
+            pending = true
+            barrier = index
+            plainSinceBarrier = true
+            index = index + 1
+            continue
+        }
+        if ((stripped.startsWith("trusted fun ") || stripped.startsWith("}")) && !stripped.startsWith("} else")) {
+            pending = false
+        }
+        if (!pending) {
+            index = index + 1
+            continue
+        }
+        val match = RM_ACCESS.find(line)
+        if (match == null) {
+            var arithmetic = false
+            if (RM_ARITHMETIC.matches(line) && line.indexOf("ablaUnsafe") < 0 && line.indexOf("\$xtensa") < 0) {
+                val eq = line.indexOf("=")
+                val rhs = line.slice(eq + 1, line.size).replace("u32(", "").replace("u64(", "")
+                arithmetic = rhs.indexOf("(") < 0
+            }
+            if (!arithmetic) plainSinceBarrier = false
+            index = index + 1
+            continue
+        }
+        pending = false
+        if (plainSinceBarrier && recoveryCount(line, "ablaUnsafe") == 1) drop.set(barrier, true)
+        val kind = match.group(1) ?? ""
+        val bits = match.group(2) ?? ""
+        val pointerName = "nativePointerFromAddress"
+        val callOpen = match.end() - pointerName.size - 1 - 1
+        val callEnd = callSpan(line, callOpen)
+        if (callEnd < 0) fatal("recover-member: unbalanced call in $module line ${index + 1}")
+        val inner = line.slice(callOpen + 1, callEnd - 1)
+        val pointerEnd = callSpan(inner, pointerName.size)
+        if (pointerEnd < 0) fatal("recover-member: unbalanced call in $module line ${index + 1}")
+        val address = inner.slice(pointerName.size + 1, pointerEnd - 1)
+        val rest = inner.slice(pointerEnd, inner.size)
+        lines[index] = line.slice(0, match.start()) + "ablaUnsafeVolatile${kind}U$bits($address$rest)" +
+            line.slice(callEnd, line.size)
+        changed = changed + 1
+        index = index + 1
+    }
+    if (changed > 0) {
+        val kept: array<string> = []
+        var i = 0
+        while (i < lines.size) {
+            if (!drop.has(i)) kept.append(lines[i])
+            i = i + 1
+        }
+        var text = kept.join("\n") + "\n"
+        if (text.indexOf("import \"abla/unsafe/mmio\"") < 0) text = "import \"abla/unsafe/mmio\"\n" + text
+        Path(module).writeText(text)
+    }
+    changed
+}
+
+// Routes `symbol+addend` literals in raw assembly through `.set` aliases. LLVM 23.1's Xtensa
+// text streamer crashes emitting a literal whose value is `symbol+addend` (`movi aN, sym+5`,
+// `.literal L, sym+5`). A local alias keeps the literal a single symbol while the object still
+// carries the relocation `sym+5`, so the addend survives linker section merging and placement
+// exactly as in the original object.
+fun aliasSymbolAddends(module: string, namespace: string): void {
+    var counter = 0
+    val out: array<string> = []
+    for (line0 in recoverySplitLines(recoveryReadText(Path(module)))) {
+        var line = line0
+        // the pattern starts with `movi` or `.literal`: skip the regex for other lines
+        if (line.startsWith("movi") || line.startsWith(".literal")) {
+            val match = RM_ADDEND.find(line)
+            if (match != null) {
+                val alias = ".Labla_addend_${namespace}_$counter"
+                counter = counter + 1
+                out.append(".set $alias, ${match.group(2) ?? ""}")
+                line = (match.group(1) ?? "") + alias
+            }
+        }
+        out.append(line)
+    }
+    Path(module).writeText(out.join("\n") + "\n")
+    return
+}
+
+
+// Replaces `exportFunction("<word>", "name")` with `requiredInternalFunction("<word>", "internal")`.
+// Returns the new text; `count` says how many selectors changed.
+class ExportRename(val text: string, val count: int)
+
+fun renameExportSelector(text: string, name: string, internal: string): ExportRename {
+    val opening = "exportFunction(\""
+    val tail = "\", \"" + name + "\")"
+    val out = byteBuffer()
+    var count = 0
+    var copied = 0
+    var from = 0
+    while (true) {
+        val at = text.indexOf(opening, from)
+        if (at < 0) break
+        var i = at + opening.size
+        val wordStart = i
+        while (i < text.size && recoveryIsWord(text[i])) i = i + 1
+        if (i > wordStart && hasPrefixAt(text, i, tail)) {
+            out.appendText(text.slice(copied, at))
+            out.appendText("requiredInternalFunction(\"${text.slice(wordStart, i)}\", \"$internal\")")
+            copied = i + tail.size
+            from = copied
+            count = count + 1
+        } else {
+            from = at + 1
+        }
+    }
+    if (count == 0) return ExportRename(text, 0)
+    out.appendText(text.slice(copied, text.size))
+    ExportRename(out.toText(), count)
+}
+
+// Publishes weak functions as weak definitions, not strong exports. ESP-IDF overrides some
+// (adc2_wifi_acquire, ieee80211_ftm_attach, ...) with strong C definitions. Each recovered body
+// gets an internal name and a `.weak name; .set name, internal` alias; calls keep using the ABI
+// symbol, so the linker still prefers a strong definition when one exists.
+fun keepWeakFunctionsWeak(module: string, link: string, weak: array<string>, namespace: string): void {
+    if (weak.size == 0 || !Path(link).exists()) return
+    var text = recoveryReadText(Path(link))
+    val aliases: array<string> = []
+    for (name in weak) {
+        val internal = "abla_weak_$name"
+        val renamed = renameExportSelector(text, name, internal)
+        if (renamed.count == 0) continue
+        text = renamed.text
+        aliases.append(".weak $name")
+        aliases.append(".set $name, $internal")
+    }
+    if (aliases.size == 0) return
+    val holder = "esp32Recovered${namespace}WeakAliases"
+    text = recoveryReplaceFirst(text, "    true\n}",
+        "    if (!requiredInternalFunction(\"$holder\", \"abla_weak_aliases_$namespace\")) return false\n    true\n}")
+    Path(link).writeText(text)
+    Path(module).appendText("\n// Weak ABI definitions; strong ESP-IDF definitions take precedence.\n" +
+        "@naked\ntrusted fun $holder(): void = \$xtensa instructions {\n" + aliases.join("\n") + "\nret.n\n}\n")
+    return
+}
+
+// Renames each `val callResultN` declaration uniquely within its function. The lifter numbers
+// call results per basic block; structurizing can merge two blocks into one scope. Each result
+// is read right after its call, so uses bind to the most recent declaration.
+fun uniqueCallResults(module: string): void {
+    val out: array<string> = []
+    var current: Map<string, string> = Map()
+    var counter = 0
+    for (line0 in recoverySplitLines(recoveryReadText(Path(module)))) {
+        var line = line0
+        if (line.indexOf("trusted fun ") >= 0 && RM_ABLA_FUNCTION.find(recoveryStrip(line)) != null) {
+            current = Map()
+            counter = 0
+        }
+        val declared = if (line.indexOf("val callResult") >= 0) RM_CALL_RESULT_DECL.find(line) else null
+        if (declared != null) {
+            counter = counter + 1
+            val old = declared.group(2) ?? ""
+            current.set(old, "callResult$counter")
+            line = recoveryReplaceFirst(line, "val $old", "val callResult$counter")
+        } else if (line.indexOf("callResult") >= 0) {
+            val out2 = byteBuffer()
+            var last = 0
+            for (m in RM_CALL_RESULT.findAll(line)) {
+                out2.appendText(line.slice(last, m.start()))
+                val word = m.text0()
+                out2.appendText(current.get(word) ?? word)
+                last = m.end()
+            }
+            out2.appendText(line.slice(last, line.size))
+            line = out2.toText()
+        }
+        out.append(line)
+    }
+    Path(module).writeText(out.join("\n") + "\n")
+    return
+}
+
+// Ends u32 functions whose structured body can reach the closing brace. Structurizing keeps only
+// the dispatcher states the original reaches; the leftover fall-through is unreachable. Make
+// that explicit the same way the lifter does for noreturn functions.
+fun terminateFallthrough(module: string): void {
+    val lines = recoverySplitLines(recoveryReadText(Path(module)))
+    val out: array<string> = []
+    var returnsU32 = false
+    val suffix = ": u32 {"
+    for (line in lines) {
+        if (line.startsWith("trusted fun ")) returnsU32 = false
+        // `^\)?(?:.*\))?: u32 \{$` (and `^trusted fun \w+\(.*\): u32 \{$`, which it contains)
+        if (line.endsWith(suffix)) {
+            val prefix = line.slice(0, line.size - suffix.size)
+            if (prefix == "" || prefix.endsWith(")")) returnsU32 = true
+        }
+        if (line == "}" && returnsU32) {
+            var previous = ""
+            var i = out.size - 1
+            while (i >= 0) {
+                if (recoveryStrip(out[i]) != "") {
+                    previous = out[i]
+                    break
+                }
+                i = i - 1
+            }
+            if (RM_FALLTHROUGH_PREVIOUS.find(previous) == null) {
+                out.append("    ablaRuntimeTrap()")
+                out.append("    return r2")
+            }
+            returnsU32 = false
+        }
+        out.append(line)
+    }
+    Path(module).writeText(out.join("\n") + "\n")
+    return
+}
+
+// `text` with every whole word (a maximal run of word characters) found in `renames` replaced.
+fun replaceWords(text: string, renames: Map<string, string>): string {
+    val out = byteBuffer()
+    var copied = 0
+    var i = 0
+    while (i < text.size) {
+        if (recoveryIsWord(text[i]) && (i == 0 || !recoveryIsWord(text[i - 1]))) {
+            var j = i + 1
+            while (j < text.size && recoveryIsWord(text[j])) j = j + 1
+            val replacement = renames.get(text.slice(i, j))
+            if (replacement != null) {
+                out.appendText(text.slice(copied, i))
+                out.appendText(replacement)
+                copied = j
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    out.appendText(text.slice(copied, text.size))
+    out.toText()
+}
+
+// Gives member-local helpers member-specific Abla names. GCC copies some static helpers into
+// several objects; their linker labels are namespaced already, so name the Abla functions the
+// same way to keep one assembled unit free of duplicate declarations.
+fun namespaceLocalFunctions(module: string, link: string, namespace: string): void {
+    if (!Path(link).exists()) return
+    val renames: Map<string, string> = Map()
+    for (m in RM_LOCAL_SELECTION.findAll(recoveryReadText(Path(link)))) {
+        val name = m.group(1) ?? ""
+        if (name.startsWith("esp32Recovered") && !renames.has(name)) {
+            renames.set(name, recoveryReplaceFirst(name, "esp32Recovered", "esp32Recovered$namespace"))
+        }
+    }
+    if (renames.size == 0) return
+    for (path in [module, link]) Path(path).writeText(replaceWords(recoveryReadText(Path(path)), renames))
+}
+
+// Imports the `$xtensa` subparser and memory helpers the passes emit.
+fun addImports(module: string, root: string): void {
+    val src = recoveryRelativePath(root + "/src", Path(module).parent().text)
+    val header = ["import \"$src/xtensa/assembly.ab\"", "import \"$src/runtime/freestanding_memory.ab\"",
+        "import \"abla/unsafe/native\"", "import \"abla/unsafe/memory\""]
+    val text = recoveryReadText(Path(module))
+    val parts: array<string> = []
+    for (line in header) if (text.indexOf(line) < 0) parts.append(line)
+    if (parts.size > 0) {
+        parts.append(text)
+        Path(module).writeText(parts.join("\n"))
+    } else {
+        Path(module).writeText(text)
+    }
+    return
+}
+
+// Whether `text` has a line starting with "error[".
+fun countErrorLines(log: string): int {
+    var count = 0
+    var at = 0
+    while (at <= log.size) {
+        if ((at == 0 || log[at - 1] == 10) && hasPrefixAt(log, at, "error[")) count = count + 1
+        val next = log.indexOf("\n", at)
+        if (next < 0) break
+        at = next + 1
+    }
+    count
+}
+
+// Compiles the lifted member and its link selectors to an Xtensa object; the number of errors.
+fun compileCheck(root: string, chip: string, work: string, selector: string): int {
+    val directory = work + "/compile"
+    Path(directory).createDirectories()
+    Path(directory + "/main.ab").writeText("import \"../lifted.ab\"\nimport \"../link.ab\"\n\n#$selector()\n")
+    Path(directory + "/build.ab").writeText(
+        "import \"abla/compiler\"\n\n" +
+        "val target = #compilerDefineTarget(\"esp32-xtensa\", \"xtensa-esp-unknown-elf\", \"elf\", \"none\", \"none\", false, false)\n" +
+        "val built = #compilerBuildProgram(\"recovery-check\", \"main.ab\", \"member.o\", \"esp32-xtensa\", \"object\", false, false)\n\n" +
+        "fun main: int = if (target && built) 0 else 1\n")
+    val compiler = recoveryAblacEnvironment(root, chip)
+    if (compiler.error != "") fatal("recover-member: ${compiler.error}")
+    val script = "ulimit -s 131072; \"${compiler.binary}\" build build.ab -o driver && ./driver"
+    val result = recoveryCapture(["bash", "-c", script], directory, compiler.names, compiler.values)
+    var log = result.output + result.errors
+    if (log.size > 2000000) log = log.slice(log.size - 2000000, log.size)
+    Path(work + "/compile.log").writeText(log)
+    if (result.status == 0 && Path(directory + "/member.o").exists()) return 0
+    val errors = countErrorLines(log)
+    if (errors < 1) 1 else errors
+}
+
+// ABI symbol -> path:line of the reference chip's recovered Abla. Link selectors
+// (`internalFunction("abla", "symbol")`) name the Abla function that owns each ABI symbol;
+// hand-renamed modules are found too.
+fun recoveredAblaIndex(root: string): Map<string, string> {
+    val ownerSymbols: array<string> = []
+    val owners: Map<string, string> = Map()
+    val definitions: Map<string, string> = Map()
+    for (path in recoveryRglob(root + "/src", ".ab")) {
+        val relative = recoveryRelativePath(path, root)
+        val lines = recoverySplitLines(recoveryReadText(Path(path)))
+        var number = 1
+        for (line in lines) {
+            if (line.indexOf("Function(\"") >= 0) {
+                for (m in RM_SELECTOR.findAll(line)) {
+                    val symbol = m.group(2) ?? ""
+                    if (!owners.has(symbol)) {
+                        owners.set(symbol, m.group(1) ?? "")
+                        ownerSymbols.append(symbol)
+                    }
+                }
+            }
+            if (line.indexOf("trusted fun ") >= 0) {
+                val m = RM_ABLA_FUNCTION.find(recoveryStrip(line))
+                if (m != null) {
+                    val name = m.group(1) ?? ""
+                    if (!definitions.has(name)) definitions.set(name, "$relative:$number")
+                }
+            }
+            number = number + 1
+        }
+    }
+    val index: Map<string, string> = Map()
+    for (symbol in ownerSymbols) {
+        val location = definitions.get(owners.get(symbol) ?? "")
+        if (location != null) index.set(symbol, location)
+    }
+    index
+}
+
+fun classify(reference: Map<string, array<string>>?, ours: Map<string, array<string>>, name: string): string {
+    if (reference == null) return "new"
+    val a = reference.get(name)
+    if (a == null) return "new"
+    val b = ours.get(name)
+    if (b == null) return "new"
+    if (compareSameSequence(a, b)) return "identical"
+    if (compareReordered(a, b)) return "reordered"
+    if (compareSameCounts(compareCoarse(a), compareCoarse(b))) return "layout"
+    "different"
+}
+
+// "esp32Recovered" + the alphanumeric words of `name` with their first letter capitalised
+// (reconstruct-xtensa-object's abla_function_name).
+fun ablaFunctionName(name: string): string {
+    val parts: array<string> = ["esp32Recovered"]
+    var i = 0
+    while (i < name.size) {
+        val c = name[i]
+        val alnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        if (!alnum) {
+            i = i + 1
+            continue
+        }
+        parts.append(if (c >= 97 && c <= 122) byteString(c - 32) else byteString(c))
+        i = i + 1
+        while (i < name.size) {
+            val d = name[i]
+            if (!((d >= 48 && d <= 57) || (d >= 65 && d <= 90) || (d >= 97 && d <= 122))) break
+            parts.append(byteString(d))
+            i = i + 1
+        }
+    }
+    parts.join("")
+}
+
+// Python's str.title() on ASCII text, then only letters and digits kept.
+fun titleAlphanumeric(text: string): string {
+    val parts: array<string> = []
+    var previousLetter = false
+    for (c in text) {
+        val upper = c >= 65 && c <= 90
+        val lower = c >= 97 && c <= 122
+        if (upper || lower) {
+            val cased = if (previousLetter) (if (upper) c + 32 else c) else (if (lower) c - 32 else c)
+            parts.append(byteString(cased))
+            previousLetter = true
+        } else {
+            if (c >= 48 && c <= 57) parts.append(byteString(c))
+            previousLetter = false
+        }
+    }
+    parts.join("")
+}
+
+// str.capitalize() on ASCII text.
+fun capitalize(text: string): string {
+    if (text.size == 0) return text
+    text.slice(0, 1).uppercase() + text.slice(1, text.size).lowercase()
+}
+
+// Runs the lifting passes until a round changes nothing; returns the rounds used.
+fun lift(root: string, source: string, rounds: int, log: string, obj: string, objdump: array<string>): int {
+    val tool = root + "/tools/abla-tool"
+    val passes: array<array<string>> = [
+        ["migrate-xtensa-recovered-blocks"],
+        // ABI-named data stays assembler-defined: raw assembly in other members
+        // and the remaining Espressif objects still reference it by name.
+        ["lift-xtensa-leaves-to-abla", "--write", "--keep-global-data", "--resolve-outgoing-stack"],
+        // Switch tables must become `when` flow while functions are still
+        // program-counter dispatchers, i.e. before structurizing.
+        ["lower-recovered-jump-tables", "--write", "--objdump", objdump.join(" "), "--discover", obj],
+        ["lower-xtensa-boundaries-to-abla", "--write"],
+        ["structurize-acyclic-recovered-functions", "--write"]
+    ]
+    Path(log).writeText("")
+    val directory = Path(source).parent().text
+    var number = 1
+    while (number <= rounds) {
+        val before = Path(source).readText()
+        for (command in passes) {
+            Path(log).appendText("== round $number: ${command.join(" ")}\n")
+            val words: array<string> = [tool]
+            for (word in command) words.append(word)
+            words.append(source)
+            val status = recoveryRunLogged(words, directory, log)
+            if (status != 0) Path(log).appendText("(exit $status)\n")
+        }
+        if (Path(source).readText() == before) return number
+        number = number + 1
+    }
+    rounds
+}
+
+class LiftStatus(val names: array<string>, val states: Map<string, string>)
+
+// Abla function name -> `lifted` or `naked` (still raw instructions).
+fun liftedStatus(source: string): LiftStatus {
+    val names: array<string> = []
+    val states: Map<string, string> = Map()
+    for (line in recoverySplitLines(recoveryReadText(Path(source)))) {
+        if (line.indexOf("trusted fun ") < 0) continue
+        val m = RM_ABLA_FUNCTION.find(recoveryStrip(line))
+        if (m != null) {
+            val name = m.group(1) ?? ""
+            if (!states.has(name)) names.append(name)
+            states.set(name, if (line.indexOf("\$xtensa instructions") >= 0) "naked" else "lifted")
+        }
+    }
+    LiftStatus(sortedStrings(names), states)
+}
+
+// ------------------------------------------------------------ the driver
+
+class Options(
+    val chip: string,
+    val archive: string,
+    val member: string,
+    val work: string,
+    val hasWork: bool,
+    val namespace: string,
+    val rounds: int,
+    val classifyOnly: bool,
+    val compileMode: bool
+)
+
+class Summary(
+    val member: string,
+    var functions: int,
+    var reusable: int,
+    val counts: Map<string, int>,
+    var lifted: string,
+    var emitted: string,
+    var rounds: string,
+    var compileResult: string,
+    var error: string
+)
+
+class Row(val name: string, val global: bool, val kind: string, val abla: string, val location: string)
+
+fun relativeToRoot(root: string, path: string): string =
+    if (path.startsWith(root + "/")) path.slice(root.size + 1, path.size) else path
+
+fun countOf(counts: Map<string, int>, key: string): int = counts.get(key) ?? 0
+
+// Recovers one member; returns a summary row for the archive table.
+fun recover(root: string, profile: RecoveryProfile, options: Options, member: string,
+    index: Map<string, string>): Summary {
+    val stem = if (member.endsWith(".o")) member.slice(0, member.size - 2) else member
+    val work = if (options.hasWork) options.work else root + "/build/recovery/" + options.chip + "/" + options.archive + "/" + stem
+    if (Path(work).exists()) Path(work).removeTree()
+    val objdump = recoveryObjdumpCommand(profile)
+    val archivePath = profile.archive(options.archive)
+    val obj = extractMember(archivePath, member, work + "/object")
+    if (obj == "") fatal("recover-member: $member is not in $archivePath")
+
+    val oursResult = compareFunctions(objdump, obj)
+    if (oursResult.error != "") fatal("recover-member: ${oursResult.error}")
+    val ours = oursResult.functions
+    val symbols = objectFunctions(objdump, obj)
+    var reference: Map<string, array<string>>? = null
+    var referenceFound = false
+    if (profile.reference != "") {
+        val referenceProfile = loadProfileOrExit(root, profile.reference)
+        var referenceObj = ""
+        if (referenceProfile.hasArchive(options.archive)) {
+            referenceObj = extractMember(referenceProfile.archive(options.archive), member, work + "/reference")
+        }
+        if (referenceObj != "") {
+            val functions = compareFunctions(recoveryObjdumpCommand(referenceProfile), referenceObj)
+            if (functions.error != "") fatal("recover-member: ${functions.error}")
+            reference = functions.functions
+            referenceFound = true
+        }
+    }
+    val rom = romSymbols(profile)
+    val useIndex = referenceFound
+
+    val rows: array<Row> = []
+    for (name in sortedStrings(symbols.names)) {
+        val kind = if (rom.has(name)) "rom" else classify(reference, ours, name)
+        val abla = ablaFunctionName(name)
+        val location = if (kind != "rom" && useIndex) (index.get(name) ?? "") else ""
+        rows.append(Row(name, symbols.global.get(name) ?? false, kind, abla, location))
+    }
+    val reuse = byteBuffer()
+    reuse.appendText("symbol\tbinding\tclass\tabla\treference_abla\n")
+    for (row in rows) {
+        reuse.appendText("${row.name}\t${if (row.global) "global" else "local"}\t${row.kind}\t${row.abla}\t${row.location}\n")
+    }
+    Path(work + "/reuse.tsv").writeText(reuse.toText())
+    val counts: Map<string, int> = Map()
+    for (row in rows) counts.set(row.kind, countOf(counts, row.kind) + 1)
+    var reusable = 0
+    for (row in rows) if ((row.kind == "identical" || row.kind == "reordered") && row.location != "") reusable = reusable + 1
+    val summary = Summary(member, rows.size, reusable, counts, "", "", "", "", "")
+    val sortedKinds: array<string> = []
+    for (key in sortedStrings(counts.keys())) sortedKinds.append("$key=${countOf(counts, key)}")
+    println("${options.chip} ${options.archive}/$member: ${rows.size} functions, ${sortedKinds.join(", ")}; reusable with existing Abla: $reusable")
+    if (options.classifyOnly) return summary
+
+    val namespace = if (options.namespace != "") options.namespace else titleAlphanumeric(stem) + capitalize(options.chip)
+    val recovered = work + "/recovered.ab"
+    val sections = symbollessCodeSections(objdump, obj)
+    val selector = namespace.slice(0, 1).lowercase() + namespace.slice(1, namespace.size) + "Link"
+    val command: array<string> = [root + "/tools/abla-tool", "reconstruct-xtensa-object", obj]
+    // Locals first, most recent first (the Python inserted each one right after the object).
+    var i = rows.size - 1
+    while (i >= 0) {
+        if (!rows[i].global) command.append(rows[i].name)
+        i = i - 1
+    }
+    for (row in rows) if (row.global && row.kind != "rom") command.append(row.name)
+    for (section in sections) command.append(section)
+    command.append("--objdump")
+    command.append(objdump.join(" "))
+    command.append("--namespace")
+    command.append(namespace)
+    command.append("--output")
+    command.append(recovered)
+    command.append("--link-output")
+    command.append(work + "/link.ab")
+    command.append("--link-selector")
+    command.append(selector)
+    if (!profile.classicCompatibility) command.append("--no-compatibility-symbols")
+    command.append("--symbol-addend-literals")
+    // Until every caller is Abla, the member's global ABI stays linker-visible.
+    if (profile.commonData) command.append("--common-data")
+    val data = objectData(objdump, obj, profile.commonData)
+    for (name in data.names) {
+        command.append(data.options.get(name) ?? "")
+        command.append(name)
+    }
+    for (row in rows) {
+        if (row.global && row.kind != "rom") {
+            command.append("--export-function")
+            command.append(row.name)
+        }
+    }
+    for (row in rows) {
+        if (!row.global) {
+            // Standalone: an own (liftable, prunable) Abla function rather than directives
+            // inside an unrelated anchor.
+            command.append("--standalone-local-function")
+            command.append(row.name)
+        }
+    }
+    for (section in sections) {
+        command.append("--standalone-local-function")
+        command.append(section)
+    }
+    // Data sections get their own anchor function: lifting moves them to Abla unless code that
+    // stays raw assembly still names them.
+    command.append("--synthetic-anchor")
+    command.append("abla_recovered_${namespace}_anchor")
+    command.append("--data-anchor-synthetic")
+    val none: array<string> = []
+    val result = recoveryCapture(command, "", none, none)
+    Path(work + "/reconstruct.log").writeText(result.output + result.errors)
+    if (result.status != 0) {
+        val errorLines = recoverySplitLines(recoveryStrip(result.errors))
+        val last = if (errorLines.size == 0) "?" else errorLines[errorLines.size - 1]
+        println("reconstruct-xtensa-object failed: $last")
+        summary.error = "reconstruct: $last"
+        return summary
+    }
+    // Recovered code reaches data as `label + offset` computed at run time (`movi`+`addi`, or
+    // Abla address arithmetic). The linker may reorder or deduplicate the contents of mergeable
+    // (SHF_MERGE) sections, which would break that arithmetic, so recovered data sections are
+    // never mergeable.
+    val recoveredLines: array<string> = []
+    val recoveredText = recoveryReadText(Path(recovered))
+    for (line in recoveredText.split("\n")) {
+        recoveredLines.append(if (line.indexOf(".pushsection ") >= 0) RM_MERGEABLE.replace(line, "$1,\"a\",@progbits") else line)
+    }
+    Path(recovered).writeText(recoveredLines.join("\n"))
+    val lifted = work + "/lifted.ab"
+    Path(lifted).writeText(Path(recovered).readText())
+    val used = lift(root, lifted, options.rounds, work + "/lift.log", obj, objdump)
+    uniqueCallResults(lifted)
+    volatileAfterMemoryBarriers(lifted)
+    for (name in unloweredTableJumps(lifted)) println("WARNING: $name still jumps through a code-address table")
+    aliasSymbolAddends(lifted, namespace)
+    val unlabeled = labelCodeOffsetTables(lifted, objdump, obj)
+    if (unlabeled.size > 0) println("code-offset table entries without a label: ${unlabeled.join(", ")}")
+    keepWeakFunctionsWeak(lifted, work + "/link.ab", weakFunctions(objdump, obj), namespace)
+    terminateFallthrough(lifted)
+    namespaceLocalFunctions(lifted, work + "/link.ab", namespace)
+    addImports(lifted, root)
+
+    val status = liftedStatus(lifted)
+    val byAbla: Map<string, Row> = Map()
+    for (row in rows) byAbla.set(row.abla, row)
+    val table = byteBuffer()
+    table.appendText("abla\tsymbol\tclass\tstatus\n")
+    var done = 0
+    for (abla in status.names) {
+        val state = status.states.get(abla) ?? ""
+        val row = byAbla.get(abla)
+        table.appendText("$abla\t${if (row == null) "" else row.name}\t${if (row == null) "" else row.kind}\t$state\n")
+    }
+    for (abla in status.names) if ((status.states.get(abla) ?? "") == "lifted") done = done + 1
+    Path(work + "/status.tsv").writeText(table.toText())
+    summary.lifted = "$done"
+    summary.emitted = "${status.names.size}"
+    summary.rounds = "$used"
+    if (options.compileMode) {
+        val errors = compileCheck(root, options.chip, work, selector)
+        summary.compileResult = "$errors"
+        if (errors == 0) println("compiles") else println("compile: $errors error(s); see ${relativeToRoot(root, work + "/compile.log")}")
+    }
+    println("lifted $done of ${status.names.size} functions in $used round(s); output ${relativeToRoot(root, lifted)}")
+    summary
+}
+
+fun usageText(): string =
+    "usage: recover-member [-h] [--work WORK] [--namespace NAMESPACE] [--rounds ROUNDS]\n" +
+    "                      [--classify-only] [--compile]\n" +
+    "                      chip archive member"
+
+fun helpText(): string =
+    usageText() + "\n\n" +
+    "Recover one Espressif archive member to Abla for a chip profile.\n\n" +
+    "positional arguments:\n" +
+    "  chip\n" +
+    "  archive               archive key from the profile, e.g. libnet80211\n" +
+    "  member                object file inside the archive, e.g. wl_chm.o, or `all`\n\n" +
+    "options:\n" +
+    "  -h, --help            show this help message and exit\n" +
+    "  --work WORK           work directory for one member (default build/recovery/...)\n" +
+    "  --namespace NAMESPACE\n" +
+    "                        assembler-local namespace (default from the member name)\n" +
+    "  --rounds ROUNDS       maximum lifting rounds\n" +
+    "  --classify-only       stop after reuse.tsv\n" +
+    "  --compile             compile the lifted member with ablac"
+
+class ParsedOptions(val options: Options, val error: string, val help: bool)
+
+fun looksLikeNumber(text: string): bool {
+    if (text.size < 2 || text[0] != 45) return false
+    allDigits(text.slice(1, text.size))
+}
+
+// Resolves a long option the way argparse does: exact, else a unique prefix. "" when unknown,
+// "?" when ambiguous.
+fun resolveOption(word: string): string {
+    val known = ["--help", "--work", "--namespace", "--rounds", "--classify-only", "--compile"]
+    for (name in known) if (name == word) return name
+    var found = ""
+    var count = 0
+    for (name in known) {
+        if (name.startsWith(word)) {
+            found = name
+            count = count + 1
+        }
+    }
+    if (count == 1) found else if (count > 1) "?" else ""
+}
+
+fun parseOptions(): ParsedOptions {
+    val blank = Options("", "", "", "", false, "", 6, false, false)
+    val positional: array<string> = []
+    val unrecognized: array<string> = []
+    var work = ""
+    var hasWork = false
+    var namespace = ""
+    var rounds = 6
+    var classifyOnly = false
+    var compileMode = false
+    val count = processArgumentCount()
+    var i = 0
+    var onlyPositional = false
+    while (i < count) {
+        val word = processArgument(i)
+        i = i + 1
+        if (onlyPositional || !word.startsWith("-") || word == "-" || looksLikeNumber(word)) {
+            positional.append(word)
+            continue
+        }
+        if (word == "--") {
+            onlyPositional = true
+            continue
+        }
+        var option = word
+        var inline = ""
+        var hasInline = false
+        if (word.startsWith("--")) {
+            val equals = word.indexOf("=")
+            if (equals >= 0) {
+                option = word.slice(0, equals)
+                inline = word.slice(equals + 1, word.size)
+                hasInline = true
+            }
+            val resolved = resolveOption(option)
+            if (resolved == "?") return ParsedOptions(blank, "ambiguous option: $option could match --classify-only, --compile", false)
+            if (resolved == "") {
+                unrecognized.append(word)
+                continue
+            }
+            option = resolved
+        } else if (word == "-h") {
+            option = "--help"
+        } else {
+            unrecognized.append(word)
+            continue
+        }
+        if (option == "--help") return ParsedOptions(blank, "", true)
+        if (option == "--classify-only" || option == "--compile") {
+            if (hasInline) return ParsedOptions(blank, "argument $option: ignored explicit argument '$inline'", false)
+            if (option == "--compile") compileMode = true else classifyOnly = true
+            continue
+        }
+        var value = inline
+        if (!hasInline) {
+            if (i >= count || (processArgument(i).startsWith("-") && processArgument(i) != "-" &&
+                !looksLikeNumber(processArgument(i)))) {
+                return ParsedOptions(blank, "argument $option: expected one argument", false)
+            }
+            value = processArgument(i)
+            i = i + 1
+        }
+        if (option == "--work") {
+            work = value
+            hasWork = true
+        } else if (option == "--namespace") {
+            namespace = value
+        } else {
+            if (!parseDecimal(value)) return ParsedOptions(blank, "argument --rounds: invalid int value: '$value'", false)
+            rounds = decimalValue(value)
+        }
+    }
+    if (positional.size < 3) {
+        val names = ["chip", "archive", "member"]
+        val missing: array<string> = []
+        var k = positional.size
+        while (k < 3) {
+            missing.append(names[k])
+            k = k + 1
+        }
+        return ParsedOptions(blank, "the following arguments are required: ${missing.join(", ")}", false)
+    }
+    while (positional.size > 3) {
+        unrecognized.append(positional[positional.size - 1])
+        positional.truncate(positional.size - 1)
+    }
+    if (unrecognized.size > 0) {
+        return ParsedOptions(blank, "unrecognized arguments: ${unrecognized.join(" ")}", false)
+    }
+    ParsedOptions(Options(positional[0], positional[1], positional[2], work, hasWork, namespace, rounds,
+        classifyOnly, compileMode), "", false)
+}
+
+fun parseDecimal(text: string): bool {
+    var t = text
+    if (t.startsWith("-") || t.startsWith("+")) t = t.slice(1, t.size)
+    allDigits(t)
+}
+
+fun decimalValue(text: string): int {
+    var negative = false
+    var t = text
+    if (t.startsWith("-")) {
+        negative = true
+        t = t.slice(1, t.size)
+    } else if (t.startsWith("+")) {
+        t = t.slice(1, t.size)
+    }
+    var value = 0
+    for (c in t) value = value * 10 + (c - 48)
+    if (negative) -value else value
+}
+
+fun main: int {
+    val root = recoveryRoot()
+    val parsed = parseOptions()
+    if (parsed.help) {
+        println(helpText())
+        return 0
+    }
+    if (parsed.error != "") {
+        eprintln(usageText())
+        eprintln("recover-member: error: ${parsed.error}")
+        return 2
+    }
+    val options = parsed.options
+    val profile = loadProfileOrExit(root, options.chip)
+    if (!profile.hasArchive(options.archive)) {
+        fatal("recover-member: ${options.chip} has no archive ${options.archive}; " +
+            "known: ${sortedStrings(profile.archiveNames).join(", ")}")
+    }
+    val index = if (profile.reference != "") recoveredAblaIndex(root) else Map<string, string>()
+    if (options.member != "all") {
+        val summary = recover(root, profile, options, options.member, index)
+        return if (summary.error != "") 1 else 0
+    }
+
+    if (options.hasWork || options.namespace != "") fatal("recover-member: --work and --namespace apply to one member")
+    val archive = profile.archive(options.archive)
+    val members = sortedStrings(uniqueStrings(archiveMembers(archive)))
+    val table = root + "/build/recovery/" + options.chip + "/" + options.archive + "/summary.tsv"
+    Path(Path(table).parent().text).createDirectories()
+    val columns: array<string> = ["member", "functions", "reusable"]
+    for (kind in RM_CLASSES) columns.append(kind)
+    for (name in ["lifted", "emitted", "rounds", "compile", "error"]) columns.append(name)
+    val totals: Map<string, int> = Map()
+    Path(table).writeText(columns.join("\t") + "\n")
+    for (member in members) {
+        val summary = recover(root, profile, options, member, index)
+        val fields: array<string> = [member, "${summary.functions}", "${summary.reusable}"]
+        for (kind in RM_CLASSES) fields.append("${countOf(summary.counts, kind)}")
+        fields.append(summary.lifted)
+        fields.append(summary.emitted)
+        fields.append(summary.rounds)
+        fields.append(summary.compileResult)
+        fields.append(summary.error)
+        Path(table).appendText(fields.join("\t") + "\n")
+        totals.set("functions", countOf(totals, "functions") + summary.functions)
+        totals.set("reusable", countOf(totals, "reusable") + summary.reusable)
+        for (kind in RM_CLASSES) totals.set(kind, countOf(totals, kind) + countOf(summary.counts, kind))
+        if (summary.lifted != "") totals.set("lifted", countOf(totals, "lifted") + decimalValue(summary.lifted))
+        if (summary.emitted != "") totals.set("emitted", countOf(totals, "emitted") + decimalValue(summary.emitted))
+        if (summary.error != "") totals.set("failed", countOf(totals, "failed") + 1)
+    }
+    val keys: array<string> = ["functions", "reusable"]
+    for (kind in RM_CLASSES) keys.append(kind)
+    for (name in ["lifted", "emitted", "failed"]) keys.append(name)
+    val parts: array<string> = []
+    for (key in keys) parts.append("$key=${countOf(totals, key)}")
+    println("TOTAL ${parts.join(" ")}")
+    println("wrote ${relativeToRoot(root, table)}")
+    0
+}

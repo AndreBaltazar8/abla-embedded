@@ -35,7 +35,7 @@ targets as instruction indexes). Functions present in both builds:
 
 ## Status (2026-10-28): recovered libnet80211 + libpp + libcoexist run on hardware
 
-`tools/recover-member esp32s3 <archive> all` lifts every member;
+`tools/abla-tool recover-member esp32s3 <archive> all` lifts every member;
 `tools/assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist` builds one
 Abla unit (about 85% of functions typed Abla, the rest raw Xtensa inside Abla).
 Linked into mono-life (`idf.py -B build-radio -D ABLA_RADIO_OBJECT=.../unit.o`)
@@ -166,7 +166,7 @@ Classic-only assumptions to parameterize (from a tooling survey):
    `esp32s3`): objdump, ESP-IDF archives, ROM linker scripts and the
    reference chip. Still to move in: the fixed-address table and the
    per-corpus tables above.
-2. **One driver** (`tools/recover-member <chip> <archive> <member>`, done):
+2. **One driver** (`tools/abla-tool recover-member <chip> <archive> <member>`, done):
    extracts the member, classifies every function (`rom`, `identical`,
    `reordered`, `layout`, `different`, `new`) against the reference chip,
    finds the reference's recovered Abla through the link selectors, then

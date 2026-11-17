@@ -9,7 +9,7 @@ triple `xtensa-esp-unknown-elf`, `-mcpu=esp32`. Full issue text is in
 |---|-------|-------|------------------|-----------------------------------------------|
 | 1 | ISel `Cannot select: Constant<N>` for `add (shl x,1..3), C` | `01-addx-large-constant.ll` | reproduces (-O0 and -O2) | `tools/esp-llvm-bin/opaque-xtensa-constant` + retry loop in `tools/esp-llvm-bin/llc` |
 | 2 | MC does not relax out-of-range conditional branches | `02-branch-relax.s` | reproduces | `tools/esp-llvm-bin/relax-xtensa-branches` + llvm-mc retry loop in `llc` |
-| 3 | `.literal L, sym+N` crashes text streamer | `03b-literal-addend.s`, `03-literal-addend.ll` | reproduces (llvm-mc segfault rc=139; llc prints an empty literal operand instead of crashing) | `alias_symbol_addends` in `tools/recover-member` (`.set alias, sym+N`) |
+| 3 | `.literal L, sym+N` crashes text streamer | `03b-literal-addend.s`, `03-literal-addend.ll` | reproduces (llvm-mc segfault rc=139; llc prints an empty literal operand instead of crashing) | `aliasSymbolAddends` in `tools/recover-member.ab` (`.set alias, sym+N`) |
 | 4 | `.cfi_def_cfa a7, N` rejected by llvm-mc | `04-cfi-frame-pointer.ll` | reproduces | CFI directives dropped in `tools/esp-llvm-bin/narrow-xtensa-assembly` (unless `ABLA_ESP_KEEP_UNWIND=1`); `.eh_frame` stripped in `llc` |
 | 5 | Inline-asm constraint `a` rejected | `05-asm-constraint-a.ll` | reproduces | none in tools; sources use `r` |
 | 6 | Code Density (`.n`) rarely selected | `06-density.ll` | reproduces (missed optimization) | `tools/esp-llvm-bin/narrow-xtensa-assembly` (`ABLA_XTENSA_NARROW=1`) |
