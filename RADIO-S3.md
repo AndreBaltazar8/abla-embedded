@@ -36,7 +36,7 @@ targets as instruction indexes). Functions present in both builds:
 ## Status (2026-10-28): recovered libnet80211 + libpp + libcoexist run on hardware
 
 `tools/abla-tool recover-member esp32s3 <archive> all` lifts every member;
-`tools/assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist` builds one
+`tools/abla-tool assemble-recovered-unit esp32s3 libnet80211 libpp libcoexist` builds one
 Abla unit (about 85% of functions typed Abla, the rest raw Xtensa inside Abla).
 Linked into mono-life (`idf.py -B build-radio -D ABLA_RADIO_OBJECT=.../unit.o`)
 the link map takes no member from the three archives, and the Paper Mono
