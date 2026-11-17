@@ -1,0 +1,171 @@
+// Regression check for the recovered-call conversion of
+// tools/direct-recovered-xtensa-calls.ab (nested calls, wide results, symbolic
+// calls of internal functions).
+//
+//     tools/abla-tool check-direct-recovered-xtensa-calls
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/command"
+import "abla/process/arguments"
+import "abla/process/time"
+import "direct-recovered-xtensa-calls.ab"
+
+fun parameterList(): string {
+    val parts: array<string> = []
+    var index = 2
+    while (index < 8) {
+        parts.append("a${index}: u32")
+        index = index + 1
+    }
+    index = 0
+    while (index < 10) {
+        parts.append("stack${index}: u32")
+        index = index + 1
+    }
+    parts.join(", ")
+}
+
+fun fail(message: string): int {
+    eprintln(message)
+    1
+}
+
+// Writes `source` to a fresh directory, runs the conversion and returns the
+// rewritten text ("" and a message in gError on failure).
+fun convert(directory: Path, name: string, source: string): string {
+    val file = directory.child(name)
+    file.writeText(source)
+    val status = runDirectCalls(Options(directory.text, true, "", [], []))
+    if (status != 0) return ""
+    file.readText()
+}
+
+// The repository root: the tool binary sits in <root>/build/abla-tools/<hash>/.
+fun repositoryRoot(): string {
+    val executable = processExecutable()
+    val marker = executable.indexOf("/build/abla-tools/")
+    if (marker >= 0) return executable.slice(0, marker)
+    currentDirectory().text
+}
+
+fun main: int {
+    val scratch = Path("/tmp/abla-direct-call-check-${realtimeNanoseconds()}")
+    scratch.createDirectories()
+    val result = runChecks(scratch)
+    scratch.removeTree()
+    result
+}
+
+fun runChecks(scratch: Path): int {
+    val parameters = parameterList()
+    val nestedDirectory = scratch.child("nested")
+    nestedDirectory.createDirectories()
+    val nested = convert(nestedDirectory, "nested.ab", [
+        "val innerLink = #internalFunction(\"inner\", \"inner_symbol\")",
+        "val outerLink = #internalFunction(\"outer\", \"outer_symbol\")",
+        "",
+        "trusted fun inner(${parameters}): u32 { a2 }",
+        "trusted fun outer(${parameters}): u32 { a2 + a3 }",
+        "",
+        "trusted fun caller(${parameters}): u32 {",
+        "    var r10 = a2",
+        "    var r11 = a3",
+        "    r10 = \$xtensa call {outer_symbol}(",
+        "        \$xtensa call {inner_symbol}(r10),",
+        "        r11",
+        "    )",
+        "    r10",
+        "}",
+        ""
+    ].join("\n"))
+    if (nested == "") return fail("conversion failed: ${gError}")
+    if (!nested.contains("inner(r10, u32(0), u32(0), u32(0), u32(0), u32(0)") ||
+        !nested.contains("r10 = outer(inner(r10, u32(0)")) {
+        return fail("nested calls were not converted intact:\n${nested}")
+    }
+    if (nested.contains("\$xtensa call")) {
+        return fail("nested target call remained after conversion:\n${nested}")
+    }
+    println("Nested recovered Xtensa call conversion passed")
+
+    val wideDirectory = scratch.child("wide")
+    wideDirectory.createDirectories()
+    val wide = convert(wideDirectory, "wide.ab", [
+        "trusted fun caller(a2:u32):u32 {",
+        "    var r10 = a2",
+        "    var r11 = u32(0)",
+        "    val unsignedResult = \$xtensa callWide {__floatunsidf}(r10)",
+        "    r10 = u32(unsignedResult)",
+        "    r11 = u32(unsignedResult >>> u64(32))",
+        "    val signedResult = \$xtensa callWide {__floatsidf}(r10)",
+        "    r10 = u32(signedResult)",
+        "    r11 = u32(signedResult >>> u64(32))",
+        "    val timerResult = \$xtensa callWide {esp_timer_get_time}()",
+        "    r10 = u32(timerResult)",
+        "    r11 = u32(timerResult >>> u64(32))",
+        "    val tlsTimeResult = \$xtensa callWide {esp_tls_get_platform_time}()",
+        "    r10 = u32(tlsTimeResult)",
+        "    r11 = u32(tlsTimeResult >>> u64(32))",
+        "    r11",
+        "}",
+        ""
+    ].join("\n"))
+    if (wide == "") return fail("conversion failed: ${gError}")
+    val expectations: array<array<string>> = [
+        ["unsignedResult", "esp32Unsigned32ToBinary64(r10)"],
+        ["signedResult", "esp32Signed32ToBinary64(i32(r10))"],
+        ["timerResult", "esp32TimerTimeMicroseconds()"],
+        ["tlsTimeResult", "esp32TimerTimeMicroseconds()"]
+    ]
+    for (expectation in expectations) {
+        val name = expectation[0]
+        val expression = expectation[1]
+        if (!wide.contains("val ${name} = ${expression}")) return fail(wide)
+        if (!wide.contains("r11 = u32(${name} >>> u64(32))")) return fail(wide)
+    }
+    if (wide.contains("\$xtensa callWide")) return fail(wide)
+    println("Binary64 conversion and timestamps preserve both return words")
+
+    // Symbolic calls the direct pass leaves behind (raw callees) call the Abla
+    // function's address instead, so LLVM sees the reference. Only
+    // internalFunction targets are lowered; exported ones keep the link-named form.
+    val addressDirectory = scratch.child("address")
+    addressDirectory.createDirectories()
+    val raw = addressDirectory.child("raw.ab")
+    raw.writeText([
+        "val rawLink = #internalFunction(\"rawCallee\", \"raw_symbol\")",
+        "val globalLink = #exportFunction(\"globalCallee\", \"global_symbol\")",
+        "",
+        "@naked",
+        "trusted fun rawCallee(): void = \$xtensa instructions { nop }",
+        "trusted fun globalCallee(): void = \$xtensa instructions { nop }",
+        "",
+        "trusted fun caller(a2: u32): u32 {",
+        "    var r10 = a2",
+        "    val wide = \$xtensa callWide {raw_symbol}(r10, u32(1))",
+        "    r10 = u32(wide)",
+        "    r10 = \$xtensa call {raw_symbol}()",
+        "    r10 = \$xtensa call {global_symbol}(r10)",
+        "    r10",
+        "}",
+        ""
+    ].join("\n"))
+    val root = repositoryRoot()
+    val lowerSource = Path(root + "/tools/lower-abla-owned-symbol-addresses.ab")
+    var lower = command(root + "/tools/lower-abla-owned-symbol-addresses")
+    if (lowerSource.exists()) lower = command(root + "/tools/abla-tool").argument("lower-abla-owned-symbol-addresses")
+    val lowered = lower.argument("--write").argument("--cross-module-functions").argument("--calls")
+        .argument(addressDirectory.text).capture()
+    if (lowered.status != 0) return fail("lower-abla-owned-symbol-addresses failed:\n${lowered.output}")
+    val rewritten = raw.readText()
+    if (!rewritten.contains("\$xtensa callAddressWide(u32(nativeFunctionAddress(rawCallee)), r10, u32(1))")) {
+        return fail(rewritten)
+    }
+    if (!rewritten.contains("r10 = \$xtensa callAddress(u32(nativeFunctionAddress(rawCallee)))")) return fail(rewritten)
+    if (!rewritten.contains("\$xtensa call {global_symbol}(r10)")) return fail(rewritten)
+    println("Symbolic calls of internal functions call their addresses; exported ones stay symbolic")
+    0
+}

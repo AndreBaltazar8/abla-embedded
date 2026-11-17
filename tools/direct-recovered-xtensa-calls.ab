@@ -1,0 +1,1416 @@
+// Replace safe recovered Xtensa symbol calls with ordinary Abla calls.
+//
+// The recovered windowed-ABI functions have a uniform six-register plus ten
+// stack-word signature. When an Abla-owned callee never reads its stack words,
+// an outgoing symbolic `$xtensa call` can call that function directly: supplied
+// register arguments retain their order and all absent ABI positions are zero.
+// This exposes the edge to normal semantic analysis, inlining, and dead-code
+// elimination. Calls with stack-dependent callees, wide/void results, indirect
+// targets, or symbols without an Abla internal mapping remain target operations.
+//
+//     tools/abla-tool direct-recovered-xtensa-calls [ROOT] [--write]
+//         [--library-root DIR] [--standard-module-prefix P]... [--standard-exclude SYMBOL]...
+//
+// This is the port of the former Python tool of the same name; its output is
+// byte for byte the same.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/arguments"
+
+// A standard call: the Abla function that replaces a libc/ROM/libgcc symbol.
+// `template` holds <<0>>, <<1>>... for the first `arity` argument texts.
+class SourceCall(val symbol: string, val arity: int, val template: string, val module: string)
+
+// The first failure (the Python tool died with a traceback); "" while fine.
+var gError = ""
+
+fun isSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+fun isIdentStart(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+fun isDigit(c: int): bool = c >= 48 && c <= 57
+
+fun isWord(c: int): bool = isIdentStart(c) || isDigit(c)
+
+fun skipSpace(t: string, from: int): int {
+    var i = from
+    while (i < t.size && isSpace(t[i])) i = i + 1
+    i
+}
+
+fun at(t: string, i: int, literal: string): bool {
+    if (i < 0 || i + literal.size > t.size) return false
+    var k = 0
+    while (k < literal.size) {
+        if (t[i + k] != literal[k]) return false
+        k = k + 1
+    }
+    true
+}
+
+// The end of the identifier starting at `i`, or -1.
+fun identEnd(t: string, i: int): int {
+    if (i >= t.size || !isIdentStart(t[i])) return -1
+    var j = i + 1
+    while (j < t.size && isWord(t[j])) j = j + 1
+    j
+}
+
+fun byteAt(t: string, i: int): int = if (i >= 0 && i < t.size) t[i] else -1
+
+fun stripText(s: string): string {
+    var a = 0
+    var b = s.size
+    while (a < b && isSpace(s[a])) a = a + 1
+    while (b > a && isSpace(s[b - 1])) b = b - 1
+    s.slice(a, b)
+}
+
+// ---- [#]internalFunction("name", "symbol") / exportFunction bindings ----
+
+// `end` is -1 when there is no binding at the position.
+class Internal(val end: int, val function: string, val symbol: string)
+
+fun matchInternal(t: string, pos: int): Internal {
+    val none = Internal(-1, "", "")
+    if (pos > 0 && isWord(t[pos - 1])) return none
+    var i = pos
+    if (byteAt(t, i) == 35) i = i + 1
+    if (at(t, i, "internalFunction(")) i = i + 17
+    else if (at(t, i, "exportFunction(")) i = i + 15
+    else return none
+    i = skipSpace(t, i)
+    if (byteAt(t, i) != 34) return none
+    val nameEnd = identEnd(t, i + 1)
+    if (nameEnd < 0 || byteAt(t, nameEnd) != 34) return none
+    val name = t.slice(i + 1, nameEnd)
+    i = skipSpace(t, nameEnd + 1)
+    if (byteAt(t, i) != 44) return none
+    i = skipSpace(t, i + 1)
+    if (byteAt(t, i) != 34) return none
+    var j = i + 1
+    while (j < t.size && t[j] != 34) j = j + 1
+    if (j >= t.size || j == i + 1) return none
+    val symbol = t.slice(i + 1, j)
+    i = skipSpace(t, j + 1)
+    if (byteAt(t, i) != 41) return none
+    Internal(i + 1, name, symbol)
+}
+
+fun findInternals(t: string): array<Internal> {
+    val result: array<Internal> = []
+    var i = 0
+    while (i < t.size) {
+        val c = t[i]
+        if (c == 35 || c == 105 || c == 101) {
+            val m = matchInternal(t, i)
+            if (m.end >= 0) {
+                result.append(m)
+                i = m.end
+                continue
+            }
+        }
+        i = i + 1
+    }
+    result
+}
+
+
+// ---- `$xtensa call {sym}(`, `callVoid`, and `val x = $xtensa callWide {sym}(` ----
+
+// `open` is the index of the `(`.
+class BraceCall(val start: int, val symbol: string, val open: int)
+
+// Every `PREFIX sym}(` with a non-empty symbol, PREFIX ending in `{`.
+fun findBraceCalls(t: string, prefix: string): array<BraceCall> {
+    val result: array<BraceCall> = []
+    var i = 0
+    while (i < t.size) {
+        val p = t.indexOf(prefix, i)
+        if (p < 0) break
+        val symbolStart = p + prefix.size
+        var j = symbolStart
+        while (j < t.size && t[j] != 125) j = j + 1
+        if (j < t.size && j > symbolStart && byteAt(t, j + 1) == 40) {
+            result.append(BraceCall(p, t.slice(symbolStart, j), j + 1))
+            i = j + 2
+        } else {
+            i = p + 1
+        }
+    }
+    result
+}
+
+// `^([ \t]*)val\s+NAME\s*=\s*$xtensa callWide {sym}(`; `start` is the line start.
+class WideCall(val start: int, val indent: string, val name: string, val symbol: string, val open: int)
+
+fun findWideCalls(t: string): array<WideCall> {
+    val result: array<WideCall> = []
+    var lastEnd = 0
+    for (call in findBraceCalls(t, "\$xtensa callWide {")) {
+        var j = call.start
+        while (j > 0 && isSpace(t[j - 1])) j = j - 1
+        if (byteAt(t, j - 1) != 61) continue
+        j = j - 1
+        while (j > 0 && isSpace(t[j - 1])) j = j - 1
+        var k = j
+        while (k > 0 && isWord(t[k - 1])) k = k - 1
+        if (k == j || !isIdentStart(t[k])) continue
+        val name = t.slice(k, j)
+        if (k == 0 || !isSpace(t[k - 1])) continue
+        var m = k
+        while (m > 0 && isSpace(t[m - 1])) m = m - 1
+        if (m < 3 || !at(t, m - 3, "val")) continue
+        var q = m - 3
+        while (q > 0 && (t[q - 1] == 32 || t[q - 1] == 9)) q = q - 1
+        if (q != 0 && t[q - 1] != 10) continue
+        if (q < lastEnd) continue
+        result.append(WideCall(q, t.slice(q, m - 3), name, call.symbol, call.open))
+        lastEnd = call.open + 1
+    }
+    result
+}
+
+// ---- delimiters and arguments ----
+
+// The index of the `right` matching the `left` at `opening`, or -1 (gError set).
+fun matchingDelimiter(text: string, opening: int, left: int, right: int): int {
+    var depth = 0
+    var quote = 0
+    var escaped = false
+    var lineComment = false
+    var blockComment = false
+    var index = opening
+    while (index < text.size) {
+        val c = text[index]
+        val following = byteAt(text, index + 1)
+        if (lineComment) {
+            if (c == 10) lineComment = false
+            index = index + 1
+            continue
+        }
+        if (blockComment) {
+            if (c == 42 && following == 47) {
+                blockComment = false
+                index = index + 2
+            } else {
+                index = index + 1
+            }
+            continue
+        }
+        if (quote != 0) {
+            if (escaped) escaped = false
+            else if (c == 92) escaped = true
+            else if (c == quote) quote = 0
+            index = index + 1
+            continue
+        }
+        if (c == 47 && following == 47) {
+            lineComment = true
+            index = index + 2
+            continue
+        }
+        if (c == 47 && following == 42) {
+            blockComment = true
+            index = index + 2
+            continue
+        }
+        if (c == 34 || c == 39) {
+            quote = c
+            index = index + 1
+            continue
+        }
+        if (c == left) {
+            depth = depth + 1
+        } else if (c == right) {
+            depth = depth - 1
+            if (depth == 0) return index
+        }
+        index = index + 1
+    }
+    if (gError == "") gError = "unterminated group at byte $opening"
+    -1
+}
+
+fun splitArguments(source: string): array<string> {
+    val arguments: array<string> = []
+    if (stripText(source) == "") return arguments
+    var start = 0
+    var round = 0
+    var square = 0
+    var brace = 0
+    var quote = 0
+    var escaped = false
+    var index = 0
+    while (index < source.size) {
+        val c = source[index]
+        index = index + 1
+        if (quote != 0) {
+            if (escaped) escaped = false
+            else if (c == 92) escaped = true
+            else if (c == quote) quote = 0
+            continue
+        }
+        if (c == 34 || c == 39) quote = c
+        else if (c == 40) round = round + 1
+        else if (c == 41) round = round - 1
+        else if (c == 91) square = square + 1
+        else if (c == 93) square = square - 1
+        else if (c == 123) brace = brace + 1
+        else if (c == 125) brace = brace - 1
+        else if (c == 44 && round == 0 && square == 0 && brace == 0) {
+            arguments.append(stripText(source.slice(start, index - 1)))
+            start = index
+        }
+    }
+    arguments.append(stripText(source.slice(start, source.size)))
+    for (argument in arguments) {
+        if (argument == "") {
+            if (gError == "") gError = "empty recovered call argument"
+        }
+    }
+    arguments
+}
+
+// ---- functions ----
+
+class Fn(
+    val name: string, val result: string, val parameters: string, val body: string,
+    val begin: int, val end: int
+)
+
+// `end` is -1 when no declaration starts at the line.
+class FunMatch(val end: int, val name: string, val parameters: string, val result: string, val delimiter: int)
+
+fun resultTypes(): array<string> = ["u64", "u32", "i32", "u16", "i16", "u8", "i8", "int", "bool", "void"]
+
+fun matchFunction(t: string, lineStart: int): FunMatch {
+    val none = FunMatch(-1, "", "", "", 0)
+    var i = lineStart
+    while (byteAt(t, i) == 64 && isIdentStart(byteAt(t, i + 1))) {
+        val newline = t.indexOf("\n", i)
+        if (newline < 0) return none
+        i = newline + 1
+    }
+    var j = i
+    if (at(t, i, "trusted") && isSpace(byteAt(t, i + 7))) j = skipSpace(t, i + 7)
+    if (!at(t, j, "fun") || !isSpace(byteAt(t, j + 3))) return none
+    var k = skipSpace(t, j + 3)
+    val nameEnd = identEnd(t, k)
+    if (nameEnd < 0) return none
+    val name = t.slice(k, nameEnd)
+    k = skipSpace(t, nameEnd)
+    if (byteAt(t, k) != 40) return none
+    val parametersStart = k + 1
+    var p = parametersStart
+    while (p < t.size) {
+        val c = t[p]
+        if (c == 123 || c == 125 || c == 61) break
+        if (c == 41) {
+            var q = skipSpace(t, p + 1)
+            if (byteAt(t, q) == 58) {
+                q = skipSpace(t, q + 1)
+                for (kind in resultTypes()) {
+                    if (at(t, q, kind)) {
+                        val r = skipSpace(t, q + kind.size)
+                        val d = byteAt(t, r)
+                        if (d == 123 || d == 61) {
+                            return FunMatch(r + 1, name, t.slice(parametersStart, p), kind, d)
+                        }
+                    }
+                }
+            }
+        }
+        p = p + 1
+    }
+    none
+}
+
+fun functionsIn(text: string): array<Fn> {
+    val result: array<Fn> = []
+    var lineStart = 0
+    while (lineStart <= text.size) {
+        val m = matchFunction(text, lineStart)
+        var next = 0
+        if (m.end >= 0) {
+            var body = ""
+            var end = 0
+            var keep = true
+            if (m.delimiter == 123) {
+                val closing = matchingDelimiter(text, m.end - 1, 123, 125)
+                if (closing < 0) return result
+                body = text.slice(m.end, closing)
+                end = closing + 1
+            } else {
+                var closing = text.indexOf("\n", m.end)
+                if (closing < 0) closing = text.size
+                body = text.slice(m.end, closing)
+                end = closing
+                if (stripText(body).startsWith("\$xtensa instructions")) keep = false
+            }
+            if (keep) result.append(Fn(m.name, m.result, m.parameters, body, lineStart, end))
+            next = text.indexOf("\n", m.end)
+        } else {
+            next = text.indexOf("\n", lineStart)
+        }
+        if (next < 0) break
+        lineStart = next + 1
+    }
+    result
+}
+
+// The names that precede a colon in a parameter list.
+fun parameterNames(parameters: string): array<string> {
+    val names: array<string> = []
+    var i = 0
+    while (i < parameters.size) {
+        if (isWord(parameters[i]) && (i == 0 || !isWord(parameters[i - 1]))) {
+            var j = i
+            while (j < parameters.size && isWord(parameters[j])) j = j + 1
+            if (isIdentStart(parameters[i])) {
+                val k = skipSpace(parameters, j)
+                if (byteAt(parameters, k) == 58) {
+                    names.append(parameters.slice(i, j))
+                    i = k + 1
+                    continue
+                }
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    names
+}
+
+fun recoveredParameters(f: Fn): bool {
+    val names = parameterNames(f.parameters)
+    if (names.size != 16) return false
+    var index = 0
+    while (index < 16) {
+        val expected = if (index < 6) "a${index + 2}" else "stack${index - 6}"
+        if (names[index] != expected) return false
+        index = index + 1
+    }
+    true
+}
+
+fun recoveredAbi(f: Fn): bool = recoveredParameters(f) && f.result == "u32"
+
+// `var incomingStackN = stackN` on a line of its own.
+fun isIncomingStackInitializer(line: string): bool {
+    val s = stripText(line)
+    if (!at(s, 0, "var") || !isSpace(byteAt(s, 3))) return false
+    var i = skipSpace(s, 3)
+    if (!at(s, i, "incomingStack") || !isDigit(byteAt(s, i + 13))) return false
+    val digit = s[i + 13]
+    i = skipSpace(s, i + 14)
+    if (byteAt(s, i) != 61) return false
+    i = skipSpace(s, i + 1)
+    if (!at(s, i, "stack") || byteAt(s, i + 5) != digit) return false
+    i + 6 == s.size
+}
+
+// `\b(incomingStack|stack)[0-9]\b`
+fun hasStackName(line: string): bool {
+    var i = 0
+    while (i < line.size) {
+        if (isWord(line[i]) && (i == 0 || !isWord(line[i - 1]))) {
+            var j = i
+            while (j < line.size && isWord(line[j])) j = j + 1
+            val size = j - i
+            if (size == 6 && at(line, i, "stack") && isDigit(line[i + 5])) return true
+            if (size == 14 && at(line, i, "incomingStack") && isDigit(line[i + 13])) return true
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    false
+}
+
+fun recoveredRegisterOnly(f: Fn): bool {
+    if (!recoveredAbi(f)) return false
+    for (line in f.body.split("\n")) {
+        if (isIncomingStackInitializer(line)) continue
+        if (hasStackName(line)) return false
+    }
+    true
+}
+
+class ScalarTypes(val ok: bool, val types: array<string>)
+
+fun scalarKinds(): array<string> = ["u32", "i32", "u16", "i16", "u8", "i8", "int", "bool"]
+
+fun simpleScalarTypes(f: Fn): ScalarTypes {
+    val result: array<string> = []
+    if (stripText(f.parameters) == "") return ScalarTypes(true, result)
+    for (parameter in splitArguments(f.parameters)) {
+        val s = stripText(parameter)
+        val nameEnd = identEnd(s, 0)
+        if (nameEnd < 0) return ScalarTypes(false, [])
+        var i = skipSpace(s, nameEnd)
+        if (byteAt(s, i) != 58) return ScalarTypes(false, [])
+        i = skipSpace(s, i + 1)
+        val kindText = s.slice(i, s.size)
+        var found = ""
+        for (kind in scalarKinds()) {
+            if (kind == kindText) found = kind
+        }
+        if (found == "") return ScalarTypes(false, [])
+        result.append(found)
+    }
+    ScalarTypes(true, result)
+}
+
+// ---- paths ----
+
+fun pathParts(text: string): array<string> {
+    val parts: array<string> = []
+    for (part in text.split("/")) {
+        if (part != "" && part != ".") parts.append(part)
+    }
+    parts
+}
+
+// The absolute path with `.`/`..` removed and every symbolic link followed.
+fun resolvePath(text: string): string {
+    var start = text
+    if (!start.startsWith("/")) start = currentDirectory().text + "/" + text
+    val todo: array<string> = []
+    val given = pathParts(start)
+    var n = given.size
+    while (n > 0) {
+        n = n - 1
+        todo.append(given[n])
+    }
+    val done: array<string> = []
+    var steps = 0
+    while (todo.size > 0 && steps < 4000) {
+        steps = steps + 1
+        val part = todo.removeLast()
+        if (part == "..") {
+            if (done.size > 0) done.removeLast()
+            continue
+        }
+        done.append(part)
+        val here = "/" + done.join("/")
+        if (Path(here).isSymbolicLink()) {
+            val target = Path(here).linkTarget()
+            done.removeLast()
+            if (target.startsWith("/")) {
+                while (done.size > 0) done.removeLast()
+            }
+            val parts = pathParts(target)
+            var m = parts.size
+            while (m > 0) {
+                m = m - 1
+                todo.append(parts[m])
+            }
+        }
+    }
+    "/" + done.join("/")
+}
+
+fun relativePath(target: string, base: string): string {
+    val a = pathParts(target)
+    val b = pathParts(base)
+    var common = 0
+    while (common < a.size && common < b.size && a[common] == b[common]) common = common + 1
+    val parts: array<string> = []
+    var i = common
+    while (i < b.size) {
+        parts.append("..")
+        i = i + 1
+    }
+    i = common
+    while (i < a.size) {
+        parts.append(a[i])
+        i = i + 1
+    }
+    if (parts.size == 0) "." else parts.join("/")
+}
+
+// Path order: component by component.
+fun pathBefore(a: string, b: string): bool {
+    val x = a.split("/")
+    val y = b.split("/")
+    var i = 0
+    while (i < x.size && i < y.size) {
+        if (x[i] != y[i]) return x[i] < y[i]
+        i = i + 1
+    }
+    x.size < y.size
+}
+
+fun collectSources(directory: Path, var out: array<string>): void {
+    for (entry in directory.entries()) {
+        val info = entry.linkInfo()
+        val name = entry.text
+        if (info.kind == 4) {
+            if (name.endsWith(".ab")) out.append(name)
+        } else if (info.isDirectory()) {
+            collectSources(entry, out)
+        } else if (name.endsWith(".ab")) {
+            out.append(name)
+        }
+    }
+}
+
+// The indices of `keys` in stable ascending order.
+fun sortedIndices(keys: array<int>): array<int> {
+    var order: array<int> = []
+    var n = 0
+    while (n < keys.size) {
+        order.append(n)
+        n = n + 1
+    }
+    var width = 1
+    while (width < order.size) {
+        val merged: array<int> = []
+        var low = 0
+        while (low < order.size) {
+            val mid = if (low + width < order.size) low + width else order.size
+            val high = if (low + 2 * width < order.size) low + 2 * width else order.size
+            var a = low
+            var b = mid
+            while (a < mid && b < high) {
+                if (keys[order[b]] < keys[order[a]]) {
+                    merged.append(order[b])
+                    b = b + 1
+                } else {
+                    merged.append(order[a])
+                    a = a + 1
+                }
+            }
+            while (a < mid) {
+                merged.append(order[a])
+                a = a + 1
+            }
+            while (b < high) {
+                merged.append(order[b])
+                b = b + 1
+            }
+            low = high
+        }
+        order = merged
+        width = width * 2
+    }
+    val result: array<int> = []
+    for (index in order) result.append(index)
+    result
+}
+
+// `paths` in path order (component by component), as a new array.
+fun sortedPaths(paths: array<string>): array<string> {
+    // Ranks by insertion into a sorted index list: directory listings are short
+    // enough per directory, but the whole tree can hold thousands of files, so
+    // merge instead.
+    var order: array<int> = []
+    var n = 0
+    while (n < paths.size) {
+        order.append(n)
+        n = n + 1
+    }
+    var width = 1
+    while (width < order.size) {
+        val merged: array<int> = []
+        var low = 0
+        while (low < order.size) {
+            val mid = if (low + width < order.size) low + width else order.size
+            val high = if (low + 2 * width < order.size) low + 2 * width else order.size
+            var a = low
+            var b = mid
+            while (a < mid && b < high) {
+                if (pathBefore(paths[order[b]], paths[order[a]])) {
+                    merged.append(order[b])
+                    b = b + 1
+                } else {
+                    merged.append(order[a])
+                    a = a + 1
+                }
+            }
+            while (a < mid) {
+                merged.append(order[a])
+                a = a + 1
+            }
+            while (b < high) {
+                merged.append(order[b])
+                b = b + 1
+            }
+            low = high
+        }
+        order = merged
+        width = width * 2
+    }
+    val result: array<string> = []
+    for (index in order) result.append(paths[index])
+    result
+}
+
+fun dirName(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash <= 0) "/" else path.slice(0, slash)
+}
+
+// ---- local symbol spellings ----
+
+// The stable source name shared by local ELF symbol spellings.
+fun recoveredLocalKey(symbol: string): string {
+    var value = symbol
+    if (value.startsWith(".text.")) value = value.slice(6, value.size)
+    value = value.replace("\$part\$", "_part_")
+    val out: array<string> = []
+    var pending = false
+    var i = 0
+    while (i < value.size) {
+        val c = value[i]
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+            if (pending && out.size > 0) out.append("_")
+            pending = false
+            out.append(value.slice(i, i + 1))
+        } else {
+            pending = true
+        }
+        i = i + 1
+    }
+    out.join("").lowercase()
+}
+
+// ---- the rewrite ----
+
+// A recovered caller with no synthetic outgoing frame cannot have emitted
+// overflow argument stores. These two variadic facades therefore receive only
+// their six register words at such sites; their absent overflow words are zero.
+fun framelessZeroStackSymbol(symbol: string): bool = symbol == "wifi_log" || symbol == "esp_rom_printf"
+
+class Scope(
+    val standard: Map<string, SourceCall>,
+    val mappings: Map<string, string>,
+    val functions: Map<string, Fn>,
+    val callers: array<Fn>,
+    val hasFrame: array<bool>
+)
+
+class Direct(val ok: bool, val expression: string, val module: string, val standard: bool)
+
+class Outgoing(val ok: bool, val words: array<string>, val module: string)
+
+class Repl(val begin: int, val end: int, val text: string)
+
+class Rewrite(val text: string, val count: int, val standardCount: int, val symbols: array<string>)
+
+fun applyTemplate(template: string, arguments: array<string>, count: int): string {
+    var result = template
+    var i = 0
+    while (i < count) {
+        result = result.replace("<<$i>>", arguments[i])
+        i = i + 1
+    }
+    result
+}
+
+fun firstArguments(arguments: array<string>, count: int): array<string> {
+    val result: array<string> = []
+    var i = 0
+    while (i < count && i < arguments.size) {
+        result.append(arguments[i])
+        i = i + 1
+    }
+    result
+}
+
+// `\bval\s+frameAddress\s*=\s*u32\(nativeStackAllocate\([^\n]+\)\)\s*\n\s*var\s+r1\s*=\s*frameAddress\b`
+fun bodyHasFrame(body: string): bool {
+    var i = 0
+    while (i < body.size) {
+        val p = body.indexOf("val", i)
+        if (p < 0) return false
+        i = p + 3
+        if (p > 0 && isWord(body[p - 1])) continue
+        if (!isSpace(byteAt(body, p + 3))) continue
+        var j = skipSpace(body, p + 3)
+        if (!at(body, j, "frameAddress")) continue
+        j = skipSpace(body, j + 12)
+        if (byteAt(body, j) != 61) continue
+        j = skipSpace(body, j + 1)
+        if (!at(body, j, "u32(nativeStackAllocate(")) continue
+        j = j + 24
+        var lineEnd = body.indexOf("\n", j)
+        if (lineEnd < 0) lineEnd = body.size
+        var q = lineEnd - 2
+        while (q >= j + 1) {
+            if (body[q] == 41 && body[q + 1] == 41) {
+                val after = q + 2
+                val m = skipSpace(body, after)
+                if (body.slice(after, m).contains("\n") && at(body, m, "var") && isSpace(byteAt(body, m + 3))) {
+                    var k = skipSpace(body, m + 3)
+                    if (at(body, k, "r1")) {
+                        k = skipSpace(body, k + 2)
+                        if (byteAt(body, k) == 61) {
+                            k = skipSpace(body, k + 1)
+                            if (at(body, k, "frameAddress") && !isWord(byteAt(body, k + 12))) return true
+                        }
+                    }
+                }
+            }
+            q = q - 1
+        }
+    }
+    false
+}
+
+fun callerOutgoing(scope: Scope, position: int): Outgoing {
+    val none = Outgoing(false, [], "")
+    var index = 0
+    while (index < scope.callers.size) {
+        val caller = scope.callers[index]
+        if (caller.begin <= position && position < caller.end) {
+            val words: array<string> = []
+            if (scope.hasFrame[index]) {
+                var offset = 0
+                while (offset < 40) {
+                    words.append("freestandingLoadWord(r1 + u32($offset))")
+                    offset = offset + 4
+                }
+                return Outgoing(true, words, "runtime/freestanding_memory.ab")
+            }
+            if (recoveredParameters(caller)) {
+                var n = 0
+                while (n < 10) {
+                    words.append("stack$n")
+                    n = n + 1
+                }
+                return Outgoing(true, words, "")
+            }
+            return none
+        }
+        index = index + 1
+    }
+    none
+}
+
+fun zeros(count: int): array<string> {
+    val result: array<string> = []
+    var i = 0
+    while (i < count) {
+        result.append("u32(0)")
+        i = i + 1
+    }
+    result
+}
+
+fun callText(target: string, arguments: array<string>): string = "$target(${arguments.join(", ")})"
+
+fun convertScalars(values: array<string>, kinds: array<string>): array<string> {
+    val converted: array<string> = []
+    var i = 0
+    while (i < values.size && i < kinds.size) {
+        val kind = kinds[i]
+        if (kind == "u32") converted.append(values[i])
+        else if (kind == "bool") converted.append("(${values[i]} != u32(0))")
+        else converted.append("$kind(${values[i]})")
+        i = i + 1
+    }
+    converted
+}
+
+// The scalar arguments for `kinds`, or an empty `ok` of false.
+fun scalarValues(scope: Scope, kinds: array<string>, arguments: array<string>, position: int): Outgoing {
+    if (kinds.size <= 6 && arguments.size >= kinds.size) {
+        return Outgoing(true, firstArguments(arguments, kinds.size), "")
+    }
+    if (kinds.size > 6 && arguments.size >= 6) {
+        val outgoing = callerOutgoing(scope, position)
+        if (outgoing.ok && kinds.size <= 16) {
+            val values = firstArguments(arguments, 6)
+            var i = 0
+            while (i < kinds.size - 6) {
+                values.append(outgoing.words[i])
+                i = i + 1
+            }
+            return Outgoing(true, values, "")
+        }
+    }
+    Outgoing(false, [], "")
+}
+
+
+fun directReplacement(
+    scope: Scope, symbol: string, arguments: array<string>, position: int, allowVoid: bool
+): Direct {
+    val none = Direct(false, "", "", false)
+    val standard = scope.standard.get(symbol)
+    if (standard != null && arguments.size >= standard.arity && arguments.size <= 7) {
+        return Direct(true, applyTemplate(standard.template, arguments, standard.arity), standard.module, true)
+    }
+    val mapped = scope.mappings.get(symbol)
+    var target = ""
+    if (mapped != null) target = mapped
+    val function = scope.functions.get(target)
+    if (function == null) return none
+    // A recovered-ABI callee that never reads its stack words ignores whatever
+    // the caller would pass there, so the absent positions are zero.
+    val registerOnly = recoveredAbi(function) && arguments.size <= 16 && recoveredRegisterOnly(function)
+    val scalar = simpleScalarTypes(function)
+    if (scalar.ok && arguments.size <= 7 && !registerOnly) {
+        val values = scalarValues(scope, scalar.types, arguments, position)
+        if (values.ok) {
+            val expression = callText(target, convertScalars(values.words, scalar.types))
+            val kind = function.result
+            if (kind == "u32") return Direct(true, expression, "", false)
+            if (kind == "i32" || kind == "u16" || kind == "i16" || kind == "u8" || kind == "i8" || kind == "int") {
+                return Direct(true, "u32(${expression})", "", false)
+            }
+            if (kind == "bool") return Direct(true, "if (${expression}) u32(1) else u32(0)", "", false)
+            if (allowVoid && kind == "void") return Direct(true, expression, "", false)
+        }
+    }
+    if (!recoveredAbi(function)) return none
+    if (arguments.size > 16) return none
+    val direct: array<string> = []
+    for (argument in arguments) direct.append(argument)
+    if (arguments.size > 6) {
+        for (zero in zeros(16 - arguments.size)) direct.append(zero)
+        return Direct(true, callText(target, direct), "", false)
+    }
+    for (zero in zeros(6 - arguments.size)) direct.append(zero)
+    var module = ""
+    if (recoveredRegisterOnly(function)) {
+        for (zero in zeros(10)) direct.append(zero)
+    } else {
+        val outgoing = callerOutgoing(scope, position)
+        if (outgoing.ok) {
+            for (word in outgoing.words) direct.append(word)
+            module = outgoing.module
+        } else if (framelessZeroStackSymbol(symbol)) {
+            for (zero in zeros(10)) direct.append(zero)
+        } else {
+            return none
+        }
+    }
+    Direct(true, callText(target, direct), module, false)
+}
+
+// The call text of a void callee whose result is not used, or "".
+fun simpleVoidReplacement(scope: Scope, symbol: string, arguments: array<string>, position: int): string {
+    val mapped = scope.mappings.get(symbol)
+    var target = ""
+    if (mapped != null) target = mapped
+    val function = scope.functions.get(target)
+    if (function == null || function.result != "void") return ""
+    val scalar = simpleScalarTypes(function)
+    if (!scalar.ok || arguments.size > 7) return ""
+    val values = scalarValues(scope, scalar.types, arguments, position)
+    if (!values.ok) return ""
+    callText(target, convertScalars(values.words, scalar.types))
+}
+
+class Assignment(val ok: bool, val indent: string, val variable: string)
+
+// `([ \t]*)(ident)\s*=\s*` over the whole text.
+fun parseAssignmentPrefix(prefix: string): Assignment {
+    var i = 0
+    while (i < prefix.size && (prefix[i] == 32 || prefix[i] == 9)) i = i + 1
+    val indent = prefix.slice(0, i)
+    val end = identEnd(prefix, i)
+    if (end < 0) return Assignment(false, "", "")
+    val variable = prefix.slice(i, end)
+    var j = skipSpace(prefix, end)
+    if (byteAt(prefix, j) != 61) return Assignment(false, "", "")
+    j = skipSpace(prefix, j + 1)
+    if (j != prefix.size) return Assignment(false, "", "")
+    Assignment(true, indent, variable)
+}
+
+fun lineStartBefore(text: string, position: int): int {
+    var i = position
+    while (i > 0 && text[i - 1] != 10) i = i - 1
+    i
+}
+
+// The sort key of "innermost first": length, then position.
+fun replKey(r: Repl, byBegin: bool): int = if (byBegin) r.begin else (r.end - r.begin) * 4294967296 + r.begin
+
+fun replOrder(repls: array<Repl>, byBegin: bool): array<int> {
+    val keys: array<int> = []
+    for (r in repls) keys.append(replKey(r, byBegin))
+    sortedIndices(keys)
+}
+
+fun failedRewrite(text: string): Rewrite = Rewrite(text, 0, 0, [])
+
+fun rewriteCalls(
+    path: string,
+    library: string,
+    originalText: string,
+    baseMappings: Map<string, string>,
+    functions: Map<string, Fn>,
+    standardTable: Map<string, SourceCall>,
+    wideTable: Map<string, SourceCall>
+): Rewrite {
+    var text = originalText
+    // Objdump names section-local functions as `.text.foo$part$0`, while the
+    // reconstructed internal binding gives the same function a collision-proof
+    // `.Labla_recovered_<owner>_local_foo_part_0` name. Resolve that spelling
+    // difference inside the owning module only; a unique suffix is proof of
+    // identity.
+    val mappings: Map<string, string> = Map()
+    for (key in baseMappings.keys()) {
+        val value = baseMappings.get(key)
+        if (value != null) mappings.set(key, value)
+    }
+    val bindings = findInternals(text)
+    val directCalls = findBraceCalls(text, "\$xtensa call {")
+    val voidCalls = findBraceCalls(text, "\$xtensa callVoid {")
+    val wideCalls = findWideCalls(text)
+    val callSymbols: Map<string, bool> = Map()
+    for (call in directCalls) callSymbols.set(call.symbol, true)
+    for (call in wideCalls) callSymbols.set(call.symbol, true)
+    for (call in voidCalls) callSymbols.set(call.symbol, true)
+    if (callSymbols.size > 0) {
+        val boundKeys: array<string> = []
+        for (binding in bindings) boundKeys.append(recoveredLocalKey(binding.symbol))
+        for (symbol in callSymbols.keys()) {
+            if (mappings.has(symbol)) continue
+            val key = recoveredLocalKey(symbol)
+            val candidates: Map<string, bool> = Map()
+            var index = 0
+            while (index < bindings.size) {
+                val bound = boundKeys[index]
+                if (bound.endsWith("local_" + key) || bound.endsWith("local_text_" + key)) {
+                    candidates.set(bindings[index].function, true)
+                }
+                index = index + 1
+            }
+            if (candidates.size == 1) mappings.set(symbol, candidates.keys()[0])
+        }
+    }
+
+    val replacements: array<Repl> = []
+    val convertedSymbols: array<string> = []
+    var standardCount = 0
+    val sourceModules: Map<string, bool> = Map()
+    val callers = functionsIn(text)
+    if (gError != "") return failedRewrite(text)
+    val frames: array<bool> = []
+    for (caller in callers) frames.append(bodyHasFrame(caller.body))
+    val scope = Scope(standardTable, mappings, functions, callers, frames)
+
+    for (call in directCalls) {
+        val closing = matchingDelimiter(text, call.open, 40, 41)
+        if (closing < 0) return failedRewrite(text)
+        val arguments = splitArguments(text.slice(call.open + 1, closing))
+        if (gError != "") return failedRewrite(text)
+        val direct = directReplacement(scope, call.symbol, arguments, call.start, false)
+        if (!direct.ok) {
+            val voidText = simpleVoidReplacement(scope, call.symbol, arguments, call.start)
+            val lineStart = lineStartBefore(text, call.start)
+            val assignment = parseAssignmentPrefix(text.slice(lineStart, call.start))
+            if (voidText == "" || !assignment.ok) continue
+            replacements.append(Repl(
+                lineStart, closing + 1,
+                "${assignment.indent}${voidText}\n${assignment.indent}${assignment.variable} = u32(0)"
+            ))
+            convertedSymbols.append(call.symbol)
+            continue
+        }
+        replacements.append(Repl(call.start, closing + 1, direct.expression))
+        convertedSymbols.append(call.symbol)
+        if (direct.standard) standardCount = standardCount + 1
+        if (direct.module != "") sourceModules.set(direct.module, true)
+    }
+
+    // The lifter represents every two-register call result uniformly even when
+    // the linked Abla function has a proven 32-bit return. Replace that exact
+    // three-line form with the ordinary call and a defined zero high word.
+    for (call in wideCalls) {
+        val closing = matchingDelimiter(text, call.open, 40, 41)
+        if (closing < 0) return failedRewrite(text)
+        val arguments = splitArguments(text.slice(call.open + 1, closing))
+        if (gError != "") return failedRewrite(text)
+        val indent = call.indent
+        val name = call.name
+        val suffix = "\n${indent}r10 = u32(${name})\n${indent}r11 = u32(${name} >>> u64(32))"
+        if (!at(text, closing + 1, suffix)) continue
+        val replaceEnd = closing + 1 + suffix.size
+        val wide = wideTable.get(call.symbol)
+        if (wide != null && arguments.size >= wide.arity && arguments.size <= 7) {
+            val expression = applyTemplate(wide.template, arguments, wide.arity)
+            replacements.append(Repl(
+                call.start, replaceEnd,
+                "${indent}val ${name} = ${expression}\n${indent}r10 = u32(${name})\n${indent}r11 = u32(${name} >>> u64(32))"
+            ))
+            convertedSymbols.append(call.symbol)
+            standardCount = standardCount + 1
+            sourceModules.set(wide.module, true)
+            continue
+        }
+        val direct = directReplacement(scope, call.symbol, arguments, call.start, false)
+        if (!direct.ok) {
+            val voidText = simpleVoidReplacement(scope, call.symbol, arguments, call.start)
+            if (voidText == "") continue
+            replacements.append(Repl(
+                call.start, replaceEnd,
+                "${indent}${voidText}\n${indent}r10 = u32(0)\n${indent}r11 = u32(0)"
+            ))
+            convertedSymbols.append(call.symbol)
+            continue
+        }
+        replacements.append(Repl(
+            call.start, replaceEnd, "${indent}r10 = ${direct.expression}\n${indent}r11 = u32(0)"
+        ))
+        convertedSymbols.append(call.symbol)
+        if (direct.standard) standardCount = standardCount + 1
+        if (direct.module != "") sourceModules.set(direct.module, true)
+    }
+
+    for (call in voidCalls) {
+        val closing = matchingDelimiter(text, call.open, 40, 41)
+        if (closing < 0) return failedRewrite(text)
+        val arguments = splitArguments(text.slice(call.open + 1, closing))
+        if (gError != "") return failedRewrite(text)
+        val direct = directReplacement(scope, call.symbol, arguments, call.start, true)
+        if (!direct.ok) continue
+        replacements.append(Repl(call.start, closing + 1, direct.expression))
+        convertedSymbols.append(call.symbol)
+        if (direct.standard) standardCount = standardCount + 1
+        if (direct.module != "") sourceModules.set(direct.module, true)
+    }
+    if (gError != "") return failedRewrite(text)
+
+    // Calls can be nested in another recovered call's argument list. Applying
+    // both edits with offsets from the original source corrupts the outer edit
+    // after the inner edit changes its byte range. Select only the innermost
+    // non-overlapping ranges in this pass; the caller repeats until every newly
+    // exposed outer call has been lowered.
+    val selected: array<Repl> = []
+    for (candidateIndex in replOrder(replacements, false)) {
+        val candidate = replacements[candidateIndex]
+        var overlaps = false
+        for (kept in selected) {
+            if (candidate.begin < kept.end && kept.begin < candidate.end) {
+                overlaps = true
+                break
+            }
+        }
+        if (!overlaps) selected.append(candidate)
+    }
+    val pieces: array<string> = []
+    var previous = 0
+    val selectedCount = selected.size
+    for (replacementIndex in replOrder(selected, true)) {
+        val replacement = selected[replacementIndex]
+        pieces.append(text.slice(previous, replacement.begin))
+        pieces.append(replacement.text)
+        previous = replacement.end
+    }
+    pieces.append(text.slice(previous, text.size))
+    text = pieces.join("")
+    for (module in sortedStrings(sourceModules.keys())) {
+        val relative = relativePath(library + "/" + module, dirName(path))
+        val importLine = "import \"${relative}\""
+        if (!text.contains(importLine)) text = importLine + "\n" + text
+    }
+    Rewrite(text, selectedCount, standardCount, convertedSymbols)
+}
+
+class Options(
+    val root: string,
+    val write: bool,
+    val libraryRoot: string,
+    val prefixes: array<string>,
+    val excludes: array<string>
+)
+
+fun tableMap(entries: array<SourceCall>): Map<string, SourceCall> {
+    val table: Map<string, SourceCall> = Map()
+    for (entry in entries) table.set(entry.symbol, entry)
+    table
+}
+
+// Runs the tool; the exit status.
+fun runDirectCalls(options: Options): int {
+    gError = ""
+    val standard = tableMap(sourceCallTable())
+    val wide = tableMap(wideSourceCallTable())
+    for (symbol in options.excludes) {
+        standard.remove(symbol)
+        wide.remove(symbol)
+    }
+    if (options.prefixes.size > 0) {
+        for (table in [standard, wide]) {
+            for (symbol in table.keys()) {
+                val entry = table.get(symbol)
+                if (entry == null) continue
+                var allowed = false
+                for (prefix in options.prefixes) {
+                    if (entry.module.startsWith(prefix)) allowed = true
+                }
+                if (!allowed) table.remove(symbol)
+            }
+        }
+    }
+    val root = resolvePath(options.root)
+    val library = resolvePath(if (options.libraryRoot != "") options.libraryRoot else options.root)
+    val found: array<string> = []
+    collectSources(Path(root), found)
+    val paths = sortedPaths(found)
+    val texts: Map<string, string> = Map()
+    for (path in paths) texts.set(path, Path(path).readText())
+
+    val mappings: Map<string, string> = Map()
+    val ambiguous: Map<string, bool> = Map()
+    for (path in paths) {
+        val text = texts.get(path)
+        if (text == null) continue
+        for (binding in findInternals(text)) {
+            val previous = mappings.get(binding.symbol)
+            if (previous != null && previous != binding.function) ambiguous.set(binding.symbol, true)
+            else mappings.set(binding.symbol, binding.function)
+        }
+    }
+    for (symbol in ambiguous.keys()) mappings.remove(symbol)
+
+    val functions: Map<string, Fn> = Map()
+    val duplicates: Map<string, bool> = Map()
+    for (path in paths) {
+        val text = texts.get(path)
+        if (text == null) continue
+        for (function in functionsIn(text)) {
+            if (functions.has(function.name)) duplicates.set(function.name, true)
+            else functions.set(function.name, function)
+        }
+    }
+    if (gError != "") {
+        eprintln(gError)
+        return 1
+    }
+    for (name in duplicates.keys()) functions.remove(name)
+
+    var changedFiles = 0
+    var converted = 0
+    var standardConverted = 0
+    val convertedSymbols: Map<string, bool> = Map()
+    for (path in paths) {
+        val original = texts.get(path)
+        if (original == null) continue
+        var rewritten = original
+        var fileCount = 0
+        var fileStandard = 0
+        val fileSymbols: array<string> = []
+        while (true) {
+            val next = rewriteCalls(path, library, rewritten, mappings, functions, standard, wide)
+            if (gError != "") {
+                eprintln(gError)
+                return 1
+            }
+            if (next.count == 0) break
+            rewritten = next.text
+            fileCount = fileCount + next.count
+            fileStandard = fileStandard + next.standardCount
+            for (symbol in next.symbols) fileSymbols.append(symbol)
+        }
+        if (fileCount == 0) continue
+        changedFiles = changedFiles + 1
+        converted = converted + fileCount
+        standardConverted = standardConverted + fileStandard
+        for (symbol in fileSymbols) convertedSymbols.set(symbol, true)
+        if (options.write) Path(path).writeText(rewritten)
+    }
+    val action = if (options.write) "rewrote" else "would rewrite"
+    println("${action} ${changedFiles} file(s), ${converted} call(s), ${convertedSymbols.size} symbol(s), ${standardConverted} standard call(s); skipped ${ambiguous.size} ambiguous mapping(s)")
+    0
+}
+
+fun usage(): void {
+    eprintln("usage: direct-recovered-xtensa-calls [-h] [--write] [--library-root LIBRARY_ROOT]")
+    eprintln("                                     [--standard-module-prefix STANDARD_MODULE_PREFIX]")
+    eprintln("                                     [--standard-exclude STANDARD_EXCLUDE]")
+    eprintln("                                     [root]")
+}
+
+fun main: int {
+    var root = "src"
+    var haveRoot = false
+    var write = false
+    var libraryRoot = ""
+    val prefixes: array<string> = []
+    val excludes: array<string> = []
+    var i = 0
+    val count = processArgumentCount()
+    while (i < count) {
+        val argument = processArgument(i)
+        i = i + 1
+        var name = argument
+        var value = ""
+        var inline = false
+        if (argument.startsWith("--") && argument.contains("=")) {
+            val equals = argument.indexOf("=")
+            name = argument.slice(0, equals)
+            value = argument.slice(equals + 1, argument.size)
+            inline = true
+        }
+        if (name == "--write" && !inline) {
+            write = true
+        } else if (name == "--library-root" || name == "--standard-module-prefix" || name == "--standard-exclude") {
+            if (!inline) {
+                if (i >= count) {
+                    usage()
+                    eprintln("direct-recovered-xtensa-calls: error: argument ${name}: expected one argument")
+                    return 2
+                }
+                value = processArgument(i)
+                i = i + 1
+            }
+            if (name == "--library-root") libraryRoot = value
+            else if (name == "--standard-module-prefix") prefixes.append(value)
+            else excludes.append(value)
+        } else if (argument == "-h" || argument == "--help") {
+            usage()
+            return 0
+        } else if (argument.startsWith("-") && argument.size > 1) {
+            usage()
+            eprintln("direct-recovered-xtensa-calls: error: unrecognized arguments: ${argument}")
+            return 2
+        } else if (!haveRoot) {
+            root = argument
+            haveRoot = true
+        } else {
+            usage()
+            eprintln("direct-recovered-xtensa-calls: error: unrecognized arguments: ${argument}")
+            return 2
+        }
+    }
+    runDirectCalls(Options(root, write, libraryRoot, prefixes, excludes))
+}
+
+// ---- standard calls (from the former Python tables) ----
+
+fun sourceCallTable(): array<SourceCall> = [
+    SourceCall("memcpy", 3, "freestandingCopy(<<0>>, <<1>>, <<2>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("memmove", 3, "freestandingMove(<<0>>, <<1>>, <<2>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("memset", 3, "freestandingSet(<<0>>, i32(<<1>>), <<2>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("memcmp", 3, "u32(freestandingCompare(<<0>>, <<1>>, <<2>>))", "runtime/freestanding_memory.ab"),
+    SourceCall("strlen", 1, "freestandingStringLength(<<0>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("strnlen", 2, "freestandingStringLengthBounded(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("strcmp", 2, "u32(freestandingStringCompare(<<0>>, <<1>>))", "runtime/freestanding_memory.ab"),
+    SourceCall("strncmp", 3, "u32(freestandingStringCompareBounded(<<0>>, <<1>>, <<2>>))", "runtime/freestanding_memory.ab"),
+    SourceCall("strcpy", 2, "freestandingStringCopy(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("strncpy", 3, "freestandingStringCopyBounded(<<0>>, <<1>>, <<2>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("strcat", 2, "freestandingStringAppend(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("strchr", 2, "freestandingStringFind(<<0>>, i32(<<1>>))", "runtime/freestanding_memory.ab"),
+    SourceCall("strrchr", 2, "freestandingStringFindLast(<<0>>, i32(<<1>>))", "runtime/freestanding_memory.ab"),
+    SourceCall("strstr", 2, "freestandingStringFindString(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("__bswapsi2", 1, "freestandingByteSwap32(<<0>>)", "runtime/freestanding_integer.ab"),
+    SourceCall("__popcountsi2", 1, "u32(freestandingPopulationCount32(<<0>>))", "runtime/freestanding_integer.ab"),
+    SourceCall("lwip_htonl", 1, "freestandingByteSwap32(<<0>>)", "runtime/freestanding_integer.ab"),
+    SourceCall("lwip_htons", 1, "u32(freestandingByteSwap16(u16(<<0>>)))", "runtime/freestanding_integer.ab"),
+    SourceCall("abort", 0, "freestandingAbortValue()", "runtime/freestanding_integer.ab"),
+    SourceCall("__assert_func", 4, "esp32AssertFailed(<<0>>, <<1>>, <<2>>, <<3>>)", "esp32/system/assert_esp32.ab"),
+    SourceCall("esp_dport_access_reg_read", 1, "esp32DportRead(<<0>>)", "esp32/dport_esp32.ab"),
+    SourceCall("xPortEnterCriticalTimeout", 2, "esp32RecoveredXPortEnterCriticalTimeout(<<0>>, <<1>>)", "esp32/freertos/port_esp32.ab"),
+    SourceCall("vPortExitCritical", 1, "esp32RecoveredVPortExitCriticalValue(<<0>>)", "esp32/freertos/port_esp32.ab"),
+    SourceCall("xPortInIsrContext", 0, "esp32RecoveredXPortInIsrContext()", "esp32/freertos/port_esp32.ab"),
+    SourceCall("malloc", 1, "esp32LibcMalloc(<<0>>)", "esp32/runtime/libc_heap_esp32.ab"),
+    SourceCall("calloc", 2, "esp32LibcCalloc(<<0>>, <<1>>)", "esp32/runtime/libc_heap_esp32.ab"),
+    SourceCall("free", 1, "esp32LibcFreeValue(<<0>>)", "esp32/runtime/libc_heap_esp32.ab"),
+    SourceCall("heap_caps_malloc", 2, "esp32HeapCapsMalloc(<<0>>, <<1>>)", "esp32/heap/capabilities_policy_esp32.ab"),
+    SourceCall("heap_caps_calloc", 3, "esp32HeapCapsCallocate(<<0>>, <<1>>, <<2>>)", "esp32/heap/capabilities_policy_esp32.ab"),
+    SourceCall("heap_caps_free", 1, "esp32HeapCapsFreeValue(<<0>>)", "esp32/heap/capabilities_base_esp32.ab"),
+    SourceCall("pbuf_free", 1, "esp32LwipPbufFree(<<0>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_alloc", 3, "esp32LwipPbufAllocate(<<0>>, <<1>>, <<2>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("mbedtls_platform_zeroize", 2, "freestandingSecureZero(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("mbedtls_to_psa_error", 1, "u32(esp32MbedtlsToPsaError(i32(<<0>>)))", "esp32/security/crypto/psa_status_esp32.ab"),
+    SourceCall("ets_delay_us", 1, "esp32EtsDelayUsValue(<<0>>)", "esp32/rom/system_esp32.ab"),
+    SourceCall("esp_rom_delay_us", 1, "esp32RomDelayUsValue(<<0>>)", "esp32/rom/system_esp32.ab"),
+    SourceCall("esp_crosscore_int_send_yield", 1, "esp32RecoveredEspCrosscoreIntSendYieldValue(<<0>>)", "esp32/system/crosscore_interrupt_esp32.ab"),
+    SourceCall("err_to_errno", 1, "u32(esp32RecoveredErrToErrno(i32(<<0>>)))", "network/lwip/error_esp32.ab"),
+    SourceCall("sys_arch_protect", 0, "esp32RecoveredSysArchProtect()", "network/lwip/freertos_arch_esp32.ab"),
+    SourceCall("memp_malloc", 1, "esp32RecoveredMempMalloc(<<0>>)", "network/lwip/memory_pools_esp32.ab"),
+    SourceCall("pbuf_add_header", 2, "esp32LwipPbufAddHeader(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_add_header_force", 2, "esp32LwipPbufAddHeaderForce(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_remove_header", 2, "esp32LwipPbufRemoveHeader(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_copy_partial", 4, "esp32LwipPbufCopyPartial(<<0>>, <<1>>, <<2>>, <<3>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("panic_print_str", 1, "esp32RecoveredPanicPrintStrValue(<<0>>)", "esp32/system/panic_esp32.ab"),
+    SourceCall("panic_print_hex", 1, "esp32RecoveredPanicPrintHexValue(<<0>>)", "esp32/system/panic_esp32.ab"),
+    SourceCall("panic_print_dec", 1, "esp32RecoveredPanicPrintDecValue(<<0>>)", "esp32/system/panic_esp32.ab"),
+    SourceCall("esp_rom_gpio_connect_in_signal", 3, "esp32RomGpioConnectInSignalValue(<<0>>, <<1>>, <<2>>)", "esp32/rom/gpio_esp32.ab"),
+    SourceCall("esp_rom_gpio_connect_out_signal", 4, "esp32RomGpioConnectOutSignalValue(<<0>>, <<1>>, <<2>>, <<3>>)", "esp32/rom/gpio_esp32.ab"),
+    SourceCall("wdt_hal_write_protect_disable", 1, "esp32WdtHalWriteProtectDisableValue(<<0>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("wdt_hal_write_protect_enable", 1, "esp32WdtHalWriteProtectEnableValue(<<0>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("wdt_hal_config_stage", 4, "esp32WdtHalConfigStageValue(<<0>>, <<1>>, <<2>>, <<3>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("bzero", 2, "freestandingZeroValue(<<0>>, <<1>>)", "runtime/freestanding_memory.ab"),
+    SourceCall("mem_free", 1, "esp32LwipMemFreeValue(<<0>>)", "network/lwip/memory_esp32.ab"),
+    SourceCall("pbuf_realloc", 2, "esp32LwipPbufReallocateValue(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_clen", 1, "esp32LwipPbufChainLength(<<0>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_cat", 2, "esp32LwipPbufConcatenateValue(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_try_get_at", 2, "u32(esp32LwipPbufTryGetAt(<<0>>, <<1>>))", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_copy", 2, "esp32LwipPbufCopy(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_clone", 3, "esp32LwipPbufClone(<<0>>, <<1>>, <<2>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_header", 2, "esp32LwipPbufHeader(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_header_force", 2, "esp32LwipPbufHeaderForce(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("pbuf_free_header", 2, "esp32LwipPbufFreeHeader(<<0>>, <<1>>)", "network/lwip/pbuf_basic_esp32.ab"),
+    SourceCall("roundup2", 2, "esp32Roundup2(<<0>>, <<1>>)", "esp32/idf6_legacy_link.ab"),
+    SourceCall("esp_ptr_executable", 1, "esp32RecoveredEspPtrExecutable(<<0>>)", "esp32/memory/address_esp32.ab"),
+    SourceCall("esp_rom_crc32_le", 3, "esp32RomCrc32Le(<<0>>, <<1>>, <<2>>)", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("crc32_le", 3, "esp32RomCrc32Le(<<0>>, <<1>>, <<2>>)", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_get_reset_reason", 1, "esp32RomGetResetReason(<<0>>)", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_software_reset_system", 0, "esp32RomSoftwareResetSystemValue()", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_software_reset_cpu", 1, "esp32RomSoftwareResetCpuValue(<<0>>)", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_output_set_as_console", 1, "esp32RomOutputSetAsConsoleValue(<<0>>)", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_install_uart_printf", 0, "esp32RomInstallUartPrintfValue()", "esp32/rom/basic_system_esp32.ab"),
+    SourceCall("esp_rom_route_intr_matrix", 3, "esp32RomRouteInterruptMatrixValue(<<0>>, <<1>>, <<2>>)", "esp32/rom/system_esp32.ab"),
+    SourceCall("ets_set_appcpu_boot_addr", 1, "esp32RomSetAppCpuBootAddressValue(<<0>>)", "esp32/rom/system_esp32.ab"),
+    SourceCall("esp_rom_output_tx_wait_idle", 1, "esp32RomOutputTxWaitIdleValue(<<0>>)", "esp32/rom/serial_output_esp32.ab"),
+    SourceCall("esp_rom_spiflash_wait_idle", 0, "esp32RomSpiflashWaitIdleValue()", "esp32/rom/spiflash_clock_esp32.ab"),
+    SourceCall("esp_dport_access_sequence_reg_read", 1, "esp32DportSequenceReadShared(<<0>>)", "esp32/dport_esp32.ab"),
+    SourceCall("Cache_Flush_rom", 1, "esp32RomCacheFlushValue(<<0>>)", "esp32/rom/cache_control_esp32.ab"),
+    SourceCall("Cache_Read_Enable_rom", 1, "esp32RomCacheReadEnableValue(<<0>>)", "esp32/rom/cache_control_esp32.ab"),
+    SourceCall("Cache_Read_Disable_rom", 1, "esp32RomCacheReadDisableValue(<<0>>)", "esp32/rom/cache_control_esp32.ab"),
+    SourceCall("wdt_hal_enable", 1, "esp32WdtHalEnableValue(<<0>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("wdt_hal_disable", 1, "esp32WdtHalDisableValue(<<0>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("wdt_hal_feed", 1, "esp32WdtHalFeedValue(<<0>>)", "esp32/power/wdt_hal_typed_esp32.ab"),
+    SourceCall("esp_rom_gpio_pad_select_gpio", 1, "esp32RomGpioPadSelectGpioValue(<<0>>)", "esp32/gpio/hal_esp32.ab"),
+    SourceCall("esp_rom_gpio_pad_pullup_only", 1, "esp32RomGpioPadPullupOnlyValue(<<0>>)", "esp32/gpio/hal_esp32.ab"),
+    SourceCall("esp_rom_spiflash_read_user_cmd", 2, "esp32RomSpiflashReadUserCommand(<<0>>, <<1>>)", "esp32/rom/spiflash_clock_esp32.ab"),
+    SourceCall("esp_rom_output_tx_one_char", 1, "esp32RomOutputTxOneCharValue(<<0>>)", "esp32/rom/serial_output_esp32.ab"),
+    SourceCall("esp_rom_cvt", 6, "esp32RomCvt(<<0>>, <<1>>, <<2>>, <<3>>, <<4>>, <<5>>)", "esp32/rom/cvt_esp32.ab"),
+    SourceCall("esp_rom_spiflash_write_encrypted_enable", 0, "esp32RomSpiflashEncryptedEnableValue()", "esp32/rom/spiflash_typed_esp32.ab"),
+    SourceCall("esp_rom_spiflash_prepare_encrypted_data", 2, "esp32RomSpiflashPrepareEncryptedDataValue(<<0>>, <<1>>)", "esp32/rom/spiflash_typed_esp32.ab"),
+    SourceCall("esp_rom_spiflash_write_encrypted_disable", 0, "esp32RomSpiflashEncryptedDisableValue()", "esp32/rom/spiflash_typed_esp32.ab"),
+    SourceCall("esp_rom_spiflash_config_param", 6, "esp32RomSpiflashConfigParam(<<0>>, <<1>>, <<2>>, <<3>>, <<4>>, <<5>>)", "esp32/rom/spiflash_typed_esp32.ab"),
+    SourceCall("esp_partition_verify", 1, "esp32PartitionVerify(<<0>>)", "esp32/storage/partition_operations_esp32.ab"),
+    SourceCall("esp_partition_copy", 5, "esp32PartitionCopy(<<0>>, <<1>>, <<2>>, <<3>>, <<4>>)", "esp32/storage/partition_operations_esp32.ab"),
+    SourceCall("esp_log_util_set_cache_enabled_cb", 1, "esp32LogSetCacheEnabledCallback(<<0>>)", "esp32/log/util_typed_esp32.ab"),
+    SourceCall("tlsf_check_hook", 3, "esp32TlsfCheckHook(<<0>>, <<1>>, <<2>>)", "esp32/heap/tlsf_esp32.ab"),
+    SourceCall("efuse_hal_get_mac", 1, "esp32EfuseGetMacValue(<<0>>)", "esp32/hal/efuse_identity_esp32.ab"),
+    SourceCall("efuse_hal_get_chip_ver_pkg", 0, "esp32EfuseGetChipVersionPackage()", "esp32/hal/efuse_identity_esp32.ab"),
+    SourceCall("spi_bus_lock_get_by_id", 1, "esp32SpiBusLockGetById(<<0>>)", "esp32/spi/bus_context_esp32.ab"),
+    SourceCall("cache_flash_mmu_set_rom", 6, "esp32CacheFlashMmuSet(<<0>>, <<1>>, <<2>>, <<3>>, <<4>>, <<5>>)", "esp32/rom/cache_mmu_esp32.ab"),
+    SourceCall("bootloader_ana_clock_glitch_reset_config", 2, "esp32BootloaderAnalogClockGlitchResetConfig(<<0>>, <<1>>)", "esp32/rom/cache_mmu_esp32.ab"),
+    SourceCall("__lshrdi3", 3, "u32((u64(<<0>>) | (u64(<<1>>) << u64(32))) >> u64(<<2>> & u32(63)))", "runtime/freestanding_integer.ab"),
+    SourceCall("__ashrdi3", 3, "u32(i64(u64(<<0>>) | (u64(<<1>>) << u64(32))) >> i64(<<2>> & u32(63)))", "runtime/freestanding_integer.ab"),
+]
+fun wideSourceCallTable(): array<SourceCall> = [
+    SourceCall("esp_timer_get_time", 0, "esp32TimerTimeMicroseconds()", "esp32/timer/lac_esp32.ab"),
+    SourceCall("esp_tls_get_platform_time", 0, "esp32TimerTimeMicroseconds()", "esp32/timer/lac_esp32.ab"),
+    SourceCall("__divdi3", 4, "u64(esp32SignedDivide64(i64(u64(<<0>>) | (u64(<<1>>) << u64(32))), i64(u64(<<2>>) | (u64(<<3>>) << u64(32)))))", "esp32/runtime/libgcc_divdi3_esp32.ab"),
+    SourceCall("__moddi3", 4, "u64(esp32SignedRemainder64(i64(u64(<<0>>) | (u64(<<1>>) << u64(32))), i64(u64(<<2>>) | (u64(<<3>>) << u64(32)))))", "esp32/runtime/libgcc_moddi3_esp32.ab"),
+    SourceCall("__extendsfdf2", 1, "esp32Binary32BitsToBinary64(<<0>>)", "esp32/runtime/libgcc_extendsfdf2_esp32.ab"),
+    SourceCall("__udivdi3", 4, "esp32UnsignedDivide64(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_udivdi3_esp32.ab"),
+    SourceCall("__umoddi3", 4, "esp32UnsignedRemainder64(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_umoddi3_esp32.ab"),
+    SourceCall("__floatunsidf", 1, "esp32Unsigned32ToBinary64(<<0>>)", "esp32/runtime/libgcc_floatsidf_esp32.ab"),
+    SourceCall("__floatsidf", 1, "esp32Signed32ToBinary64(i32(<<0>>))", "esp32/runtime/libgcc_floatsidf_esp32.ab"),
+    SourceCall("__ashrdi3", 3, "u64(i64(u64(<<0>>) | (u64(<<1>>) << u64(32))) >> i64(<<2>> & u32(63)))", "runtime/freestanding_integer.ab"),
+    SourceCall("__bswapdi2", 2, "freestandingByteSwap64(u64(<<0>>) | (u64(<<1>>) << u64(32)))", "runtime/freestanding_integer.ab"),
+    SourceCall("__ashldi3", 3, "(u64(<<0>>) | (u64(<<1>>) << u64(32))) << u64(<<2>> & u32(63))", "runtime/freestanding_integer.ab"),
+    SourceCall("__lshrdi3", 3, "(u64(<<0>>) | (u64(<<1>>) << u64(32))) >> u64(<<2>> & u32(63))", "runtime/freestanding_integer.ab"),
+    SourceCall("__muldf3", 4, "esp32Binary64Multiply(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_muldf3_esp32.ab"),
+    SourceCall("__adddf3", 4, "esp32RecoveredAdddf3(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_addsubdf3_esp32.ab"),
+    SourceCall("__subdf3", 4, "esp32RecoveredSubdf3(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_addsubdf3_esp32.ab"),
+    SourceCall("__divdf3", 4, "esp32Binary64Divide(u64(<<0>>) | (u64(<<1>>) << u64(32)), u64(<<2>>) | (u64(<<3>>) << u64(32)))", "esp32/runtime/libgcc_divdf3_esp32.ab"),
+]
