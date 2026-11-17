@@ -149,7 +149,9 @@ stack arguments, module data definitions).
 Classic-only assumptions to parameterize (from a tooling survey):
 
 - archive paths `esp_wifi/lib/esp32/...` and per-corpus tables in
-  `lower-recovered-jump-tables` (`DISPATCHES`), `lower-recovered-constant-pools`
+  `lower-recovered-jump-tables` (its curated `DISPATCHES` list, applied once to the
+  committed classic sources, was dropped when the tool moved to Abla; `--discover`
+  remains), `lower-recovered-constant-pools`
   (`POOLS`), `lower-xtensa-tail-forwards-to-abla` (`FORWARDS`),
   `repair-lifted-function-entry-offsets`, `reconstruct-xtensa-object`
   (`COMPATIBILITY_SYMBOLS`);

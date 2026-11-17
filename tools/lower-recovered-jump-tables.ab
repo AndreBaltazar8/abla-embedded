@@ -1,0 +1,1039 @@
+// Replace recovered Xtensa code-address tables with pure Abla `when` flow.
+//
+//     tools/abla-tool lower-recovered-jump-tables [--write] --objdump OBJDUMP
+//         --discover OBJECT RECOVERED.ab
+//
+// Finds and lowers every computed jump table of one recovered member. A recovered
+// rodata table whose entries are all code addresses inside the one function that
+// indexes it is a switch table; its targets map to that function's lifted blocks.
+// Run before structurizing, while functions are still program-counter dispatchers.
+//
+// The curated list of classic ESP32 dispatches (the mode without --discover) was
+// applied once to the committed sources, which no longer contain those tables;
+// it is not part of this port.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/array"
+import "abla/process/command"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "abla/sys/linux"
+import "lib/recovered-text.ab"
+import "lift-xtensa-leaves-to-abla.ab"
+
+val jtPhyTable = "esp32Data_Labla_recovered_phy_chip_v7_cal_data_rodata_91220204e0"
+
+// ---- the INITIALIZED block: storage, initializer and the value that wraps it ----
+
+class JtBlock(
+    val start: int,
+    val end: int,
+    val size: int,
+    val bodyStart: int,
+    val bodyEnd: int,
+    val value: string
+)
+
+private fun jtNoBlock(): JtBlock = JtBlock(0, -1, 0, 0, 0, "")
+
+// `esp32Data_[A-Za-z0-9_]+SUFFIX` at `at`: the end of the (maximal) run when it ends with `suffix`, else -1.
+private fun jtDataName(text: string, at: int, suffix: string): int {
+    if (!rtAt(text, at, "esp32Data_")) return -1
+    var j = at + 10
+    while (j < text.size && rtIsWord(text[j])) j += 1
+    if (j - (at + 10) < suffix.size + 1) return -1
+    if (text.slice(j - suffix.size, j) != suffix) return -1
+    j
+}
+
+/** The block of `(?ms)^val\s+...Storage\s*=\s*nativeStaticAllocate(N)\n trusted fun ...Initialize(): int {\n BODY ^}\n val ...Initialized =.*?\n val VALUE\s*=[^\n]*\n?` at line start `p`. */
+fun jtBlockAt(s: string, p: int): JtBlock {
+    if (!rtAt(s, p, "val") || p + 3 >= s.size || !rtIsSpace(s[p + 3])) return jtNoBlock()
+    var i = rtSkipSpace(s, p + 3)
+    val storageEnd = jtDataName(s, i, "Storage")
+    if (storageEnd < 0) return jtNoBlock()
+    var k = rtSkipSpace(s, storageEnd)
+    if (!rtAt(s, k, "=")) return jtNoBlock()
+    k = rtSkipSpace(s, k + 1)
+    if (!rtAt(s, k, "nativeStaticAllocate(")) return jtNoBlock()
+    k += 21
+    val digits = k
+    while (k < s.size && rtIsDigit(s[k])) k += 1
+    if (k == digits || !rtAt(s, k, ")\n")) return jtNoBlock()
+    val size = rtParseDecimal(s.slice(digits, k))
+    k += 2
+    if (!rtAt(s, k, "trusted") || k + 7 >= s.size || !rtIsSpace(s[k + 7])) return jtNoBlock()
+    k = rtSkipSpace(s, k + 7)
+    if (!rtAt(s, k, "fun") || k + 3 >= s.size || !rtIsSpace(s[k + 3])) return jtNoBlock()
+    k = rtSkipSpace(s, k + 3)
+    val initializeEnd = jtDataName(s, k, "Initialize")
+    if (initializeEnd < 0) return jtNoBlock()
+    k = initializeEnd
+    if (!rtAt(s, k, "():")) return jtNoBlock()
+    k = rtSkipSpace(s, k + 3)
+    if (!rtAt(s, k, "int")) return jtNoBlock()
+    k = rtSkipSpace(s, k + 3)
+    if (!rtAt(s, k, "{\n")) return jtNoBlock()
+    val bodyStart = k + 2
+    // The body is the shortest text for which the rest of the pattern follows a line that is just `}`.
+    var q = bodyStart
+    while (q < s.size) {
+        if ((q == bodyStart || s[q - 1] == 10) && rtAt(s, q, "}\n")) {
+            val tail = jtTailAt(s, q + 2)
+            if (tail.end >= 0) return JtBlock(p, tail.end, size, bodyStart, q, tail.value)
+        }
+        q += 1
+    }
+    jtNoBlock()
+}
+
+private fun jtTailAt(s: string, t: int): JtBlock {
+    if (!rtAt(s, t, "val") || t + 3 >= s.size || !rtIsSpace(s[t + 3])) return jtNoBlock()
+    val i = rtSkipSpace(s, t + 3)
+    val initializedEnd = jtDataName(s, i, "Initialized")
+    if (initializedEnd < 0) return jtNoBlock()
+    val k = rtSkipSpace(s, initializedEnd)
+    if (!rtAt(s, k, "=")) return jtNoBlock()
+    // `.*?\n` then `val\s+(VALUE)\s*=[^\n]*\n?`: the first line break after which the value declaration follows.
+    var nl = s.indexOf("\n", k + 1)
+    while (nl >= 0) {
+        val v = nl + 1
+        if (rtAt(s, v, "val") && v + 3 < s.size && rtIsSpace(s[v + 3])) {
+            val a = rtSkipSpace(s, v + 3)
+            if (rtAt(s, a, "esp32Data_")) {
+                var b = a + 10
+                while (b < s.size && rtIsWord(s[b])) b += 1
+                if (b > a + 10) {
+                    val c = rtSkipSpace(s, b)
+                    if (rtAt(s, c, "=")) {
+                        val lineEnd = s.indexOf("\n", c + 1)
+                        val end = if (lineEnd < 0) s.size else lineEnd + 1
+                        return JtBlock(t, end, 0, 0, 0, s.slice(a, b))
+                    }
+                }
+            }
+        }
+        nl = s.indexOf("\n", nl + 1)
+    }
+    jtNoBlock()
+}
+
+fun jtBlocks(s: string): array<JtBlock> {
+    val found: array<JtBlock> = []
+    var cursor = 0
+    var p = 0
+    while (p < s.size) {
+        if ((p == 0 || s[p - 1] == 10) && p >= cursor) {
+            val b = jtBlockAt(s, p)
+            if (b.end >= 0) {
+                found.append(b)
+                cursor = b.end
+            }
+        }
+        p += 1
+    }
+    found
+}
+
+// ---- table entries ----
+
+class JtEntries(val block: JtBlock, val symbols: array<string>, val addends: array<int>, val error: string)
+
+private fun jtEntriesFail(message: string): JtEntries = JtEntries(jtNoBlock(), [], [], message)
+
+// STORE.search(line.strip()): the table offset and the `int(EXPRESSION)` of a 32-bit store; offset -1 if none.
+class JtStore(val offset: int, val expression: string)
+
+fun jtStore(line: string): JtStore {
+    val none = JtStore(-1, "")
+    var at = line.indexOf("ablaUnsafeStoreU32(", 0)
+    while (at >= 0) {
+        val rest = at + 19
+        val markers: array<int> = []
+        var m = line.indexOf("Storage + ", rest)
+        while (m >= 0) {
+            markers.append(m)
+            m = line.indexOf("Storage + ", m + 1)
+        }
+        // `[^\n]*` is greedy: the rightmost marker that lets the rest match wins.
+        var k = markers.size - 1
+        while (k >= 0) {
+            var i = markers[k] + 10
+            val digits = i
+            while (i < line.size && rtIsDigit(line[i])) i += 1
+            if (i > digits && rtAt(line, i, "),")) {
+                var j = rtSkipSpace(line, i + 2)
+                if (rtAt(line, j, "int(")) {
+                    j += 4
+                    var end = line.size
+                    while (end > j && rtIsSpace(line[end - 1])) end -= 1
+                    if (end - 2 >= j && line[end - 1] == 41 && line[end - 2] == 41) {
+                        return JtStore(rtParseDecimal(line.slice(digits, i)), line.slice(j, end - 2))
+                    }
+                }
+            }
+            k -= 1
+        }
+        at = line.indexOf("ablaUnsafeStoreU32(", at + 1)
+    }
+    none
+}
+
+// ADDRESS.fullmatch: `^\(?\$xtensa\s+address\s+\{\{?\s*SYMBOL\s*\}\}?(?:\s*\+\s*u32\(DIGITS\))?\)?$`; end -1 if not.
+class JtAddress(val ok: bool, val symbol: string, val addend: int)
+
+fun jtAddress(text: string): JtAddress {
+    var at = 0
+    if (rtAt(text, 0, "(")) at = 1
+    val m = rtAddressAt(text, at)
+    if (m.end < 0) return JtAddress(false, "", 0)
+    var i = m.end
+    // With an addend.
+    var j = rtSkipSpace(text, i)
+    if (rtAt(text, j, "+")) {
+        j = rtSkipSpace(text, j + 1)
+        if (rtAt(text, j, "u32(")) {
+            j += 4
+            val digits = j
+            while (j < text.size && rtIsDigit(text[j])) j += 1
+            if (j > digits && rtAt(text, j, ")")) {
+                val after = j + 1
+                if (after == text.size || (after + 1 == text.size && text[after] == 41)) {
+                    return JtAddress(true, m.symbol, rtParseDecimal(text.slice(digits, j)))
+                }
+            }
+        }
+    }
+    if (i == text.size || (i + 1 == text.size && text[i] == 41)) return JtAddress(true, m.symbol, 0)
+    JtAddress(false, "", 0)
+}
+
+fun jtTableEntries(source: string, table: string): JtEntries {
+    var found = jtNoBlock()
+    for (b in jtBlocks(source)) {
+        if (found.end < 0 && b.value == table) found = b
+    }
+    if (found.end < 0) return jtEntriesFail("missing recovered table ${table}")
+    val symbols: array<string> = []
+    val addends: array<int> = []
+    for (line in rtSplitLines(source.slice(found.bodyStart, found.bodyEnd), false)) {
+        val stripped = rtStrip(line)
+        val store = jtStore(stripped)
+        if (store.offset < 0) continue
+        val address = jtAddress(rtStrip(store.expression))
+        if (!address.ok) return jtEntriesFail("non-address entry in ${table}: ${stripped}")
+        symbols.append(address.symbol)
+        addends.append(address.addend)
+    }
+    val expected = found.size / 4
+    if (table != jtPhyTable && symbols.size != expected) {
+        return jtEntriesFail("${table}: recovered ${symbols.size} of ${expected} entries")
+    }
+    JtEntries(found, symbols, addends, "")
+}
+
+// ---- functions ----
+
+class JtSpan(val begin: int, val end: int, val error: string)
+
+fun jtFunctionSpan(source: string, name: string): JtSpan {
+    val head = "trusted fun ${name}("
+    var at = source.indexOf(head, 0)
+    while (at >= 0 && !(at == 0 || source[at - 1] == 10)) at = source.indexOf(head, at + 1)
+    if (at < 0) return JtSpan(0, 0, "missing Abla function ${name}")
+    val opening = source.indexOf("{", at + head.size)
+    var depth = 0
+    var quoted = false
+    var escaped = false
+    var index = if (opening < 0) source.size else opening
+    while (index < source.size) {
+        val c = source[index]
+        if (quoted) {
+            if (escaped) escaped = false
+            else if (c == 92) escaped = true
+            else if (c == 34) quoted = false
+        } else if (c == 34) {
+            quoted = true
+        } else if (c == 123) {
+            depth += 1
+        } else if (c == 125) {
+            depth -= 1
+            if (depth == 0) return JtSpan(at, index + 1, "")
+        }
+        index += 1
+    }
+    JtSpan(0, 0, "unterminated Abla function ${name}")
+}
+
+// ---- jump sites ----
+
+class JtSites(val jumps: array<int>, val offsets: array<int>, val selectors: array<string>, val shifts: array<int>)
+
+// `\s*(r[0-9]+) = ` at `at`: the register and the position after " = ", or "" register.
+private fun jtRegisterAssignment(text: string, at: int, var out: array<int>): string {
+    if (at >= text.size || text[at] != 114) return ""
+    var i = at + 1
+    val digits = i
+    while (i < text.size && rtIsDigit(text[i])) i += 1
+    if (i == digits || !rtAt(text, i, " = ")) return ""
+    out.append(i + 3)
+    text.slice(at, i)
+}
+
+/** `\s*(r[0-9]+) = (?:\(TABLE \+ u32\(([0-9]+)\)\)|TABLE)\n?` fullmatch of a whole line: register or "", and the offset. */
+private fun jtBaseLine(line: string, table: string, var offset: array<int>): string {
+    val pos: array<int> = []
+    val register = jtRegisterAssignment(line, rtSkipSpace(line, 0), pos)
+    if (register == "") return ""
+    var i = pos[0]
+    val withOffset = "(${table} + u32("
+    if (rtAt(line, i, withOffset)) {
+        var j = i + withOffset.size
+        val digits = j
+        while (j < line.size && rtIsDigit(line[j])) j += 1
+        if (j > digits && rtAt(line, j, "))")) {
+            j += 2
+            if (j == line.size || (j + 1 == line.size && line[j] == 10)) {
+                offset.append(rtParseDecimal(line.slice(digits, j - 2)))
+                return register
+            }
+        }
+    }
+    if (rtAt(line, i, table)) {
+        val j = i + table.size
+        if (j == line.size || (j + 1 == line.size && line[j] == 10)) {
+            offset.append(0)
+            return register
+        }
+    }
+    ""
+}
+
+// `rB = rB + u32(DIGITS)` fullmatch: the digits, or -1.
+private fun jtAddLine(text: string, register: string): int {
+    val head = "${register} = ${register} + u32("
+    if (!rtAt(text, 0, head)) return -1
+    var i = head.size
+    val digits = i
+    while (i < text.size && rtIsDigit(text[i])) i += 1
+    if (i == digits || i + 1 != text.size || text[i] != 41) return -1
+    rtParseDecimal(text.slice(digits, i))
+}
+
+// `(r[0-9]+) = \((r[0-9]+) << u32\(2\)\) \+ REGISTER` fullmatch: [entry register, selector] or [].
+private fun jtShiftLine(text: string, register: string): array<string> {
+    val pos: array<int> = []
+    val entry = jtRegisterAssignment(text, 0, pos)
+    if (entry == "") return []
+    var i = pos[0]
+    if (!rtAt(text, i, "(")) return []
+    i += 1
+    if (i >= text.size || text[i] != 114) return []
+    var j = i + 1
+    while (j < text.size && rtIsDigit(text[j])) j += 1
+    if (j == i + 1) return []
+    val selector = text.slice(i, j)
+    val tail = " << u32(2)) + ${register}"
+    if (!rtAt(text, j, tail) || j + tail.size != text.size) return []
+    [entry, selector]
+}
+
+// `(r[0-9]+) = u32\(ablaUnsafeLoadU32\(.*\bint\(ENTRY\).*\)\)\)` fullmatch: the target register or "".
+private fun jtLoadLine(text: string, entry: string): string {
+    val pos: array<int> = []
+    val target = jtRegisterAssignment(text, 0, pos)
+    if (target == "") return ""
+    val head = "u32(ablaUnsafeLoadU32("
+    if (!rtAt(text, pos[0], head)) return ""
+    val from = pos[0] + head.size
+    if (!text.endsWith(")))")) return ""
+    val needle = "int(${entry})"
+    var at = text.indexOf(needle, from)
+    while (at >= 0) {
+        val boundary = at == 0 || !rtIsWord(text[at - 1])
+        if (boundary && at + needle.size <= text.size - 3) return target
+        at = text.indexOf(needle, at + 1)
+    }
+    ""
+}
+
+fun jtTableSites(function: string, table: string): JtSites {
+    val lines = rtSplitLines(function, true)
+    val jumps: array<int> = []
+    val offsets: array<int> = []
+    val selectors: array<string> = []
+    val shifts: array<int> = []
+    var index = 0
+    while (index < lines.size) {
+        val baseOffset: array<int> = []
+        val register = jtBaseLine(lines[index], table, baseOffset)
+        if (register != "") {
+            var offset = baseOffset[0]
+            var entryRegister = ""
+            var selector = ""
+            var target = ""
+            var shiftLine = 0
+            var look = index + 1
+            val limit = if (lines.size < index + 14) lines.size else index + 14
+            var done = false
+            while (!done && look < limit) {
+                val text = rtStrip(lines[look])
+                var handled = false
+                val add = jtAddLine(text, register)
+                if (add >= 0 && entryRegister == "") {
+                    offset += add
+                    handled = true
+                }
+                if (!handled) {
+                    val shift = jtShiftLine(text, register)
+                    if (shift.size == 2 && entryRegister == "") {
+                        entryRegister = shift[0]
+                        selector = shift[1]
+                        shiftLine = look
+                        handled = true
+                    }
+                }
+                if (!handled && entryRegister != "" && target == "") {
+                    val load = jtLoadLine(text, entryRegister)
+                    if (load != "") {
+                        target = load
+                        handled = true
+                    }
+                }
+                if (!handled && target != "" && text.startsWith("return u32(ablaUnsafeCall") && text.contains("(int(${target})")) {
+                    jumps.append(look)
+                    offsets.append(offset)
+                    selectors.append(selector)
+                    shifts.append(shiftLine)
+                    done = true
+                }
+                look += 1
+            }
+        }
+        index += 1
+    }
+    JtSites(jumps, offsets, selectors, shifts)
+}
+
+// ---- subprocesses ----
+
+/** shlex.split for the objdump command string: spaces separate words; quotes group; \ escapes. */
+fun jtShellSplit(text: string): array<string> {
+    val words: array<string> = []
+    var current = ""
+    var inWord = false
+    var quote = 0
+    var i = 0
+    while (i < text.size) {
+        val c = text[i]
+        if (quote == 39) {
+            if (c == 39) quote = 0 else current = current + text.slice(i, i + 1)
+        } else if (quote == 34) {
+            if (c == 34) {
+                quote = 0
+            } else if (c == 92 && i + 1 < text.size && (text[i + 1] == 34 || text[i + 1] == 92 || text[i + 1] == 36 || text[i + 1] == 96)) {
+                current = current + text.slice(i + 1, i + 2)
+                i += 1
+            } else {
+                current = current + text.slice(i, i + 1)
+            }
+        } else if (c == 39 || c == 34) {
+            quote = c
+            inWord = true
+        } else if (c == 92 && i + 1 < text.size) {
+            current = current + text.slice(i + 1, i + 2)
+            inWord = true
+            i += 1
+        } else if (rtIsSpace(c)) {
+            if (inWord) {
+                words.append(current)
+                current = ""
+                inWord = false
+            }
+        } else {
+            current = current + text.slice(i, i + 1)
+            inWord = true
+        }
+        i += 1
+    }
+    if (inWord) words.append(current)
+    words
+}
+
+class JtRun(val output: string, val status: int)
+
+fun jtRun(arguments: array<string>): JtRun {
+    val c = command(arguments[0])
+    var k = 1
+    while (k < arguments.size) {
+        c.argument(arguments[k])
+        k += 1
+    }
+    val result = c.capture()
+    JtRun(result.output, result.status)
+}
+
+/** The tools/ directory of the project this program belongs to. */
+fun jtToolsDirectory(): string {
+    val fromEnvironment = processEnvironment("ABLA_PROJECT_ROOT")
+    if (fromEnvironment != null && fromEnvironment != "") return rtPathText(fromEnvironment) + "/tools"
+    // abla-tool builds into <project>/build/abla-tools/<hash>/NAME.
+    val marker = "/build/abla-tools/"
+    val executable = rtAbsolute(processExecutable())
+    val at = executable.indexOf(marker, 0)
+    if (at >= 0) return executable.slice(0, at) + "/tools"
+    rtPathParent(executable)
+}
+
+class JtStart(val value: int, val error: string)
+
+// object_function_start: the nm address of a defined text symbol.
+fun jtFunctionStart(objectPath: string, symbol: string): JtStart {
+    if (symbol.startsWith(".text.")) return JtStart(0, "")
+    val nm = jtRun(["nm", "--defined-only", objectPath])
+    if (nm.status != 0) return JtStart(0, "Command 'nm --defined-only ${objectPath}' returned non-zero exit status ${nm.status}.")
+    for (line in nm.output.split("\n")) {
+        val parts = jtFields(line)
+        if (parts.size == 3 && jtIsHex(parts[0]) && (parts[1] == "T" || parts[1] == "t") && parts[2] == symbol &&
+            line.startsWith(parts[0]) && !rtIsSpace(line[line.size - 1])) {
+            return JtStart(jtHexValue(parts[0]), "")
+        }
+    }
+    JtStart(0, "missing ${symbol} in ${rtPathName(objectPath)}")
+}
+
+fun jtFields(line: string): array<string> {
+    val fields: array<string> = []
+    var i = 0
+    while (i < line.size) {
+        if (rtIsSpace(line[i])) {
+            i += 1
+        } else {
+            var j = i
+            while (j < line.size && !rtIsSpace(line[j])) j += 1
+            fields.append(line.slice(i, j))
+            i = j
+        }
+    }
+    fields
+}
+
+fun jtIsHex(text: string): bool {
+    if (text.size == 0) return false
+    for (c in text) if (!(rtIsDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) return false
+    true
+}
+
+fun jtHexValue(text: string): int {
+    var value = 0
+    for (c in text) {
+        val digit = if (c <= 57) c - 48 else if (c <= 70) c - 55 else c - 87
+        value = value * 16 + digit
+    }
+    value
+}
+
+// section_entry_offset: the offset of the first `entry` of a section (after its literal pool).
+fun jtSectionEntryOffset(objdump: array<string>, objectPath: string, section: string): int {
+    val arguments: array<string> = []
+    for (word in objdump) arguments.append(word)
+    arguments.append("-d")
+    arguments.append("-j")
+    arguments.append(section)
+    arguments.append(objectPath)
+    val listing = jtRun(arguments)
+    // `(?m)^\s*([0-9a-f]+):\s+\S+\s+entry\b`
+    for (line in listing.output.split("\n")) {
+        var i = rtSkipSpace(line, 0)
+        val digits = i
+        while (i < line.size && ((line[i] >= 48 && line[i] <= 57) || (line[i] >= 97 && line[i] <= 102))) i += 1
+        if (i > digits && rtAt(line, i, ":") && i + 1 < line.size && rtIsSpace(line[i + 1])) {
+            var j = rtSkipSpace(line, i + 1)
+            val wordStart = j
+            while (j < line.size && !rtIsSpace(line[j])) j += 1
+            if (j > wordStart && j < line.size) {
+                j = rtSkipSpace(line, j)
+                if (rtAt(line, j, "entry") && (j + 5 == line.size || !rtIsWord(line[j + 5]))) {
+                    return jtHexValue(line.slice(digits, i))
+                }
+            }
+        }
+    }
+    0
+}
+
+// abla_function_name of tools/reconstruct-xtensa-object.
+fun jtAblaFunctionName(name: string): string {
+    val parts: array<string> = ["esp32Recovered"]
+    var i = 0
+    while (i < name.size) {
+        if (rtIsAlnum(name[i])) {
+            var j = i
+            while (j < name.size && rtIsAlnum(name[j])) j += 1
+            parts.append(name.slice(i, i + 1).uppercase() + name.slice(i + 1, j))
+            i = j
+        } else {
+            i += 1
+        }
+    }
+    parts.join("")
+}
+
+// ---- state map ----
+
+class JtStates(val start: int, val targets: array<int>, val states: array<int>, val error: string) {
+    fun state(target: int): int {
+        var k = 0
+        while (k < this.targets.size) {
+            if (this.targets[k] == target) return this.states[k]
+            k += 1
+        }
+        -1
+    }
+}
+
+fun jtSafeName(name: string): string {
+    val out: array<string> = []
+    var k = 0
+    while (k < name.size) {
+        out.append(if (rtIsAlnum(name[k]) || name[k] == 95) name.slice(k, k + 1) else "_")
+        k += 1
+    }
+    out.join("")
+}
+
+fun jtBlockMap(tools: string, objdump: string, objectPath: string, abiFunction: string, temporary: string): JtStates {
+    val raw = temporary + "/" + abiFunction + ".ab"
+    val run = jtRun([tools + "/abla-tool", "reconstruct-xtensa-object", "--objdump", objdump, "--output", raw,
+        "--namespace", "jump_table_map", objectPath, abiFunction])
+    if (run.status != 0) {
+        return JtStates(0, [], [], "Command 'reconstruct-xtensa-object ${abiFunction}' returned non-zero exit status ${run.status}.")
+    }
+    val read = rtRead(raw)
+    if (read.error != "") return JtStates(0, [], [], read.error)
+    val labels = liftBlockLabels(read.text)
+    // A lifter failure other than a missing function body aborts the pass (Python: Unsupported).
+    if (labels.error != "") return JtStates(0, [], [], if (labels.unsupported) "!Unsupported: ${labels.error}" else labels.error)
+    val start = jtFunctionStart(objectPath, abiFunction)
+    if (start.error != "") return JtStates(0, [], [], start.error)
+    val targets: array<int> = [start.value]
+    val states: array<int> = [0]
+    val prefix = ".Labla_recovered_${jtSafeName(abiFunction)}_"
+    var index = 0
+    while (index < labels.labels.size) {
+        val label = labels.labels[index]
+        if (label.startsWith(prefix) && label.size > prefix.size) {
+            val hex = label.slice(prefix.size, label.size)
+            if (jtIsHex(hex)) {
+                val value = jtHexValue(hex)
+                var slot = -1
+                var k = 0
+                while (k < targets.size) {
+                    if (targets[k] == value) slot = k
+                    k += 1
+                }
+                if (slot >= 0) states[slot] = index else {
+                    targets.append(value)
+                    states.append(index)
+                }
+            }
+        }
+        index += 1
+    }
+    JtStates(start.value, targets, states, "")
+}
+
+// target_offset: the code offset a table entry points at, or an error text.
+class JtTarget(val offset: int, val error: string)
+
+fun jtTargetOffset(symbol: string, addend: int, function: string, start: int): JtTarget {
+    val prefix = ".Labla_recovered_${jtSafeName(function)}_"
+    if (symbol.startsWith(prefix) && symbol.size > prefix.size && jtIsHex(symbol.slice(prefix.size, symbol.size))) {
+        return JtTarget(jtHexValue(symbol.slice(prefix.size, symbol.size)) + addend, "")
+    }
+    if (symbol == function || symbol.endsWith("_section_entry")) return JtTarget(start + addend, "")
+    if (symbol.startsWith(".")) return JtTarget(addend, "")
+    JtTarget(0, "unsupported jump-table target ${symbol}+${addend}")
+}
+
+// ---- lowering ----
+
+class JtLowered(val source: string, val replacements: int, val log: array<string>)
+
+fun jtLowerFunctionTable(
+    source: string, ablaFunction: string, abiFunction: string, table: string,
+    symbols: array<string>, addends: array<int>, objectPath: string, objdumpText: string,
+    tools: string, temporary: string
+): JtLowered {
+    val log: array<string> = []
+    val span = jtFunctionSpan(source, ablaFunction)
+    if (span.error != "") {
+        log.append("!ValueError: ${span.error}")
+        return JtLowered(source, 0, log)
+    }
+    val functionText = source.slice(span.begin, span.end)
+    val sites = jtTableSites(functionText, table)
+    if (sites.jumps.size == 0) {
+        log.append("${abiFunction}: table ${table} has no recognized jump site")
+        return JtLowered(source, 0, log)
+    }
+    val states = jtBlockMap(tools, objdumpText, objectPath, abiFunction, temporary)
+    if (states.error.startsWith("!")) {
+        log.append(states.error)
+        return JtLowered(source, 0, log)
+    }
+    if (states.error != "") {
+        log.append("${abiFunction}: table ${table} left as data (${states.error})")
+        return JtLowered(source, 0, log)
+    }
+    val objdump = jtShellSplit(objdumpText)
+    val lines = rtSplitLines(functionText, true)
+    var replacements = 0
+    // Sites in reverse (jump line, offset, selector, shift line) order.
+    val order: array<int> = []
+    var n = 0
+    while (n < sites.jumps.size) {
+        order.append(n)
+        n += 1
+    }
+    var a = 1
+    while (a < order.size) {
+        var b = a
+        while (b > 0 && jtSiteBefore(sites, order[b - 1], order[b])) {
+            val swap = order[b]
+            order[b] = order[b - 1]
+            order[b - 1] = swap
+            b -= 1
+        }
+        a += 1
+    }
+    for (site in order) {
+        val lineIndex = sites.jumps[site]
+        val offset = sites.offsets[site]
+        val selector = sites.selectors[site]
+        val shiftLine = sites.shifts[site]
+        val mapping: array<int> = []
+        var entry = offset / 4
+        var stopped = false
+        while (!stopped && entry < symbols.size) {
+            var addend = addends[entry]
+            val symbol = symbols[entry]
+            if (abiFunction.startsWith(".text.") && symbol.contains("_local_" + jtSafeName(abiFunction))) {
+                addend += jtSectionEntryOffset(objdump, objectPath, abiFunction)
+            }
+            val target = jtTargetOffset(symbol, addend, abiFunction, states.start)
+            if (target.error != "") {
+                stopped = true
+            } else {
+                val state = states.state(target.offset)
+                if (state < 0) {
+                    mapping.clear()
+                    stopped = true
+                } else {
+                    mapping.append(state)
+                }
+            }
+            entry += 1
+        }
+        if (mapping.size == 0) {
+            log.append("${abiFunction}: table ${table}+${offset} has unmapped targets")
+            return JtLowered(source, 0, log)
+        }
+        val indent = lines[lineIndex].slice(0, rtSkipSpace(lines[lineIndex], 0))
+        val indexName = "jumpTableIndex${shiftLine}"
+        val arms: array<string> = []
+        var value = 0
+        for (state in mapping) {
+            arms.append("${indent}    ${value} -> ${state}\n")
+            value += 1
+        }
+        lines[lineIndex] = "${indent}programCounter = when (${indexName}) {\n${arms.join("")}${indent}    else -> -1\n${indent}}\n"
+        val shiftIndent = lines[shiftLine].slice(0, rtSkipSpace(lines[shiftLine], 0))
+        lines[shiftLine] = "${shiftIndent}val ${indexName} = ${selector}\n" + lines[shiftLine]
+        replacements += 1
+        log.append("${abiFunction} -> ${mapping.size}-arm Abla when (offset ${offset})")
+    }
+    if (replacements == 0) return JtLowered(source, 0, log)
+    JtLowered(source.slice(0, span.begin) + lines.join("") + source.slice(span.end, source.size), replacements, log)
+}
+
+// sorted(sites, reverse=True): a before b when a's tuple is smaller (so b moves up).
+private fun jtSiteBefore(sites: JtSites, a: int, b: int): bool {
+    if (sites.jumps[a] != sites.jumps[b]) return sites.jumps[a] < sites.jumps[b]
+    if (sites.offsets[a] != sites.offsets[b]) return sites.offsets[a] < sites.offsets[b]
+    if (sites.selectors[a] != sites.selectors[b]) return sites.selectors[a] < sites.selectors[b]
+    sites.shifts[a] < sites.shifts[b]
+}
+
+// `(?<![\w$])TABLE(?![\w])`
+fun jtUsesTable(text: string, table: string): bool {
+    var at = text.indexOf(table, 0)
+    while (at >= 0) {
+        val before = at == 0 || !(rtIsWord(text[at - 1]) || text[at - 1] == 36)
+        val after = at + table.size >= text.size || !rtIsWord(text[at + table.size])
+        if (before && after) return true
+        at = text.indexOf(table, at + 1)
+    }
+    false
+}
+
+// The assembly-defined tables: `(?m)^(\.L[\w.$]+):\n((?:\.long\s+[^\n]+\n)+)` with their `.long SYMBOL[+0xOFFSET]` entries.
+class JtAssemblyTable(val label: string, val symbols: array<string>, val addends: array<int>)
+
+fun jtAssemblyTables(source: string): array<JtAssemblyTable> {
+    val tables: array<JtAssemblyTable> = []
+    val lines = rtSplitNewlines(source)
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i]
+        var labelEnd = -1
+        if (line.startsWith(".L")) {
+            var j = 2
+            while (j < line.size && (rtIsWord(line[j]) || line[j] == 46 || line[j] == 36)) j += 1
+            if (j > 2 && rtAt(line, j, ":\n") && j + 2 == line.size) labelEnd = j
+        }
+        if (labelEnd < 0) {
+            i += 1
+            continue
+        }
+        val block: array<string> = []
+        var k = i + 1
+        while (k < lines.size && jtLongLine(lines[k])) {
+            block.append(lines[k])
+            k += 1
+        }
+        if (block.size == 0) {
+            i += 1
+            continue
+        }
+        val symbols: array<string> = []
+        val addends: array<int> = []
+        val text = block.join("")
+        var at = text.indexOf(".long", 0)
+        while (at >= 0) {
+            var next = at + 1
+            var p = at + 5
+            if (p < text.size && rtIsSpace(text[p])) {
+                p = rtSkipSpace(text, p)
+                val symbolStart = p
+                while (p < text.size && !rtIsSpace(text[p]) && text[p] != 43) p += 1
+                if (p > symbolStart) {
+                    var addend = 0
+                    var end = p
+                    if (rtAt(text, p, "+0x")) {
+                        var h = p + 3
+                        while (h < text.size && jtIsHex(text.slice(h, h + 1))) h += 1
+                        if (h > p + 3) {
+                            addend = jtHexValue(text.slice(p + 3, h))
+                            end = h
+                        }
+                    }
+                    symbols.append(text.slice(symbolStart, p))
+                    addends.append(addend)
+                    next = end
+                }
+            }
+            at = text.indexOf(".long", next)
+        }
+        // A later table of the same label replaces an earlier one.
+        var replaced = false
+        var t = 0
+        while (t < tables.size) {
+            if (tables[t].label == line.slice(0, labelEnd)) {
+                tables[t] = JtAssemblyTable(line.slice(0, labelEnd), symbols, addends)
+                replaced = true
+            }
+            t += 1
+        }
+        if (!replaced) tables.append(JtAssemblyTable(line.slice(0, labelEnd), symbols, addends))
+        i = k
+    }
+    tables
+}
+
+// `\.long\s+[^\n]+\n`: ".long", whitespace, then at least one more character on the line.
+private fun jtLongLine(line: string): bool {
+    if (!line.startsWith(".long") || !line.endsWith("\n")) return false
+    if (line.size < 8 || !rtIsSpace(line[5])) return false
+    // after the first whitespace character at least one non-newline character must follow
+    line.size - 1 > 6
+}
+
+fun main: int {
+    val usage = "lower-recovered-jump-tables [-h] [--write] [--archive-root ARCHIVE_ROOT] --objdump OBJDUMP [--discover OBJECT] root"
+    val args = rtParseArguments(["--write"], ["--archive-root", "--objdump", "--discover"])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error == "" && args.positionals.size > 1) {
+        return rtUsageError("lower-recovered-jump-tables", usage, "unrecognized arguments: ${rtRest(args.positionals, 1)}")
+    }
+    if (args.error != "") return rtUsageError("lower-recovered-jump-tables", usage, args.error)
+    if (!args.has("--objdump") || args.positionals.size == 0) {
+        val missing: array<string> = []
+        if (!args.has("--objdump")) missing.append("--objdump")
+        if (args.positionals.size == 0) missing.append("root")
+        return rtUsageError("lower-recovered-jump-tables", usage, "the following arguments are required: ${missing.join(", ")}")
+    }
+    if (!args.has("--discover")) {
+        if (!args.has("--archive-root")) return rtUsageError("lower-recovered-jump-tables", usage, "--archive-root is required without --discover")
+        eprintln("lower-recovered-jump-tables: the curated classic ESP32 dispatch list (no --discover) is not ported; use --discover OBJECT")
+        return 1
+    }
+    val write = args.has("--write")
+    val sourcePath = rtAbsolute(args.positionals[0])
+    val objectPath = rtAbsolute(args.value("--discover", ""))
+    val objdumpText = args.value("--objdump", "")
+    val tools = jtToolsDirectory()
+
+    val nm = jtRun(["nm", "--defined-only", objectPath])
+    if (nm.status != 0) {
+        eprintln("nm --defined-only ${objectPath} failed with status ${nm.status}")
+        return 1
+    }
+    // abi_by_abla: Abla function name -> ABI symbol; text sections without a symbol come second.
+    val abiNames: array<string> = []
+    val abiSymbols: array<string> = []
+    for (line in nm.output.split("\n")) {
+        val parts = jtFields(line)
+        if (parts.size == 3 && jtIsHex(parts[0]) && (parts[1] == "T" || parts[1] == "t") && line.startsWith(parts[0]) &&
+            !rtIsSpace(line[line.size - 1])) {
+            jtSetAbi(abiNames, abiSymbols, jtAblaFunctionName(parts[2]), parts[2], true)
+        }
+    }
+    val sections = jtRun(["objdump", "-h", objectPath])
+    if (sections.status != 0) {
+        eprintln("objdump -h ${objectPath} failed with status ${sections.status}")
+        return 1
+    }
+    // `(?m)^\s*\d+\s+(\.text\.\S+)\s`
+    for (line in sections.output.split("\n")) {
+        var i = rtSkipSpace(line, 0)
+        val digits = i
+        while (i < line.size && rtIsDigit(line[i])) i += 1
+        if (i > digits && i < line.size && rtIsSpace(line[i])) {
+            val j = rtSkipSpace(line, i)
+            if (rtAt(line, j, ".text.")) {
+                var k = j
+                while (k < line.size && !rtIsSpace(line[k])) k += 1
+                if (k < line.size) jtSetAbi(abiNames, abiSymbols, jtAblaFunctionName(line.slice(j, k)), line.slice(j, k), false)
+            }
+        }
+    }
+    val read = rtRead(sourcePath)
+    if (read.error != "") {
+        eprintln(read.error)
+        return 1
+    }
+    var source = read.text
+    var loweredCount = 0
+    val directory = rtPathParent(sourcePath)
+    val temporary = "${directory}/.abla-jump-map.${linuxSyscall0(39)}"
+    if (!Path(temporary).createDirectories()) {
+        eprintln("cannot create ${temporary}")
+        return 1
+    }
+    val tables = jtAssemblyTables(source)
+    val tableNames: array<string> = []
+    val assembly: array<int> = []
+    for (b in jtBlocks(source)) {
+        tableNames.append(b.value)
+        assembly.append(-1)
+    }
+    var t = 0
+    while (t < tables.size) {
+        tableNames.append("\$xtensa address {${tables[t].label}}")
+        assembly.append(t)
+        t += 1
+    }
+    var failure = ""
+    var c = 0
+    while (failure == "" && c < tableNames.size) {
+        val table = tableNames[c]
+        var symbols: array<string> = []
+        var addends: array<int> = []
+        var usable = true
+        if (assembly[c] < 0) {
+            val entries = jtTableEntries(source, table)
+            if (entries.error != "") usable = false
+            else {
+                symbols = entries.symbols
+                addends = entries.addends
+            }
+        } else {
+            symbols = tables[assembly[c]].symbols
+            addends = tables[assembly[c]].addends
+        }
+        if (usable && symbols.size > 0) {
+            val users: array<string> = []
+            var cursor = 0
+            var p = 0
+            val head = "trusted fun "
+            while (failure == "" && p < source.size) {
+                if ((p == 0 || source[p - 1] == 10) && p >= cursor && rtAt(source, p, head)) {
+                    var q = p + head.size
+                    val nameStart = q
+                    while (q < source.size && rtIsWord(source[q])) q += 1
+                    if (q > nameStart && q < source.size && source[q] == 40) {
+                        val name = source.slice(nameStart, q)
+                        val span = jtFunctionSpan(source, name)
+                        if (span.error != "") failure = "!ValueError: ${span.error}"
+                        else if (jtUsesTable(source.slice(span.begin, span.end), table)) users.append(name)
+                        cursor = q + 1
+                    }
+                }
+                p += 1
+            }
+            for (user in users) {
+                if (failure != "") break
+                val abi = jtLookup(abiNames, abiSymbols, user)
+                if (abi == "") continue
+                val lowered = jtLowerFunctionTable(source, user, abi, table, symbols, addends, objectPath, objdumpText, tools, temporary)
+                for (message in lowered.log) {
+                    if (message.startsWith("!")) failure = message else println(message)
+                }
+                source = lowered.source
+                loweredCount += lowered.replacements
+            }
+        }
+        c += 1
+    }
+    Path(temporary).removeTree()
+    if (failure != "") {
+        eprintln(failure.slice(1, failure.size))
+        return 1
+    }
+    if (write && loweredCount > 0) {
+        val error = rtWrite(sourcePath, source)
+        if (error != "") {
+            eprintln(error)
+            return 1
+        }
+    }
+    println("${if (write) "lowered" else "would lower"} ${loweredCount} computed jumps")
+    0
+}
+
+private fun jtSetAbi(var names: array<string>, var symbols: array<string>, name: string, symbol: string, override: bool): void {
+    var k = 0
+    while (k < names.size) {
+        if (names[k] == name) {
+            if (override) symbols[k] = symbol
+            return
+        }
+        k += 1
+    }
+    names.append(name)
+    symbols.append(symbol)
+}
+
+private fun jtLookup(names: array<string>, symbols: array<string>, name: string): string {
+    var k = 0
+    while (k < names.size) {
+        if (names[k] == name) return symbols[k]
+        k += 1
+    }
+    ""
+}
