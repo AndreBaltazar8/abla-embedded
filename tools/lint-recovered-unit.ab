@@ -1,0 +1,2168 @@
+// Static lint for the recovered ESP32-S3 Wi-Fi unit: finds latent mistranslations.
+//
+//     tools/abla-tool lint-recovered-unit [--root build/recovery/esp32s3]
+//                                         [--check ID,...] [--limit N] [--tsv FILE]
+//
+// Self-test fixture: tools/testdata/lint-recovered-unit (expects 7 check groups: COMPJUMP ENTRYOFF FRAMEARG MMIO RAWCALL STACKARG STALEARG, and the exit status 1).
+// (This program replaces tools/lint-recovered-unit, a Python script; its
+// regular expressions were Python's, here they are small hand scanners.)
+//
+// Scans <root>/unit/*/*.ab (the assembled unit). Every finding is a *suspect*
+// that must be triaged against the original object's disassembly. Checks:
+//
+//   MMIO      non-volatile load/store whose address derives from a constant in a
+//             peripheral window (0x60000000-0x600FFFFF, 0x3FF00000-0x3FFFFFFF,
+//             0x50000000-0x5000FFFF RTC). LLVM may narrow/merge/reorder those.
+//   ENTRYOFF  `nativeFunctionAddress(F) + N` / `$xtensa address {code} + N`, N != 0:
+//             an address inside a function body that no longer has the original layout.
+//   RAWCALL   direct Abla call to a function whose body is raw Xtensa (@naked).
+//   STALEARG  direct call passing r10..r15 never assigned in the caller (and not
+//             a parameter) to a callee that reads that parameter.
+//   STACKARG  direct call forwarding the caller's own incoming stackN into a callee
+//             that reads stackN, or a caller that stores to r1+N right before a
+//             direct call to a callee with stack parameters (outgoing stack
+//             arguments a lifted call cannot pass).
+//   COMPJUMP  computed tail/jump through a register loaded from a table (left
+//             unlowered switch).
+//   LONGOFF   `.long/.word sym+0xNN` in raw asm where sym is a code symbol.
+//   DATADUP   data symbol referenced by raw asm under one name and stored by Abla
+//             under another (the same original symbol, two different storages).
+//   DRIFT-MEM / DRIFT-CALL / DRIFT-MEMW
+//             (needs xtensa objdump: $XTENSA_OBJDUMP, run via steam-run if on PATH)
+//             per original function, compares the width/direction multiset of memory ops, the
+//             number of calls and the number of `memw` barriers in the original object against
+//             the lifted function (typed or raw). A lifted body that lost or gained a store,
+//             changed an access width, dropped a call or a barrier has drifted.
+//   SYMTAB    (needs objdump) every defined global/weak symbol of the original member objects
+//             versus unit/unit.o: missing symbols, weak<->strong, data size, function<->object.
+//   RAWSPLIT  one original symbol defined both in raw asm and as Abla storage.
+//
+// Text is read as bytes: `\w` is ASCII (a non-ASCII letter next to a number or
+// identifier counts as a non-word character, unlike Python's `\w`).
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/environment"
+
+// ---------------------------------------------------------------- characters
+
+fun lintIsWord(c: int): bool =
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+fun lintIsSpace(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+fun lintIsDigit(c: int): bool = c >= 48 && c <= 57
+
+fun lintIsHex(c: int): bool =
+    (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+
+fun lintIsHexLower(c: int): bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+
+fun lintIsAlphaUnderscore(c: int): bool =
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+// [\w.$]
+fun lintIsSymbolByte(c: int): bool = lintIsWord(c) || c == 46 || c == 36
+
+fun lintAt(s: string, i: int): int = if (i >= 0 && i < s.size) s[i] else -1
+
+fun lintSkipSpace(s: string, i: int): int {
+    var p = i
+    while (p < s.size && lintIsSpace(s[p])) p = p + 1
+    p
+}
+
+fun lintSkipWord(s: string, i: int): int {
+    var p = i
+    while (p < s.size && lintIsWord(s[p])) p = p + 1
+    p
+}
+
+fun lintSkipDigits(s: string, i: int): int {
+    var p = i
+    while (p < s.size && lintIsDigit(s[p])) p = p + 1
+    p
+}
+
+fun lintHasAt(s: string, i: int, word: string): bool {
+    if (i < 0 || i + word.size > s.size) return false
+    var k = 0
+    while (k < word.size) {
+        if (s[i + k] != word[k]) return false
+        k = k + 1
+    }
+    true
+}
+
+// \b at byte offset i.
+fun lintBoundary(s: string, i: int): bool {
+    val before = i > 0 && lintIsWord(s[i - 1])
+    val after = i < s.size && lintIsWord(s[i])
+    before != after
+}
+
+fun lintFind(s: string, needle: string, from: int = 0): int = s.indexOf(needle, from)
+
+fun lintContains(s: string, needle: string): bool = s.indexOf(needle) >= 0
+
+// \bword\b for a word made of word characters.
+fun lintContainsWord(s: string, word: string): bool {
+    var at = s.indexOf(word)
+    while (at >= 0) {
+        val end = at + word.size
+        if ((at == 0 || !lintIsWord(s[at - 1])) && (end >= s.size || !lintIsWord(s[end]))) return true
+        at = s.indexOf(word, at + 1)
+    }
+    false
+}
+
+fun lintAllDigits(s: string): bool {
+    if (s.size == 0) return false
+    for (c in s) {
+        if (!lintIsDigit(c)) return false
+    }
+    true
+}
+
+// Python's text[:count] counts characters, not bytes.
+fun lintPrefix(s: string, count: int): string {
+    if (s.size <= count) return s
+    if (s.codePointCount() <= count) return s
+    s.codePointSlice(0, count)
+}
+
+// Python's text.splitlines-free reading: universal newlines, then split("\n").
+fun lintSplitLines(text: string): array<string> {
+    var normalized = text
+    if (normalized.indexOf("\r") >= 0) normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    lintCopyStrings(normalized.split("\n"))
+}
+
+fun lintReadLines(path: string): array<string> {
+    val read = Path(path).readTextResult()
+    if (!read.succeeded) return []
+    lintSplitLines(read.text)
+}
+
+fun lintCopyStrings(values: array<string>): array<string> {
+    val copy: array<string> = []
+    for (value in values) copy.append(value)
+    copy
+}
+
+fun lintContainsString(values: array<string>, value: string): bool {
+    for (item in values) {
+        if (item == value) return true
+    }
+    false
+}
+
+fun lintCopyMap(source: Map<string, string>): Map<string, string> {
+    val copy: Map<string, string> = Map()
+    for (key in source.keys()) {
+        val value = source.get(key)
+        if (value != null) copy.set(key, value)
+    }
+    copy
+}
+
+// ------------------------------------------------------------------- numbers
+
+val LINT_PERIPH_LOW = [0x60000000, 0x3FF00000, 0x50000000]
+val LINT_PERIPH_HIGH = [0x600FFFFF, 0x3FFFFFFF, 0x5000FFFF]
+val LINT_PERIPH_NAME = ["periph", "dport/rtc-fast", "rtc-slow"]
+
+fun lintPeriphName(v: int): string {
+    var i = 0
+    while (i < 3) {
+        if (v >= LINT_PERIPH_LOW[i] && v <= LINT_PERIPH_HIGH[i]) return LINT_PERIPH_NAME[i]
+        i = i + 1
+    }
+    ""
+}
+
+// Python's int(token, 0) for the tokens NUM finds; -1 when it would raise.
+fun lintConstValue(token: string): int {
+    if (token.startsWith("0x") || token.startsWith("0X")) {
+        var v = 0
+        var i = 2
+        if (token.size == 2) return -1
+        while (i < token.size) {
+            val c = token[i]
+            val d = if (c <= 57) c - 48 else (c | 32) - 87
+            if (!lintIsHex(c)) return -1
+            v = v * 16 + d
+            i = i + 1
+        }
+        return v
+    }
+    if (!lintAllDigits(token)) return -1
+    var v = 0
+    for (c in token) v = v * 10 + (c - 48)
+    // A decimal literal with a leading zero is invalid for int(token, 0), unless it is all zeros.
+    if (token.size > 1 && token[0] == 48 && v != 0) return -1
+    v
+}
+
+// \b(\d{6,10}|0x[0-9a-fA-F]{6,8})\b: a whole word run of that shape.
+fun lintNumbers(s: string): array<string> {
+    val found: array<string> = []
+    var i = 0
+    while (i < s.size) {
+        if (lintIsWord(s[i]) && (i == 0 || !lintIsWord(s[i - 1]))) {
+            val end = lintSkipWord(s, i)
+            val run = s.slice(i, end)
+            var ok = false
+            if (lintAllDigits(run) && run.size >= 6 && run.size <= 10) ok = true
+            if (run.startsWith("0x") && run.size >= 8 && run.size <= 10) {
+                ok = true
+                var k = 2
+                while (k < run.size) {
+                    if (!lintIsHex(run[k])) ok = false
+                    k = k + 1
+                }
+            }
+            if (ok) found.append(run)
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    found
+}
+
+// \b[A-Za-z_]\w*\b: a whole word run starting with a letter or underscore.
+fun lintIdentifiers(s: string): array<string> {
+    val found: array<string> = []
+    var i = 0
+    while (i < s.size) {
+        if (lintIsWord(s[i]) && (i == 0 || !lintIsWord(s[i - 1]))) {
+            val end = lintSkipWord(s, i)
+            if (lintIsAlphaUnderscore(s[i])) found.append(s.slice(i, end))
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    found
+}
+
+// int(digits) for a string of decimal digits ("" is 0).
+fun lintDecimal(s: string): int {
+    var v = 0
+    for (c in s) v = v * 10 + (c - 48)
+    v
+}
+
+fun lintNonZeroDigits(s: string): bool {
+    for (c in s) {
+        if (c != 48) return true
+    }
+    false
+}
+
+// ------------------------------------------------------------------- matches
+
+class LintMatch(val ok: bool, val end: int, val a: string, val b: string)
+
+val LINT_NO_MATCH = LintMatch(false, 0, "", "")
+
+// The text of `s` split at top-level commas, each part trimmed (Python's split_args).
+fun lintSplitArgs(s: string): array<string> {
+    val out: array<string> = []
+    var depth = 0
+    var from = 0
+    var k = 0
+    while (k < s.size) {
+        val c = s[k]
+        if (c == 40) depth = depth + 1 else if (c == 41) depth = depth - 1
+        if (c == 44 && depth == 0) {
+            out.append(s.slice(from, k).trim())
+            from = k + 1
+        }
+        k = k + 1
+    }
+    val last = s.slice(from, s.size).trim()
+    if (last != "") out.append(last)
+    out
+}
+
+// The arguments of the call whose `(` is just before `start`: up to the matching `)`;
+// none when it never closes.
+fun lintCallArgsFrom(line: string, start: int): array<string> {
+    var depth = 1
+    var end = 0
+    var k = start
+    while (k < line.size) {
+        if (line[k] == 40) depth = depth + 1
+        if (line[k] == 41) depth = depth - 1
+        if (depth == 0) {
+            end = k - start
+            break
+        }
+        k = k + 1
+    }
+    lintSplitArgs(line.slice(start, start + end))
+}
+
+// The arguments of `name(` (first occurrence) in `line`; null when absent.
+fun lintCallArgs(line: string, name: string): array<string>? {
+    val p = line.indexOf(name + "(")
+    if (p < 0) return null
+    lintCallArgsFrom(line, p + name.size + 1)
+}
+
+// ------------------------------------------------------------- source model
+
+class Fn(
+    val name: string,
+    val file: string,
+    val line: int,
+    val raw: bool,
+    val params: array<string>,
+    val body: array<string>,
+    val attrs: array<string>,
+    var reads: array<string>,
+    var readsDone: bool
+)
+
+// FUN = ^(?:trusted\s+)?(?:export\s+)?fun\s+(\w+)\s*\(  -> the name, "" when no match.
+fun lintFunName(ln: string): string {
+    var p = 0
+    if (lintHasAt(ln, 0, "trusted") && lintIsSpace(lintAt(ln, 7))) p = lintSkipSpace(ln, 7)
+    if (lintHasAt(ln, p, "export") && lintIsSpace(lintAt(ln, p + 6))) p = lintSkipSpace(ln, p + 6)
+    if (!lintHasAt(ln, p, "fun") || !lintIsSpace(lintAt(ln, p + 3))) return ""
+    p = lintSkipSpace(ln, p + 3)
+    val end = lintSkipWord(ln, p)
+    if (end == p) return ""
+    if (lintAt(ln, lintSkipSpace(ln, end)) != 40) return ""
+    ln.slice(p, end)
+}
+
+// findall(r"(\w+)\s*:\s*u32", text)
+fun lintParamNames(text: string): array<string> {
+    val found: array<string> = []
+    var i = 0
+    while (i < text.size) {
+        if (lintIsWord(text[i])) {
+            val end = lintSkipWord(text, i)
+            var p = lintSkipSpace(text, end)
+            if (lintAt(text, p) == 58) {
+                p = lintSkipSpace(text, p + 1)
+                if (lintHasAt(text, p, "u32")) {
+                    found.append(text.slice(i, end))
+                    i = p + 3
+                    continue
+                }
+            }
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    found
+}
+
+fun lintParse(path: string): array<Fn> {
+    val lines = lintReadLines(path)
+    val fns: array<Fn> = []
+    var attrs: array<string> = []
+    var i = 0
+    while (i < lines.size) {
+        val ln = lines[i]
+        if (ln.startsWith("@")) attrs.append(ln)
+        val name = lintFunName(ln)
+        if (name != "") {
+            val start = i
+            var j = i
+            val sig: array<string> = []
+            while (j < lines.size && !lines[j].trimEnd().endsWith("{")) {
+                sig.append(lines[j])
+                j = j + 1
+            }
+            sig.append(if (j < lines.size) lines[j] else "")
+            val joined = sig.join(" ")
+            val close = joined.indexOf(")")
+            val params = lintParamNames(if (close < 0) joined else joined.slice(0, close))
+            var raw = lintContains(sig[sig.size - 1], "\$xtensa instructions")
+            for (a in attrs) {
+                if (lintContains(a, "@naked")) raw = true
+            }
+            var k = j + 1
+            while (k < lines.size && lines[k] != "}") k = k + 1
+            val body: array<string> = []
+            var b = j + 1
+            while (b < k && b < lines.size) {
+                body.append(lines[b])
+                b = b + 1
+            }
+            fns.append(Fn(name, path, start + 1, raw, params, body, lintCopyStrings(attrs), [], false))
+            attrs = []
+            i = k
+        } else if (!ln.startsWith("@") && ln.trim() != "") {
+            attrs = []
+        }
+        i = i + 1
+    }
+    fns
+}
+
+// ASSIGN = ^\s*(?:var\s+|val\s+)?(r\d+)\s*=\s*(.*)$ ; a: register, b: right-hand side.
+fun lintAssign(ln: string): LintMatch {
+    var p = lintSkipSpace(ln, 0)
+    if ((lintHasAt(ln, p, "var") || lintHasAt(ln, p, "val")) && lintIsSpace(lintAt(ln, p + 3))) {
+        // A prefix that is followed by a register; otherwise the register must start here.
+        val q = lintSkipSpace(ln, p + 3)
+        if (lintAt(ln, q) == 114 && lintIsDigit(lintAt(ln, q + 1))) p = q
+    }
+    if (lintAt(ln, p) != 114) return LINT_NO_MATCH
+    val digits = lintSkipDigits(ln, p + 1)
+    if (digits == p + 1) return LINT_NO_MATCH
+    var e = lintSkipSpace(ln, digits)
+    if (lintAt(ln, e) != 61) return LINT_NO_MATCH
+    e = lintSkipSpace(ln, e + 1)
+    LintMatch(true, ln.size, ln.slice(p, digits), ln.slice(e, ln.size))
+}
+
+// \s*REG\s*=  at the start of the line.
+fun lintStartsAssignTo(ln: string, reg: string): bool {
+    val p = lintSkipSpace(ln, 0)
+    if (!lintHasAt(ln, p, reg)) return false
+    lintAt(ln, lintSkipSpace(ln, p + reg.size)) == 61
+}
+
+// \s*var\s+NAME\s*=  (rest after the = in `end`), or -1.
+fun lintVarAssignEnd(ln: string, name: string): int {
+    val p = lintSkipSpace(ln, 0)
+    if (!lintHasAt(ln, p, "var") || !lintIsSpace(lintAt(ln, p + 3))) return -1
+    val q = lintSkipSpace(ln, p + 3)
+    if (!lintHasAt(ln, q, name)) return -1
+    val e = lintSkipSpace(ln, q + name.size)
+    if (lintAt(ln, e) != 61) return -1
+    e + 1
+}
+
+// \s*var\s+REG\s*=\s*P\s*$
+fun lintMatchVarCopy(ln: string, reg: string, p: string): bool {
+    val e = lintVarAssignEnd(ln, reg)
+    if (e < 0) return false
+    val q = lintSkipSpace(ln, e)
+    if (!lintHasAt(ln, q, p)) return false
+    lintSkipSpace(ln, q + p.size) == ln.size
+}
+
+// \besp32Recovered\w*\(  -> the function name, "" if none (leftmost that fits).
+fun lintFindRecoveredCall(s: string): string {
+    var at = s.indexOf("esp32Recovered")
+    while (at >= 0) {
+        if (at == 0 || !lintIsWord(s[at - 1])) {
+            val end = lintSkipWord(s, at)
+            if (lintAt(s, end) == 40) return s.slice(at, end)
+        }
+        at = s.indexOf("esp32Recovered", at + 1)
+    }
+    ""
+}
+
+// ablaUnsafe(Volatile)?(Load|Store)(U8|...)?\(   all matches
+class MemAccess(val start: int, val end: int, val volatile: bool, val store: bool, val width: string)
+
+fun lintMemAccesses(ln: string): array<MemAccess> {
+    val found: array<MemAccess> = []
+    val types = ["U8", "U16", "U32", "S8", "S16", "I8", "I16", "I32", "U64"]
+    var from = 0
+    while (true) {
+        val at = ln.indexOf("ablaUnsafe", from)
+        if (at < 0) break
+        var p = at + 10
+        var volatile = false
+        if (lintHasAt(ln, p, "Volatile")) {
+            volatile = true
+            p = p + 8
+        }
+        var store = false
+        var ok = false
+        if (lintHasAt(ln, p, "Load")) {
+            ok = true
+            p = p + 4
+        } else if (lintHasAt(ln, p, "Store")) {
+            ok = true
+            store = true
+            p = p + 5
+        }
+        if (!ok && volatile) {
+            // `Volatile` taken but no Load/Store after it: without it the next text is `Volatile...`, no match either.
+            from = at + 1
+            continue
+        }
+        if (ok) {
+            var width = "None"
+            for (t in types) {
+                if (lintHasAt(ln, p, t)) {
+                    width = t
+                    p = p + t.size
+                    break
+                }
+            }
+            if (lintAt(ln, p) == 40) {
+                found.append(MemAccess(at, p + 1, volatile, store, width))
+                from = p + 1
+                continue
+            }
+        }
+        from = at + 1
+    }
+    found
+}
+
+// ablaUnsafeStoreU(32|16|8)\(nativePointerFromAddress\(int\((?:\(r1 \+ u32\((\d+)\)\)|r1)\)
+// first match: ok, and the slot (0 for the plain r1 form).
+fun lintFrameStore(ln: string): LintMatch {
+    var from = 0
+    while (true) {
+        val at = ln.indexOf("ablaUnsafeStoreU", from)
+        if (at < 0) break
+        var p = at + 16
+        var widthEnd = -1
+        for (w in ["32", "16", "8"]) {
+            if (widthEnd < 0 && lintHasAt(ln, p, w)) widthEnd = p + w.size
+        }
+        if (widthEnd >= 0 && lintHasAt(ln, widthEnd, "(nativePointerFromAddress(int(")) {
+            val q = widthEnd + 30
+            if (lintHasAt(ln, q, "(r1 + u32(")) {
+                val d = lintSkipDigits(ln, q + 10)
+                if (d > q + 10 && lintHasAt(ln, d, "))") && lintAt(ln, d + 2) == 41) {
+                    return LintMatch(true, d + 3, ln.slice(q + 10, d), "")
+                }
+            }
+            if (lintHasAt(ln, q, "r1)")) return LintMatch(true, q + 3, "", "")
+        }
+        from = at + 1
+    }
+    LINT_NO_MATCH
+}
+
+// ablaUnsafeCall\w*\(int\((r\d+)\)  -> the register, "" if none.
+fun lintCompJump(ln: string): string {
+    var from = 0
+    while (true) {
+        val at = ln.indexOf("ablaUnsafeCall", from)
+        if (at < 0) break
+        val end = lintSkipWord(ln, at + 14)
+        if (lintHasAt(ln, end, "(int(r") && lintIsDigit(lintAt(ln, end + 6))) {
+            val d = lintSkipDigits(ln, end + 6)
+            if (lintAt(ln, d) == 41) return ln.slice(end + 5, d)
+        }
+        from = at + 1
+    }
+    ""
+}
+
+// \+ \(?r\d+ <<|\* u32\(4\)|\bu32\(2\)
+fun lintIndexedTableShape(rhs: string): bool {
+    if (lintContains(rhs, "* u32(4)")) return true
+    var at = rhs.indexOf("u32(2)")
+    while (at >= 0) {
+        if (at == 0 || !lintIsWord(rhs[at - 1])) return true
+        at = rhs.indexOf("u32(2)", at + 1)
+    }
+    var from = 0
+    while (true) {
+        val plus = rhs.indexOf("+ ", from)
+        if (plus < 0) break
+        var p = plus + 2
+        if (lintAt(rhs, p) == 40) p = p + 1
+        if (lintAt(rhs, p) == 114 && lintIsDigit(lintAt(rhs, p + 1))) {
+            val d = lintSkipDigits(rhs, p + 1)
+            if (lintHasAt(rhs, d, " <<")) return true
+        }
+        from = plus + 1
+    }
+    false
+}
+
+// The tail `\)?\s*\+\s*u32\((\d+)\)` at `pos`; a: the digits.
+fun lintOffsetTail(ln: string, pos: int): LintMatch {
+    var attempt = 0
+    while (attempt < 2) {
+        var p = pos
+        var usable = true
+        if (attempt == 0) {
+            if (lintAt(ln, p) == 41) p = p + 1 else usable = false
+        }
+        if (usable) {
+            p = lintSkipSpace(ln, p)
+            if (lintAt(ln, p) == 43) {
+                p = lintSkipSpace(ln, p + 1)
+                if (lintHasAt(ln, p, "u32(")) {
+                    val d = lintSkipDigits(ln, p + 4)
+                    if (d > p + 4 && lintAt(ln, d) == 41) return LintMatch(true, d + 1, ln.slice(p + 4, d), "")
+                }
+            }
+        }
+        attempt = attempt + 1
+    }
+    LINT_NO_MATCH
+}
+
+// finditer(<prefix>(\w+)<close>\)?\s*\+\s*u32\((\d+)\)): a: the name, b: the digits.
+fun lintOffsets(ln: string, prefix: string, close: string): array<LintMatch> {
+    val found: array<LintMatch> = []
+    var from = 0
+    while (true) {
+        val at = ln.indexOf(prefix, from)
+        if (at < 0) break
+        val nameStart = at + prefix.size
+        val nameEnd = lintSkipWord(ln, nameStart)
+        if (nameEnd > nameStart && lintHasAt(ln, nameEnd, close)) {
+            val tail = lintOffsetTail(ln, nameEnd + close.size)
+            if (tail.ok) {
+                found.append(LintMatch(true, tail.end, ln.slice(nameStart, nameEnd), tail.a))
+                from = tail.end
+                continue
+            }
+        }
+        from = at + 1
+    }
+    found
+}
+
+// mm2 = ablaUnsafeCall\w*\(int\((r\d+)\)|\$xtensa call(?:Wide)? \{(\w+)\}|\$xtensa call(?:x|Wide)\w*|\$xtensa callAddress(?:Wide)?\(
+// ok = found; a: symbol of the `{name}` form ("" for the others).
+fun lintCallSite(ln: string): LintMatch {
+    var i = 0
+    while (i < ln.size) {
+        val c = ln[i]
+        if (c == 97 && lintHasAt(ln, i, "ablaUnsafeCall")) {
+            val end = lintSkipWord(ln, i + 14)
+            if (lintHasAt(ln, end, "(int(r") && lintIsDigit(lintAt(ln, end + 6))) {
+                val d = lintSkipDigits(ln, end + 6)
+                if (lintAt(ln, d) == 41) return LintMatch(true, d + 1, "", "")
+            }
+        } else if (c == 36 && lintHasAt(ln, i, "\$xtensa call")) {
+            val q = i + 12
+            // `call(Wide)? \{(\w+)\}`
+            var withWide = lintHasAt(ln, q, "Wide")
+            var attempt = 0
+            while (attempt < 2) {
+                var p = q
+                var usable = true
+                if (attempt == 0) {
+                    if (withWide) p = p + 4 else usable = false
+                }
+                if (usable && lintHasAt(ln, p, " {")) {
+                    val e = lintSkipWord(ln, p + 2)
+                    if (e > p + 2 && lintAt(ln, e) == 125) return LintMatch(true, e + 1, ln.slice(p + 2, e), "")
+                }
+                attempt = attempt + 1
+            }
+            if (lintAt(ln, q) == 120 || withWide) return LintMatch(true, q + 1, "", "")
+            if (lintHasAt(ln, q, "Address")) {
+                var p = q + 7
+                if (lintHasAt(ln, p, "Wide") && lintAt(ln, p + 4) == 40) return LintMatch(true, p + 5, "", "")
+                if (lintAt(ln, p) == 40) return LintMatch(true, p + 1, "", "")
+            }
+        }
+        i = i + 1
+    }
+    LINT_NO_MATCH
+}
+
+// ------------------------------------------------------------------ findings
+
+class Finding(val check: string, val file: string, val line: int, val fn: string, val msg: string)
+
+class Lint(
+    val root: string,
+    val only: Map<string, bool>,
+    var objdump: string,
+    var steamRun: string,
+    val findings: array<Finding>,
+    val fns: Map<string, Fn>,
+    var deadTables: array<string>,
+    val deadLabels: Map<string, bool>
+)
+
+fun Lint.add(check: string, fn: Fn, offset: int, msg: string): void {
+    if (this.only.size > 0 && !this.only.has(check)) return
+    this.findings.append(Finding(check, fn.file, fn.line + offset, fn.name, msg))
+}
+
+// Parameters (aN / strideN) the callee body actually reads.
+fun Lint.calleeReads(var callee: Fn): array<string> {
+    if (callee.readsDone) return lintCopyStrings(callee.reads)
+    val reads: array<string> = []
+    for (p in callee.params) {
+        if (p.size >= 2 && p[0] == 97 && lintAllDigits(p.slice(1, p.size))) {
+            val reg = "r" + p.slice(1, p.size)
+            for (ln in callee.body) {
+                if (lintMatchVarCopy(ln, reg, p)) continue
+                if (!lintContainsWord(ln, reg)) continue
+                if (lintStartsAssignTo(ln, reg)) {
+                    val eq = ln.indexOf("=")
+                    if (!lintContainsWord(ln.slice(eq + 1, ln.size), reg)) break
+                }
+                reads.append(p)
+                break
+            }
+            continue
+        }
+        if (p.startsWith("stack") && lintAllDigits(p.slice(5, p.size))) {
+            val inc = "incomingStack" + p.slice(5, p.size)
+            for (ln in callee.body) {
+                if (lintVarAssignEnd(ln, inc) >= 0) continue
+                if ((lintContainsWord(ln, inc) || lintContainsWord(ln, p)) && lintFindRecoveredCall(ln) == "") {
+                    reads.append(p)
+                    break
+                }
+            }
+        }
+    }
+    callee.reads = reads
+    callee.readsDone = true
+    lintCopyStrings(reads)
+}
+
+fun Lint.isDeadTable(fnName: string): bool {
+    for (st in this.deadTables) {
+        if (lintContains(fnName, st) || fnName.replace("Initialize", "Storage") == st) return true
+    }
+    false
+}
+
+// The first periph window containing a NUM constant of `s`: "name const NUM" (last one wins).
+fun lintConstTaint(s: string): string {
+    var taint = ""
+    for (nm in lintNumbers(s)) {
+        val v = lintConstValue(nm)
+        if (v >= 0 && lintPeriphName(v) != "") taint = lintPeriphName(v) + " const " + nm
+    }
+    taint
+}
+
+fun Lint.checkTyped(fn: Fn): void {
+    var tracked: Map<string, string> = Map()
+    val scopes: array<Map<string, string>> = []
+    val assigned: Map<string, bool> = Map()
+    for (p in fn.params) assigned.set(p, true)
+    val memTbl: Map<string, string> = Map()
+    var pendingIdx = -1
+    var pendingSlot = 0
+    val body = fn.body
+    var idx = 0
+    while (idx < body.size) {
+        val ln = body[idx]
+        val s = ln.trim()
+        if (s == "" || s.startsWith("//")) {
+            idx = idx + 1
+            continue
+        }
+        if (s.startsWith("}") && lintContains(s, "else") && s.endsWith("{") && scopes.size > 0) {
+            tracked = lintCopyMap(scopes[scopes.size - 1])
+        } else if (s.startsWith("}") && scopes.size > 0) {
+            scopes.truncate(scopes.size - 1)
+        } else if (s.endsWith("{")) {
+            scopes.append(lintCopyMap(tracked))
+        }
+        val assign = lintAssign(ln)
+        val hasLhs = assign.ok
+        val lhs = assign.a
+        val rhs = assign.b
+
+        // ENTRYOFF
+        for (m in lintOffsets(ln, "nativeFunctionAddress(", ")")) {
+            if (lintNonZeroDigits(m.b)) {
+                val tgt = this.fns.get(m.a)
+                var kind = if (tgt != null && tgt.raw) "RAW" else "TYPED-ABLA"
+                val dead = this.isDeadTable(fn.name)
+                if (dead) kind = kind + ", dead lowered-switch table"
+                this.add(if (dead) "ENTRYOFF-DEAD" else "ENTRYOFF", fn, idx + 1,
+                    "[$kind target] nativeFunctionAddress(${m.a}) + ${m.b}")
+            }
+        }
+        for (m in lintOffsets(ln, "\$xtensa address {", "}")) {
+            val tgt = this.fns.get(m.a)
+            if (lintNonZeroDigits(m.b) && tgt != null) {
+                this.add("ENTRYOFF", fn, idx + 1, "\$xtensa address {${m.a}} + ${m.b} (code symbol)")
+            }
+        }
+
+        // MMIO taint
+        if (hasLhs) {
+            var taint = lintConstTaint(rhs)
+            for (idn in lintIdentifiers(rhs)) {
+                if (tracked.has(idn) && idn != "r1" && taint == "") {
+                    val t = tracked.get(idn)
+                    if (t != null) taint = t
+                }
+            }
+            if (lintContains(rhs, "ablaUnsafe")) taint = ""
+            if (taint != "") tracked.set(lhs, taint) else tracked.remove(lhs)
+            if (!s.startsWith("var ")) assigned.set(lhs, true)
+        }
+        for (mm in lintMemAccesses(ln)) {
+            if (mm.volatile) continue
+            val args = lintCallArgsFrom(ln, mm.end)
+            if (args.size == 0) continue
+            val addr = args[0]
+            var why = ""
+            for (nm in lintNumbers(addr)) {
+                val v = lintConstValue(nm)
+                if (v >= 0 && lintPeriphName(v) != "") why = "literal $nm (${lintPeriphName(v)})"
+            }
+            for (idn in lintIdentifiers(addr)) {
+                if (tracked.has(idn)) {
+                    val t = tracked.get(idn)
+                    if (t != null) why = t + " via " + idn
+                }
+            }
+            if (why != "") {
+                this.add("MMIO", fn, idx + 1,
+                    "non-volatile ${if (mm.store) "store" else "load"} ${mm.width} at $why: ${lintPrefix(s, 110)}")
+            }
+        }
+
+        // frame-slot stores
+        val frame = lintFrameStore(ln)
+        if (frame.ok) {
+            pendingIdx = idx
+            pendingSlot = lintDecimal(frame.a)
+        }
+
+        // computed jumps / tail calls
+        val cm = lintCompJump(ln)
+        if (cm != "" && s.startsWith("return")) {
+            val definition = memTbl.get(cm)
+            this.add("COMPJUMP", fn, idx + 1,
+                "computed tail call through $cm (definition: ${if (definition == null) "unknown" else definition})")
+        }
+        if (hasLhs && lintContains(rhs, "ablaUnsafeLoadU32(") && lintIndexedTableShape(rhs)) {
+            memTbl.set(lhs, "line ${fn.line + idx + 1}: indexed load")
+        } else if (hasLhs) {
+            memTbl.remove(lhs)
+        }
+
+        // direct calls to Abla functions
+        if (hasLhs && lintContains(rhs, "esp32Recovered")) {
+            val calleeName = lintFindRecoveredCall(rhs)
+            val callee = if (calleeName == "") null else this.fns.get(calleeName)
+            if (callee != null) {
+                val found = lintCallArgs(rhs, callee.name)
+                val args: array<string> = if (found == null) [] else found
+                if (callee.raw) {
+                    this.add("RAWCALL", fn, idx + 1, "direct call to raw-body ${callee.name}")
+                } else {
+                    val reads = this.calleeReads(callee)
+                    var pi = 0
+                    while (pi < callee.params.size && pi < args.size) {
+                        val p = callee.params[pi]
+                        val a = args[pi]
+                        pi = pi + 1
+                        if (!lintContainsString(reads, p)) continue
+                        if (a.size >= 2 && a[0] == 114 && lintAllDigits(a.slice(1, a.size))) {
+                            val n = lintDecimal(a.slice(1, a.size))
+                            if (n >= 10 && n <= 15 && !assigned.has(a)) {
+                                this.add("STALEARG", fn, idx + 1, "${callee.name} reads $p but caller never set $a")
+                            }
+                        }
+                        if (a.startsWith("stack") && lintAllDigits(a.slice(5, a.size)) && p.startsWith("stack")) {
+                            this.add("STACKARG", fn, idx + 1,
+                                "${callee.name} reads $p; caller forwards its own incoming $a")
+                        }
+                    }
+                    if (pendingIdx >= 0 && idx - pendingIdx <= 12) {
+                        val sp = "stack${pendingSlot / 4}"
+                        if (lintContainsString(reads, sp) &&
+                            !lintContains(rhs, "freestandingLoadWord(r1 + u32($pendingSlot))")) {
+                            this.add("STACKARG", fn, idx + 1,
+                                "store to r1+$pendingSlot before call to ${callee.name}, which reads $sp; lifted call cannot pass it")
+                        }
+                    }
+                    assigned.set(lhs, true)
+                }
+            }
+        }
+        if (pendingIdx >= 0 && idx - pendingIdx <= 12 && pendingSlot < 40 && pendingIdx != idx &&
+            !(hasLhs && lintContains(rhs, "esp32Recovered"))) {
+            val site = lintCallSite(ln)
+            val word0Passed = pendingSlot == 0 && lintContains(ln, "ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))")
+            if (site.ok && !word0Passed) {
+                val tgt = if (site.a == "") null else this.fns.get(site.a)
+                var hit = tgt == null
+                if (tgt != null) {
+                    if (tgt.raw) {
+                        hit = true
+                    } else {
+                        for (p in this.calleeReads(tgt)) {
+                            if (p.startsWith("stack")) hit = true
+                        }
+                    }
+                }
+                if (hit) {
+                    this.add("FRAMEARG", fn, idx + 1,
+                        "store to r1+$pendingSlot (line ${fn.line + pendingIdx + 1}) before ${if (site.a == "") "indirect" else "symbolic"} call: possible outgoing stack arg")
+                    pendingIdx = -1
+                }
+            }
+        }
+        idx = idx + 1
+    }
+}
+
+// ------------------------------------------------------------------- raw asm
+
+// ^(\.?[A-Za-z_][\w.$]*):\s*$  -> the label, "" if none.
+fun lintLabelLine(ln: string): string {
+    var p = 0
+    if (lintAt(ln, 0) == 46) p = 1
+    if (!lintIsAlphaUnderscore(lintAt(ln, p))) return ""
+    var e = p + 1
+    while (e < ln.size && lintIsSymbolByte(ln[e])) e = e + 1
+    if (lintAt(ln, e) != 58) return ""
+    if (lintSkipSpace(ln, e + 1) != ln.size) return ""
+    ln.slice(0, e)
+}
+
+// \s*\.(?:long|word|4byte)\s+([\w.$]+)\+(0x[0-9a-fA-F]+|\d+)\s*$ : a: symbol, b: offset text.
+fun lintLongOffset(ln: string): LintMatch {
+    var p = lintSkipSpace(ln, 0)
+    if (lintAt(ln, p) != 46) return LINT_NO_MATCH
+    p = p + 1
+    var d = -1
+    for (name in ["long", "word", "4byte"]) {
+        if (d < 0 && lintHasAt(ln, p, name)) d = p + name.size
+    }
+    if (d < 0 || !lintIsSpace(lintAt(ln, d))) return LINT_NO_MATCH
+    val symStart = lintSkipSpace(ln, d)
+    var e = symStart
+    while (e < ln.size && lintIsSymbolByte(ln[e])) e = e + 1
+    if (e == symStart || lintAt(ln, e) != 43) return LINT_NO_MATCH
+    val numStart = e + 1
+    var n = numStart
+    if (lintHasAt(ln, numStart, "0x")) {
+        var h = numStart + 2
+        while (h < ln.size && lintIsHex(ln[h])) h = h + 1
+        if (h > numStart + 2 && lintSkipSpace(ln, h) == ln.size) return LintMatch(true, ln.size, ln.slice(symStart, e), ln.slice(numStart, h))
+    }
+    n = lintSkipDigits(ln, numStart)
+    if (n > numStart && lintSkipSpace(ln, n) == ln.size) return LintMatch(true, ln.size, ln.slice(symStart, e), ln.slice(numStart, n))
+    LINT_NO_MATCH
+}
+
+// int(text, 0)
+fun lintIntAuto(text: string): int {
+    if (text.startsWith("0x")) {
+        var v = 0
+        var i = 2
+        while (i < text.size) {
+            val c = text[i]
+            v = v * 16 + (if (c <= 57) c - 48 else (c | 32) - 87)
+            i = i + 1
+        }
+        return v
+    }
+    lintDecimal(text)
+}
+
+fun Lint.checkRaw(fn: Fn, codeSyms: Map<string, bool>): void {
+    var label = ""
+    var idx = 0
+    while (idx < fn.body.size) {
+        val ln = fn.body[idx]
+        val lm = lintLabelLine(ln)
+        if (lm != "") label = lm
+        val mm = lintLongOffset(ln)
+        if (mm.ok && codeSyms.has(mm.a) && lintIntAuto(mm.b) != 0) {
+            val dead = this.deadLabels.has(label)
+            this.add(if (dead) "LONGOFF-DEAD" else "LONGOFF", fn, idx + 1,
+                ".long ${mm.a}+${mm.b} in table $label" + (if (dead) " (dead: only feeds a lowered `when`)" else ""))
+        }
+        idx = idx + 1
+    }
+}
+
+// --------------------------------------------------------------------- drift
+
+class FnStats(
+    val ops: Map<string, int>,
+    var calls: int,
+    var memw: int,
+    val refs: array<string>
+)
+
+fun lintBump(var counter: Map<string, int>, key: string): void {
+    val v = counter.get(key)
+    counter.set(key, if (v == null) 1 else v + 1)
+}
+
+fun lintCount(counter: Map<string, int>, key: string): int {
+    val v = counter.get(key)
+    if (v == null) 0 else v
+}
+
+// The counter key of an access opcode ("L32", "S8", ...); "" for other opcodes.
+fun lintOpKey(op: string): string = when (op) {
+    "l8ui" -> "L8"
+    "l16ui", "l16si" -> "L16"
+    "l32i", "l32i.n", "l32ai" -> "L32"
+    "s8i" -> "S8"
+    "s16i" -> "S16"
+    "s32i", "s32i.n", "s32ri" -> "S32"
+    else -> ""
+}
+
+fun lintIsSignExtOp(op: string): bool = op == "l16si" || op == "sext" || op == "srai" || op == "sra"
+
+fun lintIsSignedCompareOp(op: string): bool =
+    op == "blt" || op == "bge" || op == "blti" || op == "bgei" || op == "bltz" || op == "bgez" || op == "min" || op == "max"
+
+// re.fullmatch(r"call(x)?(0|4|8|12)", op)
+fun lintIsCallOp(op: string): bool {
+    if (!op.startsWith("call")) return false
+    var rest = op.slice(4, op.size)
+    if (rest.startsWith("x")) rest = rest.slice(1, rest.size)
+    rest == "0" || rest == "4" || rest == "8" || rest == "12"
+}
+
+// a\d+,\s*a1,  at the start of `rest`
+fun lintIsFrameOperand(rest: string): bool {
+    if (lintAt(rest, 0) != 97) return false
+    val d = lintSkipDigits(rest, 1)
+    if (d == 1 || lintAt(rest, d) != 44) return false
+    val p = lintSkipSpace(rest, d + 1)
+    lintHasAt(rest, p, "a1,")
+}
+
+// The disassembly label line `[0-9a-f]{8} <NAME(-0xHEX)?>:`  -> NAME, "" if no match.
+fun lintDisassemblyLabel(ln: string): string {
+    if (ln.size < 12 || !ln.endsWith(">:")) return ""
+    var k = 0
+    while (k < 8) {
+        if (!lintIsHexLower(ln[k])) return ""
+        k = k + 1
+    }
+    if (ln[8] != 32 || ln[9] != 60) return ""
+    // the name stops at the first > (it cannot contain > or +)
+    val close = ln.indexOf(">", 10)
+    if (close != ln.size - 2) return ""
+    val inner = ln.slice(10, close)
+    if (inner.indexOf("+") >= 0) return ""
+    var p = 1
+    while (p < inner.size) {
+        if (inner[p] == 45 && lintHasAt(inner, p, "-0x")) {
+            var h = p + 3
+            var allHex = h < inner.size
+            while (h < inner.size) {
+                if (!lintIsHexLower(inner[h])) allHex = false
+                h = h + 1
+            }
+            if (allHex) return inner.slice(0, p)
+        }
+        p = p + 1
+    }
+    if (inner.size == 0) "" else inner
+}
+
+// ^\s+[0-9a-f]+:\s+R_XTENSA_\w+\s+([A-Za-z_][\w.$]*)(?:[+-]0x[0-9a-f]+)?$  -> symbol or "".
+fun lintRelocSymbol(ln: string): string {
+    if (!lintIsSpace(lintAt(ln, 0))) return ""
+    var p = lintSkipSpace(ln, 0)
+    val h = p
+    while (p < ln.size && lintIsHexLower(ln[p])) p = p + 1
+    if (p == h || lintAt(ln, p) != 58) return ""
+    p = p + 1
+    if (!lintIsSpace(lintAt(ln, p))) return ""
+    p = lintSkipSpace(ln, p)
+    if (!lintHasAt(ln, p, "R_XTENSA_")) return ""
+    p = p + 9
+    val w = lintSkipWord(ln, p)
+    if (w == p) return ""
+    p = w
+    if (!lintIsSpace(lintAt(ln, p))) return ""
+    p = lintSkipSpace(ln, p)
+    if (!lintIsAlphaUnderscore(lintAt(ln, p))) return ""
+    var e = p + 1
+    while (e < ln.size && lintIsSymbolByte(ln[e])) e = e + 1
+    val sym = ln.slice(p, e)
+    if (e == ln.size) return sym
+    if ((ln[e] == 43 || ln[e] == 45) && lintHasAt(ln, e + 1, "0x")) {
+        var q = e + 3
+        val hs = q
+        while (q < ln.size && lintIsHexLower(ln[q])) q = q + 1
+        if (q > hs && q == ln.size) return sym
+    }
+    ""
+}
+
+// ^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+(\S+)\s*(.*)$ : a: the opcode, b: the operands.
+fun lintInstruction(ln: string): LintMatch {
+    var p = lintSkipSpace(ln, 0)
+    val h = p
+    while (p < ln.size && lintIsHexLower(ln[p])) p = p + 1
+    if (p == h || lintAt(ln, p) != 58) return LINT_NO_MATCH
+    p = p + 1
+    if (!lintIsSpace(lintAt(ln, p))) return LINT_NO_MATCH
+    p = lintSkipSpace(ln, p)
+    // tokens: a leading run of 2-8 digit hex tokens that are each followed by space
+    val starts: array<int> = []
+    val ends: array<int> = []
+    var q = p
+    while (q < ln.size) {
+        var e = q
+        while (e < ln.size && !lintIsSpace(ln[e])) e = e + 1
+        val len = e - q
+        var hex = len >= 2 && len <= 8
+        var k = q
+        while (hex && k < e) {
+            if (!lintIsHexLower(ln[k])) hex = false
+            k = k + 1
+        }
+        if (!hex || e >= ln.size) break
+        starts.append(q)
+        ends.append(e)
+        q = lintSkipSpace(ln, e)
+    }
+    if (starts.size == 0) return LINT_NO_MATCH
+    if (q < ln.size) {
+        var e = q
+        while (e < ln.size && !lintIsSpace(ln[e])) e = e + 1
+        return LintMatch(true, ln.size, ln.slice(q, e), ln.slice(lintSkipSpace(ln, e), ln.size))
+    }
+    // Every token was a group: the last one backs off to be the opcode.
+    if (starts.size < 2) return LINT_NO_MATCH
+    val last = starts.size - 1
+    LintMatch(true, ln.size, ln.slice(starts[last], ends[last]), "")
+}
+
+fun Lint.runObjdump(arguments: array<string>): string {
+    var executable = this.objdump
+    val cmd = if (this.steamRun != "") command(this.steamRun) else command(executable)
+    if (this.steamRun != "") cmd.argument(executable)
+    for (a in arguments) cmd.argument(a)
+    cmd.captureText()
+}
+
+class StatsTable(val index: Map<string, int>, val stats: array<FnStats>)
+
+fun Lint.objdumpFunctions(obj: string): StatsTable {
+    val out = this.runObjdump(["-dr", obj])
+    val table = StatsTable(Map(), [])
+    var cur = -1
+    for (ln in lintSplitLines(out)) {
+        val label = lintDisassemblyLabel(ln)
+        if (label != "") {
+            val existing = table.index.get(label)
+            if (existing == null) {
+                table.stats.append(FnStats(Map(), 0, 0, []))
+                cur = table.stats.size - 1
+                table.index.set(label, cur)
+            } else {
+                cur = existing
+            }
+            continue
+        }
+        if (cur < 0) continue
+        val sym = lintRelocSymbol(ln)
+        if (sym != "") {
+            if (!sym.startsWith(".") && !lintContainsString(table.stats[cur].refs, sym)) table.stats[cur].refs.append(sym)
+            continue
+        }
+        val m = lintInstruction(ln)
+        if (!m.ok) continue
+        val op = m.a
+        val key = lintOpKey(op)
+        if (key != "") {
+            if (lintIsFrameOperand(m.b)) continue
+            lintBump(table.stats[cur].ops, key)
+        } else if (lintIsCallOp(op)) {
+            table.stats[cur].calls = table.stats[cur].calls + 1
+        } else if (op == "memw") {
+            table.stats[cur].memw = table.stats[cur].memw + 1
+        }
+        if (lintIsSignExtOp(op)) {
+            lintBump(table.stats[cur].ops, "SIGNEXT")
+        } else if (lintIsSignedCompareOp(op)) {
+            lintBump(table.stats[cur].ops, "SGNCMP")
+        }
+    }
+    table
+}
+
+// [\w.$]-free op token of a raw line: \s*([a-z0-9.]+)\b
+fun lintRawOp(ln: string): string {
+    val start = lintSkipSpace(ln, 0)
+    var end = start
+    while (end < ln.size && ((ln[end] >= 97 && ln[end] <= 122) || lintIsDigit(ln[end]) || ln[end] == 46)) end = end + 1
+    while (end > start) {
+        if (lintBoundary(ln, end)) return ln.slice(start, end)
+        end = end - 1
+    }
+    ""
+}
+
+// \s*[a-z0-9.]+\s+a\d+,\s*a1,  at the start of a raw line
+fun lintRawFrameOperand(ln: string): bool {
+    var p = lintSkipSpace(ln, 0)
+    val s = p
+    while (p < ln.size && ((ln[p] >= 97 && ln[p] <= 122) || lintIsDigit(ln[p]) || ln[p] == 46)) p = p + 1
+    if (p == s || !lintIsSpace(lintAt(ln, p))) return false
+    p = lintSkipSpace(ln, p)
+    lintIsFrameOperand(ln.slice(p, ln.size))
+}
+
+// Count of ablaUnsafe(Volatile)?(Load|Store)U(8|16|32)\( whose argument does not start
+// with a frame-slot address, keyed like the objdump ops ("L32", "S8", ...).
+fun lintLiftedAccesses(text: string, var ops: Map<string, int>): void {
+    var from = 0
+    while (true) {
+        val at = text.indexOf("ablaUnsafe", from)
+        if (at < 0) break
+        var p = at + 10
+        if (lintHasAt(text, p, "Volatile")) p = p + 8
+        var kind = ""
+        if (lintHasAt(text, p, "Load")) {
+            kind = "L"
+            p = p + 4
+        } else if (lintHasAt(text, p, "Store")) {
+            kind = "S"
+            p = p + 5
+        }
+        if (kind != "" && lintAt(text, p) == 85) {
+            var w = ""
+            for (cand in ["8", "16", "32"]) {
+                if (w == "" && lintHasAt(text, p + 1, cand)) w = cand
+            }
+            if (w != "" && lintAt(text, p + 1 + w.size) == 40) {
+                val q = p + 2 + w.size
+                var frame = false
+                if (lintHasAt(text, q, "nativePointerFromAddress(int(")) {
+                    val r = q + 29
+                    if (lintHasAt(text, r, "(r1") && !lintIsWord(lintAt(text, r + 3))) frame = true
+                    if (lintHasAt(text, r, "r1)")) frame = true
+                }
+                if (!frame) lintBump(ops, kind + w)
+                from = q
+                continue
+            }
+        }
+        from = at + 1
+    }
+}
+
+// \bi(?:8|16)\(
+fun lintCountSignExt(text: string): int {
+    var count = 0
+    var at = text.indexOf("i")
+    while (at >= 0) {
+        if (at == 0 || !lintIsWord(text[at - 1])) {
+            if (lintHasAt(text, at + 1, "8(") || lintHasAt(text, at + 1, "16(")) count = count + 1
+        }
+        at = text.indexOf("i", at + 1)
+    }
+    count
+}
+
+// i32\([^()]*\)\s*(?:<|>)|i32\(r\d+\) (?:<|>)
+fun lintCountSignedCompare(text: string): int {
+    var count = 0
+    var i = 0
+    while (i < text.size) {
+        if (text[i] == 105 && lintHasAt(text, i, "i32(")) {
+            var p = i + 4
+            while (p < text.size && text[p] != 40 && text[p] != 41) p = p + 1
+            var matched = false
+            var end = 0
+            if (lintAt(text, p) == 41) {
+                val q = lintSkipSpace(text, p + 1)
+                if (lintAt(text, q) == 60 || lintAt(text, q) == 62) {
+                    matched = true
+                    end = q + 1
+                }
+            }
+            if (matched) {
+                count = count + 1
+                i = end
+                continue
+            }
+        }
+        i = i + 1
+    }
+    count
+}
+
+// [^>]>>[^>]
+fun lintCountShifts(text: string): int {
+    var count = 0
+    var i = 0
+    while (i + 3 < text.size) {
+        if (text[i] != 62 && text[i + 1] == 62 && text[i + 2] == 62 && text[i + 3] != 62) {
+            count = count + 1
+            var e = i + 4
+            // the fourth character may be a multi-byte code point
+            while (e < text.size && text[e] >= 128 && text[e] < 192) e = e + 1
+            i = e
+        } else {
+            i = i + 1
+        }
+    }
+    count
+}
+
+// The number of calls in lifted code:
+//   \bablaUnsafeCall\w*\(|\$xtensa call(?:Wide|x\w*|Address(?:Wide)?)?\b|\b(?:esp32Recovered|freestanding)\w*\(
+fun lintCountCalls(text: string): int {
+    var count = 0
+    var i = 0
+    while (i < text.size) {
+        val c = text[i]
+        var advance = 0
+        if (c == 97 && (i == 0 || !lintIsWord(text[i - 1])) && lintHasAt(text, i, "ablaUnsafeCall")) {
+            val end = lintSkipWord(text, i + 14)
+            if (lintAt(text, end) == 40) advance = end + 1 - i
+        } else if (c == 36 && lintHasAt(text, i, "\$xtensa call")) {
+            val q = i + 12
+            if (lintHasAt(text, q, "Wide") && lintBoundary(text, q + 4)) {
+                advance = 16
+            } else if (lintAt(text, q) == 120) {
+                advance = lintSkipWord(text, q + 1) - i
+            } else if (lintHasAt(text, q, "Address")) {
+                if (lintHasAt(text, q + 7, "Wide") && lintBoundary(text, q + 11)) {
+                    advance = 23
+                } else if (lintBoundary(text, q + 7)) {
+                    advance = 19
+                }
+            }
+            if (advance == 0 && lintBoundary(text, q)) advance = 12
+        } else if ((c == 101 || c == 102) && (i == 0 || !lintIsWord(text[i - 1]))) {
+            var prefix = 0
+            if (lintHasAt(text, i, "esp32Recovered")) prefix = 14
+            if (lintHasAt(text, i, "freestanding")) prefix = 12
+            if (prefix > 0) {
+                val end = lintSkipWord(text, i + prefix)
+                if (lintAt(text, end) == 40) advance = end + 1 - i
+            }
+        }
+        if (advance > 0) {
+            count = count + 1
+            i = i + advance
+        } else {
+            i = i + 1
+        }
+    }
+    count
+}
+
+fun lintCountFunLines(lines: array<string>): int {
+    var count = 0
+    for (ln in lines) {
+        var p = lintSkipSpace(ln, 0)
+        if (lintHasAt(ln, p, "trusted ")) p = p + 8
+        if (lintHasAt(ln, p, "fun ")) count = count + 1
+    }
+    count
+}
+
+class LiftedStats(val ops: Map<string, int>, val calls: int, val memw: int)
+
+fun lintLiftedStats(fn: Fn): LiftedStats {
+    val ops: Map<string, int> = Map()
+    var calls = 0
+    var memw = 0
+    if (fn.raw) {
+        for (ln in fn.body) {
+            val op = lintRawOp(ln)
+            if (op == "") continue
+            val key = lintOpKey(op)
+            if (key != "") {
+                if (lintRawFrameOperand(ln)) continue
+                lintBump(ops, key)
+            } else if (lintIsCallOp(op)) {
+                calls = calls + 1
+            } else if (op == "memw") {
+                memw = memw + 1
+            }
+            if (lintIsSignExtOp(op)) {
+                lintBump(ops, "SIGNEXT")
+            } else if (lintIsSignedCompareOp(op)) {
+                lintBump(ops, "SGNCMP")
+            }
+        }
+        return LiftedStats(ops, calls, memw)
+    }
+    val text = fn.body.join("\n")
+    lintLiftedAccesses(text, ops)
+    ops.set("SIGNEXT", lintCountSignExt(text) + lintCountShifts(text))
+    ops.set("SGNCMP", lintCountSignedCompare(text))
+    calls = lintCountCalls(text) - lintCountFunLines(fn.body)
+    memw = lintCountOccurrences(text, "xtensaMemoryBarrier()")
+    LiftedStats(ops, calls, memw)
+}
+
+fun lintCountOccurrences(text: string, needle: string): int {
+    var count = 0
+    var at = text.indexOf(needle)
+    while (at >= 0) {
+        count = count + 1
+        at = text.indexOf(needle, at + needle.size)
+    }
+    count
+}
+
+// ------------------------------------------------------------------- listing
+
+fun lintIsDirectory(path: string): bool = Path(path).info().isDirectory()
+
+// The names (not paths) of the entries of `dir` ending in `suffix`, sorted.
+fun lintListNames(dir: string, suffix: string, directories: bool): array<string> {
+    val names: array<string> = []
+    for (entry in Path(dir).entries()) {
+        val name = entry.name()
+        if (directories) {
+            if (entry.info().isDirectory()) names.append(name)
+        } else if (name.endsWith(suffix)) {
+            names.append(name)
+        }
+    }
+    sortedStrings(names)
+}
+
+fun lintJoin(a: string, b: string): string = if (a == "") b else a + "/" + b
+
+// pathlib's str(): no empty or `.` components, no trailing slash.
+fun lintNormalizePath(path: string): string {
+    val parts: array<string> = []
+    for (part in path.split("/")) {
+        if (part != "" && part != ".") parts.append(part)
+    }
+    val joined = parts.join("/")
+    if (path.startsWith("/")) return "/" + joined
+    if (joined == "") "." else joined
+}
+
+// `unit/*/*.ab` files under root, sorted like pathlib sorts paths (by component).
+fun lintUnitFiles(root: string): array<string> {
+    val files: array<string> = []
+    val unit = lintJoin(root, "unit")
+    for (dir in lintListNames(unit, "", true)) {
+        for (name in lintListNames(unit + "/" + dir, ".ab", false)) {
+            files.append(unit + "/" + dir + "/" + name)
+        }
+    }
+    files
+}
+
+fun lintBaseName(path: string): string {
+    val at = path.lastIndexOf("/")
+    if (at < 0) path else path.slice(at + 1, path.size)
+}
+
+fun lintParentName(path: string): string {
+    val at = path.lastIndexOf("/")
+    if (at < 0) return ""
+    lintBaseName(path.slice(0, at))
+}
+
+// Path.stem
+fun lintStem(path: string): string {
+    val name = lintBaseName(path)
+    val dot = name.lastIndexOf(".")
+    if (dot <= 0) name else name.slice(0, dot)
+}
+
+fun lintWhich(name: string): string {
+    val path = processEnvironment("PATH")
+    if (path == null) return ""
+    for (dir in path.split(":")) {
+        val candidate = (if (dir == "") "." else dir) + "/" + name
+        val info = Path(candidate).info()
+        if (info.exists() && !info.isDirectory()) return candidate
+    }
+    ""
+}
+
+// ----------------------------------------------------------------- the checks
+
+// Python's repr of a list of strings.
+fun lintReprList(items: array<string>): string {
+    val parts: array<string> = []
+    for (item in items) parts.append("'" + item + "'")
+    "[" + parts.join(", ") + "]"
+}
+
+val LINT_LIBC = ["memset", "memcpy", "memcmp", "memmove", "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strchr",
+    "bzero", "abs", "__divsi3", "__udivsi3", "__modsi3", "__umodsi3", "__mulsi3", "__ashldi3", "__lshrdi3",
+    "__muldi3", "__udivdi3", "__umoddi3", "__divdi3", "__moddi3", "__ashrdi3", "__clzsi2", "__ctzsi2",
+    "memchr", "strncasecmp", "strcasecmp", "strstr", "strcat", "strrchr"]
+
+// findall(r"<prefix>(\d+)") group values
+fun lintFindNumbers(text: string, prefix: string): array<int> {
+    val found: array<int> = []
+    var at = text.indexOf(prefix)
+    while (at >= 0) {
+        val d = lintSkipDigits(text, at + prefix.size)
+        if (d > at + prefix.size) {
+            found.append(lintDecimal(text.slice(at + prefix.size, d)))
+            at = text.indexOf(prefix, d)
+        } else {
+            at = text.indexOf(prefix, at + 1)
+        }
+    }
+    found
+}
+
+// findall(r"// abla-feature-rewrite: calls=\d+ refs=(\S*)")
+fun lintFeatureRefs(text: string): array<string> {
+    val found: array<string> = []
+    val prefix = "// abla-feature-rewrite: calls="
+    var at = text.indexOf(prefix)
+    while (at >= 0) {
+        val d = lintSkipDigits(text, at + prefix.size)
+        if (d > at + prefix.size && lintHasAt(text, d, " refs=")) {
+            var e = d + 6
+            while (e < text.size && !lintIsSpace(text[e])) e = e + 1
+            found.append(text.slice(d + 6, e))
+            at = text.indexOf(prefix, e)
+        } else {
+            at = text.indexOf(prefix, at + 1)
+        }
+    }
+    found
+}
+
+fun Lint.checkDrift(files: array<string>, abiFor: Map<string, string>): void {
+    var wanted = this.only.size == 0
+    for (c in this.only.keys()) {
+        if (c.startsWith("DRIFT")) wanted = true
+    }
+    if (!wanted) return
+    if (this.objdump == "") return
+    val abiForRev: Map<string, string> = Map()
+    for (k in abiFor.keys()) {
+        val v = abiFor.get(k)
+        if (v != null) abiForRev.set(v, k)
+    }
+    for (f in files) {
+        val member = lintStem(f)
+        if (member.endsWith("_link")) continue
+        val objDir = this.root + "/" + lintParentName(f) + "/" + member + "/object"
+        val objs = lintListNames(objDir, ".o", false)
+        if (objs.size == 0) continue
+        val orig = this.objdumpFunctions(objDir + "/" + objs[0])
+        for (fn in lintParse(f)) {
+            val sym = abiFor.get(fn.name)
+            if (sym == null) continue
+            val oi = orig.index.get(sym)
+            if (oi == null) continue
+            val o = orig.stats[oi]
+            val lifted = lintLiftedStats(fn)
+            var lost = false
+            val keys: array<string> = []
+            for (k in o.ops.keys()) keys.append(k)
+            for (k in lifted.ops.keys()) {
+                if (!lintContainsString(keys, k)) keys.append(k)
+            }
+            for (k in o.ops.keys()) {
+                if (lintCount(lifted.ops, k) < lintCount(o.ops, k)) lost = true
+            }
+            if (lost) {
+                val parts: array<string> = []
+                for (k in sortedStrings(keys)) {
+                    val before = lintCount(o.ops, k)
+                    val after = lintCount(lifted.ops, k)
+                    if (before != after) parts.append("'$k': ($before, $after)")
+                }
+                this.add("DRIFT-MEM", fn, 0, "$sym: mem ops orig->lifted {${parts.join(", ")}}")
+            }
+            if (o.refs.size > 0) {
+                var text = fn.body.join("\n")
+                for (refs in lintFeatureRefs(text)) text = text + "\n" + refs.replace(",", "\n")
+                val absent: array<string> = []
+                for (r in o.refs) {
+                    if (r == sym) continue
+                    if (lintContains(text, r)) continue
+                    val unitName = abiForRev.get(r)
+                    if (unitName != null && lintContains(text, unitName)) continue
+                    if (lintContainsString(LINT_LIBC, r) || r == "__stack_chk_fail") continue
+                    absent.append(r)
+                }
+                val sorted = sortedStrings(absent)
+                if (sorted.size > 0) {
+                    val shown: array<string> = []
+                    var n = 0
+                    while (n < sorted.size && n < 6) {
+                        shown.append(sorted[n])
+                        n = n + 1
+                    }
+                    this.add("DRIFT-REF", fn, 0, "$sym: original references absent from lifted: ${lintReprList(shown)}")
+                }
+            }
+            if (lifted.memw < o.memw) {
+                this.add("DRIFT-MEMW", fn, 0, "$sym: memw orig ${o.memw} lifted ${lifted.memw}")
+            }
+            val bodyText = fn.body.join("\n")
+            var merged = 0
+            for (n in lintFindNumbers(bodyText, "// abla-merged-calls: ")) merged = merged + n
+            for (n in lintFindNumbers(bodyText, "// abla-feature-rewrite: calls=")) merged = merged + n
+            if (lifted.calls + merged < o.calls) {
+                this.add("DRIFT-CALL", fn, 0, "$sym: calls orig ${o.calls} lifted ${lifted.calls}")
+            }
+        }
+    }
+}
+
+class SymEntry(val bind: string, val size: int, val kind: string, val section: string)
+
+// ^([0-9a-f]{8}) (.{7}) (\S+)\s+([0-9a-f]{8}) (?:\.hidden )?(\S+)$ -> a: flags, b: section;
+// the size and name are returned through the SymLine.
+class SymLine(val ok: bool, val flags: string, val section: string, val size: int, val name: string)
+
+fun lintSymbolLine(ln: string): SymLine {
+    val none = SymLine(false, "", "", 0, "")
+    if (ln.size < 20) return none
+    var k = 0
+    while (k < 8) {
+        if (!lintIsHexLower(ln[k])) return none
+        k = k + 1
+    }
+    if (ln[8] != 32 || ln[16] != 32) return none
+    val flags = ln.slice(9, 16)
+    if (lintContains(flags, "\n")) return none
+    var p = 17
+    val sectionStart = p
+    while (p < ln.size && !lintIsSpace(ln[p])) p = p + 1
+    if (p == sectionStart || p >= ln.size) return none
+    val section = ln.slice(sectionStart, p)
+    p = lintSkipSpace(ln, p)
+    var h = 0
+    while (h < 8) {
+        if (!lintIsHexLower(lintAt(ln, p + h))) return none
+        h = h + 1
+    }
+    if (lintAt(ln, p + 8) != 32) return none
+    var size = 0
+    var d = 0
+    while (d < 8) {
+        val c = ln[p + d]
+        size = size * 16 + (if (c <= 57) c - 48 else c - 87)
+        d = d + 1
+    }
+    var rest = ln.slice(p + 9, ln.size)
+    var name = rest
+    if (rest.startsWith(".hidden ")) name = rest.slice(8, rest.size)
+    if (name == "") return none
+    for (c in name) {
+        if (lintIsSpace(c)) return none
+    }
+    SymLine(true, flags, section, size, name)
+}
+
+fun Lint.symtab(obj: string): Map<string, SymEntry> {
+    val out = this.runObjdump(["-t", obj])
+    val syms: Map<string, SymEntry> = Map()
+    for (ln in lintSplitLines(out)) {
+        val m = lintSymbolLine(ln)
+        if (!m.ok) continue
+        val flags = m.flags
+        val weak = flags[1] == 119
+        if (m.section == "*UND*" || m.section == "*ABS*" || (flags[0] != 103 && flags[0] != 117 && !weak)) continue
+        val kind = if (lintContains(flags, "F")) "F" else if (lintContains(flags, "O")) "O" else "?"
+        syms.set(m.name, SymEntry(if (weak) "weak" else "strong", m.size, kind, m.section))
+    }
+    syms
+}
+
+fun Lint.checkSymtab(): void {
+    if (this.only.size > 0 && !this.only.has("SYMTAB")) return
+    val unitO = this.root + "/unit/unit.o"
+    if (this.objdump == "" || !Path(unitO).exists()) return
+    val fresh = this.symtab(unitO)
+    val dummy = Fn("symtab", unitO, 0, false, [], [], [], [], false)
+    for (obj in lintObjectFiles(this.root)) {
+        val dirName = lintBaseName(obj.slice(0, obj.lastIndexOf("/object/")))
+        val syms = this.symtab(obj)
+        for (name in syms.keys()) {
+            val old = syms.get(name)
+            if (old == null) continue
+            val nm = fresh.get(name)
+            if (nm == null) {
+                this.add("SYMTAB", dummy, 0, "$dirName: `$name` (${old.bind} ${old.kind}, ${old.size} bytes) missing in unit.o")
+                continue
+            }
+            if (nm.bind != old.bind) this.add("SYMTAB", dummy, 0, "`$name` binding ${old.bind} -> ${nm.bind}")
+            if (old.kind == "O" && nm.kind == "O" && nm.size != old.size) {
+                this.add("SYMTAB", dummy, 0, "`$name` data size ${old.size} -> ${nm.size}")
+            }
+            if (old.kind != nm.kind && old.kind != "?" && nm.kind != "?") {
+                this.add("SYMTAB", dummy, 0, "`$name` type ${old.kind} -> ${nm.kind}")
+            }
+        }
+    }
+}
+
+// sorted(root.glob("*/*/object/*.o"))
+fun lintObjectFiles(root: string): array<string> {
+    val found: array<string> = []
+    val top = if (root == "") "." else root
+    for (a in lintListNames(top, "", true)) {
+        for (b in lintListNames(lintJoin(root, a), "", true)) {
+            val dir = lintJoin(root, a) + "/" + b + "/object"
+            if (!lintIsDirectory(dir)) continue
+            for (name in lintListNames(dir, ".o", false)) found.append(dir + "/" + name)
+        }
+    }
+    found
+}
+
+// ------------------------------------------------------------ data and tables
+
+// \b(esp32Data_\w+Storage)\b : each whole word run of that shape in the line.
+fun lintStorageTokens(ln: string): array<string> {
+    val found: array<string> = []
+    var i = 0
+    while (i < ln.size) {
+        if (lintIsWord(ln[i]) && (i == 0 || !lintIsWord(ln[i - 1]))) {
+            val end = lintSkipWord(ln, i)
+            val run = ln.slice(i, end)
+            if (run.startsWith("esp32Data_") && run.endsWith("Storage") && run.size >= 18) found.append(run)
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    found
+}
+
+// [\s,{(]((?:\.L)?[A-Za-z_][\w.$]*_data_[\w.$]*)\b  finditer -> the groups
+fun lintDataLabels(ln: string): array<string> {
+    val found: array<string> = []
+    var i = 0
+    while (i < ln.size) {
+        val c = ln[i]
+        if (!(lintIsSpace(c) || c == 44 || c == 123 || c == 40)) {
+            i = i + 1
+            continue
+        }
+        var k = i + 1
+        if (lintHasAt(ln, k, ".L")) k = k + 2
+        if (!lintIsAlphaUnderscore(lintAt(ln, k))) {
+            i = i + 1
+            continue
+        }
+        var run = k + 1
+        while (run < ln.size && lintIsSymbolByte(ln[run])) run = run + 1
+        var matchEnd = -1
+        var p = run - 6
+        while (p >= k + 1 && matchEnd < 0) {
+            if (lintHasAt(ln, p, "_data_")) {
+                var e = run
+                while (e >= p + 6) {
+                    if (lintBoundary(ln, e)) {
+                        matchEnd = e
+                        break
+                    }
+                    e = e - 1
+                }
+            }
+            p = p - 1
+        }
+        if (matchEnd < 0) {
+            i = i + 1
+        } else {
+            found.append(ln.slice(i + 1, matchEnd))
+            i = matchEnd
+        }
+    }
+    found
+}
+
+fun lintLabelOnlyLine(ln: string, label: string): bool =
+    lintHasAt(ln, 0, label) && lintAt(ln, label.size) == 58 && lintSkipSpace(ln, label.size + 1) == ln.size
+
+fun lintJoinLines(lines: array<string>, from: int, count: int): string {
+    val parts: array<string> = []
+    var n = from
+    while (n < lines.size && n < from + count) {
+        parts.append(lines[n])
+        n = n + 1
+    }
+    parts.join("\n")
+}
+
+fun lintAddUse(var map: Map<string, array<string>>, key: string, value: string): void {
+    if (!map.has(key)) {
+        val fresh: array<string> = []
+        map.set(key, fresh)
+    }
+    val list = map.get(key)
+    if (list != null) list.append(value)
+}
+
+// Storage symbols that only feed an already-lowered `when` (dead leftover jump tables);
+// fills `lint.deadLabels` with the raw data labels that do.
+fun Lint.loweredTables(files: array<string>): array<string> {
+    val uses: Map<string, array<string>> = Map()
+    for (f in files) {
+        val lines = lintReadLines(f)
+        var n = 0
+        while (n < lines.size) {
+            val ln = lines[n]
+            for (st in lintStorageTokens(ln)) {
+                val p = lintSkipSpace(ln, 0)
+                if (lintHasAt(ln, p, "val " + st + " =")) continue
+                if (lintContains(ln, "StoreU32(nativePointerFromAddress(" + st)) continue
+                if (lintSkipSpace(ln, p + st.size) == ln.size && lintHasAt(ln, p, st)) continue
+                lintAddUse(uses, st, lintJoinLines(lines, n, 3))
+            }
+            n = n + 1
+        }
+    }
+    val labels: Map<string, array<string>> = Map()
+    for (f in files) {
+        val lines = lintReadLines(f)
+        var n = 0
+        while (n < lines.size) {
+            val ln = lines[n]
+            for (lab in lintDataLabels(ln)) {
+                if (lintLabelOnlyLine(ln, lab)) continue
+                if (lintContains(ln, "\$xtensa address {" + lab + "}")) {
+                    lintAddUse(labels, lab, lintJoinLines(lines, n, 4))
+                } else {
+                    lintAddUse(labels, lab, "USE")
+                }
+            }
+            n = n + 1
+        }
+    }
+    for (lab in labels.keys()) {
+        val u = labels.get(lab)
+        if (u == null || u.size == 0) continue
+        var all = true
+        for (x in u) {
+            if (x == "USE" || !lintContains(x, "jumpTableIndex")) all = false
+        }
+        if (all) this.deadLabels.set(lab, true)
+    }
+    val dead: array<string> = []
+    for (st in uses.keys()) {
+        val u = uses.get(st)
+        if (u == null || u.size == 0) continue
+        var all = true
+        for (x in u) {
+            if (!lintContains(x, "jumpTableIndex")) all = false
+        }
+        if (all) dead.append(st)
+    }
+    dead
+}
+
+// ^(?:var|val)\s+(esp32Data_\w+Storage)\b  -> the storage name, "" if none.
+fun lintStorageDeclaration(ln: string): string {
+    if (!(lintHasAt(ln, 0, "var") || lintHasAt(ln, 0, "val")) || !lintIsSpace(lintAt(ln, 3))) return ""
+    val p = lintSkipSpace(ln, 3)
+    val end = lintSkipWord(ln, p)
+    val run = ln.slice(p, end)
+    if (run.startsWith("esp32Data_") && run.endsWith("Storage") && run.size >= 18) return run
+    ""
+}
+
+// The positions after `dram\d*(?:_\d+)?` in the order the regex tries them.
+fun lintDramEnds(st: string, p: int): array<int> {
+    val ends: array<int> = []
+    if (!lintHasAt(st, p, "dram")) return ends
+    val q = p + 4
+    val digitsEnd = lintSkipDigits(st, q)
+    var c = digitsEnd
+    while (c >= q) {
+        if (lintAt(st, c) == 95) {
+            val d = lintSkipDigits(st, c + 1)
+            var k = d
+            while (k > c + 1) {
+                ends.append(k)
+                k = k - 1
+            }
+        }
+        ends.append(c)
+        c = c - 1
+    }
+    ends
+}
+
+// The group of esp32Data_.*?_data_(?:bss|data|dram\d*(?:_\d+)?|rodata|literal\d*)_(\w+?)(?:_[0-9a-f]{10})?Storage$ ; "" if none.
+fun lintStorageSuffix(st: string): string {
+    if (!st.startsWith("esp32Data_") || !st.endsWith("Storage")) return ""
+    var s = 10
+    while (s + 6 <= st.size) {
+        if (lintHasAt(st, s, "_data_")) {
+            val q = s + 6
+            val ends: array<int> = []
+            if (lintHasAt(st, q, "bss")) ends.append(q + 3)
+            if (lintHasAt(st, q, "data")) ends.append(q + 4)
+            for (e in lintDramEnds(st, q)) ends.append(e)
+            if (lintHasAt(st, q, "rodata")) ends.append(q + 6)
+            if (lintHasAt(st, q, "literal")) {
+                val dend = lintSkipDigits(st, q + 7)
+                var c = dend
+                while (c >= q + 7) {
+                    ends.append(c)
+                    c = c - 1
+                }
+            }
+            for (e in ends) {
+                if (lintAt(st, e) != 95) continue
+                val start = e + 1
+                // (\w+?) then (?:_[0-9a-f]{10})?Storage$ : the shortest group that fits
+                val withHash = st.size - 18
+                if (withHash >= start + 1 && st[withHash] == 95 && lintHasAt(st, withHash + 11, "Storage")) {
+                    var hex = true
+                    var h = 0
+                    while (h < 10) {
+                        if (!lintIsHexLower(st[withHash + 1 + h])) hex = false
+                        h = h + 1
+                    }
+                    if (hex) return st.slice(start, withHash)
+                }
+                val plain = st.size - 7
+                if (plain >= start + 1) {
+                    // the group is all word characters; `st` is a word run
+                    return st.slice(start, plain)
+                }
+            }
+        }
+        s = s + 1
+    }
+    ""
+}
+
+// re.sub(r"[^A-Za-z0-9_]", "_", sym): one underscore per character.
+fun lintSanitize(sym: string): string {
+    val parts: array<string> = []
+    for (c in sym) {
+        if (lintIsWord(c)) {
+            parts.append(utf8Encode(c))
+        } else if (c < 128 || c >= 192) {
+            parts.append("_")
+        }
+    }
+    parts.join("")
+}
+
+class RawDef(val file: string, val line: int)
+
+fun Lint.checkData(files: array<string>): void {
+    if (this.only.size > 0 && !this.only.has("DATADUP") && !this.only.has("RAWSPLIT")) return
+    val rawDefs: Map<string, array<RawDef>> = Map()
+    val storage: Map<string, RawDef> = Map()
+    for (f in files) {
+        var inRaw = false
+        val lines = lintReadLines(f)
+        var n = 0
+        while (n < lines.size) {
+            val ln = lines[n]
+            if (lintContains(ln, "\$xtensa instructions") || ln.startsWith("\$xtensa data")) {
+                inRaw = true
+            } else if (ln == "}") {
+                inRaw = false
+            }
+            if (inRaw) {
+                val label = lintLabelLine(ln)
+                if (label != "" && !label.startsWith(".")) {
+                    if (!rawDefs.has(label)) {
+                        val fresh: array<RawDef> = []
+                        rawDefs.set(label, fresh)
+                    }
+                    val list = rawDefs.get(label)
+                    if (list != null) list.append(RawDef(f, n + 1))
+                }
+            }
+            val declared = lintStorageDeclaration(ln)
+            if (declared != "") storage.set(declared, RawDef(f, n + 1))
+            n = n + 1
+        }
+    }
+    val bySuffix: Map<string, array<string>> = Map()
+    for (st in storage.keys()) {
+        val suffix = lintStorageSuffix(st)
+        if (suffix != "") lintAddUse(bySuffix, suffix, st)
+    }
+    for (sym in rawDefs.keys()) {
+        val locs = rawDefs.get(sym)
+        if (locs == null) continue
+        val matches = bySuffix.get(lintSanitize(sym))
+        if (matches == null) continue
+        for (st in matches) {
+            val where = storage.get(st)
+            if (where == null) continue
+            val fobj = Fn(sym, locs[0].file, locs[0].line, true, [], [], [], [], false)
+            this.add("RAWSPLIT", fobj, 0,
+                "`$sym` defined in raw asm (line ${locs[0].line}) and as Abla storage ${lintPrefix(st, 90)} (${lintBaseName(where.file)}:${where.line})")
+        }
+    }
+}
+
+// ------------------------------------------------------------------------ run
+
+// `// Original ABI symbol: (\S+)` at the start of the line.
+fun lintAbiComment(ln: string): string {
+    val prefix = "// Original ABI symbol: "
+    if (!ln.startsWith(prefix)) return ""
+    var e = prefix.size
+    while (e < ln.size && !lintIsSpace(ln[e])) e = e + 1
+    ln.slice(prefix.size, e)
+}
+
+fun Lint.run(): void {
+    val files = lintUnitFiles(this.root)
+    val allFns: array<Fn> = []
+    for (f in files) {
+        for (fn in lintParse(f)) allFns.append(fn)
+    }
+    for (fn in allFns) this.fns.set(fn.name, fn)
+    val abiToFn: Map<string, string> = Map()
+    for (f in files) {
+        var cur = ""
+        for (ln in lintReadLines(f)) {
+            val abi = lintAbiComment(ln)
+            if (abi != "") cur = abi
+            val name = lintFunName(ln)
+            if (name != "" && cur != "") {
+                abiToFn.set(cur, name)
+                cur = ""
+            }
+        }
+    }
+    val codeSyms: Map<string, bool> = Map()
+    for (k in abiToFn.keys()) codeSyms.set(k, true)
+    for (k in this.fns.keys()) codeSyms.set(k, true)
+    this.deadTables = this.loweredTables(files)
+    for (fn in allFns) {
+        if (fn.raw) this.checkRaw(fn, codeSyms) else this.checkTyped(fn)
+    }
+    this.checkData(files)
+    val fnToAbi: Map<string, string> = Map()
+    for (k in abiToFn.keys()) {
+        val v = abiToFn.get(k)
+        if (v != null) fnToAbi.set(v, k)
+    }
+    this.checkDrift(files, fnToAbi)
+    this.checkSymtab()
+}
+
+// ------------------------------------------------------------------------ main
+
+fun lintUsage(): void {
+    eprintln("usage: lint-recovered-unit [-h] [--root ROOT] [--check CHECK] [--limit LIMIT] [--tsv TSV]")
+}
+
+fun main: int {
+    var root = "build/recovery/esp32s3"
+    var check = ""
+    var limit = 15
+    var tsv = ""
+    var i = 0
+    val count = processArgumentCount()
+    while (i < count) {
+        var arg = processArgument(i)
+        var value = ""
+        var inline = false
+        val eq = arg.indexOf("=")
+        if (arg.startsWith("--") && eq > 0) {
+            value = arg.slice(eq + 1, arg.size)
+            arg = arg.slice(0, eq)
+            inline = true
+        }
+        if (arg == "-h" || arg == "--help") {
+            lintUsage()
+            return 0
+        }
+        if (arg == "--root" || arg == "--check" || arg == "--limit" || arg == "--tsv") {
+            if (!inline) {
+                i = i + 1
+                if (i >= count) {
+                    lintUsage()
+                    eprintln("lint-recovered-unit: error: argument $arg: expected one argument")
+                    return 2
+                }
+                value = processArgument(i)
+            }
+            if (arg == "--root") root = value
+            if (arg == "--check") check = value
+            if (arg == "--tsv") tsv = value
+            if (arg == "--limit") {
+                if (!lintAllDigits(value.trimStart().replace("-", "")) || value.trim() == "") {
+                    lintUsage()
+                    eprintln("lint-recovered-unit: error: argument --limit: invalid int value: '$value'")
+                    return 2
+                }
+                limit = if (value.trim().startsWith("-")) 0 - lintDecimal(value.trim().replace("-", "")) else lintDecimal(value.trim().replace("+", ""))
+            }
+        } else {
+            lintUsage()
+            eprintln("lint-recovered-unit: error: unrecognized arguments: ${processArgument(i)}")
+            return 2
+        }
+        i = i + 1
+    }
+    root = lintNormalizePath(root)
+    if (!lintIsDirectory(lintJoin(root, "unit"))) {
+        eprintln("lint-recovered-unit: $root/unit not found (run tools/build-recovered-radio first)")
+        return 1
+    }
+    val only: Map<string, bool> = Map()
+    for (c in check.split(",")) {
+        if (c != "") only.set(c, true)
+    }
+    var objdump = ""
+    val fromEnvironment = processEnvironment("XTENSA_OBJDUMP")
+    if (fromEnvironment != null && fromEnvironment != "") {
+        objdump = fromEnvironment
+    } else {
+        val home = processEnvironment("HOME")
+        if (home != null) {
+            objdump = home + "/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-objdump"
+        }
+    }
+    if (objdump == "" || !Path(objdump).exists()) objdump = lintWhich("xtensa-esp32s3-elf-objdump")
+    val lint = Lint(root, only, objdump, lintWhich("steam-run"), [], Map(), [], Map())
+    lint.run()
+    val byCheck: Map<string, array<Finding>> = Map()
+    val names: array<string> = []
+    for (f in lint.findings) {
+        if (!byCheck.has(f.check)) {
+            val fresh: array<Finding> = []
+            byCheck.set(f.check, fresh)
+            names.append(f.check)
+        }
+        val list = byCheck.get(f.check)
+        if (list != null) list.append(f)
+    }
+    val out: array<string> = []
+    for (name in sortedStrings(names)) {
+        val items = byCheck.get(name)
+        if (items == null) continue
+        val fnNames: Map<string, bool> = Map()
+        for (it in items) fnNames.set(it.fn, true)
+        out.append("== $name: ${items.size} finding(s), ${fnNames.size} function(s)")
+        val shown = if (limit >= 0) (if (limit < items.size) limit else items.size) else (if (items.size + limit > 0) items.size + limit else 0)
+        var n = 0
+        while (n < shown) {
+            val f = items[n]
+            val rel = if (f.file.startsWith(root + "/")) f.file.slice(root.size + 1, f.file.size) else f.file
+            out.append("  $rel:${f.line} ${f.fn}: ${f.msg}")
+            n = n + 1
+        }
+        if (items.size > limit) out.append("  ... ${items.size - limit} more (--limit)")
+    }
+    if (out.size > 0) println(out.join("\n"))
+    if (tsv != "") {
+        val rows: array<string> = []
+        for (f in lint.findings) rows.append("${f.check}\t${f.file}\t${f.line}\t${f.fn}\t${f.msg}\n")
+        Path(tsv).writeText(rows.join(""))
+    }
+    for (f in lint.findings) {
+        if (!f.check.endsWith("-DEAD")) return 1
+    }
+    0
+}
