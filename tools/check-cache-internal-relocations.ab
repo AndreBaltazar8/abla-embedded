@@ -1,0 +1,89 @@
+// Reject IRAM/DRAM relocations into flash in mixed-placement ELF32 objects.
+//
+// Complements the LLVM noinline boundary check. Not final linker, computed
+// pointer, stack or hardware proof; ROM absolute symbols remain allowed.
+//
+//     tools/abla-tool check-cache-internal-relocations OBJECT.o
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/elf.ab"
+
+fun cacheInternalName(name: string): bool =
+    name == ".iram1" || name == ".dram1" || name.startsWith(".iram1.") || name.startsWith(".dram1.")
+
+class RelocationCheck(val checked: int, val error: string)
+
+fun cacheRelocationsFail(message: string): RelocationCheck = RelocationCheck(0, message)
+
+fun validateCacheInternalRelocations(data: string): RelocationCheck {
+    val elf = elf32Parse(data)
+    if (elf.error != "") return cacheRelocationsFail(elf.error)
+    val sections = elf.sections
+    val count = sections.size
+    var roots = 0
+    for (section in sections) {
+        if (cacheInternalName(section.name) && (section.flags & ELF_SHF_ALLOC) != 0) roots = roots + 1
+    }
+    var checked = 0
+    var index = 0
+    while (index < count) {
+        val section = sections[index]
+        index = index + 1
+        if (section.kind != ELF_SHT_RELA && section.kind != ELF_SHT_REL) continue
+        if (section.info >= count || section.link >= count) {
+            return cacheRelocationsFail("invalid relocation section links")
+        }
+        val origin = sections[section.info]
+        if (!cacheInternalName(origin.name) || (origin.flags & ELF_SHF_ALLOC) == 0) continue
+        val symbols = sections[section.link]
+        val stride = if (section.kind == ELF_SHT_RELA) 12 else 8
+        if (section.entrySize != stride || symbols.entrySize != 16 || section.size % stride != 0) {
+            return cacheRelocationsFail("invalid relocation or symbol stride")
+        }
+        val table = elf.sectionBytes(symbols)
+        for (relocation in elf.relocations(index - 1)) {
+            if (relocation.kind == 0) continue // R_XTENSA_NONE
+            if (relocation.symbol * 16 >= symbols.size) {
+                return cacheRelocationsFail("relocation symbol outside table")
+            }
+            val target = elfU16(table, relocation.symbol * 16 + 14)
+            if (target == ELF_SHN_ABS) continue // e.g. permitted hardware ROM
+            if (target == 0 || target >= count) {
+                return cacheRelocationsFail("unresolved cache-critical relocation")
+            }
+            val referenced = sections[target]
+            if (!cacheInternalName(referenced.name) || (referenced.flags & ELF_SHF_ALLOC) == 0) {
+                return cacheRelocationsFail("${origin.name} references non-internal section ${referenced.name}")
+            }
+            checked = checked + 1
+        }
+    }
+    // A closure that is whole in internal memory has no relocation to check: the check is
+    // vacuous only when there is no allocated internal section at all. It relies on
+    // place-internal-closure having renamed everything reachable from the roots, so a root
+    // with references always has a relocation section here; a missing one is not detected.
+    if (roots == 0) return cacheRelocationsFail("no allocated internal sections")
+    RelocationCheck(checked, "")
+}
+
+fun main: int {
+    if (processArgumentCount() != 1) {
+        eprintln("usage: check-cache-internal-relocations OBJECT.o")
+        return 2
+    }
+    val data = Path(processArgument(0)).readTextResult()
+    if (!data.succeeded) {
+        eprintln("cannot read ${processArgument(0)}")
+        return 1
+    }
+    val result = validateCacheInternalRelocations(data.text)
+    if (result.error != "") {
+        eprintln(result.error)
+        return 1
+    }
+    println("PASS: ${result.checked} internal-memory relocations remain internal (object-level only)")
+    0
+}

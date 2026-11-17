@@ -1,0 +1,270 @@
+// Little-endian ELF32 reader and fixture builder shared by the object checks
+// in tools/ and tests/. Binary data is a `string` of bytes (what
+// Path.readText() returns for a binary file). Readers never panic on a
+// truncated file: a field outside the data reads as 0 and `elf32Parse`
+// reports `error` for a damaged header or section table.
+
+import "abla/bytes"
+import "abla/text"
+
+val ELF_SHT_PROGBITS = 1
+val ELF_SHT_SYMTAB = 2
+val ELF_SHT_STRTAB = 3
+val ELF_SHT_RELA = 4
+val ELF_SHT_REL = 9
+val ELF_SHF_WRITE = 1
+val ELF_SHF_ALLOC = 2
+val ELF_SHF_EXECINSTR = 4
+val ELF_SHN_ABS = 0xfff1
+
+fun elfU8(data: string, offset: int): int =
+    if (offset < 0 || offset >= data.size) 0 else data[offset]
+
+fun elfU16(data: string, offset: int): int =
+    elfU8(data, offset) | (elfU8(data, offset + 1) << 8)
+
+fun elfU32(data: string, offset: int): int =
+    elfU16(data, offset) | (elfU16(data, offset + 2) << 16)
+
+// Sign-extended 32-bit value.
+fun elfS32(data: string, offset: int): int {
+    val value = elfU32(data, offset)
+    if (value >= 0x80000000) value - 0x100000000 else value
+}
+
+fun elfInRange(data: string, offset: int, size: int): bool =
+    offset >= 0 && size >= 0 && offset + size <= data.size
+
+// The bytes of data[begin, end), clamped to the data.
+fun elfSlice(data: string, begin: int, end: int): string {
+    val low = if (begin < 0) 0 else begin
+    val high = if (end > data.size) data.size else end
+    if (low >= high) "" else data.slice(low, high)
+}
+
+// The NUL-terminated string at `offset` of `table`.
+fun elfCString(table: string, offset: int): string {
+    if (offset < 0 || offset >= table.size) return ""
+    var end = offset
+    while (end < table.size && table[end] != 0) end = end + 1
+    table.slice(offset, end)
+}
+
+class Elf32Section(
+    val name: string,
+    val nameOffset: int,
+    val kind: int,
+    val flags: int,
+    val address: int,
+    val offset: int,
+    val size: int,
+    val link: int,
+    val info: int,
+    val alignment: int,
+    val entrySize: int
+)
+
+class Elf32(
+    val data: string,
+    val sections: array<Elf32Section>,
+    val entry: int,
+    val kind: int,
+    val error: string
+)
+
+fun elf32Parse(data: string): Elf32 {
+    val none: array<Elf32Section> = []
+    if (data.size < 52 || elfU8(data, 0) != 0x7f || elfU8(data, 1) != 0x45 ||
+        elfU8(data, 2) != 0x4c || elfU8(data, 3) != 0x46 ||
+        elfU8(data, 4) != 1 || elfU8(data, 5) != 1) {
+        return Elf32(data, none, 0, 0, "expected little-endian ELF32")
+    }
+    val table = elfU32(data, 32)
+    val stride = elfU16(data, 46)
+    val count = elfU16(data, 48)
+    val namesIndex = elfU16(data, 50)
+    if (stride != 40 || count == 0 || namesIndex >= count ||
+        !elfInRange(data, table, count * 40)) {
+        return Elf32(data, none, elfU32(data, 24), elfU16(data, 16), "unsupported ELF32 section table")
+    }
+    val namesHeader = table + namesIndex * 40
+    val names = elfSlice(data, elfU32(data, namesHeader + 16), elfU32(data, namesHeader + 16) + elfU32(data, namesHeader + 20))
+    val sections: array<Elf32Section> = []
+    var index = 0
+    while (index < count) {
+        val at = table + index * 40
+        val nameOffset = elfU32(data, at)
+        sections.append(Elf32Section(
+            elfCString(names, nameOffset), nameOffset, elfU32(data, at + 4),
+            elfU32(data, at + 8), elfU32(data, at + 12), elfU32(data, at + 16),
+            elfU32(data, at + 20), elfU32(data, at + 24), elfU32(data, at + 28),
+            elfU32(data, at + 32), elfU32(data, at + 36)))
+        index = index + 1
+    }
+    Elf32(data, sections, elfU32(data, 24), elfU16(data, 16), "")
+}
+
+fun Elf32.sectionBytes(section: Elf32Section): string =
+    if (section.kind == 8) "" else elfSlice(this.data, section.offset, section.offset + section.size)
+
+// Index of the one section called `name`; -1 when none or several.
+fun Elf32.uniqueSection(name: string): int {
+    var found = -1
+    var index = 0
+    while (index < this.sections.size) {
+        if (this.sections[index].name == name) {
+            if (found >= 0) return -1
+            found = index
+        }
+        index = index + 1
+    }
+    found
+}
+
+fun Elf32.sectionIndex(name: string): int {
+    var index = 0
+    while (index < this.sections.size) {
+        if (this.sections[index].name == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+class Elf32Symbol(
+    val name: string,
+    val nameOffset: int,
+    val value: int,
+    val size: int,
+    val info: int,
+    val other: int,
+    val sectionIndex: int
+) {
+    fun binding(): int = this.info >> 4
+    fun kind(): int = this.info & 15
+}
+
+fun Elf32.symbols(symtab: int): array<Elf32Symbol> {
+    val result: array<Elf32Symbol> = []
+    if (symtab < 0 || symtab >= this.sections.size) return result
+    val section = this.sections[symtab]
+    if (section.link < 0 || section.link >= this.sections.size) return result
+    val strings = this.sectionBytes(this.sections[section.link])
+    val bytes = this.sectionBytes(section)
+    var at = 0
+    while (at + 16 <= bytes.size) {
+        val nameOffset = elfU32(bytes, at)
+        result.append(Elf32Symbol(elfCString(strings, nameOffset), nameOffset,
+            elfU32(bytes, at + 4), elfU32(bytes, at + 8), elfU8(bytes, at + 12),
+            elfU8(bytes, at + 13), elfU16(bytes, at + 14)))
+        at = at + 16
+    }
+    result
+}
+
+class Elf32Relocation(val offset: int, val symbol: int, val kind: int, val addend: int)
+
+// Entries of the SHT_REL (addend 0) or SHT_RELA section at `index`.
+fun Elf32.relocations(index: int): array<Elf32Relocation> {
+    val result: array<Elf32Relocation> = []
+    val section = this.sections[index]
+    val stride = if (section.kind == ELF_SHT_RELA) 12 else 8
+    val bytes = this.sectionBytes(section)
+    var at = 0
+    while (at + stride <= bytes.size) {
+        val info = elfU32(bytes, at + 4)
+        result.append(Elf32Relocation(elfU32(bytes, at), info >> 8, info & 255,
+            if (stride == 12) elfS32(bytes, at + 8) else 0))
+        at = at + stride
+    }
+    result
+}
+
+// ---- byte building (fixtures and mutations) ----
+
+fun elfByte(value: int): string = byteEncode(value & 255)
+fun elfBytes16(value: int): string = elfByte(value) + elfByte(value >> 8)
+fun elfBytes32(value: int): string = elfBytes16(value) + elfBytes16(value >> 16)
+
+// Hex digits ("00 48 03", spaces allowed) to bytes.
+fun elfHex(text: string): string {
+    var result = ""
+    var high = -1
+    val digits = text.replace(" ", "")
+    var index = 0
+    while (index < digits.size) {
+        val ch = digits[index]
+        val digit = if (ch >= 48 && ch <= 57) ch - 48 else if (ch >= 97 && ch <= 102) ch - 87 else ch - 55
+        if (high < 0) {
+            high = digit
+        } else {
+            result = result + elfByte(high * 16 + digit)
+            high = -1
+        }
+        index = index + 1
+    }
+    result
+}
+
+// A copy of `data` with the byte at `offset` replaced.
+fun elfWithByte(data: string, offset: int, value: int): string =
+    data.slice(0, offset) + elfByte(value) + data.slice(offset + 1, data.size)
+
+fun elfWithU32(data: string, offset: int, value: int): string =
+    data.slice(0, offset) + elfBytes32(value) + data.slice(offset + 4, data.size)
+
+fun elfNul(): string = byteEncode(0)
+
+fun elfZeros(count: int): string {
+    var result = ""
+    var index = 0
+    while (index < count) {
+        result = result + byteEncode(0)
+        index = index + 1
+    }
+    result
+}
+
+// Names joined with NUL terminators, starting with an empty name (offset 0).
+fun elfNameTable(names: array<string>): string {
+    var result = elfNul()
+    for (name in names) result = result + name + elfNul()
+    result
+}
+
+fun elfNameOffset(table: string, name: string): int {
+    val at = table.indexOf(elfNul() + name + elfNul())
+    if (at < 0) -1 else at + 1
+}
+
+// An ELF32 file under construction: the 52-byte header followed by section
+// payloads; `finish` appends the section header table.
+class ElfFixture(var data: string, val headers: array<string>)
+
+fun elfFixture(): ElfFixture {
+    val header = elfByte(0x7f) + "ELF" + elfByte(1) + elfByte(1) + elfZeros(46)
+    val nullHeader: array<string> = [elfZeros(40)]
+    ElfFixture(header, nullHeader)
+}
+
+// Appends a section and returns its index.
+fun ElfFixture.add(nameOffset: int, kind: int, flags: int, payload: string,
+        link: int, info: int, entrySize: int): int {
+    val start = this.data.size
+    this.data = this.data + payload
+    this.headers.append(elfBytes32(nameOffset) + elfBytes32(kind) + elfBytes32(flags) +
+        elfBytes32(0) + elfBytes32(start) + elfBytes32(payload.size) +
+        elfBytes32(link) + elfBytes32(info) + elfBytes32(4) + elfBytes32(entrySize))
+    this.headers.size - 1
+}
+
+// The file with its section header table; `namesIndex` is the section-name
+// string table's index.
+fun ElfFixture.finish(namesIndex: int): string {
+    val table = this.data.size
+    var result = this.data
+    for (header in this.headers) result = result + header
+    result = elfWithU32(result, 32, table)
+    result = result.slice(0, 46) + elfBytes16(40) + elfBytes16(this.headers.size) +
+        elfBytes16(namesIndex) + result.slice(52, result.size)
+    result
+}
