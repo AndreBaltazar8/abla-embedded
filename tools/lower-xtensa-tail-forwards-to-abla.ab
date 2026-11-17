@@ -1,0 +1,283 @@
+// Replace naked Xtensa forwarding shims with typed Abla calls.
+//
+// The recovered interface-control table originally used tiny tail-jump objects.
+// Once both the table and target implementations live in the same Abla module,
+// the exact register forwarding can be represented by ordinary scalar function
+// parameters. This pass also repairs recovered call sites that previously called
+// a void naked shim and then synthesized a zero return value.
+//
+//     tools/abla-tool lower-xtensa-tail-forwards-to-abla [--write] ROOT
+import "abla/io"
+import "abla/text"
+import "lib/recovered-text.ab"
+
+class Forward(val name: string, val arity: int, val target: string)
+
+fun forwards(): array<Forward> = [
+    Forward("esp32InterfaceFreeReceiveBuffer", 1, "esp32RecoveredPpRecycleRxPkt"),
+    Forward("esp32InterfaceBeaconMonitorConfigure", 1, "esp32RecoveredPmBeaconMonitorConfigure"),
+    Forward("esp32InterfaceCreateWifiTask", 0, "esp32RecoveredPpCreateTask"),
+    Forward("esp32InterfaceDeleteWifiTask", 0, "esp32RecoveredPpDeleteTask"),
+    Forward("esp32InterfacePacketBufferAllocate", 3, "esp32RecoveredEsfBufAlloc"),
+    Forward("esp32InterfacePacketBufferRecycleReceive", 1, "esp32RecoveredPpRecycleRxPkt"),
+    Forward("esp32InterfacePacketBufferRecycleTransmit", 1, "esp32RecoveredEsfBufRecycle"),
+    Forward("esp32InterfaceGetSixMegabitSchedule", 0, "esp32RecoveredRcGetG6MSched"),
+    Forward("esp32InterfaceGetFixedRate", 3, "esp32RecoveredRcGetFixRate"),
+    Forward("esp32InterfaceGetKeepAliveTime", 0, "esp32RecoveredPmGetKeepAliveTime"),
+    Forward("esp32InterfaceGetNextBeaconOffset", 0, "esp32RecoveredWDevGetNextBcnOffset"),
+    Forward("esp32InterfaceGetNextTbtt", 0, "esp32RecoveredWDevGetNextTBTT"),
+    Forward("esp32InterfaceGetPacketTaskHandle", 0, "esp32RecoveredPpGetTaskHdl"),
+    Forward("esp32InterfaceResetTbtt", 0, "esp32RecoveredWDevResetTBTT"),
+    Forward("esp32InterfaceSetBeaconInterval", 1, "esp32RecoveredWDevSetBeaconInt"),
+    Forward("esp32InterfaceSetKeepAliveTime", 1, "esp32RecoveredPmSetKeepAliveTime"),
+    Forward("esp32InterfaceSetMinimumActiveTime", 1, "esp32RecoveredPmSetSleepMinActiveTime"),
+    Forward("esp32InterfaceSetBroadcastWaitTime", 1, "esp32RecoveredPmSetSleepWaitBroadcastDataTime"),
+    Forward("esp32InterfaceStopHardwareTransmitQueue", 0, "esp32RecoveredLmacStopHwTxq"),
+    Forward("esp32InterfaceSetPerPacketRate", 2, "esp32RecoveredTrcSetPerPktRate"),
+    Forward("esp32InterfaceUpdatePhysicalMode", 2, "esp32RecoveredTrcUpdateIfxPhyMode"),
+    Forward("esp32InterfaceTransmitQueueEmpty", 0, "esp32RecoveredPpTxqEmpty"),
+    Forward("esp32InterfaceUpdateLightSleepDefaults", 2, "esp32RecoveredPmUpdateLightSleepDefaultParams"),
+    Forward("esp32InterfaceUpdateModemSleepDefaults", 0, "esp32RecoveredPmUpdateModemSleepDefaultParams")
+]
+
+val tailImports =
+    "import \"./packet_processing_esp32.ab\"\n" +
+    "import \"./esf_buf_esp32.ab\"\n" +
+    "import \"./transmit_rate_control_esp32.ab\"\n" +
+    "import \"./power_management_esp32.ab\"\n" +
+    "import \"./wifi_device_esp32.ab\"\n" +
+    "import \"./low_mac_esp32.ab\"\n"
+
+/** The end of the definition `@naked\s*\ntrusted fun NAME(.*?)\s*:\s*void\s*=\s*\n\s*$xtensa tailN {[^}]+}` starting at `at`, or -1. */
+fun tailDefinitionEnd(source: string, at: int, forward: Forward): int {
+    var i = at + 6
+    val spaceStart = i
+    i = rtSkipSpace(source, i)
+    // The whitespace run must end with the newline that precedes `trusted`.
+    if (i == spaceStart || source[i - 1] != 10) return -1
+    val head = "trusted fun ${forward.name}("
+    if (!rtAt(source, i, head)) return -1
+    var closing = source.indexOf(")", i + head.size)
+    while (closing >= 0) {
+        var j = rtSkipSpace(source, closing + 1)
+        if (rtAt(source, j, ":")) {
+            j = rtSkipSpace(source, j + 1)
+            if (rtAt(source, j, "void")) {
+                j = rtSkipSpace(source, j + 4)
+                if (rtAt(source, j, "=")) {
+                    val runStart = j + 1
+                    j = rtSkipSpace(source, runStart)
+                    if (source.slice(runStart, j).contains("\n") && rtAt(source, j, "\$xtensa tail${forward.arity} {")) {
+                        val open = j + ("\$xtensa tail${forward.arity} {").size
+                        val close = source.indexOf("}", open)
+                        if (close > open) return close + 1
+                    }
+                }
+            }
+        }
+        closing = source.indexOf(")", closing + 1)
+    }
+    -1
+}
+
+private fun tailTargetArguments(parameters: array<string>): string {
+    val all: array<string> = []
+    for (parameter in parameters) all.append(parameter)
+    while (all.size < 16) all.append("u32(0)")
+    all.join(", ")
+}
+
+class TailDefinitions(val text: string, val count: int, val error: string)
+
+fun tailLowerDefinitions(original: string): TailDefinitions {
+    var source = original
+    var changed = 0
+    for (forward in forwards()) {
+        val parameters: array<string> = []
+        val names: array<string> = []
+        var k = 0
+        while (k < forward.arity) {
+            parameters.append("a${2 + k}: u32")
+            names.append("a${2 + k}")
+            k += 1
+        }
+        val replacement = "trusted fun ${forward.name}(${parameters.join(", ")}): u32 =\n    ${forward.target}(${tailTargetArguments(names)})"
+        var begin = source.indexOf("@naked", 0)
+        var end = -1
+        while (begin >= 0 && end < 0) {
+            end = tailDefinitionEnd(source, begin, forward)
+            if (end < 0) begin = source.indexOf("@naked", begin + 1)
+        }
+        if (end < 0) return TailDefinitions("", changed, "did not find one tail definition for ${forward.name}")
+        source = source.slice(0, begin) + replacement + source.slice(end, source.size)
+        changed += 1
+    }
+    if (!source.contains("import \"./packet_processing_esp32.ab\"")) source = rtInsertAfterImports(source, tailImports)
+    TailDefinitions(source, changed, "")
+}
+
+/** Where the zero-return statement following a void shim call ends (an offset past `end`), or -1. */
+fun tailZeroReturnEnd(source: string, end: int): int {
+    val runEnd = rtSkipSpace(source, end)
+    var lastNewline = -1
+    var i = end
+    while (i < runEnd) {
+        if (source[i] == 10) lastNewline = i
+        i += 1
+    }
+    if (lastNewline < 0) return -1
+    i = lastNewline + 1
+    while (i < runEnd) {
+        if (source[i] != 32 && source[i] != 9) return -1
+        i += 1
+    }
+    if (!rtAt(source, runEnd, "r10")) return -1
+    var j = rtSkipSpace(source, runEnd + 3)
+    if (!rtAt(source, j, "=")) return -1
+    j = rtSkipSpace(source, j + 1)
+    if (!rtAt(source, j, "u32(0)")) return -1
+    j + 6
+}
+
+class TailCalls(val text: string, val calls: int, val zeroReturns: int, val error: string)
+
+private fun tailFail(message: string): TailCalls = TailCalls("", 0, 0, message)
+
+fun tailLowerCalls(original: string): TailCalls {
+    var source = original
+    var calls = 0
+    var zeroReturns = 0
+    for (forward in forwards()) {
+        val name = forward.name
+        var cursor = 0
+        val output: array<string> = []
+        while (true) {
+            // `\bNAME\s*\(` searched in source[cursor:]: the slice start counts as a word boundary.
+            var found = -1
+            var at = source.indexOf(name, cursor)
+            while (at >= 0 && found < 0) {
+                val boundary = at == cursor || !rtIsWord(source[at - 1])
+                if (boundary) {
+                    val after = rtSkipSpace(source, at + name.size)
+                    if (after < source.size && source[after] == 40) found = after
+                }
+                if (found < 0) at = source.indexOf(name, at + 1)
+            }
+            if (found < 0) {
+                output.append(source.slice(cursor, source.size))
+                break
+            }
+            val start = at
+            val opening = found
+            val closing = rtMatchingParenthesis(source, opening)
+            if (closing < 0) return tailFail("unterminated call at byte ${opening}")
+            val arguments = rtSplitArguments(source.slice(opening + 1, closing))
+            val forwarded: array<string> = []
+            if (arguments.size >= forward.arity) {
+                var k = 0
+                while (k < forward.arity) {
+                    forwarded.append(arguments[k])
+                    k += 1
+                }
+            } else if (arguments.size == 0) {
+                var k = 0
+                while (k < forward.arity) {
+                    forwarded.append("r${10 + k}")
+                    k += 1
+                }
+            } else {
+                return tailFail("${name} has ${arguments.size} arguments, expected ${forward.arity}")
+            }
+            var lineStart = 0
+            if (start > 0) {
+                val previous = source.slice(0, start).lastIndexOf("\n")
+                lineStart = previous + 1
+            }
+            val plainStatement = rtStrip(source.slice(lineStart, start)) == ""
+            var replacement = "${name}(${forwarded.join(", ")})"
+            if (plainStatement && arguments.size == 0) replacement = "r10 = " + replacement
+            var end = closing + 1
+            if (plainStatement && arguments.size == 0) {
+                val following = tailZeroReturnEnd(source, end)
+                if (following >= 0) {
+                    end = following
+                    zeroReturns += 1
+                }
+            }
+            output.append(source.slice(cursor, start))
+            output.append(replacement)
+            cursor = end
+            calls += 1
+        }
+        source = output.join("")
+    }
+    TailCalls(source, calls, zeroReturns, "")
+}
+
+fun main: int {
+    val usage = "lower-xtensa-tail-forwards-to-abla [-h] [--write] root"
+    val args = rtParseArguments(["--write"], [])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error == "" && args.positionals.size > 1) {
+        return rtUsageError("lower-xtensa-tail-forwards-to-abla", usage, "unrecognized arguments: ${rtRest(args.positionals, 1)}")
+    }
+    if (args.error != "") return rtUsageError("lower-xtensa-tail-forwards-to-abla", usage, args.error)
+    if (args.positionals.size == 0) {
+        return rtUsageError("lower-xtensa-tail-forwards-to-abla", usage, "the following arguments are required: root")
+    }
+    val write = args.has("--write")
+    val root = rtPathText(args.positionals[0])
+    val forward = rtPathJoin(root, "esp32/radio/interface_control_forward_esp32.ab")
+    val original = rtRead(forward)
+    if (original.error != "") {
+        eprintln(original.error)
+        return 1
+    }
+    val definitions = tailLowerDefinitions(original.text)
+    if (definitions.error != "") {
+        eprintln("ValueError: ${definitions.error}")
+        return 1
+    }
+    var filesChanged = 1
+    var calls = 0
+    var zeroReturns = 0
+    val paths: array<string> = [forward]
+    val texts: array<string> = [definitions.text]
+    val files = if (rtIsDirectory(root)) rtRglobAb(root) else []
+    for (path in files) {
+        if (path == forward) continue
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val updated = tailLowerCalls(read.text)
+        if (updated.error != "") {
+            eprintln("ValueError: ${updated.error}")
+            return 1
+        }
+        if (updated.text == read.text) continue
+        paths.append(path)
+        texts.append(updated.text)
+        filesChanged += 1
+        calls += updated.calls
+        zeroReturns += updated.zeroReturns
+    }
+    if (write) {
+        var k = 0
+        while (k < paths.size) {
+            val error = rtWrite(paths[k], texts[k])
+            if (error != "") {
+                eprintln(error)
+                return 1
+            }
+            k += 1
+        }
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("${action} ${definitions.count} definitions and ${calls} calls in ${filesChanged} files; removed ${zeroReturns} synthetic zero returns")
+    0
+}

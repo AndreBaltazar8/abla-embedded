@@ -1,0 +1,129 @@
+// Turn recovered ESP32 object constant-pool references into pure Abla data.
+//
+//     tools/abla-tool lower-recovered-constant-pools [--write] --archive-root DIR ROOT
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/command"
+import "lib/elf.ab"
+import "lib/recovered-text.ab"
+
+class ConstantPool(val source: string, val archive: string, val member: string, val variable: string)
+
+fun constantPools(): array<ConstantPool> = [
+    ConstantPool("src/esp32/wifi/api_esp32.ab", "libnet80211.a", "ieee80211_api.o", "esp32WifiApiConstantPool"),
+    ConstantPool("src/esp32/wifi/connection_esp32.ab", "libnet80211.a", "wl_cnx.o", "esp32WifiConnectionConstantPool"),
+    ConstantPool("src/esp32/wifi/mesh_config_esp32.ab", "libmesh.a", "mesh_config.o", "esp32MeshConfigConstantPool"),
+    ConstantPool("src/esp32/wifi/mesh_main_esp32.ab", "libmesh.a", "mesh_main.o", "esp32MeshMainConstantPool"),
+    ConstantPool("src/esp32/wifi/mesh_route_esp32.ab", "libmesh.a", "mesh_route.o", "esp32MeshRouteConstantPool"),
+    ConstantPool("src/esp32/wifi/mesh_utilities_esp32.ab", "libmesh.a", "mesh_utilities.o", "esp32MeshUtilitiesConstantPool")
+]
+
+class PoolSection(val data: string, val error: string)
+
+/** The `.rodata.str1.1` bytes of `member` in `archive` (`ar p`). */
+fun constantPoolSection(archive: string, member: string): PoolSection {
+    val extracted = command("ar").argument("p").argument(archive).argument(member).capture()
+    if (extracted.status != 0) return PoolSection("", "ar p ${archive} ${member} failed with status ${extracted.status}")
+    val elf = elf32Parse(extracted.output)
+    if (elf.error != "") return PoolSection("", "${member} is not a little-endian ELF32 object")
+    val index = elf.sectionIndex(".rodata.str1.1")
+    if (index < 0) return PoolSection("", "${member} has no .rodata.str1.1 section")
+    PoolSection(elf.sectionBytes(elf.sections[index]), "")
+}
+
+/** The `$xtensa address {.rodata.str1.1}` references of `source` as (start, end) spans. */
+fun constantPoolReferences(source: string): array<int> {
+    val spans: array<int> = []
+    for (m in rtAddresses(source)) {
+        if (m.symbol == ".rodata.str1.1") {
+            spans.append(m.start)
+            spans.append(m.end)
+        }
+    }
+    spans
+}
+
+fun constantPoolBytes(value: string): string {
+    val chunks = rtByteLiterals(value)
+    if (chunks.size == 1) return chunks[0]
+    val parts: array<string> = []
+    var index = 0
+    while (index < chunks.size) {
+        parts.append(chunks[index] + (if (index + 1 < chunks.size) " +" else ""))
+        index += 1
+    }
+    parts.join("\n        ")
+}
+
+fun main: int {
+    val usage = "lower-recovered-constant-pools [-h] [--write] --archive-root ARCHIVE_ROOT root"
+    val args = rtParseArguments(["--write"], ["--archive-root"])
+    if (args.help) {
+        println(usage)
+        return 0
+    }
+    if (args.error == "" && args.positionals.size > 1) {
+        return rtUsageError("lower-recovered-constant-pools", usage, "unrecognized arguments: ${rtRest(args.positionals, 1)}")
+    }
+    if (args.error != "") return rtUsageError("lower-recovered-constant-pools", usage, args.error)
+    if (!args.has("--archive-root") || args.positionals.size == 0) {
+        val missing: array<string> = []
+        if (!args.has("--archive-root")) missing.append("--archive-root")
+        if (args.positionals.size == 0) missing.append("root")
+        return rtUsageError("lower-recovered-constant-pools", usage, "the following arguments are required: ${missing.join(", ")}")
+    }
+    val write = args.has("--write")
+    val archiveRoot = rtPathText(args.value("--archive-root", ""))
+    val root = rtPathText(args.positionals[0])
+    var changed = 0
+    var references = 0
+    var totalBytes = 0
+    for (pool in constantPools()) {
+        val path = rtPathJoin(root, pool.source)
+        val read = rtRead(path)
+        if (read.error != "") {
+            eprintln(read.error)
+            return 1
+        }
+        val source = read.text
+        val spans = constantPoolReferences(source)
+        val found = spans.size / 2
+        if (found == 0) continue
+        val section = constantPoolSection(rtPathJoin(archiveRoot, pool.archive), pool.member)
+        if (section.error != "") {
+            eprintln("ValueError: ${section.error}")
+            return 1
+        }
+        val data = section.data
+        val parts: array<string> = []
+        var cursor = 0
+        var k = 0
+        while (k < spans.size) {
+            parts.append(source.slice(cursor, spans[k]))
+            parts.append(pool.variable)
+            cursor = spans[k + 1]
+            k += 2
+        }
+        parts.append(source.slice(cursor, source.size))
+        val declaration = "\n// Immutable bytes recovered from the original object's .rodata.str1.1.\n" +
+            "val ${pool.variable} = u32(nativeStaticBytes(\n" +
+            "        ${constantPoolBytes(data)}\n" +
+            "))\n"
+        val lowered = rtInsertAfterImports(parts.join(""), declaration)
+        if (write) {
+            val error = rtWrite(path, lowered)
+            if (error != "") {
+                eprintln(error)
+                return 1
+            }
+        }
+        changed += 1
+        references += found
+        totalBytes += data.size
+        println("${path}: ${found} references, ${data.size} bytes from ${pool.member}")
+    }
+    val action = if (write) "lowered" else "would lower"
+    println("${action} ${references} constant-pool references in ${changed} files to ${totalBytes} Abla-owned immutable bytes")
+    0
+}
