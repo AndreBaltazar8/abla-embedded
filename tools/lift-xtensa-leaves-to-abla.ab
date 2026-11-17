@@ -1,0 +1,845 @@
+// Lift mechanically safe Xtensa leaf bodies to ordinary typed Abla.
+//
+// Recovered archive members initially use naked `$xtensa instructions` bodies so
+// they can be linked and checked before a source-level reconstruction exists.
+// This tool removes that boundary for straight-line scalar leaves. It is
+// deliberately all-or-nothing per function: branches, calls, nested sections,
+// unknown instructions, ambiguous register inputs, and observable secondary
+// return registers leave the original body byte-for-byte unchanged.
+//
+// The generated functions use the Xtensa windowed ABI's six register arguments
+// plus ten possible stack words. LLVM only reads a stack argument when the
+// lifted body uses it, so the common fixed signature remains ABI-compatible with
+// callers that pass fewer words while retaining enough information for the
+// recovered ESP32 corpus.
+//
+//     tools/abla-tool lift-xtensa-leaves-to-abla [--write] [--keep-global-data]
+//         [--resolve-outgoing-stack] PATH...
+//
+// The lifting itself lives in tools/lib/lift/ (base, flow, lift, data, blocks); this
+// file holds the whole-file passes and the command line.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/process/environment"
+import "lib/abfiles.ab"
+export import "lib/lift/base.ab"
+export import "lib/lift/flow.ab"
+export import "lib/lift/lift.ab"
+export import "lib/lift/data.ab"
+export import "lib/lift/blocks.ab"
+
+// Abla function names (or `*`) that stay raw assembly (a debugging aid).
+fun keepRaw(name: string): bool {
+    val value = processEnvironment("ABLA_LIFT_KEEP_RAW")
+    if (value == null) return false
+    for (entry in value.split(",")) {
+        if (entry != "" && (entry == name || entry == "*")) return true
+    }
+    false
+}
+
+class TransformResult(val count: int, val reasons: Map<string, int>)
+
+private fun bump(var reasons: Map<string, int>, reason: string): void {
+    reasons.set(reason, (reasons.get(reason) ?? 0) + 1)
+    return
+}
+
+private fun mergeAddresses(var into: Map<string, string>, from: Map<string, string>): void {
+    for (symbol in from.keys()) into.set(symbol, from.get(symbol) ?? "")
+    return
+}
+
+// head[:head.rfind("trusted fun")] with `@naked\n` removed
+private fun annotationsOf(head: string): string {
+    val at = head.lastIndexOf("trusted fun")
+    val prefix = if (at < 0) head.slice(0, head.size - 1) else head.slice(0, at)
+    prefix.replace("@naked\n", "")
+}
+
+private fun aliasPrefix(owner: string, aliases: array<string>): string {
+    val declarations: array<string> = []
+    for (alias in aliases) {
+        val binding = internalHelperName(owner + "::" + alias) + "Link"
+        declarations.append("val " + binding + " = #internalFunction(\"" + owner + "\", \"" + alias + "\")")
+    }
+    declarations.join("\n")
+}
+
+private fun applyAddresses(source: string, addresses: Map<string, string>): string {
+    var transformed = source
+    for (symbol in addresses.keys()) {
+        transformed = transformed.replace("\$xtensa address {" + symbol + "}", addresses.get(symbol) ?? "")
+    }
+    transformed
+}
+
+private fun hasImport(text: string, module: string): bool = text.contains("import \"" + module + "\"")
+
+// ---- parameters of a typed source signature ----
+
+class Parameters(val names: array<string>, val error: string)
+
+fun sourceParameterNames(parameterSource: string): Parameters {
+    val inside = parameterSource.slice(1, parameterSource.size - 1).trim()
+    val names: array<string> = []
+    if (inside == "") return Parameters(names, "")
+    for (raw in splitOperands(inside)) {
+        val parameter = raw.trim()
+        var end = 0
+        if (parameter.size > 0 && (parameter[0] == 95 || isAlphaByte(parameter[0]))) {
+            end = 1
+            while (end < parameter.size && isWordByte(parameter[end])) end = end + 1
+        }
+        var p = end
+        var ok = end > 0
+        while (p < parameter.size && isSpaceByte(parameter[p])) p = p + 1
+        if (ok && (p >= parameter.size || parameter[p] != 58)) ok = false
+        if (ok) {
+            p = p + 1
+            while (p < parameter.size && isSpaceByte(parameter[p])) p = p + 1
+            if (parameter.slice(p, parameter.size) != "u32") ok = false
+        }
+        if (!ok) return Parameters([], "non-u32 source parameter")
+        names.append(parameter.slice(0, end))
+    }
+    if (names.size > 16) return Parameters([], "more than sixteen source parameters")
+    Parameters(names, "")
+}
+
+class SignatureLift(val source: string, val error: string)
+
+fun sourceSignatureLift(
+    name: string,
+    parameters: string,
+    lifted: Lifted,
+    annotations: string,
+    resultType: string,
+): SignatureLift {
+    val parsed = sourceParameterNames(parameters)
+    if (parsed.error != "") return SignatureLift("", parsed.error)
+    val names = parsed.names
+    val bodyBegin = lifted.source.indexOf(" {\n", 0)
+    if (bodyBegin < 0 || !lifted.source.endsWith("\n}")) return SignatureLift("", "malformed lifted source")
+    val body = lifted.source.slice(bodyBegin + 3, lifted.source.size - 2)
+    val lines = splitLines(body)
+    var register = 2
+    while (register < 8) {
+        val expected = "    var r${register} = a${register}"
+        val at = indexOfLine(lines, expected)
+        if (at < 0) return SignatureLift("", "unexpected lifted register prologue")
+        val argumentIndex = register - 2
+        val value = if (argumentIndex < names.size) names[argumentIndex] else "u32(0)"
+        lines[at] = "    var r${register} = " + value
+        register = register + 1
+    }
+    var stackIndex = 0
+    while (stackIndex < 10) {
+        val expected = "    var incomingStack${stackIndex} = stack${stackIndex}"
+        val at = indexOfLine(lines, expected)
+        if (at < 0) return SignatureLift("", "unexpected lifted stack prologue")
+        val argumentIndex = 6 + stackIndex
+        val value = if (argumentIndex < names.size) names[argumentIndex] else "u32(0)"
+        lines[at] = "    var incomingStack${stackIndex} = " + value
+        stackIndex = stackIndex + 1
+    }
+    if (resultType == "void") {
+        var index = 0
+        while (index < lines.size) {
+            val stripped = lines[index].trim()
+            if (stripped == "return r2" || stripped == "r2") {
+                lines[index] = lines[index].slice(0, lines[index].size - lstrip(lines[index]).size) + "return"
+            }
+            index = index + 1
+        }
+    }
+    SignatureLift(annotations + "trusted fun " + name + parameters + ": " + resultType + " {\n" +
+        lines.join("\n") + "\n}", "")
+}
+
+// ---- the whole-file passes ----
+
+private fun addCommonImports(
+    text: string, lifted: int, usesMemory: bool, usesInternal: bool, includeFloatAndBuild: bool,
+): string {
+    var transformed = text
+    if (lifted > 0 && usesMemory && !hasImport(transformed, "abla/unsafe/memory")) {
+        transformed = "import \"abla/unsafe/memory\"\n" + transformed
+    }
+    if (lifted > 0 && transformed.contains("ablaRuntimeTrap()") && !hasImport(transformed, "abla/runtime/self")) {
+        transformed = "import \"abla/runtime/self\"\n" + transformed
+    }
+    if (includeFloatAndBuild) {
+        if (usesInternal && !hasImport(transformed, "abla/build")) {
+            transformed = "import \"abla/build\"\n" + transformed
+        }
+        if (lifted > 0 && transformed.contains("f32FromBits(") && !hasImport(transformed, "abla/float")) {
+            transformed = "import \"abla/float\"\n" + transformed
+        }
+    }
+    transformed
+}
+
+// Raw bodies of the matches, in order.
+private fun bodiesOf(matches: array<BlockMatch>): array<string> {
+    val bodies: array<string> = []
+    for (match in matches) bodies.append(match.body())
+    bodies
+}
+
+fun transformRawBlocks(path: string, write: bool): TransformResult {
+    val source = Path(path).readText()
+    val matches = findBlocks(source, 0)
+    val rawBodies = bodiesOf(matches)
+    val candidateSymbols = Map<string, int>()
+    val bodyLiftable: array<bool> = []
+    for (match in matches) {
+        val aliasSplit = extractFunctionAliases(match.body())
+        val helpers = extractLiftableTextHelpers(match.name, aliasSplit.body)
+        val stripped = stripParseableDataSections(resolveSelfOffsetTables(helpers.body))
+        for (symbol in stripped.symbols.keys()) candidateSymbols.set(symbol, 1)
+        var liftable = false
+        if (match.head().contains("@naked\n")) {
+            if (lift(match.name, stripped.body).error == "") liftable = true
+        } else if (stripped.body.trim() == "") {
+            liftable = true
+        }
+        bodyLiftable.append(liftable)
+    }
+    val safeCross = nameSet()
+    for (symbol in candidateSymbols.keys()) {
+        var any = false
+        var all = true
+        var index = 0
+        while (index < rawBodies.size) {
+            if (rawBodies[index].contains(symbol)) {
+                any = true
+                if (!bodyLiftable[index]) all = false
+            }
+            index = index + 1
+        }
+        if (any && all) safeCross.add(symbol)
+    }
+    var liftedCount = 0
+    val reasons = Map<string, int>()
+    var usesMemory = false
+    var usesInternalFunction = false
+    val dataAddresses = Map<string, string>()
+
+    var out = ""
+    var last = 0
+    for (match in matches) {
+        out = out + source.slice(last, match.start)
+        last = match.end
+        val whole = match.whole()
+        val name = match.name
+        val head = match.head()
+        if (keepRaw(name)) {
+            bump(reasons, "kept raw (ABLA_LIFT_KEEP_RAW)")
+            out = out + whole
+            continue
+        }
+        if (!head.contains("@naked\n")) {
+            val extractedData = extractLiftableDataSections(match.body(), rawBodies, safeCross, true)
+            if (extractedData.declarations.size > 0 && extractedData.body.trim() == "") {
+                mergeAddresses(dataAddresses, extractedData.addresses)
+                usesMemory = true
+                liftedCount = liftedCount + 1
+                out = out + extractedData.declarations.join("\n\n") + "\n\n" +
+                    "trusted fun " + name + "(): void { return }"
+                continue
+            }
+            bump(reasons, "not naked")
+            out = out + whole
+            continue
+        }
+        val aliasSplit = extractFunctionAliases(match.body())
+        val extracted = extractLiftableTextHelpers(name, aliasSplit.body)
+        for (reason in extracted.reasons) bump(reasons, reason)
+        var prefix = ""
+        if (extracted.declarations.size > 0) {
+            prefix = extracted.declarations.join("\n\n") + "\n\n"
+            liftedCount = liftedCount + extracted.count
+            usesMemory = usesMemory || extracted.usesMemory
+            usesInternalFunction = true
+        }
+        if (aliasSplit.aliases.size > 0) {
+            prefix = aliasPrefix(name, aliasSplit.aliases) + "\n\n" + prefix
+            usesInternalFunction = true
+        }
+        val recoveredBody = resolveSelfOffsetTables(extracted.body)
+        var extractedData = extractLiftableDataSections(recoveredBody, rawBodies, safeCross, true)
+        val result = lift(name, extractedData.body)
+        if (result.error != "") {
+            bump(reasons, result.error)
+            // Data still named by a label must stay assembler-defined.
+            var named = false
+            for (symbol in extractedData.addresses.keys()) {
+                if (extractedData.body.contains(symbol)) named = true
+            }
+            if (named) extractedData = ExtractedData(recoveredBody, [], Map<string, string>(), 0)
+            if (extractedData.declarations.size > 0) {
+                prefix = extractedData.declarations.join("\n\n") + "\n\n" + prefix
+                mergeAddresses(dataAddresses, extractedData.addresses)
+                usesMemory = true
+                liftedCount = liftedCount + extractedData.count
+            }
+            if (extracted.declarations.size == 0 && extractedData.declarations.size == 0) {
+                out = out + whole
+                continue
+            }
+            out = out + prefix + head + "\$xtensa instructions {\n" + extractedData.body + "\n}"
+            continue
+        }
+        if (extractedData.declarations.size > 0) {
+            prefix = extractedData.declarations.join("\n\n") + "\n\n" + prefix
+            mergeAddresses(dataAddresses, extractedData.addresses)
+            usesMemory = true
+        }
+        liftedCount = liftedCount + 1
+        usesMemory = usesMemory || result.usesMemory
+        out = out + prefix + annotationsOf(head) + result.source
+    }
+    out = out + source.slice(last, source.size)
+    var transformed = applyAddresses(out, dataAddresses)
+    transformed = addCommonImports(transformed, liftedCount, usesMemory, usesInternalFunction, true)
+    if (write && transformed != source) Path(path).writeText(transformed)
+    TransformResult(liftedCount, reasons)
+}
+
+fun transformU32Blocks(path: string, write: bool): TransformResult {
+    val source = Path(path).readText()
+    val matches = findBlocks(source, 1)
+    if (matches.size == 0) return TransformResult(0, Map<string, int>())
+    val allRawBodies: array<string> = []
+    for (match in findBlocks(source, 0)) allRawBodies.append(match.body())
+    for (match in matches) allRawBodies.append(match.body())
+    val candidateSymbols = Map<string, int>()
+    val liftable: array<bool> = []
+    for (match in matches) {
+        val aliasSplit = extractFunctionAliases(match.body())
+        val helpers = extractLiftableTextHelpers(match.name, aliasSplit.body)
+        val stripped = stripParseableDataSections(resolveSelfOffsetTables(helpers.body))
+        for (symbol in stripped.symbols.keys()) candidateSymbols.set(symbol, 1)
+        var ok = sourceParameterNames(match.parameters).error == ""
+        if (ok) ok = lift(match.name, stripped.body).error == ""
+        liftable.append(ok)
+    }
+    val safeCross = nameSet()
+    for (symbol in candidateSymbols.keys()) {
+        var referencingAll = 0
+        for (body in allRawBodies) if (body.contains(symbol)) referencingAll = referencingAll + 1
+        var referencingU32 = 0
+        var allLiftable = true
+        var index = 0
+        while (index < matches.size) {
+            if (matches[index].body().contains(symbol)) {
+                referencingU32 = referencingU32 + 1
+                if (!liftable[index]) allLiftable = false
+            }
+            index = index + 1
+        }
+        if (referencingAll > 0 && referencingAll == referencingU32 && referencingU32 > 0 && allLiftable) {
+            safeCross.add(symbol)
+        }
+    }
+    var liftedCount = 0
+    val reasons = Map<string, int>()
+    var usesMemory = false
+    var usesInternalFunction = false
+    val dataAddresses = Map<string, string>()
+
+    var out = ""
+    var last = 0
+    for (match in matches) {
+        out = out + source.slice(last, match.start)
+        last = match.end
+        val name = match.name
+        val head = match.head()
+        if (keepRaw(name)) {
+            bump(reasons, "kept raw (ABLA_LIFT_KEEP_RAW)")
+            out = out + match.whole()
+            continue
+        }
+        val aliasSplit = extractFunctionAliases(match.body())
+        val helpers = extractLiftableTextHelpers(name, aliasSplit.body)
+        for (reason in helpers.reasons) bump(reasons, reason)
+        var prefix = ""
+        if (helpers.declarations.size > 0) {
+            prefix = helpers.declarations.join("\n\n") + "\n\n"
+            liftedCount = liftedCount + helpers.count
+            usesMemory = usesMemory || helpers.usesMemory
+            usesInternalFunction = true
+        }
+        if (aliasSplit.aliases.size > 0) {
+            prefix = aliasPrefix(name, aliasSplit.aliases) + "\n\n" + prefix
+            usesInternalFunction = true
+        }
+        val recoveredBody = resolveSelfOffsetTables(helpers.body)
+        val data = extractLiftableDataSections(recoveredBody, allRawBodies, safeCross, true)
+        val result = lift(name, data.body)
+        var replacement = SignatureLift("", result.error)
+        if (result.error == "") {
+            replacement = sourceSignatureLift(name, match.parameters, result, annotationsOf(head), "u32")
+        }
+        if (replacement.error != "") {
+            bump(reasons, replacement.error)
+            if (helpers.declarations.size == 0) {
+                out = out + match.whole()
+                continue
+            }
+            out = out + prefix + head + "\$xtensa instructionsU32 {\n" + helpers.body + "\n}"
+            continue
+        }
+        if (data.declarations.size > 0) {
+            prefix = data.declarations.join("\n\n") + "\n\n" + prefix
+            mergeAddresses(dataAddresses, data.addresses)
+            usesMemory = true
+        }
+        liftedCount = liftedCount + 1
+        usesMemory = usesMemory || result.usesMemory
+        out = out + prefix + replacement.source
+    }
+    out = out + source.slice(last, source.size)
+    var transformed = applyAddresses(out, dataAddresses)
+    transformed = addCommonImports(transformed, liftedCount, usesMemory, usesInternalFunction, true)
+    if (write && transformed != source) Path(path).writeText(transformed)
+    TransformResult(liftedCount, reasons)
+}
+
+fun transformTypedVoidBlocks(path: string, write: bool): TransformResult {
+    val source = Path(path).readText()
+    val matches = findBlocks(source, 2)
+    if (matches.size == 0) return TransformResult(0, Map<string, int>())
+    val rawBodies = bodiesOf(matches)
+    val candidateSymbols = Map<string, int>()
+    val liftable: array<bool> = []
+    for (match in matches) {
+        val aliasSplit = extractFunctionAliases(match.body())
+        val helpers = extractLiftableTextHelpers(match.name, aliasSplit.body)
+        val stripped = stripParseableDataSections(resolveSelfOffsetTables(helpers.body))
+        for (symbol in stripped.symbols.keys()) candidateSymbols.set(symbol, 1)
+        var ok = sourceParameterNames(match.parameters).error == ""
+        if (ok) ok = lift(match.name, stripped.body).error == ""
+        liftable.append(ok)
+    }
+    val safeSymbols = nameSet()
+    for (symbol in candidateSymbols.keys()) {
+        var users = 0
+        var allLiftable = true
+        var index = 0
+        while (index < matches.size) {
+            if (matches[index].body().contains(symbol)) {
+                users = users + 1
+                if (!liftable[index]) allLiftable = false
+            }
+            index = index + 1
+        }
+        if (users > 0 && allLiftable) safeSymbols.add(symbol)
+    }
+    var count = 0
+    val reasons = Map<string, int>()
+    var usesMemory = false
+    val dataAddresses = Map<string, string>()
+
+    var out = ""
+    var last = 0
+    for (match in matches) {
+        out = out + source.slice(last, match.start)
+        last = match.end
+        val aliasSplit = extractFunctionAliases(match.body())
+        val helpers = extractLiftableTextHelpers(match.name, aliasSplit.body)
+        val recovered = resolveSelfOffsetTables(helpers.body)
+        val data = extractLiftableDataSections(recovered, rawBodies, safeSymbols, true)
+        val result = lift(match.name, data.body)
+        var replacement = SignatureLift("", result.error)
+        if (result.error == "") {
+            replacement = sourceSignatureLift(match.name, match.parameters, result, annotationsOf(match.head()), "void")
+        }
+        if (replacement.error != "") {
+            bump(reasons, replacement.error)
+            out = out + match.whole()
+            continue
+        }
+        var prefix = ""
+        if (data.declarations.size > 0) {
+            prefix = data.declarations.join("\n\n") + "\n\n"
+            mergeAddresses(dataAddresses, data.addresses)
+            usesMemory = true
+        }
+        count = count + 1
+        usesMemory = usesMemory || result.usesMemory
+        out = out + prefix + replacement.source
+    }
+    out = out + source.slice(last, source.size)
+    var transformed = applyAddresses(out, dataAddresses)
+    transformed = addCommonImports(transformed, count, usesMemory, false, false)
+    if (write && transformed != source) Path(path).writeText(transformed)
+    TransformResult(count, reasons)
+}
+
+fun liftInlineData(path: string, write: bool): TransformResult {
+    val source = Path(path).readText()
+    val declarations: array<string> = []
+    val addresses = Map<string, string>()
+    var count = 0
+    val matches = findBlocks(source, 3)
+    val allRawBodies = bodiesOf(matches)
+    var out = ""
+    var last = 0
+    for (match in matches) {
+        val extracted = extractLiftableDataSections(match.body(), allRawBodies, nameSet(), false)
+        if (extracted.declarations.size == 0 || extracted.body.trim() != "") continue
+        for (declaration in extracted.declarations) declarations.append(declaration)
+        mergeAddresses(addresses, extracted.addresses)
+        count = count + 1
+        out = out + source.slice(last, match.start) + match.indent + "// Static data is emitted by Abla above."
+        last = match.end
+    }
+    if (count == 0) return TransformResult(0, Map<string, int>())
+    out = out + source.slice(last, source.size)
+    var transformed = applyAddresses(out, addresses)
+    if (!hasImport(transformed, "abla/unsafe/memory")) transformed = "import \"abla/unsafe/memory\"\n" + transformed
+    // after the leading run of import lines
+    var insertion = 0
+    var scanning = true
+    while (scanning) {
+        scanning = false
+        if (startsWithAt(transformed, "import \"", insertion)) {
+            val nl = transformed.indexOf("\n", insertion)
+            if (nl > insertion + 9 && transformed[nl - 1] == 34) {
+                insertion = nl + 1
+                scanning = true
+            }
+        }
+    }
+    transformed = transformed.slice(0, insertion) + declarations.join("\n\n") + "\n\n" +
+        transformed.slice(insertion, transformed.size)
+    if (write) Path(path).writeText(transformed)
+    TransformResult(count, Map<string, int>())
+}
+
+// ---- relocation-free read-only data ----
+
+class ReadonlyResult(val blocks: int, val bytes: int)
+
+// The end of a word-character run starting at `from`.
+private fun wordEnd(text: string, from: int): int {
+    var p = from
+    while (p < text.size && isWordByte(text[p])) p = p + 1
+    p
+}
+
+class DataBlock(val start: int, val end: int, val storage: string, val size: int, val body: string,
+    val initialized: string, val value: string)
+
+// One INITIALIZED_DATA match at `at` (a line start), or null.
+private fun matchInitializedData(text: string, at: int): DataBlock? {
+    var p = at
+    if (!startsWithAt(text, "val", p)) return null
+    var q = skipSpacesFrom(text, p + 3)
+    if (q == p + 3) return null
+    var e = wordEnd(text, q)
+    val storage = text.slice(q, e)
+    if (!storage.startsWith("esp32Data_") || !storage.endsWith("Storage") || storage.size <= 17) return null
+    q = skipSpacesFrom(text, e)
+    if (q >= text.size || text[q] != 61) return null
+    q = skipSpacesFrom(text, q + 1)
+    val allocate = "nativeStaticAllocate("
+    if (!startsWithAt(text, allocate, q)) return null
+    q = q + allocate.size
+    e = q
+    while (e < text.size && isDigitByte(text[e])) e = e + 1
+    if (e == q) return null
+    val sizeText = text.slice(q, e)
+    if (!startsWithAt(text, ")\n", e)) return null
+    q = e + 2
+    if (!startsWithAt(text, "trusted", q)) return null
+    var r = skipSpacesFrom(text, q + 7)
+    if (r == q + 7) return null
+    if (!startsWithAt(text, "fun", r)) return null
+    q = skipSpacesFrom(text, r + 3)
+    if (q == r + 3) return null
+    e = wordEnd(text, q)
+    val initialize = text.slice(q, e)
+    if (!initialize.startsWith("esp32Data_") || !initialize.endsWith("Initialize") || initialize.size <= 20) return null
+    q = e
+    if (!startsWithAt(text, "():", q)) return null
+    q = skipSpacesFrom(text, q + 3)
+    if (!startsWithAt(text, "int", q)) return null
+    q = skipSpacesFrom(text, q + 3)
+    if (!startsWithAt(text, "{\n", q)) return null
+    val bodyStart = q + 2
+    // `.*?^\}\n` then the two remaining declarations; a later `}` line is tried on failure
+    var close = bodyStart
+    while (close <= text.size) {
+        if ((close == 0 || text[close - 1] == 10) && startsWithAt(text, "}\n", close)) {
+            val tail = matchInitializedTail(text, close + 2, initialize)
+            if (tail != null) {
+                return DataBlock(at, tail.end, storage, parseSize(sizeText), text.slice(bodyStart, close),
+                    tail.initialized, tail.value)
+            }
+        }
+        val nl = text.indexOf("\n", close)
+        if (nl < 0) break
+        close = nl + 1
+    }
+    null
+}
+
+private fun parseSize(text: string): int = text.parseInt() ?? 0
+
+class DataTail(val end: int, val initialized: string, val value: string)
+
+private fun skipSpacesFrom(text: string, from: int): int {
+    var p = from
+    while (p < text.size && isSpaceByte(text[p])) p = p + 1
+    p
+}
+
+private fun matchInitializedTail(text: string, at: int, initialize: string): DataTail? {
+    if (!startsWithAt(text, "val", at)) return null
+    var q = skipSpacesFrom(text, at + 3)
+    if (q == at + 3) return null
+    var e = wordEnd(text, q)
+    val initialized = text.slice(q, e)
+    if (!initialized.startsWith("esp32Data_") || !initialized.endsWith("Initialized") || initialized.size <= 21) return null
+    q = skipSpacesFrom(text, e)
+    if (q >= text.size || text[q] != 61) return null
+    q = skipSpacesFrom(text, q + 1)
+    if (!startsWithAt(text, initialize, q)) return null
+    q = q + initialize.size
+    if (!startsWithAt(text, "()\n", q)) return null
+    q = q + 3
+    if (!startsWithAt(text, "val", q)) return null
+    val r = skipSpacesFrom(text, q + 3)
+    if (r == q + 3) return null
+    e = wordEnd(text, r)
+    val value = text.slice(r, e)
+    if (!value.startsWith("esp32Data_") || value.size <= 10) return null
+    q = skipSpacesFrom(text, e)
+    if (q >= text.size || text[q] != 61) return null
+    q = skipSpacesFrom(text, q + 1)
+    if (!startsWithAt(text, "u32(", q)) return null
+    q = q + 4
+    if (!startsWithAt(text, initialized, q)) return null
+    q = q + initialized.size
+    if (!startsWithAt(text, ")", q)) return null
+    q = q + 1
+    if (q < text.size && text[q] == 10) q = q + 1
+    DataTail(q, initialized, value)
+}
+
+// ^\s*ablaUnsafeStoreU(8|16|32)\(nativePointerFromAddress\(STORAGE\s*\+\s*N\),\s*N\)\s*$
+// Returns [bits, storage, offset, value] or an empty array.
+private fun literalDataStore(line: string): array<string> {
+    val none: array<string> = []
+    var p = skipSpacesFrom(line, 0)
+    val head = "ablaUnsafeStoreU"
+    if (!startsWithAt(line, head, p)) return none
+    p = p + head.size
+    var bits = ""
+    if (startsWithAt(line, "8", p)) bits = "8"
+    else if (startsWithAt(line, "16", p)) bits = "16"
+    else if (startsWithAt(line, "32", p)) bits = "32"
+    else return none
+    p = p + bits.size
+    val middle = "(nativePointerFromAddress("
+    if (!startsWithAt(line, middle, p)) return none
+    p = p + middle.size
+    val e = wordEnd(line, p)
+    val storage = line.slice(p, e)
+    if (!storage.startsWith("esp32Data_") || !storage.endsWith("Storage") || storage.size <= 17) return none
+    p = skipSpacesFrom(line, e)
+    if (p >= line.size || line[p] != 43) return none
+    p = skipSpacesFrom(line, p + 1)
+    var d = p
+    while (d < line.size && isDigitByte(line[d])) d = d + 1
+    if (d == p) return none
+    val offset = line.slice(p, d)
+    if (!startsWithAt(line, "),", d)) return none
+    p = skipSpacesFrom(line, d + 2)
+    d = p
+    while (d < line.size && isDigitByte(line[d])) d = d + 1
+    if (d == p) return none
+    val value = line.slice(p, d)
+    if (d >= line.size || line[d] != 41) return none
+    if (skipSpacesFrom(line, d + 1) != line.size) return none
+    [bits, storage, offset, value]
+}
+
+fun liftReadonlyData(path: string, write: bool): ReadonlyResult {
+    val source = Path(path).readText()
+    var convertedBytes = 0
+    var convertedBlocks = 0
+    var out = ""
+    var last = 0
+    var scan = 0
+    while (scan <= source.size) {
+        if (scan > 0 && source[scan - 1] != 10) {
+            val nl = source.indexOf("\n", scan)
+            if (nl < 0) break
+            scan = nl + 1
+            continue
+        }
+        val block = if (scan < source.size) matchInitializedData(source, scan) else null
+        if (block == null) {
+            val nl = source.indexOf("\n", scan)
+            if (nl < 0) break
+            scan = nl + 1
+            continue
+        }
+        val whole = source.slice(block.start, block.end)
+        var replacement = whole
+        if (block.storage.contains("_rodata") && block.size >= 1) {
+            val contents: array<int> = filledArray(block.size, 0)
+            var sawStore = true
+            var sawAny = false
+            for (rawLine in splitLines(block.body)) {
+                val line = rawLine.trim()
+                if (line.size == 0 || line.startsWith("//") || line == block.storage) continue
+                val store = literalDataStore(rawLine)
+                if (store.size == 0 || store[1] != block.storage) {
+                    sawStore = false
+                    break
+                }
+                val width = (store[0].parseInt() ?? 0) / 8
+                val offset = store[2].parseInt() ?? -1
+                if (offset < 0 || offset + width > block.size) {
+                    sawStore = false
+                    break
+                }
+                val value = (store[3].parseInt() ?? 0) & ((1 << (width * 8)) - 1)
+                var byteIndex = 0
+                while (byteIndex < width) {
+                    contents[offset + byteIndex] = (value >> (8 * byteIndex)) & 255
+                    byteIndex = byteIndex + 1
+                }
+                sawAny = true
+            }
+            if (sawStore && sawAny) {
+                convertedBytes = convertedBytes + block.size
+                convertedBlocks = convertedBlocks + 1
+                replacement = "val " + block.storage + " = nativeStaticBytes(\n    " + ablaByteString(contents) + "\n)\n" +
+                    "val " + block.initialized + " = " + block.storage + "\n" +
+                    "val " + block.value + " = u32(" + block.initialized + ")\n"
+            }
+        }
+        out = out + source.slice(last, block.start) + replacement
+        last = block.end
+        scan = block.end
+        if (scan < source.size && source[scan - 1] != 10) {
+            val nl = source.indexOf("\n", scan)
+            if (nl < 0) break
+            scan = nl + 1
+        }
+    }
+    out = out + source.slice(last, source.size)
+    if (write && out != source) Path(path).writeText(out)
+    ReadonlyResult(convertedBlocks, convertedBytes)
+}
+
+// ---- semantic-sensitive opcodes ----
+
+// The unsafe FP mnemonics found in any raw body, sorted.
+fun unsafeSemanticInstructions(source: string): array<string> {
+    val found: array<string> = []
+    for (kind in [0, 1, 2, 3]) {
+        for (match in findBlocks(source, kind)) {
+            for (raw in splitLines(match.body())) {
+                val line = raw.trim()
+                if (line.size == 0 || line[0] == 35 || line[0] == 46) continue
+                val mnemonic = parseInstruction(line).mnemonic
+                if (isUnsafeFloatMnemonic(mnemonic) && !containsLine(found, mnemonic)) found.append(mnemonic)
+            }
+        }
+    }
+    sortedStrings(found)
+}
+
+private fun reasonLess(left: string, leftCount: int, right: string, rightCount: int): bool {
+    if (leftCount != rightCount) return leftCount > rightCount
+    left < right
+}
+
+fun main: int {
+    var write = false
+    var keepData = false
+    var resolveStack = false
+    val paths: array<string> = []
+    var index = 0
+    while (index < processArgumentCount()) {
+        val argument = processArgument(index)
+        if (argument == "--write") write = true
+        else if (argument == "--keep-global-data") keepData = true
+        else if (argument == "--resolve-outgoing-stack") resolveStack = true
+        else paths.append(argument)
+        index = index + 1
+    }
+    if (paths.size == 0) {
+        eprintln("usage: lift-xtensa-leaves-to-abla [-h] [--write] [--keep-global-data] [--resolve-outgoing-stack] paths [paths ...]")
+        eprintln("lift-xtensa-leaves-to-abla: error: the following arguments are required: paths")
+        return 2
+    }
+    setKeepGlobalData(keepData)
+    setResolveOutgoingStack(resolveStack)
+    val files: array<string> = []
+    for (path in paths) {
+        if (Path(path).info().isDirectory()) {
+            val found: array<string> = []
+            rglobAb(path, found)
+            for (file in sortedUniquePaths(found)) files.append(file)
+        } else {
+            files.append(path)
+        }
+    }
+    var violations = 0
+    for (path in files) {
+        val unsafe = unsafeSemanticInstructions(Path(path).readText())
+        if (unsafe.size > 0) {
+            eprintln("${path}: refusing lossy Xtensa FP translation: " + unsafe.join(", "))
+            violations = violations + 1
+        }
+    }
+    if (violations > 0) return 1
+    var total = 0
+    var readonlyBlocks = 0
+    var readonlyBytes = 0
+    val reasons = Map<string, int>()
+    for (path in files) {
+        val readonly = liftReadonlyData(path, write)
+        readonlyBlocks = readonlyBlocks + readonly.blocks
+        readonlyBytes = readonlyBytes + readonly.bytes
+        for (result in [transformRawBlocks(path, write), transformU32Blocks(path, write), transformTypedVoidBlocks(path, write), liftInlineData(path, write)]) {
+            total = total + result.count
+            for (reason in result.reasons.keys()) {
+                reasons.set(reason, (reasons.get(reason) ?? 0) + (result.reasons.get(reason) ?? 0))
+            }
+        }
+    }
+    val action = if (write) "lifted" else "liftable"
+    println("${total} Xtensa leaf function(s) ${action} as ordinary Abla")
+    val dataAction = if (write) "moved" else "movable"
+    println("${readonlyBlocks} relocation-free rodata block(s) ${dataAction} to ${readonlyBytes} immutable byte(s)")
+    val ordered: array<string> = []
+    for (reason in reasons.keys()) {
+        ordered.append(reason)
+        var at = ordered.size - 1
+        while (at > 0 && reasonLess(reason, reasons.get(reason) ?? 0, ordered[at - 1], reasons.get(ordered[at - 1]) ?? 0)) {
+            ordered[at] = ordered[at - 1]
+            at = at - 1
+        }
+        ordered[at] = reason
+    }
+    var shown = 0
+    for (reason in ordered) {
+        if (shown >= 30) break
+        println("${"${reasons.get(reason) ?? 0}".padStart(5)} not lifted: ${reason}")
+        shown = shown + 1
+    }
+    0
+}

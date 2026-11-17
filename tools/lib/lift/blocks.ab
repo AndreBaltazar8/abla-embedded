@@ -1,0 +1,171 @@
+// Locating the raw `$xtensa instructions` bodies of a recovered Abla source, the way the
+// original's regular expressions did (MULTILINE | DOTALL; the Abla regex library has no
+// line anchors, so these are scanned by hand). Each match carries the exact spans.
+
+import "abla/text"
+import "base.ab"
+import "flow.ab"
+
+// kind 0: `fun NAME(...): void = $xtensa instructions {` (BLOCK)
+// kind 1: `fun NAME(...): u32 = $xtensa instructionsU32 {` (U32_BLOCK)
+// kind 2: as 0 with at least one letter in the parameter list (TYPED_VOID_BLOCK)
+// kind 3: a `$xtensa instructions {` block standing on its own lines (INLINE_BLOCK)
+class BlockMatch(
+    val start: int,
+    val end: int,
+    val headEnd: int,
+    val name: string,
+    val parameters: string,
+    val indent: string,
+    val bodyStart: int,
+    val bodyEnd: int,
+    val text: string,
+) {
+    fun whole(): string = this.text.slice(this.start, this.end)
+    fun head(): string = this.text.slice(this.start, this.headEnd)
+    fun body(): string = this.text.slice(this.bodyStart, this.bodyEnd)
+}
+
+private fun isSpaceOrTab(c: int): bool = c == 32 || c == 9
+
+private fun skipAnySpace(text: string, from: int): int {
+    var p = from
+    while (p < text.size && isSpaceByte(text[p])) p = p + 1
+    p
+}
+
+// The position of the line start at or after `from` (from itself when it is one).
+private fun nextLineStart(text: string, from: int): int {
+    if (from >= text.size) return text.size + 1
+    if (from == 0 || text[from - 1] == 10) return from
+    val nl = text.indexOf("\n", from)
+    if (nl < 0) text.size + 1 else nl + 1
+}
+
+private fun identifierEnd(text: string, from: int): int {
+    if (from >= text.size) return from
+    val c = text[from]
+    if (!(c == 95 || isAlphaByte(c))) return from
+    var p = from + 1
+    while (p < text.size && isWordByte(text[p])) p = p + 1
+    p
+}
+
+// After `)` of the parameter list at index `close`: `\s*:\s*TYPE\s*=\s*` and the opening literal.
+// Returns the index just after `{\n`, or -1.
+private fun headerTail(text: string, afterParameters: int, resultType: string, opener: string, spaceBeforeColon: bool): int {
+    var p = if (spaceBeforeColon) skipAnySpace(text, afterParameters) else afterParameters
+    if (p >= text.size || text[p] != 58) return -1
+    p = skipAnySpace(text, p + 1)
+    if (!startsWithAt(text, resultType, p)) return -1
+    p = skipAnySpace(text, p + resultType.size)
+    if (p >= text.size || text[p] != 61) return -1
+    p = skipAnySpace(text, p + 1)
+    if (!startsWithAt(text, opener, p)) return -1
+    p
+}
+
+// Try a function-header match whose head starts at annotation or fun line `s`.
+private fun tryFunction(text: string, s: int, kind: int): BlockMatch? {
+    var p = s
+    // annotation lines: ^@[^\n]+\n
+    while (p < text.size && text[p] == 64) {
+        val nl = text.indexOf("\n", p)
+        if (nl < 0 || nl == p + 1) break
+        p = nl + 1
+    }
+    // ^(?:trusted\s+)?fun\s+
+    if (startsWithAt(text, "trusted", p)) {
+        val q = skipAnySpace(text, p + 7)
+        if (q == p + 7) return null
+        p = q
+    }
+    if (!startsWithAt(text, "fun", p)) return null
+    var q = skipAnySpace(text, p + 3)
+    if (q == p + 3) return null
+    val nameStart = q
+    val nameEnd = identifierEnd(text, q)
+    if (nameEnd == nameStart) return null
+    val name = text.slice(nameStart, nameEnd)
+    if (nameEnd >= text.size || text[nameEnd] != 40) return null
+    val opener = if (kind == 1) "\$xtensa instructionsU32 {\n" else "\$xtensa instructions {\n"
+    val resultType = if (kind == 1) "u32" else "void"
+    var headerEnd = -1
+    var parameters = ""
+    if (kind == 0) {
+        // \([^\n]*?\):\s*void  (lazy: the first closing paren that lets the rest match)
+        var close = nameEnd + 1
+        while (headerEnd < 0 && close < text.size && text[close] != 10) {
+            if (text[close] == 41) {
+                val tail = headerTail(text, close + 1, resultType, opener, false)
+                if (tail >= 0) headerEnd = tail
+            }
+            close = close + 1
+        }
+        parameters = ""
+    } else {
+        // \([^)]*\) up to the first closing paren (may cross lines)
+        val close = text.indexOf(")", nameEnd + 1)
+        if (close < 0) return null
+        parameters = text.slice(nameEnd, close + 1)
+        if (kind == 2) {
+            var hasLetter = false
+            var k = nameEnd + 1
+            while (k < close) {
+                if (isAlphaByte(text[k]) || text[k] == 95) hasLetter = true
+                k = k + 1
+            }
+            if (!hasLetter) return null
+        }
+        headerEnd = headerTail(text, close + 1, resultType, opener, true)
+    }
+    if (headerEnd < 0) return null
+    val bodyStart = headerEnd + opener.size
+    val k = text.indexOf("\n}", bodyStart)
+    if (k < 0) return null
+    BlockMatch(s, k + 2, headerEnd, name, parameters, "", bodyStart, k, text)
+}
+
+private fun tryInline(text: string, s: int): BlockMatch? {
+    var p = s
+    while (p < text.size && isSpaceOrTab(text[p])) p = p + 1
+    val opener = "\$xtensa instructions {\n"
+    if (!startsWithAt(text, opener, p)) return null
+    val bodyStart = p + opener.size
+    var k = text.indexOf("\n", bodyStart)
+    // `.*?\n^[ \t]*\}`: the first newline whose following line is blank-or-indent then `}`
+    // (the body may be empty only when the opener's own newline is followed by that line)
+    var searchFrom = bodyStart - 1
+    k = text.indexOf("\n", searchFrom)
+    while (k >= 0) {
+        var q = k + 1
+        while (q < text.size && isSpaceOrTab(text[q])) q = q + 1
+        if (q < text.size && text[q] == 125 && k >= bodyStart) {
+            return BlockMatch(s, q + 1, bodyStart, "", "", text.slice(s, p), bodyStart, k, text)
+        }
+        k = text.indexOf("\n", k + 1)
+    }
+    null
+}
+
+fun findBlocks(text: string, kind: int): array<BlockMatch> {
+    val found: array<BlockMatch> = []
+    var s = 0
+    while (s <= text.size) {
+        val line = nextLineStart(text, s)
+        if (line > text.size) break
+        s = line
+        val match = if (kind == 3) tryInline(text, s) else tryFunction(text, s, kind)
+        if (match != null) {
+            found.append(match)
+            s = nextLineStart(text, match.end)
+            if (match.end < text.size && text[match.end] == 10) s = match.end + 1
+            if (s > text.size) break
+        } else {
+            val nl = text.indexOf("\n", s)
+            if (nl < 0) break
+            s = nl + 1
+        }
+    }
+    found
+}

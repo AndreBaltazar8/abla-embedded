@@ -1,0 +1,68 @@
+// Taken branches to LEND must not become hardware-loop back edges.
+//
+// The lifter records the cancellation (`loopEnd == N` / `loopActive = false`) before the
+// target program counter is assigned, and the structurizer keeps that provenance. Since
+// the structurizer expresses hardware loops with labeled blocks, "kept" is now checked on
+// its output: a taken branch to LEND leaves the loop without the iteration decrement, and
+// a jump to LEND leaves no loop at all (the Python test of the same name asserted that the
+// structurizer left such a source unchanged, which stopped being true when the
+// structurizer learned labeled blocks, and it has failed since).
+
+import "abla/io"
+import "abla/text"
+import "../tools/lift-xtensa-leaves-to-abla.ab" as lifter
+import "../tools/structurize-acyclic-recovered-functions.ab" as structure
+
+fun fail(message: string): int {
+    println("FAIL $message")
+    1
+}
+
+fun loopBody(branch: string): string =
+    "entry a1, 16\nmovi a9, 8\nloop a9, .Lend\n" + branch + "addi a2, a2, 1\n.Lend:\nretw.n"
+
+fun main: int {
+    for (branch in ["beq a2, a3, .Lend\n", "j .Lend\n"]) {
+        val lifted = lifter.liftControlFlow("earlyExit", loopBody(branch))
+        if (lifted.error != "") return fail("$branch: ${lifted.error}")
+        val source = lifted.source
+        if (!source.contains("loopEnd == ") || !source.contains("loopActive = false")) {
+            return fail("$branch: early exit lost its loop cancellation")
+        }
+        // The explicit cancellation is executed before assignment of the target PC.
+        val cancellation = source.lastIndexOf("loopActive = false")
+        if (!source.slice(cancellation, source.size).contains("programCounter = ")) {
+            return fail("$branch: cancellation is not followed by the target assignment")
+        }
+        val structured = structure.transform(source)
+        if (structured.count != 1 || structured.text.contains("programCounter")) {
+            return fail("$branch: structurizer did not structure the early exit")
+        }
+        if (branch.startsWith("beq")) {
+            // the taken edge leaves the loop at once; only the fall-through edge iterates
+            val taken = structured.text.indexOf("if (r2 == r3) {", 0)
+            val other = structured.text.indexOf("} else {", taken)
+            if (taken < 0 || other < 0 ||
+                !structured.text.slice(taken + 15, other).trim().startsWith("break@")) {
+                return fail("$branch: taken branch to LEND does not leave the loop")
+            }
+            if (structured.text.slice(taken, other).contains("loopCounter")) {
+                return fail("$branch: taken branch to LEND counts as an iteration")
+            }
+        } else if (structured.text.contains("while (true)")) {
+            return fail("$branch: a jump to LEND still loops")
+        }
+    }
+
+    val lifted = lifter.liftControlFlow("fallthrough", loopBody(""))
+    if (lifted.error != "") return fail("fallthrough: ${lifted.error}")
+    if (lifted.source.contains("loopEnd == ")) return fail("fallthrough: spurious loop-end cancellation")
+    val structured = structure.transform(lifted.source)
+    if (structured.count != 1 || !structured.text.contains("loopCounter = loopCounter - u32(1)") ||
+        !structured.text.contains("continue@l1")) {
+        return fail("fallthrough: the loop was not structured")
+    }
+    if (structured.text.contains("programCounter")) return fail("fallthrough: dispatcher state remains")
+    println("Xtensa LEND provenance: conditional exit, jump exit, and fallthrough passed")
+    0
+}

@@ -1,0 +1,457 @@
+// Shared pieces of the Xtensa leaf lifter (tools/lift-xtensa-leaves-to-abla.ab): the
+// error state that stands in for Python's Unsupported exception, text helpers with
+// Python's semantics, and the operand parsing the lifted instructions use.
+//
+// A lifting step that cannot go on calls liftFail(message) and returns; the first
+// message wins, like the first `raise Unsupported`. Callers look at liftHasError()
+// after each step. liftTake() hands the message over and clears the state, which is
+// the `except Unsupported` of the original.
+
+import "abla/text"
+import "abla/crypto"
+
+var liftErrorText = ""
+var liftErrorUnsafe = false
+
+fun liftFail(message: string): void {
+    if (liftErrorText == "") liftErrorText = message
+    return
+}
+
+// The original's UnsafeSemanticInstruction, which no `except Unsupported` catches.
+fun liftFailUnsafe(message: string): void {
+    if (liftErrorText == "") {
+        liftErrorText = message
+        liftErrorUnsafe = true
+    }
+    return
+}
+
+fun liftHasError(): bool = liftErrorText != ""
+
+fun liftErrorMessage(): string = liftErrorText
+
+fun liftErrorIsUnsafe(): bool = liftErrorUnsafe
+
+fun liftClearError(): void {
+    liftErrorText = ""
+    liftErrorUnsafe = false
+    return
+}
+
+// ---- characters and text (Python semantics where the tool depends on them) ----
+
+fun isDigitByte(c: int): bool = c >= 48 && c <= 57
+
+fun isAlphaByte(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
+fun isHexByte(c: int): bool =
+    isDigitByte(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+
+// [.$A-Za-z_]
+fun isSymbolStart(c: int): bool = c == 46 || c == 36 || c == 95 || isAlphaByte(c)
+
+// [.$A-Za-z0-9_]
+fun isSymbolByte(c: int): bool = isSymbolStart(c) || isDigitByte(c)
+
+// [A-Za-z0-9_]
+fun isWordByte(c: int): bool = c == 95 || isAlphaByte(c) || isDigitByte(c)
+
+fun isSpaceByte(c: int): bool = c == 32 || (c >= 9 && c <= 13)
+
+fun hexValue(c: int): int =
+    if (c >= 97) c - 87 else if (c >= 65) c - 55 else c - 48
+
+fun strip(text: string): string = text.trim()
+
+// Python's str.splitlines(): \n, \r\n, \r, \v, \f and the FS/GS/RS separators end a
+// line, and a final terminator does not start an empty one.
+fun splitLines(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var index = 0
+    val size = text.size
+    while (index < size) {
+        val c = text[index]
+        if (c == 10 || c == 13 || c == 11 || c == 12 || c == 28 || c == 29 || c == 30) {
+            lines.append(text.slice(begin, index))
+            if (c == 13 && index + 1 < size && text[index + 1] == 10) index = index + 1
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    if (begin < size) lines.append(text.slice(begin, size))
+    lines
+}
+
+// splitlines(keepends=True)
+fun splitLinesKeepEnds(text: string): array<string> {
+    val lines: array<string> = []
+    var begin = 0
+    var index = 0
+    val size = text.size
+    while (index < size) {
+        val c = text[index]
+        if (c == 10 || c == 13 || c == 11 || c == 12 || c == 28 || c == 29 || c == 30) {
+            if (c == 13 && index + 1 < size && text[index + 1] == 10) index = index + 1
+            lines.append(text.slice(begin, index + 1))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    if (begin < size) lines.append(text.slice(begin, size))
+    lines
+}
+
+// text.split(None, 1)[1] of a stripped, non-empty text: the part after the first
+// whitespace run, or "" when there is none.
+fun afterFirstWord(text: string): string {
+    var index = 0
+    while (index < text.size && !isSpaceByte(text[index])) index = index + 1
+    while (index < text.size && isSpaceByte(text[index])) index = index + 1
+    text.slice(index, text.size)
+}
+
+fun firstWord(text: string): string {
+    var index = 0
+    while (index < text.size && !isSpaceByte(text[index])) index = index + 1
+    text.slice(0, index)
+}
+
+fun hasWhitespace(text: string): bool {
+    for (c in text) if (isSpaceByte(c)) return true
+    false
+}
+
+// text.count(needle) for a non-empty needle: non-overlapping occurrences.
+fun countOccurrences(text: string, needle: string): int {
+    if (needle.size == 0) return text.size + 1
+    var count = 0
+    var at = text.indexOf(needle, 0)
+    while (at >= 0) {
+        count = count + 1
+        at = text.indexOf(needle, at + needle.size)
+    }
+    count
+}
+
+fun lowerHex(value: int): string {
+    if (value == 0) return "0"
+    val digits = "0123456789abcdef"
+    var out = ""
+    var rest = value
+    while (rest != 0) {
+        val digit = rest & 15
+        out = digits.slice(digit, digit + 1) + out
+        rest = rest >>> 4
+    }
+    out
+}
+
+fun hexByteText(value: int): string {
+    val digits = "0123456789abcdef"
+    digits.slice((value >> 4) & 15, ((value >> 4) & 15) + 1) + digits.slice(value & 15, (value & 15) + 1)
+}
+
+// hashlib.sha1(symbol.encode()).hexdigest()[:10]
+fun sha1Prefix(symbol: string): string = hexEncode(sha1(symbol)).slice(0, 10)
+
+// re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
+fun readableName(symbol: string): string {
+    var out = ""
+    var inRun = false
+    var index = 0
+    while (index < symbol.size) {
+        val c = symbol[index]
+        if (isAlphaByte(c) || isDigitByte(c)) {
+            out = out + symbol.slice(index, index + 1)
+            inRun = false
+        } else if (!inRun) {
+            out = out + "_"
+            inRun = true
+        }
+        index = index + 1
+    }
+    var begin = 0
+    var end = out.size
+    while (begin < end && out[begin] == 95) begin = begin + 1
+    while (end > begin && out[end - 1] == 95) end = end - 1
+    out.slice(begin, end)
+}
+
+fun containsLine(lines: array<string>, wanted: string): bool {
+    for (line in lines) if (line == wanted) return true
+    false
+}
+
+fun indexOfLine(lines: array<string>, wanted: string): int {
+    var index = 0
+    while (index < lines.size) {
+        if (lines[index] == wanted) return index
+        index = index + 1
+    }
+    -1
+}
+
+fun joinLines(lines: array<string>): string = lines.join("\n")
+
+fun leadingSpaces(line: string): int {
+    var count = 0
+    while (count < line.size && isSpaceByte(line[count])) count = count + 1
+    count
+}
+
+fun lstrip(text: string): string = text.trimStart()
+
+fun isAllDigits(text: string): bool {
+    if (text.size == 0) return false
+    for (c in text) if (!isDigitByte(c)) return false
+    true
+}
+
+// ---- integers ----
+
+// Python's int(text, 0): optional surrounding whitespace and sign, a 0x/0o/0b prefix
+// or a decimal without leading zeros, and single underscores between digits.
+fun immediate(text: string): int? {
+    val t = text.trim()
+    var index = 0
+    var negative = false
+    if (index < t.size && (t[index] == 43 || t[index] == 45)) {
+        negative = t[index] == 45
+        index = index + 1
+    }
+    if (index >= t.size) return null
+    var base = 10
+    var prefixed = false
+    if (t[index] == 48 && index + 1 < t.size) {
+        val p = t[index + 1]
+        if (p == 120 || p == 88) { base = 16; prefixed = true }
+        else if (p == 111 || p == 79) { base = 8; prefixed = true }
+        else if (p == 98 || p == 66) { base = 2; prefixed = true }
+        if (prefixed) index = index + 2
+    }
+    var value = 0
+    var digits = 0
+    var previousDigit = false
+    var afterPrefix = prefixed
+    var leadingZero = false
+    while (index < t.size) {
+        val c = t[index]
+        if (c == 95) {
+            if (!previousDigit && !afterPrefix) return null
+            previousDigit = false
+            afterPrefix = false
+            index = index + 1
+            continue
+        }
+        var digit = -1
+        if (isDigitByte(c)) digit = c - 48
+        else if (c >= 97 && c <= 102) digit = c - 87
+        else if (c >= 65 && c <= 70) digit = c - 55
+        if (digit < 0 || digit >= base) return null
+        if (!prefixed && digits == 0 && digit == 0) leadingZero = true
+        value = value * base + digit
+        digits = digits + 1
+        previousDigit = true
+        afterPrefix = false
+        index = index + 1
+    }
+    if (digits == 0 || !previousDigit) return null
+    if (!prefixed && leadingZero && value != 0) return null
+    if (negative) -value else value
+}
+
+fun unsigned32(value: int): int = value & 4294967295
+
+// ---- registers and symbols ----
+
+// a0..a15
+fun isScalarRegister(text: string): bool = isNumberedRegister(text, 97)
+
+// f0..f15
+fun isFloatRegister(text: string): bool = isNumberedRegister(text, 102)
+
+// b0..b15
+fun isBoolRegister(text: string): bool = isNumberedRegister(text, 98)
+
+private fun isNumberedRegister(text: string, letter: int): bool {
+    if (text.size < 2 || text.size > 3 || text[0] != letter) return false
+    if (!isDigitByte(text[1])) return false
+    if (text.size == 2) return true
+    if (text[1] != 49) return false
+    text[2] >= 48 && text[2] <= 53
+}
+
+// a0 or a1..a15 spelled as in re.compile(r"a(?:[0-9]|1[0-5])$") applied with fullmatch.
+fun registerName(text: string): string {
+    if (!isScalarRegister(text)) {
+        liftFail("not a scalar register: $text")
+        return "r0"
+    }
+    "r" + text.slice(1, text.size)
+}
+
+fun floatRegisterName(text: string): string {
+    if (!isFloatRegister(text)) {
+        liftFail("not a float register: $text")
+        return "f0"
+    }
+    text
+}
+
+fun boolRegisterName(text: string): string {
+    if (!isBoolRegister(text)) {
+        liftFail("not a boolean register: $text")
+        return "b0"
+    }
+    text
+}
+
+// LABEL.fullmatch: [.$A-Za-z_][.$A-Za-z0-9_]*:
+fun isLabelLine(line: string): bool {
+    if (line.size < 2 || line[line.size - 1] != 58) return false
+    if (!isSymbolStart(line[0])) return false
+    var index = 1
+    while (index < line.size - 1) {
+        if (!isSymbolByte(line[index])) return false
+        index = index + 1
+    }
+    true
+}
+
+// [.$A-Za-z_][.$A-Za-z0-9_]*
+fun isPlainSymbol(text: string): bool {
+    if (text.size == 0 || !isSymbolStart(text[0])) return false
+    for (c in text) if (!isSymbolByte(c)) return false
+    true
+}
+
+// SYMBOL_EXPRESSION.fullmatch: symbol with an optional +/- hex-or-decimal offset.
+// Returns [symbol, operator, offset] (operator and offset "" when absent), or an empty array.
+fun symbolExpressionParts(text: string): array<string> {
+    val none: array<string> = []
+    if (text.size == 0 || !isSymbolStart(text[0])) return none
+    var index = 1
+    while (index < text.size && isSymbolByte(text[index])) index = index + 1
+    val symbol = text.slice(0, index)
+    if (index == text.size) return [symbol, "", ""]
+    val operator = text[index]
+    if (operator != 43 && operator != 45) return none
+    val offset = text.slice(index + 1, text.size)
+    var ok = false
+    if (offset.size > 2 && offset[0] == 48 && (offset[1] == 120 || offset[1] == 88)) {
+        ok = true
+        var at = 2
+        while (at < offset.size) {
+            if (!isHexByte(offset[at])) ok = false
+            at = at + 1
+        }
+    }
+    if (!ok && isAllDigits(offset)) ok = true
+    if (!ok) return none
+    [symbol, text.slice(index, index + 1), offset]
+}
+
+fun isSymbolExpression(text: string): bool = symbolExpressionParts(text).size != 0
+
+// A literal expression as the lifted source spells it.
+fun symbolValue(text: string): string {
+    val value = immediate(text)
+    if (value != null) return "u32(${unsigned32(value)})"
+    val parts = symbolExpressionParts(text)
+    if (parts.size == 0) {
+        liftFail("unsupported literal expression: $text")
+        return "u32(0)"
+    }
+    var result = "\$xtensa address {" + parts[0] + "}"
+    if (parts[2] != "") {
+        val offset = immediate(parts[2])
+        val amount = if (offset == null) 0 else offset
+        result = "(" + result + " " + parts[1] + " u32(" + "$amount" + "))"
+    }
+    result
+}
+
+// A set of names (the original's set[str]).
+class NameSet(val items: Map<string, int>) {
+    fun has(name: string): bool = this.items.has(name)
+    fun add(name: string): void {
+        this.items.set(name, 1)
+        return
+    }
+    fun discard(name: string): void {
+        this.items.remove(name)
+        return
+    }
+    fun size(): int = this.items.size
+}
+
+fun nameSet(): NameSet = NameSet(Map<string, int>())
+
+fun operand(text: string, assigned: NameSet): string {
+    if (isScalarRegister(text)) {
+        val name = registerName(text)
+        if (!assigned.has(name)) {
+            liftFail("read before definition: $text")
+            return name
+        }
+        return name
+    }
+    symbolValue(text)
+}
+
+fun signedOf(value: string): string = "i32(" + value + ")"
+
+fun floatOperand(text: string, assigned: NameSet): string {
+    val name = floatRegisterName(text)
+    if (!assigned.has(name)) {
+        liftFail("read before definition: $text")
+    }
+    name
+}
+
+fun memoryAddress(base: string, offset: string, assigned: NameSet): string {
+    val baseValue = operand(base, assigned)
+    val amount = immediate(offset)
+    if (amount == null) {
+        liftFail("nonconstant memory offset: $offset")
+        return baseValue
+    }
+    if (amount == 0) return baseValue
+    if (amount > 0) return "(" + baseValue + " + u32(" + "$amount" + "))"
+    "(" + baseValue + " - u32(" + "${-amount}" + "))"
+}
+
+fun loadExpression(width: int, address: string, signedLoad: bool): string {
+    val intrinsic = if (width == 8) "ablaUnsafeLoadU8"
+        else if (width == 16) "ablaUnsafeLoadU16" else "ablaUnsafeLoadU32"
+    val loaded = "u32(" + intrinsic + "(nativePointerFromAddress(int(" + address + "))))"
+    if (signedLoad && width == 16) return "u32(i32(i16(" + loaded + ")))"
+    loaded
+}
+
+class Insn(val mnemonic: string, val operands: array<string>)
+
+fun splitOperands(text: string): array<string> {
+    val parts: array<string> = []
+    for (part in text.split(",")) parts.append(part.trim())
+    parts
+}
+
+fun parseInstruction(line: string): Insn {
+    val stripped = line.trim()
+    if (stripped.size == 0) return Insn("", [])
+    val head = firstWord(stripped)
+    val rest = afterFirstWord(stripped)
+    val mnemonic = head.lowercase()
+    val operands: array<string> = if (rest.size == 0) [] else splitOperands(rest)
+    Insn(mnemonic, operands)
+}
+
+fun floorDiv(value: int, divisor: int): int {
+    val quotient = value / divisor
+    if (value % divisor != 0 && ((value < 0) != (divisor < 0))) quotient - 1 else quotient
+}
+
+fun floorMod(value: int, divisor: int): int = value - floorDiv(value, divisor) * divisor

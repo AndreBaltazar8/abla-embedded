@@ -1,0 +1,1192 @@
+// Text and control-flow analysis for the Xtensa leaf lifter: nested-section scanning,
+// raw-instruction normalization, basic-block records and branch conditions, and the
+// call and outgoing-stack analyses that decide what a lifted call passes.
+
+import "abla/text"
+import "base.ab"
+
+// ---- the lifter's modes (set by the command line) ----
+
+var keepGlobalData = false
+var resolveOutgoingStackMode = false
+
+fun setKeepGlobalData(value: bool): void {
+    keepGlobalData = value
+    return
+}
+
+fun setResolveOutgoingStack(value: bool): void {
+    resolveOutgoingStackMode = value
+    return
+}
+
+fun isKeepGlobalData(): bool = keepGlobalData
+
+fun isResolveOutgoingStack(): bool = resolveOutgoingStackMode
+
+// ---- instruction groups ----
+
+fun isBranch(mnemonic: string): bool = when (mnemonic) {
+    "beq", "bne", "beqz", "beqz.n", "bnez", "bnez.n",
+    "beqi", "bnei", "blt", "bge", "bltu", "bgeu", "blti",
+    "bgei", "bltui", "bgeui", "bltz", "bgez", "bbci", "bbci.l",
+    "bbsi", "bbsi.l", "bbc", "bbs", "bany", "bnone", "ball",
+    "bnall", "bt", "bf" -> true
+    else -> false
+}
+
+fun isReturn(mnemonic: string): bool = when (mnemonic) {
+    "ret", "ret.n", "retw", "retw.n" -> true
+    else -> false
+}
+
+fun isStore(mnemonic: string): bool = when (mnemonic) {
+    "s8i", "s16i", "s32i", "s32i.n" -> true
+    else -> false
+}
+
+fun isUnsafeFloatMnemonic(mnemonic: string): bool = when (mnemonic) {
+    "addexp.s", "addexpm.s", "const.s", "div0.s", "divn.s", "madd.s", "maddn.s",
+    "mkdadj.s", "msub.s", "nexp01.s", "recip0.s", "rsqrt0.s", "sqrt0.s" -> true
+    else -> false
+}
+
+fun unsafeFloatMnemonics(): array<string> = [
+    "addexp.s", "addexpm.s", "const.s", "div0.s", "divn.s", "madd.s", "maddn.s",
+    "mkdadj.s", "msub.s", "nexp01.s", "recip0.s", "rsqrt0.s", "sqrt0.s",
+]
+
+fun rejectUnsafeSemanticInstruction(mnemonic: string): void {
+    if (isUnsafeFloatMnemonic(mnemonic)) {
+        liftFailUnsafe("refusing lossy Xtensa FP translation of " + mnemonic)
+    }
+    return
+}
+
+// \bword\b
+fun containsWord(text: string, word: string): bool {
+    var at = text.indexOf(word, 0)
+    while (at >= 0) {
+        val before = at == 0 || !isWordByte(text[at - 1])
+        val end = at + word.size
+        val after = end >= text.size || !isWordByte(text[end])
+        if (before && after) return true
+        at = text.indexOf(word, at + 1)
+    }
+    false
+}
+
+// re.search(r"\b(?:f|b)(?:[0-9]|1[0-5])\b", body)
+fun containsFloatOrBoolRegister(body: string): bool {
+    var index = 0
+    while (index < body.size) {
+        val c = body[index]
+        if ((c == 102 || c == 98) && (index == 0 || !isWordByte(body[index - 1]))) {
+            var end = index + 1
+            while (end < body.size && isWordByte(body[end])) end = end + 1
+            val word = body.slice(index + 1, end)
+            if (word.size == 1 && isDigitByte(word[0])) return true
+            if (word.size == 2 && word[0] == 49 && word[1] >= 48 && word[1] <= 53) return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+// ---- incoming stack arguments ----
+
+// The word index and the byte offset of an access to the incoming stack
+// arguments, or index -1.
+class StackLocation(val index: int, val byteOffset: int)
+
+fun incomingStackLocation(offset: int, frameSize: int, width: int): StackLocation {
+    val relative = offset - frameSize
+    if (relative < 0) return StackLocation(-1, 0)
+    val index = floorDiv(relative, 4)
+    val byteOffset = floorMod(relative, 4)
+    if (index >= 10 || byteOffset + width / 8 > 4) return StackLocation(-1, 0)
+    if (width == 32 && byteOffset != 0) return StackLocation(-1, 0)
+    StackLocation(index, byteOffset)
+}
+
+// The expression for a load from the incoming stack words, or "" when the load is not one.
+fun incomingStackLoad(width: int, signedLoad: bool, offset: int, frameSize: int): string {
+    val location = incomingStackLocation(offset, frameSize, width)
+    if (location.index < 0) return ""
+    val word = "incomingStack${location.index}"
+    val shifted = if (location.byteOffset == 0) word
+        else "(" + word + " >>> u32(" + "${location.byteOffset * 8}" + "))"
+    if (width == 32) return shifted
+    val mask = (1 << width) - 1
+    val value = "(" + shifted + " & u32(" + "$mask" + "))"
+    if (signedLoad && width == 16) return "u32(i32(i16(" + value + ")))"
+    value
+}
+
+// ---- calls ----
+
+// Whether the CALL8 result in a11 is observed before being replaced.
+fun callSecondaryResultUsed(instructions: array<Insn>, callIndex: int): bool {
+    var index = callIndex + 1
+    while (index < instructions.size) {
+        val mnemonic = instructions[index].mnemonic
+        val operands = instructions[index].operands
+        index = index + 1
+        if (mnemonic == "call8" || mnemonic == "callx8") return true
+        if (containsLine(operands, "a11")) {
+            val destination = operands.size > 0 && operands[0] == "a11"
+            var again = false
+            var k = 1
+            while (k < operands.size) {
+                if (operands[k] == "a11") again = true
+                k = k + 1
+            }
+            if (destination && again) return true
+            if (destination && !isStore(mnemonic) && !noDestination(mnemonic) &&
+                !conditionalDestination(mnemonic)) return false
+            return true
+        }
+    }
+    false
+}
+
+private fun noDestination(mnemonic: string): bool {
+    if (isBranch(mnemonic)) return true
+    when (mnemonic) {
+        "memw", "rsync", "esync", "ret", "ret.n", "retw", "retw.n",
+        "ssr", "ssl", "ssai", "ssa8l", "ssa8b", "wsr.scompare1",
+        "break", "ill", "ill.n" -> true
+        else -> false
+    }
+}
+
+private fun conditionalDestination(mnemonic: string): bool = when (mnemonic) {
+    "moveqz", "movnez", "movgez", "movltz" -> true
+    else -> false
+}
+
+fun bodyHasControlFlow(body: string): bool {
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 46 || line[0] == 35) continue
+        val mnemonic = firstWord(line).lowercase()
+        if (isBranch(mnemonic) || mnemonic == "j" || mnemonic == "jx" || mnemonic.startsWith("loop")) return true
+    }
+    false
+}
+
+private fun sortedInts(values: array<int>): array<int> {
+    val result: array<int> = []
+    for (value in values) {
+        var present = false
+        for (seen in result) if (seen == value) present = true
+        if (present) continue
+        result.append(value)
+        var index = result.size - 1
+        while (index > 0 && value < result[index - 1]) {
+            result[index] = result[index - 1]
+            index = index - 1
+        }
+        result[index] = value
+    }
+    result
+}
+
+// The instruction records of a body: blank lines, comments, directives and labels dropped.
+fun instructionRecords(body: string): array<Insn> {
+    val records: array<Insn> = []
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 35 || line[0] == 46 || isLabelLine(line)) continue
+        records.append(parseInstruction(line))
+    }
+    records
+}
+
+// The outgoing stack offsets a lifted CALLX8 could silently lose.
+fun ambiguousCallx8StackArguments(body: string): array<int> {
+    val none: array<int> = []
+    val records = instructionRecords(body)
+    var frameSize = 0
+    for (record in records) {
+        if (record.mnemonic == "entry" && record.operands.size == 2 && record.operands[0] == "a1") {
+            val amount = immediate(record.operands[1])
+            if (amount != null) frameSize = amount
+        }
+    }
+    if (frameSize <= 0) return none
+    val storeIndexes: array<int> = []
+    val storeOffsets: array<int> = []
+    val calls: array<int> = []
+    var index = 0
+    while (index < records.size) {
+        val record = records[index]
+        if (record.mnemonic == "callx8") calls.append(index)
+        if (isStore(record.mnemonic) && record.operands.size == 3 && record.operands[1] == "a1") {
+            val offset = immediate(record.operands[2])
+            if (offset != null && offset >= 0 && offset < (if (frameSize < 40) frameSize else 40)) {
+                storeIndexes.append(index)
+                storeOffsets.append(offset)
+            }
+        }
+        index = index + 1
+    }
+    if (calls.size == 0 || storeIndexes.size == 0) return none
+    if (bodyHasControlFlow(body)) return sortedInts(storeOffsets)
+    val result: array<int> = []
+    var k = 0
+    while (k < storeIndexes.size) {
+        var before = false
+        for (callIndex in calls) if (storeIndexes[k] < callIndex) before = true
+        if (before) result.append(storeOffsets[k])
+        k = k + 1
+    }
+    sortedInts(result)
+}
+
+// What resolveOutgoingStack found: `applies` false means the analysis did not apply.
+class OutgoingStack(val applies: bool, val offsets: array<int>, val passWord0: bool)
+
+private fun loadWidth(mnemonic: string): int = when (mnemonic) {
+    "l8ui" -> 1
+    "l16ui", "l16si" -> 2
+    "l32i", "l32i.n" -> 4
+    else -> 0
+}
+
+private fun storeWidth(mnemonic: string): int = when (mnemonic) {
+    "s8i" -> 1
+    "s16i" -> 2
+    "s32i", "s32i.n" -> 4
+    else -> 0
+}
+
+// Prove which frame-bottom stores are outgoing stack arguments (see the Python original's
+// resolve_outgoing_stack for the reasoning).
+fun resolveOutgoingStack(body: string): OutgoingStack {
+    val no = OutgoingStack(false, [], false)
+    var frameSize = 0
+    val loadStarts: array<int> = []
+    val loadSizes: array<int> = []
+    val storeStarts: array<int> = []
+    val storeSizes: array<int> = []
+    val addressTaken: array<int> = []
+    var calls = 0
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 35 || line[0] == 46 || isLabelLine(line)) continue
+        val insn = parseInstruction(line)
+        val mnemonic = insn.mnemonic
+        val operands = insn.operands
+        if (mnemonic == "call8" || mnemonic == "callx8") calls = calls + 1
+        if (mnemonic == "entry" && operands.size == 2 && operands[0] == "a1") {
+            val amount = immediate(operands[1])
+            if (amount == null || amount <= 0) return no
+            frameSize = amount
+            continue
+        }
+        if (!containsLine(operands, "a1")) continue
+        val lw = loadWidth(mnemonic)
+        val sw = storeWidth(mnemonic)
+        if (lw != 0 || sw != 0) {
+            if (operands.size != 3 || operands[0] == "a1" || operands[1] != "a1") return no
+            val offset = immediate(operands[2])
+            if (offset == null || offset < 0) return no
+            if (lw != 0) {
+                loadStarts.append(offset)
+                loadSizes.append(lw)
+            } else {
+                storeStarts.append(offset)
+                storeSizes.append(sw)
+            }
+            continue
+        }
+        if ((mnemonic == "addi" || mnemonic == "addi.n" || mnemonic == "addmi") &&
+            operands.size == 3 && operands[0] != "a1" && operands[1] == "a1") {
+            val amount = immediate(operands[2])
+            if (amount == null || amount < 0) return no
+            addressTaken.append(amount)
+            continue
+        }
+        return no
+    }
+    if (frameSize <= 0) return no
+    if (calls == 0) return OutgoingStack(true, [], false)
+    var localFloor = frameSize
+    var i = 0
+    while (i < loadStarts.size) {
+        if (loadStarts[i] < frameSize && loadStarts[i] < localFloor) localFloor = loadStarts[i]
+        i = i + 1
+    }
+    for (taken in addressTaken) if (taken < localFloor) localFloor = taken
+    val limit = if (frameSize < 40) frameSize else 40
+    val candidates: array<int> = []
+    var s = 0
+    while (s < storeStarts.size) {
+        val offset = storeStarts[s]
+        val width = storeSizes[s]
+        s = s + 1
+        if (offset >= limit || offset >= localFloor) continue
+        var overlaps = false
+        var l = 0
+        while (l < loadStarts.size) {
+            if (loadStarts[l] < offset + width && offset < loadStarts[l] + loadSizes[l]) overlaps = true
+            l = l + 1
+        }
+        if (overlaps) continue
+        var slot = offset - offset % 4
+        while (slot < offset + width) {
+            candidates.append(slot)
+            slot = slot + 4
+        }
+    }
+    if (candidates.size == 0) return OutgoingStack(true, [], false)
+    val unique = sortedInts(candidates)
+    if (unique.size == 1 && unique[0] == 0) return OutgoingStack(true, [], true)
+    OutgoingStack(true, unique, false)
+}
+
+// ---- nested assembler sections ----
+
+class SectionMatch(
+    val start: int,
+    val end: int,
+    val header: string,
+    val body: string,
+)
+
+private fun isLineStart(text: string, index: int): bool = index == 0 || text[index - 1] == 10
+
+fun startsWithAt(text: string, prefix: string, at: int): bool {
+    if (at < 0 || at + prefix.size > text.size) return false
+    var k = 0
+    while (k < prefix.size) {
+        if (text[at + k] != prefix[k]) return false
+        k = k + 1
+    }
+    true
+}
+
+// NESTED_SECTION: ^\.pushsection\s+([^\n]+)\n(.*?)^\.popsection\s*$ over the whole text,
+// non-overlapping, left to right (MULTILINE | DOTALL).
+fun findNestedSections(text: string): array<SectionMatch> {
+    val found: array<SectionMatch> = []
+    var scan = 0
+    val size = text.size
+    var at = text.indexOf(".pushsection", scan)
+    while (at >= 0) {
+        var matchEnd = -1
+        if (isLineStart(text, at)) {
+            var p = at + 12
+            val wsStart = p
+            while (p < size && isSpaceByte(text[p])) p = p + 1
+            if (p > wsStart) {
+                // [^\n]+ after the greedy \s+; give back whitespace when nothing is left
+                val headerStart = p
+                var headerEnd = headerStart
+                while (headerEnd < size && text[headerEnd] != 10) headerEnd = headerEnd + 1
+                if (headerEnd > headerStart && headerEnd < size && text[headerEnd] == 10) {
+                    val bodyStart = headerEnd + 1
+                    var line = bodyStart
+                    var done = false
+                    while (!done && line <= size) {
+                        if (line < size && startsWithAt(text, ".popsection", line)) {
+                            var e = line + 11
+                            while (e < size && isSpaceByte(text[e])) e = e + 1
+                            var stop = e
+                            while (stop >= line + 11 && !(stop == size || text[stop] == 10)) stop = stop - 1
+                            if (stop >= line + 11) {
+                                found.append(SectionMatch(at, stop, text.slice(headerStart, headerEnd), text.slice(bodyStart, line)))
+                                matchEnd = stop
+                                done = true
+                            }
+                        }
+                        if (!done) {
+                            val nl = text.indexOf("\n", line)
+                            if (nl < 0) line = size + 1 else line = nl + 1
+                        }
+                    }
+                }
+            }
+        }
+        if (matchEnd >= 0) scan = matchEnd else scan = at + 1
+        if (scan > size) break
+        at = text.indexOf(".pushsection", scan)
+    }
+    found
+}
+
+// NESTED_SECTION.sub("", text)
+fun removeNestedSections(text: string): string {
+    val matches = findNestedSections(text)
+    if (matches.size == 0) return text
+    var out = ""
+    var last = 0
+    for (m in matches) {
+        out = out + text.slice(last, m.start)
+        last = m.end
+    }
+    out + text.slice(last, text.size)
+}
+
+// ---- raw encodings ----
+
+private fun skipSpaces(text: string, from: int): int {
+    var p = from
+    while (p < text.size && isSpaceByte(text[p])) p = p + 1
+    p
+}
+
+private fun hasRegisterShape(text: string): bool = isScalarRegister(text)
+
+// `.byte 0x00`, `.byte 0x3N`, `.byte 0x40` on three consecutive column-0 lines: the
+// raw encoding of SSA8B aN. Returns the register number, or -1.
+private fun ssa8bRegisterAt(lines: array<string>, index: int): int {
+    if (index + 2 >= lines.size) return -1
+    if (!isByteLine(lines[index], "0x00")) return -1
+    if (!isByteLine(lines[index + 2], "0x40")) return -1
+    val middle = lines[index + 1]
+    // .byte\s+0x3([0-9a-f])\s*
+    if (!middle.startsWith(".byte")) return -1
+    var p = 5
+    val start = p
+    p = skipSpaces(middle, p)
+    if (p == start) return -1
+    if (!middle.slice(p, middle.size).startsWith("0x3")) return -1
+    p = p + 3
+    if (p >= middle.size) return -1
+    val c = middle[p]
+    if (!(isDigitByte(c) || (c >= 97 && c <= 102))) return -1
+    p = p + 1
+    if (skipSpaces(middle, p) != middle.size) return -1
+    hexValue(c)
+}
+
+// ^\.byte\s+VALUE\s*$ on one line
+private fun isByteLine(line: string, value: string): bool {
+    if (!line.startsWith(".byte")) return false
+    var p = 5
+    val start = p
+    p = skipSpaces(line, p)
+    if (p == start) return false
+    if (!line.slice(p, line.size).startsWith(value)) return false
+    skipSpaces(line, p + value.size) == line.size
+}
+
+// The registers of a literal-pool TLS sequence, matched line by line.
+private fun threadPointerRegister(line: string): string {
+    val t = line.trim()
+    if (firstWord(t) != "rur.threadptr") return ""
+    val insn = parseInstruction(t)
+    if (insn.operands.size != 1 || !isScalarRegister(insn.operands[0])) return ""
+    insn.operands[0]
+}
+
+// `.literal LABEL, 0`: returns the label or "".
+private fun literalZeroLabel(line: string): string {
+    val t = line.trim()
+    if (firstWord(t) != ".literal") return ""
+    val rest = afterFirstWord(t)
+    val comma = rest.indexOf(",", 0)
+    if (comma <= 0) return ""
+    val label = rest.slice(0, comma).trim()
+    if (label.size == 0 || hasWhitespace(label)) return ""
+    if (rest.slice(comma + 1, rest.size).trim() != "0") return ""
+    label
+}
+
+// `.reloc LABEL, R_XTENSA_TLS_TPOFF, SYMBOL`: returns [label, symbol] or an empty array.
+private fun tlsRelocParts(line: string): array<string> {
+    val none: array<string> = []
+    val t = line.trim()
+    if (firstWord(t) != ".reloc") return none
+    val rest = afterFirstWord(t)
+    val firstComma = rest.indexOf(",", 0)
+    if (firstComma <= 0) return none
+    val label = rest.slice(0, firstComma).trim()
+    if (label.size == 0 || hasWhitespace(label)) return none
+    val after = rest.slice(firstComma + 1, rest.size)
+    val secondComma = after.indexOf(",", 0)
+    if (secondComma < 0) return none
+    if (after.slice(0, secondComma).trim() != "R_XTENSA_TLS_TPOFF") return none
+    val symbol = after.slice(secondComma + 1, after.size).trim()
+    if (!isPlainSymbol(symbol)) return none
+    [label, symbol]
+}
+
+// `l32r aN, LABEL`: returns aN or "".
+private fun literalLoadRegister(line: string, label: string): string {
+    val t = line.trim()
+    if (firstWord(t) != "l32r") return ""
+    val insn = parseInstruction(t)
+    if (insn.operands.size != 2 || !isScalarRegister(insn.operands[0]) || insn.operands[1] != label) return ""
+    insn.operands[0]
+}
+
+// `add[.n] aD, aX, aY`: returns [aD, aX, aY] or an empty array.
+private fun addRegisters(line: string): array<string> {
+    val none: array<string> = []
+    val t = line.trim()
+    val word = firstWord(t)
+    if (word != "add" && word != "add.n") return none
+    val insn = parseInstruction(t)
+    if (insn.operands.size != 3) return none
+    for (operand in insn.operands) if (!isScalarRegister(operand)) return none
+    [insn.operands[0], insn.operands[1], insn.operands[2]]
+}
+
+// Older objdump spelling of SSA8B, and the GCC local-exec TLS address sequence, recovered
+// to the operations the lifter understands.
+fun normalizeEncodedInstructions(body: string): string {
+    var lines = splitLines(body)
+    // SSA8B aN printed as three raw bytes: a byte-index shift, not SSL's bit-index shift.
+    val first: array<string> = []
+    var changedText = false
+    var i = 0
+    while (i < lines.size) {
+        val register = ssa8bRegisterAt(lines, i)
+        if (register >= 0) {
+            first.append("ssa8b\ta${register}")
+            changedText = true
+            i = i + 3
+        } else {
+            first.append(lines[i])
+            i = i + 1
+        }
+    }
+    // the five-line local-exec TLS address sequence
+    val second: array<string> = []
+    i = 0
+    while (i < first.size) {
+        var replaced = false
+        if (i + 4 < first.size) {
+            val destination = threadPointerRegister(first[i])
+            val label = literalZeroLabel(first[i + 1])
+            val reloc = tlsRelocParts(first[i + 2])
+            if (destination != "" && label != "" && reloc.size == 2 && reloc[0] == label) {
+                val offset = literalLoadRegister(first[i + 3], label)
+                val add = addRegisters(first[i + 4])
+                if (offset != "" && add.size == 3 && add[0] == destination && add[1] == destination &&
+                    add[2] == offset) {
+                    second.append("abla.tlsaddress\t${destination}, ${reloc[1]}")
+                    changedText = true
+                    i = i + 5
+                    replaced = true
+                }
+            }
+        }
+        if (!replaced) {
+            second.append(first[i])
+            i = i + 1
+        }
+    }
+    lines = second
+    // Reordered schedules: recover them only when neither temporary is touched in the gap.
+    val removed = Map<int, int>()
+    val replacements = Map<int, string>()
+    var relocIndex = 0
+    while (relocIndex < lines.size) {
+        val reloc = tlsRelocParts(lines[relocIndex])
+        if (reloc.size != 2 || relocIndex == 0) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        val label = reloc[0]
+        val symbol = reloc[1]
+        if (literalZeroLabel(lines[relocIndex - 1]) != label) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        var offsetIndex = -1
+        var offsetRegister = ""
+        var index = relocIndex + 1
+        val scanEnd = if (lines.size < relocIndex + 8) lines.size else relocIndex + 8
+        while (index < scanEnd && offsetIndex < 0) {
+            val register = literalLoadRegister(lines[index], label)
+            if (register != "") {
+                offsetIndex = index
+                offsetRegister = register
+            }
+            index = index + 1
+        }
+        if (offsetIndex < 0) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        var threadIndex = -1
+        var destination = ""
+        index = if (relocIndex - 4 > 0) relocIndex - 4 else 0
+        val threadEnd = if (lines.size < offsetIndex + 8) lines.size else offsetIndex + 8
+        while (index < threadEnd && threadIndex < 0) {
+            val register = threadPointerRegister(lines[index])
+            if (register != "") {
+                threadIndex = index
+                destination = register
+            }
+            index = index + 1
+        }
+        if (threadIndex < 0) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        var addIndex = -1
+        val high = if (threadIndex > offsetIndex) threadIndex else offsetIndex
+        index = high + 1
+        val addEnd = if (lines.size < high + 9) lines.size else high + 9
+        while (index < addEnd && addIndex < 0) {
+            val add = addRegisters(lines[index])
+            if (add.size == 3 && add[0] == destination &&
+                ((add[1] == destination && add[2] == offsetRegister) ||
+                    (add[1] == offsetRegister && add[2] == destination))) {
+                addIndex = index
+            }
+            index = index + 1
+        }
+        if (addIndex < 0) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        val low = if (threadIndex < offsetIndex) threadIndex else offsetIndex
+        var unsafe = false
+        index = low
+        while (index <= addIndex) {
+            val designated = index == relocIndex - 1 || index == relocIndex || index == offsetIndex ||
+                index == threadIndex || index == addIndex
+            if (!designated && (containsWord(lines[index], destination) || containsWord(lines[index], offsetRegister))) {
+                unsafe = true
+            }
+            index = index + 1
+        }
+        if (unsafe) {
+            relocIndex = relocIndex + 1
+            continue
+        }
+        replacements.set(low, "abla.tlsaddress\t${destination}, ${symbol}")
+        for (member in [relocIndex - 1, relocIndex, offsetIndex, threadIndex, addIndex]) {
+            if (member != low) removed.set(member, 1)
+        }
+        relocIndex = relocIndex + 1
+    }
+    if (removed.size == 0 && replacements.size == 0) {
+        if (changedText) return lines.join("\n")
+        return body
+    }
+    val out: array<string> = []
+    var k = 0
+    while (k < lines.size) {
+        if (!removed.has(k)) {
+            val replacement = replacements.get(k)
+            if (replacement != null) out.append(replacement) else out.append(lines[k])
+        }
+        k = k + 1
+    }
+    out.join("\n")
+}
+
+// ---- basic blocks ----
+
+class BasicBlock(var label: string, var instructions: array<string>, var terminator: string)
+
+class FlowRecords(val literals: array<string>, val blocks: array<BasicBlock>, val frameSize: int)
+
+class FlowBuilder(
+    val blocks: array<BasicBlock>,
+    var label: string,
+    var instructions: array<string>,
+    var synthetic: int,
+) {
+    fun finish(terminator: string): void {
+        if (this.instructions.size > 0 || terminator != "" || this.blocks.size == 0) {
+            this.blocks.append(BasicBlock(this.label, this.instructions, terminator))
+        }
+        this.synthetic = this.synthetic + 1
+        this.label = "__fallthrough_${this.synthetic}"
+        this.instructions = []
+        return
+    }
+}
+
+fun startsWithAny(text: string, prefixes: array<string>): bool {
+    for (prefix in prefixes) if (text.startsWith(prefix)) return true
+    false
+}
+
+fun controlFlowRecords(body: string): FlowRecords {
+    val literals: array<string> = []
+    val kinds: array<int> = []
+    val texts: array<string> = []
+    var frameSize = 0
+    val empty = FlowRecords(literals, [], 0)
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 35) continue
+        if (line.startsWith(".literal ")) {
+            literals.append(line)
+            continue
+        }
+        if (startsWithAny(line, [".literal_position", ".align ", ".p2align "])) continue
+        if (line == ".byte 0x00" || line == ".byte 0") continue
+        if (line[0] == 46 && !isLabelLine(line)) {
+            liftFail("assembler directive: " + firstWord(line))
+            return empty
+        }
+        if (isLabelLine(line)) {
+            kinds.append(0)
+            texts.append(line.slice(0, line.size - 1))
+            continue
+        }
+        val insn = parseInstruction(line)
+        if (insn.mnemonic == "entry") {
+            if (insn.operands.size != 2 || insn.operands[0] != "a1") {
+                liftFail("nonstandard ENTRY")
+                return empty
+            }
+            val value = immediate(insn.operands[1])
+            if (value == null || value < 0) {
+                liftFail("nonconstant ENTRY frame")
+                return empty
+            }
+            frameSize = value
+            continue
+        }
+        kinds.append(1)
+        texts.append(line)
+    }
+    val builder = FlowBuilder([], "__entry", [], 0)
+    var previousKind = -1
+    var index = 0
+    while (index < kinds.size) {
+        val kind = kinds[index]
+        val record = texts[index]
+        index = index + 1
+        if (kind == 0) {
+            if (previousKind == 0) {
+                // Consecutive labels alias one address: the first gets an empty block.
+                builder.blocks.append(BasicBlock(builder.label, [], ""))
+                builder.synthetic = builder.synthetic + 1
+                builder.label = "__fallthrough_${builder.synthetic}"
+            }
+            if (builder.instructions.size > 0) {
+                builder.finish("")
+            } else if (builder.blocks.size > 0 &&
+                builder.blocks[builder.blocks.size - 1].terminator == "" &&
+                builder.blocks[builder.blocks.size - 1].label.startsWith("__fallthrough_")) {
+                builder.blocks[builder.blocks.size - 1].label = record
+                builder.label = "__fallthrough_${builder.synthetic + 1}"
+                previousKind = kind
+                continue
+            }
+            builder.label = record
+            previousKind = kind
+            continue
+        }
+        val mnemonic = parseInstruction(record).mnemonic
+        if (isBranch(mnemonic) || mnemonic == "j" || mnemonic == "jx" || isReturn(mnemonic) ||
+            mnemonic.startsWith("loop")) {
+            builder.finish(record)
+        } else {
+            builder.instructions.append(record)
+        }
+        previousKind = kind
+    }
+    if (builder.instructions.size > 0) builder.finish("")
+    if (builder.blocks.size == 0) {
+        liftFail("empty control-flow body")
+        return empty
+    }
+    FlowRecords(literals, builder.blocks, frameSize)
+}
+
+// ---- branch conditions ----
+
+class BranchCondition(val condition: string, val target: string)
+
+private val allScalarRegisters: NameSet = allRegisters()
+
+private fun allRegisters(): NameSet {
+    val all = nameSet()
+    var index = 1
+    while (index < 16) {
+        all.add("r${index}")
+        index = index + 1
+    }
+    all
+}
+
+fun branchCondition(mnemonic: string, arguments: array<string>): BranchCondition {
+    val bad = BranchCondition("true", "")
+    val assigned = allScalarRegisters
+    if (arguments.size == 0) {
+        liftFail("branch operands: $mnemonic")
+        return bad
+    }
+    val target = arguments[arguments.size - 1]
+    val values: array<string> = []
+    var valueIndex = 0
+    while (valueIndex < arguments.size - 1) {
+        values.append(arguments[valueIndex])
+        valueIndex = valueIndex + 1
+    }
+    if (mnemonic == "bt" || mnemonic == "bf") {
+        if (values.size != 1) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        var condition = boolRegisterName(values[0])
+        if (mnemonic == "bf") condition = "!" + condition
+        return BranchCondition(condition, target)
+    }
+    if (mnemonic == "beqz" || mnemonic == "beqz.n" || mnemonic == "bnez" || mnemonic == "bnez.n" ||
+        mnemonic == "bltz" || mnemonic == "bgez") {
+        if (values.size != 1) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        val value = operand(values[0], assigned)
+        val condition = if (mnemonic == "beqz" || mnemonic == "beqz.n") value + " == u32(0)"
+            else if (mnemonic == "bnez" || mnemonic == "bnez.n") value + " != u32(0)"
+            else if (mnemonic == "bltz") "i32(" + value + ") < 0"
+            else "i32(" + value + ") >= 0"
+        return BranchCondition(condition, target)
+    }
+    if (mnemonic == "beqi" || mnemonic == "bnei" || mnemonic == "blti" || mnemonic == "bgei" ||
+        mnemonic == "bltui" || mnemonic == "bgeui") {
+        if (values.size != 2) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        var left = operand(values[0], assigned)
+        val rightValue = immediate(values[1])
+        if (rightValue == null) {
+            liftFail("branch immediate: $mnemonic")
+            return bad
+        }
+        var right = "u32(" + "${unsigned32(rightValue)}" + ")"
+        val operation = when (mnemonic) {
+            "beqi" -> "=="
+            "bnei" -> "!="
+            "blti" -> "<"
+            "bgei" -> ">="
+            "bltui" -> "<"
+            else -> ">="
+        }
+        if (mnemonic == "blti" || mnemonic == "bgei") {
+            left = "i32(" + left + ")"
+            right = "i32(" + right + ")"
+        }
+        return BranchCondition(left + " " + operation + " " + right, target)
+    }
+    if (mnemonic == "beq" || mnemonic == "bne" || mnemonic == "blt" || mnemonic == "bge" ||
+        mnemonic == "bltu" || mnemonic == "bgeu") {
+        if (values.size != 2) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        var left = operand(values[0], assigned)
+        var right = operand(values[1], assigned)
+        val operation = when (mnemonic) {
+            "beq" -> "=="
+            "bne" -> "!="
+            "blt" -> "<"
+            "bge" -> ">="
+            "bltu" -> "<"
+            else -> ">="
+        }
+        if (mnemonic == "blt" || mnemonic == "bge") {
+            left = "i32(" + left + ")"
+            right = "i32(" + right + ")"
+        }
+        return BranchCondition(left + " " + operation + " " + right, target)
+    }
+    if (mnemonic == "bbci" || mnemonic == "bbci.l" || mnemonic == "bbsi" || mnemonic == "bbsi.l" ||
+        mnemonic == "bbc" || mnemonic == "bbs") {
+        if (values.size != 2) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        val value = operand(values[0], assigned)
+        val bit = operand(values[1], assigned)
+        val expected = if (mnemonic.startsWith("bbc")) "==" else "!="
+        return BranchCondition("((" + value + " >>> (" + bit + " & u32(31))) & u32(1)) " + expected + " u32(0)", target)
+    }
+    if (mnemonic == "bany" || mnemonic == "bnone" || mnemonic == "ball" || mnemonic == "bnall") {
+        if (values.size != 2) {
+            liftFail("branch operands: $mnemonic")
+            return bad
+        }
+        val left = operand(values[0], assigned)
+        val right = operand(values[1], assigned)
+        val intersection = "(" + left + " & " + right + ")"
+        val condition = if (mnemonic == "bany") intersection + " != u32(0)"
+            else if (mnemonic == "bnone") intersection + " == u32(0)"
+            else if (mnemonic == "ball") intersection + " == " + right
+            else intersection + " != " + right
+        return BranchCondition(condition, target)
+    }
+    liftFail("branch: $mnemonic")
+    bad
+}
+
+// ---- argument registers at calls ----
+
+// The a10..a15 register an instruction may write (its first operand), or -1.
+fun writtenArgumentRegister(operands: array<string>): int {
+    if (operands.size == 0) return -1
+    val text = operands[0]
+    if (text.size == 3 && text[0] == 97 && text[1] == 49 && text[2] >= 48 && text[2] <= 53) {
+        return 10 + text[2] - 48
+    }
+    -1
+}
+
+private fun highestBit(mask: int): int {
+    var register = 15
+    while (register >= 10) {
+        if ((mask & (1 << register)) != 0) return register
+        register = register - 1
+    }
+    9
+}
+
+// Highest argument register each CALL8/CALLX8 can pass a value in (a bitmask holds the
+// defined registers). The map is keyed by instruction index.
+fun callArgumentHighest(instructions: array<Insn>, definedMask: int): Map<int, int> {
+    var defined = definedMask
+    val highest = Map<int, int>()
+    var index = 0
+    while (index < instructions.size) {
+        val insn = instructions[index]
+        if (insn.mnemonic == "call8" || insn.mnemonic == "callx8") {
+            highest.set(index, highestBit(defined))
+            defined = (1 << 10) | (1 << 11)
+        } else {
+            val register = writtenArgumentRegister(insn.operands)
+            if (register >= 0) defined = defined | (1 << register)
+        }
+        index = index + 1
+    }
+    highest
+}
+
+// Per block, the argument registers (bitmask) that may hold a value at entry.
+fun callArgumentEntrySets(blocks: array<BasicBlock>, labels: Map<string, int>): array<int> {
+    val successors: array<array<int>> = []
+    val callsFlag: array<bool> = []
+    val writtenMask: array<int> = []
+    var index = 0
+    while (index < blocks.size) {
+        val block = blocks[index]
+        var written = 0
+        var calls = false
+        for (record in block.instructions) {
+            val insn = parseInstruction(record)
+            if (insn.mnemonic == "call8" || insn.mnemonic == "callx8") {
+                calls = true
+                written = (1 << 10) | (1 << 11)
+            } else {
+                val register = writtenArgumentRegister(insn.operands)
+                if (register >= 0) written = written | (1 << register)
+            }
+        }
+        callsFlag.append(calls)
+        writtenMask.append(written)
+        val following: array<int> = if (index + 1 < blocks.size) [index + 1] else []
+        if (block.terminator == "") {
+            successors.append(following)
+            index = index + 1
+            continue
+        }
+        val insn = parseInstruction(block.terminator)
+        if (isReturn(insn.mnemonic)) {
+            successors.append([])
+        } else if (insn.mnemonic == "j" && insn.operands.size == 1 && labels.has(insn.operands[0])) {
+            successors.append([labels.get(insn.operands[0]) ?? 0])
+        } else if (isBranch(insn.mnemonic) && insn.operands.size > 0 && labels.has(insn.operands[insn.operands.size - 1])) {
+            val list: array<int> = [labels.get(insn.operands[insn.operands.size - 1]) ?? 0]
+            for (next in following) list.append(next)
+            successors.append(list)
+        } else {
+            val all: array<int> = []
+            var k = 0
+            while (k < blocks.size) {
+                all.append(k)
+                k = k + 1
+            }
+            successors.append(all)
+        }
+        index = index + 1
+    }
+    val entry: array<int> = filledArray(blocks.size, 0)
+    var changed = true
+    while (changed) {
+        changed = false
+        var b = 0
+        while (b < blocks.size) {
+            val out = if (callsFlag[b]) writtenMask[b] else (entry[b] | writtenMask[b])
+            for (successor in successors[b]) {
+                if ((out & ~entry[successor]) != 0) {
+                    entry[successor] = entry[successor] | out
+                    changed = true
+                }
+            }
+            b = b + 1
+        }
+    }
+    entry
+}
+
+// ---- ENTRY-relative jump tables ----
+
+private fun hexDigitsAt(text: string, from: int): int {
+    var end = from
+    while (end < text.size && isHexByte(text[end])) end = end + 1
+    end
+}
+
+private fun parseHexRange(text: string, from: int, end: int): int {
+    var value = 0
+    var p = from
+    while (p < end) {
+        value = value * 16 + hexValue(text[p])
+        p = p + 1
+    }
+    value
+}
+
+// Recovered GCC jump tables store `99991f+offset` and dispatch with JX: in a typed
+// control-flow function those code addresses become state-machine block numbers.
+fun resolveSelfOffsetTables(body: string): string {
+    val marker = "99991f+0x"
+    if (!body.contains(marker)) return body
+    val requested = Map<int, int>()
+    var at = body.indexOf(marker, 0)
+    while (at >= 0) {
+        val start = at + marker.size
+        val end = hexDigitsAt(body, start)
+        if (end > start) {
+            requested.set(parseHexRange(body, start, end), 1)
+            at = body.indexOf(marker, end)
+        } else {
+            at = body.indexOf(marker, at + 1)
+        }
+    }
+    val lines = splitLines(body)
+    val rewritten: array<string> = []
+    var depth = 0
+    var started = false
+    var codeOffset = 0
+    val inserted = Map<int, int>()
+    val existingTargets = Map<int, string>()
+    var lastTopLabel = ""
+    for (raw in lines) {
+        val line = raw.trim()
+        if (line.startsWith(".pushsection ")) {
+            depth = depth + 1
+            rewritten.append(raw)
+            continue
+        }
+        if (line == ".popsection") {
+            depth = if (depth - 1 > 0) depth - 1 else 0
+            rewritten.append(raw)
+            continue
+        }
+        if (depth != 0) {
+            rewritten.append(raw)
+            continue
+        }
+        if (isLabelLine(line)) {
+            lastTopLabel = line.slice(0, line.size - 1)
+            rewritten.append(raw)
+            continue
+        }
+        if (!started && line.startsWith("entry")) {
+            started = true
+            codeOffset = 0
+        }
+        val executable = started && line.size > 0 && line[0] != 35 && !isLabelLine(line) &&
+            !startsWithAny(line, [".literal ", ".literal_position", ".local ", ".global ", ".hidden ", ".type ", ".size "])
+        if (executable && requested.has(codeOffset)) {
+            if (lastTopLabel != "") {
+                existingTargets.set(codeOffset, lastTopLabel)
+            } else {
+                rewritten.append(".Labla_lift_self_${lowerHex(codeOffset)}:")
+            }
+            inserted.set(codeOffset, 1)
+        }
+        rewritten.append(raw)
+        if (!executable) continue
+        lastTopLabel = ""
+        if (line.startsWith(".byte ")) {
+            codeOffset = codeOffset + splitOperands(line.slice(6, line.size)).size
+            continue
+        }
+        if (line.startsWith(".p2align ")) {
+            val amount = immediate(afterFirstWord(line).split(",")[0])
+            if (amount != null && amount >= 0 && amount <= 12) {
+                val alignment = 1 << amount
+                codeOffset = floorDiv(codeOffset + alignment - 1, alignment) * alignment
+            }
+            continue
+        }
+        if (line.startsWith(".align ") || line.startsWith(".balign ")) {
+            val amount = immediate(afterFirstWord(line).split(",")[0])
+            if (amount != null && amount > 0) {
+                codeOffset = floorDiv(codeOffset + amount - 1, amount) * amount
+            }
+            continue
+        }
+        if (line[0] == 46) continue
+        val insn = parseInstruction(line)
+        codeOffset = codeOffset + (if (insn.mnemonic.endsWith(".n")) 2 else 3)
+    }
+    if (started && requested.has(codeOffset)) {
+        rewritten.append(".Labla_lift_self_${lowerHex(codeOffset)}:")
+        inserted.set(codeOffset, 1)
+    }
+    if (inserted.size == 0) return body
+    val withLabels = rewritten.join("\n")
+    val executableText = removeNestedSections(withLabels)
+    val normalized = normalizeEncodedInstructions(executableText)
+    val records = controlFlowRecords(normalized)
+    if (liftHasError()) {
+        liftClearError()
+        return body
+    }
+    val offsets = Map<int, int>()
+    offsets.set(0, 0)
+    var index = 0
+    while (index < records.blocks.size) {
+        val label = records.blocks[index].label
+        val prefix = ".Labla_lift_self_"
+        if (label.startsWith(prefix) && label.size > prefix.size) {
+            val end = hexDigitsAt(label, prefix.size)
+            if (end == label.size) offsets.set(parseHexRange(label, prefix.size, end), index)
+        }
+        for (offset in existingTargets.keys()) {
+            if (label == (existingTargets.get(offset) ?? "")) offsets.set(offset, index)
+        }
+        index = index + 1
+    }
+    var replaced = 0
+    var out = ""
+    var last = 0
+    var position = withLabels.indexOf(marker, 0)
+    while (position >= 0) {
+        val start = position + marker.size
+        val end = hexDigitsAt(withLabels, start)
+        if (end > start) {
+            val offset = parseHexRange(withLabels, start, end)
+            val mapped = offsets.get(offset)
+            if (mapped != null) {
+                replaced = replaced + 1
+                out = out + withLabels.slice(last, position) + "$mapped"
+                last = end
+            }
+            position = withLabels.indexOf(marker, end)
+        } else {
+            position = withLabels.indexOf(marker, position + 1)
+        }
+    }
+    out = out + withLabels.slice(last, withLabels.size)
+    if (replaced > 0) "# ABLA_LIFT_INTERNAL_JUMP_TABLE\n" + out else out
+}

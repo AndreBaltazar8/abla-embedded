@@ -1,0 +1,1251 @@
+// Lifting one recovered Xtensa body to typed Abla: the straight-line lifter and the
+// program-counter dispatcher used for bodies with branches.
+//
+// lift(name, body) returns a Lifted whose `error` is empty on success; an unsupported
+// instruction leaves the source empty and the reason in `error` (the original raised
+// Unsupported). `unsafe` marks the one error the original did not let callers catch.
+
+import "abla/text"
+import "abla/process/environment"
+import "base.ab"
+import "flow.ab"
+
+class Lifted(val source: string, val usesMemory: bool, val error: string, val unsafe: bool)
+
+fun liftedFailure(message: string, unsafe: bool): Lifted = Lifted("", false, message, unsafe)
+
+fun takeFailure(): Lifted {
+    val failure = Lifted("", false, liftErrorMessage(), liftErrorIsUnsafe())
+    liftClearError()
+    failure
+}
+
+// Re-raise a nested lift's error in the caller.
+fun propagateFailure(lifted: Lifted): void {
+    if (lifted.unsafe) liftFailUnsafe(lifted.error) else liftFail(lifted.error)
+    return
+}
+
+private fun specialRead(mnemonic: string): bool = when (mnemonic) {
+    "rsr.intenable", "rsr.interrupt", "rsr.prid", "rsr.ccount",
+    "rsr.ccompare0", "rsr.cpenable", "rsr.ibreakenable", "rsr.ps",
+    "rsr.excsave4", "rsr.excsave5", "rsr.excsave7",
+    "rsr.debugcause", "rsr.exccause",
+    "rsr.epc1", "rsr.epc2", "rsr.epc3", "rsr.epc4", "rsr.epc5",
+    "rsr.epc6", "rsr.epc7",
+    "rur.threadptr" -> true
+    else -> false
+}
+
+private fun specialWrite(mnemonic: string): bool = when (mnemonic) {
+    "wsr.intenable", "wsr.intset", "wsr.intclear", "wsr.ccompare0",
+    "wsr.cpenable", "wsr.ibreakenable", "wsr.ibreaka0", "wsr.ibreaka1",
+    "wsr.dbreaka0", "wsr.dbreaka1", "wsr.dbreakc0", "wsr.dbreakc1",
+    "wsr.ps", "wsr.ccount", "wsr.eps2", "wsr.epc1", "wsr.epc2",
+    "wsr.epc3", "wsr.eps3", "wsr.vecbase", "wur.threadptr" -> true
+    else -> false
+}
+
+private fun binaryOperator(mnemonic: string): string = when (mnemonic) {
+    "add", "add.n" -> "+"
+    "sub" -> "-"
+    "and" -> "&"
+    "or" -> "|"
+    "xor" -> "^"
+    "mull" -> "*"
+    else -> ""
+}
+
+private fun scaledShift(mnemonic: string): int = when (mnemonic) {
+    "addx2" -> 1
+    "addx4" -> 2
+    "addx8" -> 3
+    else -> 0
+}
+
+// Width of a load in bits, 0 for other mnemonics.
+private fun loadBits(mnemonic: string): int = when (mnemonic) {
+    "l8ui" -> 8
+    "l16ui", "l16si" -> 16
+    "l32i", "l32i.n" -> 32
+    else -> 0
+}
+
+private fun storeBits(mnemonic: string): int = when (mnemonic) {
+    "s8i" -> 8
+    "s16i" -> 16
+    "s32i", "s32i.n" -> 32
+    else -> 0
+}
+
+private fun parameterNames(): array<string> {
+    val names: array<string> = []
+    var index = 2
+    while (index < 8) {
+        names.append("a${index}")
+        index = index + 1
+    }
+    index = 0
+    while (index < 10) {
+        names.append("stack${index}")
+        index = index + 1
+    }
+    names
+}
+
+private fun parameterSource(): string {
+    val parts: array<string> = []
+    for (parameter in parameterNames()) parts.append(parameter + ": u32")
+    parts.join(",\n    ")
+}
+
+private fun intrinsicStore(bits: int): string =
+    if (bits == 8) "ablaUnsafeStoreU8" else if (bits == 16) "ablaUnsafeStoreU16" else "ablaUnsafeStoreU32"
+
+class LinCtx(val statements: array<string>, val assigned: NameSet) {
+    fun add(statement: string): void {
+        this.statements.append(statement)
+        return
+    }
+
+    fun store(destination: string, value: string): void {
+        val name = registerName(destination)
+        this.statements.append("    " + name + " = " + value)
+        this.assigned.add(name)
+        return
+    }
+}
+
+fun envFlag(name: string, wanted: string): bool {
+    val value = processEnvironment(name)
+    value != null && value == wanted
+}
+
+// Lift one body. `outgoingStackWord` is -1 (decide here), 0 or 1 (the function-level
+// verdict when lifting a basic block); `callDefined` is a bitmask of argument registers
+// (10..15) that may hold a value at the block's entry, or -1.
+fun lift(
+    name: string,
+    body: string,
+    assumeAllRegisters: bool = false,
+    assumeWideCalls: bool = false,
+    outgoingStackWord: int = -1,
+    callDefined: int = -1,
+): Lifted {
+    val result = liftBody(name, body, assumeAllRegisters, assumeWideCalls, outgoingStackWord, callDefined)
+    if (liftHasError()) return takeFailure()
+    result
+}
+
+private fun liftBody(
+    name: string,
+    original: string,
+    assumeAllRegisters: bool,
+    assumeWideCalls: bool,
+    outgoingStackWordIn: int,
+    callDefined: int,
+): Lifted {
+    val failed = Lifted("", false, "", false)
+    val body = normalizeEncodedInstructions(original)
+    if (body.contains(".pushsection") || body.contains(".section") || body.contains(".reloc")) {
+        liftFail("nested assembler-owned definitions")
+        return failed
+    }
+    var ambiguousStack: array<int> = []
+    var outgoingStackWord = outgoingStackWordIn
+    if (outgoingStackWord < 0) {
+        val resolved = if (isResolveOutgoingStack()) resolveOutgoingStack(body) else OutgoingStack(false, [], false)
+        if (!resolved.applies) {
+            outgoingStackWord = 0
+            ambiguousStack = ambiguousCallx8StackArguments(body)
+        } else {
+            ambiguousStack = resolved.offsets
+            outgoingStackWord = if (resolved.passWord0) 1 else 0
+        }
+    }
+    if (ambiguousStack.size > 0) {
+        val offsets: array<string> = []
+        for (offset in ambiguousStack) offsets.append("a1+${offset}")
+        liftFail("dynamic CALLX8 may consume untyped outgoing stack arguments at " + offsets.join(", "))
+        return failed
+    }
+    if (bodyHasControlFlow(body)) return liftControlFlowBody(name, body, outgoingStackWord == 1)
+    for (word in ["call0", "call4", "call12", "callx0", "callx4", "callx12", "jx"]) {
+        if (containsWord(body, word)) {
+            liftFail("non-windowed or non-call8 transfer")
+            return failed
+        }
+    }
+
+    val literals = Map<string, string>()
+    val instructions: array<Insn> = []
+    var frameSize = 0
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 35 || isLabelLine(line)) continue
+        if (line.startsWith(".literal ")) {
+            val parts = splitOperands(line.slice(9, line.size))
+            if (parts.size != 2) {
+                liftFail("malformed literal")
+                return failed
+            }
+            literals.set(parts[0], parts[1])
+            continue
+        }
+        if (startsWithAny(line, [".literal_position", ".align ", ".p2align "])) continue
+        if (line == ".byte 0x00" || line == ".byte 0") continue
+        if (line[0] == 46) {
+            liftFail("assembler directive: " + firstWord(line))
+            return failed
+        }
+        val insn = parseInstruction(line)
+        rejectUnsafeSemanticInstruction(insn.mnemonic)
+        if (liftHasError()) return failed
+        if (insn.mnemonic == "entry") {
+            if (insn.operands.size != 2 || insn.operands[0] != "a1") {
+                liftFail("nonstandard ENTRY")
+                return failed
+            }
+            val value = immediate(insn.operands[1])
+            if (value == null || value < 0) {
+                liftFail("nonconstant ENTRY frame")
+                return failed
+            }
+            frameSize = value
+            continue
+        }
+        instructions.append(insn)
+    }
+
+    val assigned = nameSet()
+    var index = 2
+    while (index < 8) {
+        assigned.add("r${index}")
+        index = index + 1
+    }
+    if (assumeAllRegisters) {
+        index = 1
+        while (index < 16) {
+            assigned.add("r${index}")
+            index = index + 1
+        }
+    }
+    if (frameSize > 0) assigned.add("r1")
+    val statements: array<string> = []
+    val usesReturnAddress = containsWord(body, "a0")
+    if (usesReturnAddress && frameSize > 0) {
+        statements.append("    var r0 = \$xtensa returnAddress()")
+        assigned.add("r0")
+    }
+    index = 2
+    while (index < 8) {
+        statements.append("    var r${index} = a${index}")
+        index = index + 1
+    }
+    index = 8
+    while (index < 16) {
+        statements.append("    var r${index} = u32(0)")
+        index = index + 1
+    }
+    val registerPrologueSize = statements.size
+    index = 0
+    while (index < 10) {
+        statements.append("    var incomingStack${index} = stack${index}")
+        index = index + 1
+    }
+    var usesFloat = false
+    for (insn in instructions) {
+        for (value in insn.operands) {
+            if (isFloatRegister(value) || isBoolRegister(value)) usesFloat = true
+        }
+    }
+    if (usesFloat) {
+        index = 0
+        while (index < 16) {
+            statements.append("    var f${index} = f32FromBits(u32(0))")
+            index = index + 1
+        }
+        index = 0
+        while (index < 16) {
+            statements.append("    var b${index} = false")
+            index = index + 1
+        }
+    }
+    statements.append("    var shiftAmount = u32(0)")
+    statements.append("    var compareExchangeExpected = u32(0)")
+    var usesMemory = false
+    var usesLocalFrame = false
+    var returned = false
+    val registerSymbols = Map<string, string>()
+    val ctx = LinCtx(statements, assigned)
+
+    val callHighest = if (callDefined >= 0) callArgumentHighest(instructions, callDefined) else Map<int, int>()
+    var instructionIndex = 0
+    while (instructionIndex < instructions.size) {
+        if (liftHasError()) return failed
+        val position = instructionIndex
+        instructionIndex = instructionIndex + 1
+        val insn = instructions[position]
+        val mnemonic = insn.mnemonic
+        val operands = insn.operands
+        if (returned) {
+            liftFail("instructions after return")
+            return failed
+        }
+        if (isReturn(mnemonic)) {
+            if (operands.size > 0) {
+                liftFail("return operands")
+                return failed
+            }
+            ctx.add("    return r2")
+            returned = true
+            continue
+        }
+        if (mnemonic == "nop" || mnemonic == "nop.n") {
+            ctx.add("    xtensaNoOperation()")
+            continue
+        }
+        if (mnemonic == "excw") continue
+        if (mnemonic == "abla.tlsaddress") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val symbol = operands[1]
+            if (!isPlainSymbol(symbol)) {
+                liftFail("TLS symbol")
+                return failed
+            }
+            ctx.store(operands[0], "\$xtensa tlsAddress {" + symbol + "}")
+            continue
+        }
+        if (mnemonic == "movsp") {
+            if (operands.size != 2 || operands[0] != "a1") {
+                liftFail(mnemonic)
+                return failed
+            }
+            val source = operand(operands[1], assigned)
+            if (!assigned.has("r1")) {
+                liftFail("MOVSP without a materialized stack")
+                return failed
+            }
+            ctx.add("    r1 = u32(nativeStackAllocate(int(r1 - " + source + ")))")
+            usesLocalFrame = true
+            continue
+        }
+        if (mnemonic == "call8" || mnemonic == "callx8") {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            var target = ""
+            var targetRegister = ""
+            var dynamicTarget = false
+            if (mnemonic == "call8") {
+                target = operands[0]
+            } else {
+                targetRegister = registerName(operands[0])
+                target = registerSymbols.get(targetRegister) ?? ""
+                dynamicTarget = target == ""
+                if (!dynamicTarget && statements.size > 0 &&
+                    statements[statements.size - 1].startsWith("    " + targetRegister + " = \$xtensa address ")) {
+                    statements.truncate(statements.size - 1)
+                }
+            }
+            val callArguments: array<string> = []
+            var highestArgument = 9
+            index = 10
+            while (index < 16) {
+                if (assigned.has("r${index}")) highestArgument = index
+                index = index + 1
+            }
+            val limited = callHighest.get(position)
+            if (limited != null && limited < highestArgument) highestArgument = limited
+            index = 10
+            while (index <= highestArgument) {
+                val register = "r${index}"
+                callArguments.append(if (assigned.has(register)) register else "u32(0)")
+                index = index + 1
+            }
+            if (outgoingStackWord == 1) {
+                while (callArguments.size < 6) callArguments.append("u32(0)")
+                callArguments.append("u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r1))))")
+                usesMemory = true
+                usesLocalFrame = true
+            }
+            val arguments = callArguments.join(", ")
+            val wideResult = assumeWideCalls || callSecondaryResultUsed(instructions, position)
+            val modeSuffix = if (wideResult) "Wide" else ""
+            var callSource = ""
+            if (mnemonic == "callx8" && dynamicTarget) {
+                val nativeResult = if (wideResult) "I64" else "I32"
+                var nativeName = "ablaUnsafeCall" + nativeResult
+                for (ignored in callArguments) nativeName = nativeName + "I32"
+                val nativeArguments: array<string> = ["int(" + targetRegister + ")"]
+                for (argument in callArguments) nativeArguments.append("int(" + argument + ")")
+                val conversion = if (wideResult) "u64" else "u32"
+                callSource = conversion + "(" + nativeName + "(" + nativeArguments.join(", ") + "))"
+            } else {
+                callSource = "\$xtensa call" + modeSuffix + " {" + target + "}(" + arguments + ")"
+            }
+            if (wideResult) {
+                val resultName = "callResult${position}"
+                ctx.add("    val " + resultName + " = " + callSource)
+                ctx.add("    r10 = u32(" + resultName + ")")
+                ctx.add("    r11 = u32(" + resultName + " >>> u64(32))")
+            } else {
+                ctx.add("    r10 = " + callSource)
+            }
+            index = 8
+            while (index < 16) {
+                assigned.discard("r${index}")
+                index = index + 1
+            }
+            assigned.add("r10")
+            if (wideResult) assigned.add("r11")
+            registerSymbols.clear()
+            continue
+        }
+        if (operands.size > 0 && isScalarRegister(operands[0]) && storeBits(mnemonic) == 0) {
+            registerSymbols.remove(registerName(operands[0]))
+        }
+        if (mnemonic == "mov" || mnemonic == "mov.n" || mnemonic == "movi" || mnemonic == "movi.n") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            ctx.store(operands[0], operand(operands[1], assigned))
+            if (!isScalarRegister(operands[1]) && immediate(operands[1]) == null) {
+                registerSymbols.set(registerName(operands[0]), operands[1])
+            }
+            continue
+        }
+        if (mnemonic == "l32r") {
+            if (operands.size != 2 || !literals.has(operands[1])) {
+                liftFail("unresolved L32R")
+                return failed
+            }
+            val literal = literals.get(operands[1]) ?? ""
+            ctx.store(operands[0], symbolValue(literal))
+            if (immediate(literal) == null && isSymbolExpression(literal)) {
+                registerSymbols.set(registerName(operands[0]), literal)
+            }
+            continue
+        }
+        if (specialRead(mnemonic)) {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            ctx.store(operands[0], "\$xtensa read {" + mnemonic + "}")
+            continue
+        }
+        if (mnemonic == "rsil") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val level = immediate(operands[1])
+            if (level == null || level < 0 || level > 15) {
+                liftFail("RSIL level")
+                return failed
+            }
+            ctx.store(operands[0], "\$xtensa raiseInterruptLevel {" + "${level}" + "}")
+            continue
+        }
+        if (mnemonic == "wsr.scompare1") {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[0], assigned)
+            ctx.add("    compareExchangeExpected = " + value)
+            continue
+        }
+        if (mnemonic == "s32c1i") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = registerName(operands[0])
+            if (!assigned.has(destination)) {
+                liftFail("atomic desired value is undefined")
+                return failed
+            }
+            val address = memoryAddress(operands[1], operands[2], assigned)
+            ctx.store(operands[0], "\$xtensa atomicCompareExchange(" + address + ", compareExchangeExpected, " + destination + ")")
+            continue
+        }
+        if (specialWrite(mnemonic)) {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[0], assigned)
+            ctx.add("    \$xtensa write(" + value + ") {" + mnemonic + "}")
+            continue
+        }
+        if (mnemonic == "rsync" || mnemonic == "esync") {
+            if (operands.size > 0) {
+                liftFail(mnemonic)
+                return failed
+            }
+            ctx.add("    \$xtensa eventSynchronize()")
+            continue
+        }
+        if (mnemonic == "wfr") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = floatRegisterName(operands[0])
+            val source = operand(operands[1], assigned)
+            ctx.add("    " + destination + " = f32FromBits(" + source + ")")
+            assigned.add(destination)
+            continue
+        }
+        if (mnemonic == "rfr") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val source = floatOperand(operands[1], assigned)
+            ctx.store(operands[0], "f32ToBits(" + source + ")")
+            continue
+        }
+        if (mnemonic == "ufloat.s" || mnemonic == "float.s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val scale = immediate(operands[2])
+            if (scale == null || scale < 0 || scale > 31) {
+                liftFail("floating scale: $mnemonic")
+                return failed
+            }
+            val source = operand(operands[1], assigned)
+            var expression = if (mnemonic == "ufloat.s") "f32FromU32(" + source + ")"
+                else "f32FromI32(i32(" + source + "))"
+            if (scale != 0) expression = expression + " / f32FromU32(u32(" + "${1 << scale}" + "))"
+            val destination = floatRegisterName(operands[0])
+            ctx.add("    " + destination + " = " + expression)
+            assigned.add(destination)
+            continue
+        }
+        if (mnemonic == "utrunc.s" || mnemonic == "trunc.s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val scale = immediate(operands[2])
+            if (scale == null || scale < 0 || scale > 31) {
+                liftFail("floating scale: $mnemonic")
+                return failed
+            }
+            var source = floatOperand(operands[1], assigned)
+            if (scale != 0) source = source + " * f32FromU32(u32(" + "${1 << scale}" + "))"
+            val conversion = if (mnemonic == "utrunc.s") "f32ToU32" else "f32ToI32"
+            ctx.store(operands[0], "u32(" + conversion + "(" + source + "))")
+            continue
+        }
+        if (mnemonic == "mov.s" || mnemonic == "neg.s" || mnemonic == "abs.s") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val source = floatOperand(operands[1], assigned)
+            var expression = source
+            if (mnemonic == "neg.s") expression = "-" + source
+            if (mnemonic == "abs.s") {
+                expression = "if (" + source + " < f32FromBits(u32(0))) -" + source + " else " + source
+            }
+            val destination = floatRegisterName(operands[0])
+            ctx.add("    " + destination + " = " + expression)
+            assigned.add(destination)
+            continue
+        }
+        if (mnemonic == "add.s" || mnemonic == "sub.s" || mnemonic == "mul.s" || mnemonic == "div.s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = floatOperand(operands[1], assigned)
+            val right = floatOperand(operands[2], assigned)
+            val operation = when (mnemonic) {
+                "add.s" -> "+"
+                "sub.s" -> "-"
+                "mul.s" -> "*"
+                else -> "/"
+            }
+            val destination = floatRegisterName(operands[0])
+            ctx.add("    " + destination + " = " + left + " " + operation + " " + right)
+            assigned.add(destination)
+            continue
+        }
+        if (mnemonic == "madd.s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = floatRegisterName(operands[0])
+            if (!assigned.has(destination)) {
+                liftFail("read before definition: " + operands[0])
+                return failed
+            }
+            val left = floatOperand(operands[1], assigned)
+            val right = floatOperand(operands[2], assigned)
+            ctx.add("    " + destination + " = " + destination + " + (" + left + " * " + right + ")")
+            continue
+        }
+        if (mnemonic == "oeq.s" || mnemonic == "olt.s" || mnemonic == "ole.s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = boolRegisterName(operands[0])
+            val left = floatOperand(operands[1], assigned)
+            val right = floatOperand(operands[2], assigned)
+            val operation = if (mnemonic == "oeq.s") "==" else if (mnemonic == "olt.s") "<" else "<="
+            ctx.add("    " + destination + " = " + left + " " + operation + " " + right)
+            assigned.add(destination)
+            continue
+        }
+        if (mnemonic == "lsi") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val address = memoryAddress(operands[1], operands[2], assigned)
+            val destination = floatRegisterName(operands[0])
+            ctx.add("    " + destination + " = f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(" + address + ")))))")
+            assigned.add(destination)
+            usesMemory = true
+            continue
+        }
+        if (mnemonic == "ssi") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val source = floatOperand(operands[0], assigned)
+            val address = memoryAddress(operands[1], operands[2], assigned)
+            ctx.add("    ablaUnsafeStoreU32(nativePointerFromAddress(int(" + address + ")), int(f32ToBits(" + source + ")))")
+            usesMemory = true
+            continue
+        }
+        val binary = binaryOperator(mnemonic)
+        if (binary != "") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val right = operand(operands[2], assigned)
+            ctx.store(operands[0], left + " " + binary + " " + right)
+            continue
+        }
+        if (mnemonic == "addi" || mnemonic == "addi.n" || mnemonic == "addmi") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val amount = immediate(operands[2])
+            if (amount == null) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val operation = if (amount >= 0) "+" else "-"
+            val magnitude = if (amount >= 0) amount else -amount
+            ctx.store(operands[0], left + " " + operation + " u32(" + "${magnitude}" + ")")
+            if (operands[1] == "a1") usesLocalFrame = true
+            continue
+        }
+        val scaled = scaledShift(mnemonic)
+        if (scaled > 0) {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val indexValue = operand(operands[1], assigned)
+            val base = operand(operands[2], assigned)
+            ctx.store(operands[0], "(" + indexValue + " << u32(" + "${scaled}" + ")) + " + base)
+            continue
+        }
+        if (mnemonic == "subx2" || mnemonic == "subx4" || mnemonic == "subx8") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val shift = if (mnemonic == "subx2") 1 else if (mnemonic == "subx4") 2 else 3
+            val scaledValue = operand(operands[1], assigned)
+            val subtrahend = operand(operands[2], assigned)
+            ctx.store(operands[0], "(" + scaledValue + " << u32(" + "${shift}" + ")) - " + subtrahend)
+            continue
+        }
+        if (mnemonic == "slli" || mnemonic == "srli" || mnemonic == "srai") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val amount = operand(operands[2], assigned)
+            var expression = ""
+            if (mnemonic == "slli") expression = value + " << " + amount
+            else if (mnemonic == "srli") expression = value + " >>> " + amount
+            else expression = "u32(" + signedOf(value) + " >> int(" + amount + "))"
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "extui") {
+            if (operands.size != 4) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val offset = immediate(operands[2])
+            val width = immediate(operands[3])
+            if (offset == null || width == null || width < 1 || width > 32) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val mask = if (width == 32) 4294967295 else (1 << width) - 1
+            ctx.store(operands[0], "(" + value + " >>> u32(" + "${offset}" + ")) & u32(" + "${mask}" + ")")
+            continue
+        }
+        if (mnemonic == "sext") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val signBit = immediate(operands[2])
+            if (signBit == null || signBit < 0 || signBit > 31) {
+                liftFail("SEXT sign bit")
+                return failed
+            }
+            val shift = 31 - signBit
+            ctx.store(operands[0], "u32(i32(" + value + " << u32(" + "${shift}" + ")) >> " + "${shift}" + ")")
+            continue
+        }
+        if (mnemonic == "neg" || mnemonic == "abs") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val expression = if (mnemonic == "neg") "u32(0) - " + value
+                else "if (" + signedOf(value) + " < 0) u32(0) - " + value + " else " + value
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "ssr" || mnemonic == "ssl" || mnemonic == "ssai") {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            var value = operand(operands[0], assigned)
+            if (mnemonic == "ssl") value = "u32(32) - (" + value + " & u32(31))"
+            ctx.add("    shiftAmount = " + value + " & u32(31)")
+            continue
+        }
+        if (mnemonic == "sll" || mnemonic == "srl" || mnemonic == "sra") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            var expression = ""
+            if (mnemonic == "sll") expression = value + " << ((u32(32) - shiftAmount) & u32(31))"
+            else if (mnemonic == "srl") expression = value + " >>> shiftAmount"
+            else expression = "u32(" + signedOf(value) + " >> int(shiftAmount))"
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "src") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val high = operand(operands[1], assigned)
+            val low = operand(operands[2], assigned)
+            val expression = "if (shiftAmount == u32(0)) " + low + " else ((" + high +
+                " << (u32(32) - shiftAmount)) | (" + low + " >>> shiftAmount))"
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "ssa8l" || mnemonic == "ssa8b") {
+            if (operands.size != 1) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val value = operand(operands[0], assigned)
+            var amount = "(" + value + " & u32(3)) << u32(3)"
+            if (mnemonic == "ssa8b") amount = "u32(32) - (" + amount + ")"
+            ctx.add("    shiftAmount = (" + amount + ") & u32(31)")
+            continue
+        }
+        if (mnemonic == "nsau") {
+            if (operands.size != 2) {
+                liftFail(mnemonic)
+                return failed
+            }
+            ctx.store(operands[0], "ablaCountLeadingZerosU32(" + operand(operands[1], assigned) + ")")
+            continue
+        }
+        if (mnemonic == "minu" || mnemonic == "maxu" || mnemonic == "min" || mnemonic == "max") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val right = operand(operands[2], assigned)
+            val signedCompare = mnemonic == "min" || mnemonic == "max"
+            val comparison = if (mnemonic == "minu" || mnemonic == "min") "<" else ">"
+            val comparedLeft = if (signedCompare) signedOf(left) else left
+            val comparedRight = if (signedCompare) signedOf(right) else right
+            ctx.store(operands[0], "if (" + comparedLeft + " " + comparison + " " + comparedRight + ") " + left + " else " + right)
+            continue
+        }
+        if (mnemonic == "muluh" || mnemonic == "mulsh") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val right = operand(operands[2], assigned)
+            val expression = if (mnemonic == "muluh") "u32((u64(" + left + ") * u64(" + right + ")) >>> u64(32))"
+                else "u32((i64(" + signedOf(left) + ") * i64(" + signedOf(right) + ")) >> 32)"
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "mul16u" || mnemonic == "mul16s") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val right = operand(operands[2], assigned)
+            val expression = if (mnemonic == "mul16u") "(" + left + " & u32(65535)) * (" + right + " & u32(65535))"
+                else "u32(i32(i16(" + left + ")) * i32(i16(" + right + ")))"
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "quou" || mnemonic == "remu" || mnemonic == "quos" || mnemonic == "rems") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val left = operand(operands[1], assigned)
+            val right = operand(operands[2], assigned)
+            val operation = if (mnemonic == "quou" || mnemonic == "quos") "/" else "%"
+            val expression = if (mnemonic == "quos" || mnemonic == "rems")
+                "u32(" + signedOf(left) + " " + operation + " " + signedOf(right) + ")"
+                else left + " " + operation + " " + right
+            ctx.store(operands[0], expression)
+            continue
+        }
+        if (mnemonic == "moveqz" || mnemonic == "movnez") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = registerName(operands[0])
+            if (!assigned.has(destination)) {
+                liftFail("conditional move into undefined register")
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val condition = operand(operands[2], assigned)
+            val comparison = if (mnemonic == "moveqz") "==" else "!="
+            ctx.add("    if (" + condition + " " + comparison + " u32(0)) " + destination + " = " + value)
+            continue
+        }
+        if (mnemonic == "movgez" || mnemonic == "movltz") {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val destination = registerName(operands[0])
+            if (!assigned.has(destination)) {
+                liftFail("conditional move into undefined register")
+                return failed
+            }
+            val value = operand(operands[1], assigned)
+            val condition = operand(operands[2], assigned)
+            val comparison = if (mnemonic == "movgez") ">=" else "<"
+            ctx.add("    if (i32(" + condition + ") " + comparison + " 0) " + destination + " = " + value)
+            continue
+        }
+        val bitsLoaded = loadBits(mnemonic)
+        if (bitsLoaded != 0) {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            val signedLoad = mnemonic == "l16si"
+            val amount = immediate(operands[2])
+            if (operands[1] == "a1" && amount != null) {
+                val argument = incomingStackLoad(bitsLoaded, signedLoad, amount, frameSize)
+                if (argument != "") {
+                    ctx.store(operands[0], argument)
+                    continue
+                }
+                usesLocalFrame = true
+            }
+            val address = memoryAddress(operands[1], operands[2], assigned)
+            ctx.store(operands[0], loadExpression(bitsLoaded, address, signedLoad))
+            usesMemory = true
+            continue
+        }
+        val bitsStored = storeBits(mnemonic)
+        if (bitsStored != 0) {
+            if (operands.size != 3) {
+                liftFail(mnemonic)
+                return failed
+            }
+            if (operands[1] == "a1") {
+                val amount = immediate(operands[2])
+                if (amount == null) {
+                    liftFail("store into incoming stack arguments")
+                    return failed
+                }
+                val location = incomingStackLocation(amount, frameSize, bitsStored)
+                if (location.index >= 0) {
+                    val value = operand(operands[0], assigned)
+                    val target = "incomingStack${location.index}"
+                    if (bitsStored == 32) {
+                        ctx.add("    " + target + " = " + value)
+                    } else {
+                        val shift = location.byteOffset * 8
+                        val valueMask = (1 << bitsStored) - 1
+                        val fieldMask = unsigned32(~(valueMask << shift))
+                        var inserted = "(" + value + " & u32(" + "${valueMask}" + "))"
+                        if (shift != 0) inserted = "(" + inserted + " << u32(" + "${shift}" + "))"
+                        ctx.add("    " + target + " = (" + target + " & u32(" + "${fieldMask}" + ")) | " + inserted)
+                    }
+                    continue
+                }
+                usesLocalFrame = true
+            }
+            val address = memoryAddress(operands[1], operands[2], assigned)
+            val value = operand(operands[0], assigned)
+            ctx.add("    " + intrinsicStore(bitsStored) + "(nativePointerFromAddress(int(" + address + ")), int(" + value + "))")
+            usesMemory = true
+            continue
+        }
+        if (mnemonic == "memw") {
+            if (operands.size > 0) {
+                liftFail(mnemonic)
+                return failed
+            }
+            ctx.add("    xtensaMemoryBarrier()")
+            continue
+        }
+        if (mnemonic == "break" || mnemonic == "ill" || mnemonic == "ill.n") {
+            ctx.add("    ablaRuntimeTrap()")
+            continue
+        }
+        liftFail("instruction: $mnemonic")
+        return failed
+    }
+    if (liftHasError()) return failed
+
+    if (!returned) {
+        ctx.add("    ablaRuntimeTrap()")
+        ctx.add("    return r2")
+    }
+    var materializes = usesLocalFrame
+    if (!materializes) {
+        for (statement in statements) if (containsWord(statement, "r1")) materializes = true
+    }
+    val finalStatements: array<string> = []
+    if (materializes) {
+        if (frameSize <= 0) {
+            liftFail("frame access without ENTRY")
+            return failed
+        }
+        var at = 0
+        for (statement in statements) {
+            if (at == registerPrologueSize) {
+                finalStatements.append("    val frameAddress = u32(nativeStackAllocate(" + "${frameSize}" + "))")
+                finalStatements.append("    var r1 = frameAddress")
+            }
+            finalStatements.append(statement)
+            at = at + 1
+        }
+        assigned.add("r1")
+    } else {
+        for (statement in statements) finalStatements.append(statement)
+    }
+    val source = "trusted fun " + name + "(\n    " + parameterSource() + "\n): u32 {\n" +
+        finalStatements.join("\n") + "\n}"
+    Lifted(source, usesMemory || usesLocalFrame, "", false)
+}
+
+// Statements of one basic block lifted by the linear lifter, without the block-local
+// frame materialization (the outer function owns one frame and one register set).
+class BlockStatements(val statements: array<string>, val usesMemory: bool)
+
+fun liftedLinearStatements(
+    name: string,
+    literals: array<string>,
+    instructions: array<string>,
+    frameSize: int,
+    outgoingStackWord: bool,
+    callDefined: int,
+): BlockStatements {
+    val none = BlockStatements([], false)
+    val parts: array<string> = []
+    for (literal in literals) parts.append(literal)
+    parts.append("entry a1, ${frameSize}")
+    for (instruction in instructions) parts.append(instruction)
+    parts.append("retw.n")
+    val fake = parts.join("\n")
+    val outgoing = if (isResolveOutgoingStack()) (if (outgoingStackWord) 1 else 0) else -1
+    val lifted = lift(name + "Block", fake, true, true, outgoing, callDefined)
+    if (lifted.error != "") {
+        propagateFailure(lifted)
+        return none
+    }
+    val marker = "    var shiftAmount = u32(0)\n    var compareExchangeExpected = u32(0)\n"
+    val begin = lifted.source.indexOf(marker, 0)
+    val end = lifted.source.lastIndexOf("\n    return r2\n}")
+    if (begin < 0 || end < 0) {
+        liftFail("cannot extract lifted basic block")
+        return none
+    }
+    val body = if (begin + marker.size <= end) lifted.source.slice(begin + marker.size, end) else ""
+    val kept: array<string> = []
+    if (body.size > 0) {
+        for (statement in splitLines(body)) {
+            val trimmed = statement.trim()
+            if (trimmed.startsWith("val frameAddress = u32(nativeStackAllocate(") || trimmed == "var r1 = frameAddress") continue
+            kept.append(statement)
+        }
+    }
+    BlockStatements(kept, lifted.usesMemory)
+}
+
+fun controlFlowMaterializesStack(blocks: array<BasicBlock>, frameSize: int): bool {
+    for (block in blocks) {
+        for (line in block.instructions) {
+            val insn = parseInstruction(line)
+            if (!containsLine(insn.operands, "a1")) continue
+            if ((insn.mnemonic == "l32i" || insn.mnemonic == "l32i.n") && insn.operands.size == 3 &&
+                insn.operands[1] == "a1") {
+                val offset = immediate(insn.operands[2])
+                if (offset != null && offset >= frameSize && floorMod(offset - frameSize, 4) == 0) continue
+            }
+            return true
+        }
+    }
+    false
+}
+
+private fun liftControlFlowBody(name: string, body: string, outgoingStackWord: bool): Lifted {
+    val failed = Lifted("", false, "", false)
+    if (body.contains(".pushsection") || body.contains(".section") || body.contains(".reloc")) {
+        liftFail("nested assembler-owned definitions")
+        return failed
+    }
+    val internalJumpTable = body.contains("ABLA_LIFT_INTERNAL_JUMP_TABLE")
+    val records = controlFlowRecords(body)
+    if (liftHasError()) return failed
+    val blocks = records.blocks
+    val frameSize = records.frameSize
+    val labels = Map<string, int>()
+    var blockIndex = 0
+    while (blockIndex < blocks.size) {
+        labels.set(blocks[blockIndex].label, blockIndex)
+        blockIndex = blockIndex + 1
+    }
+    // Only sequential fallthrough to LEND performs the implicit hardware-loop back edge.
+    val hardwareEnds = Map<string, int>()
+    for (candidate in blocks) {
+        if (candidate.terminator != "") {
+            val insn = parseInstruction(candidate.terminator)
+            if (insn.mnemonic == "loop" || insn.mnemonic == "loopnez" || insn.mnemonic == "loopgtz") {
+                if (insn.operands.size < 2) {
+                    liftFail("loop operands: " + insn.mnemonic)
+                    return failed
+                }
+                hardwareEnds.set(insn.operands[1], 1)
+            }
+        }
+    }
+    val statements: array<string> = []
+    var index = 2
+    if (containsWord(body, "a0") && frameSize > 0) statements.append("    var r0 = \$xtensa returnAddress()")
+    while (index < 8) {
+        statements.append("    var r${index} = a${index}")
+        index = index + 1
+    }
+    index = 8
+    while (index < 16) {
+        statements.append("    var r${index} = u32(0)")
+        index = index + 1
+    }
+    index = 0
+    while (index < 10) {
+        statements.append("    var incomingStack${index} = stack${index}")
+        index = index + 1
+    }
+    if (containsFloatOrBoolRegister(body)) {
+        index = 0
+        while (index < 16) {
+            statements.append("    var f${index} = f32FromBits(u32(0))")
+            index = index + 1
+        }
+        index = 0
+        while (index < 16) {
+            statements.append("    var b${index} = false")
+            index = index + 1
+        }
+    }
+    val materializesStack = controlFlowMaterializesStack(blocks, frameSize)
+    if (materializesStack) {
+        statements.append("    val frameAddress = u32(nativeStackAllocate(" + "${frameSize}" + "))")
+        statements.append("    var r1 = frameAddress")
+    } else {
+        statements.append("    var r1 = u32(0)")
+    }
+    statements.append("    var shiftAmount = u32(0)")
+    statements.append("    var compareExchangeExpected = u32(0)")
+    statements.append("    var programCounter = 0")
+    statements.append("    var loopCounter = u32(0)")
+    statements.append("    var loopStart = 0")
+    statements.append("    var loopEnd = 0")
+    statements.append("    var loopActive = false")
+    statements.append("    while (true) {")
+    statements.append("        if (loopActive && programCounter == loopEnd) {")
+    statements.append("            loopCounter = loopCounter - u32(1)")
+    statements.append("            if (loopCounter != u32(0)) programCounter = loopStart")
+    statements.append("            if (loopCounter == u32(0)) loopActive = false")
+    statements.append("        }")
+    var usesMemory = materializesStack
+
+    statements.append("        when (programCounter) {")
+    val callEntry = if (!envFlag("ABLA_LIFT_ALL_CALL_ARGUMENTS", "1")) callArgumentEntrySets(blocks, labels) else []
+    val useCallEntry = !envFlag("ABLA_LIFT_ALL_CALL_ARGUMENTS", "1")
+    blockIndex = 0
+    while (blockIndex < blocks.size) {
+        val block = blocks[blockIndex]
+        statements.append("            ${blockIndex} -> {")
+        val lifted = liftedLinearStatements(
+            name, records.literals, block.instructions, frameSize, outgoingStackWord,
+            if (useCallEntry) callEntry[blockIndex] else -1,
+        )
+        if (liftHasError()) return failed
+        usesMemory = usesMemory || lifted.usesMemory
+        for (statement in lifted.statements) statements.append("        " + statement)
+        val nextIndex = blockIndex + 1
+        if (block.terminator != "") {
+            val insn = parseInstruction(block.terminator)
+            val mnemonic = insn.mnemonic
+            val operands = insn.operands
+            if (isReturn(mnemonic)) {
+                statements.append("            return r2")
+            } else if (mnemonic == "j") {
+                if (operands.size != 1) {
+                    liftFail("J operands")
+                    return failed
+                }
+                val target = operands[0]
+                if (labels.has(target)) {
+                    val targetIndex = labels.get(target) ?? 0
+                    if (hardwareEnds.has(target)) {
+                        statements.append("            if (loopEnd == ${targetIndex}) loopActive = false")
+                    }
+                    statements.append("            programCounter = ${targetIndex}")
+                } else {
+                    statements.append("            return \$xtensa call {" + target + "}(r2, r3, r4, r5, r6, r7)")
+                }
+            } else if (mnemonic == "jx") {
+                if (operands.size != 1) {
+                    liftFail("JX operands")
+                    return failed
+                }
+                val target = registerName(operands[0])
+                if (internalJumpTable) {
+                    statements.append("            programCounter = int(" + target + ")")
+                } else {
+                    statements.append("            return u32(ablaUnsafeCallI32I32I32I32I32I32I32(int(" + target +
+                        "), int(r2), int(r3), int(r4), int(r5), int(r6), int(r7)))")
+                }
+            } else if (isBranch(mnemonic)) {
+                val branch = branchCondition(mnemonic, operands)
+                if (liftHasError()) return failed
+                val target = branch.target
+                if (!labels.has(target)) {
+                    liftFail("unknown branch target: $target")
+                    return failed
+                }
+                if (nextIndex >= blocks.size) {
+                    liftFail("conditional branch without fallthrough")
+                    return failed
+                }
+                val targetIndex = labels.get(target) ?? 0
+                if (hardwareEnds.has(target)) {
+                    statements.append("            if ((" + branch.condition + ") && loopEnd == ${targetIndex}) loopActive = false")
+                }
+                statements.append("            programCounter = if (" + branch.condition + ") ${targetIndex} else ${nextIndex}")
+            } else if (mnemonic.startsWith("loop")) {
+                if (operands.size != 2) {
+                    liftFail("loop operands: $mnemonic")
+                    return failed
+                }
+                val count = operand(operands[0], allLoopRegisters())
+                val target = operands[1]
+                if (!labels.has(target) || nextIndex >= blocks.size) {
+                    liftFail("invalid hardware-loop target")
+                    return failed
+                }
+                val targetIndex = labels.get(target) ?? 0
+                var condition = ""
+                if (mnemonic == "loopgtz") condition = "i32(" + count + ") > 0"
+                else if (mnemonic == "loopnez") condition = count + " != u32(0)"
+                else condition = "true"
+                statements.append("            loopCounter = " + count)
+                statements.append("            loopStart = ${nextIndex}")
+                statements.append("            loopEnd = ${targetIndex}")
+                statements.append("            loopActive = " + condition)
+                statements.append("            programCounter = if (" + condition + ") ${nextIndex} else ${targetIndex}")
+            } else {
+                liftFail("terminator: $mnemonic")
+                return failed
+            }
+        } else if (nextIndex < blocks.size) {
+            statements.append("            programCounter = ${nextIndex}")
+        } else {
+            statements.append("            ablaRuntimeTrap()")
+            statements.append("            return r2")
+        }
+        statements.append("        }")
+        blockIndex = blockIndex + 1
+    }
+    statements.append("            else -> ablaRuntimeTrap()")
+    statements.append("        }")
+    statements.append("    }")
+    statements.append("    r2")
+    val source = "trusted fun " + name + "(\n    " + parameterSource() + "\n): u32 {\n" +
+        statements.join("\n") + "\n}"
+    Lifted(source, usesMemory, "", false)
+}
+
+private fun allLoopRegisters(): NameSet {
+    val all = nameSet()
+    var index = 1
+    while (index < 16) {
+        all.add("r${index}")
+        index = index + 1
+    }
+    all
+}
+
+// Lift a body with branches as a program-counter dispatcher (lift_control_flow).
+fun liftControlFlow(name: string, body: string, outgoingStackWord: bool = false): Lifted {
+    val result = liftControlFlowBody(name, body, outgoingStackWord)
+    if (liftHasError()) return takeFailure()
+    result
+}

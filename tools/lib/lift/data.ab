@@ -1,0 +1,634 @@
+// Assembler-owned data and helper functions nested in a recovered body: parsing a data
+// section, moving it into Abla static storage, and moving local helper functions out.
+
+import "abla/text"
+import "base.ab"
+import "flow.ab"
+import "lift.ab"
+
+// ---- names ----
+
+fun dataIdentifier(symbol: string): string {
+    var readable = readableName(symbol)
+    if (readable.size == 0 || isDigitByte(readable[0])) readable = "data_" + readable
+    "esp32Data_" + readable + "_" + sha1Prefix(symbol)
+}
+
+fun internalHelperName(symbol: string): string {
+    var readable = readableName(symbol)
+    if (readable.size == 0 || isDigitByte(readable[0])) readable = "local_" + readable
+    "esp32Internal_" + readable + "_" + sha1Prefix(symbol)
+}
+
+// Exact native bytes as an Abla string expression (no C terminator is added).
+fun ablaByteString(value: array<int>): string {
+    val chunks: array<string> = []
+    var offset = 0
+    while (offset < value.size) {
+        var chunk = ""
+        var index = offset
+        while (index < value.size && index < offset + 32) {
+            chunk = chunk + "\\x" + hexByteText(value[index])
+            index = index + 1
+        }
+        chunks.append(chunk)
+        offset = offset + 32
+    }
+    if (chunks.size == 1) return "\"" + chunks[0] + "\""
+    val quoted: array<string> = []
+    for (chunk in chunks) quoted.append("\"" + chunk + "\"")
+    "(\n        " + quoted.join(" +\n        ") + "\n    )"
+}
+
+// ---- Python string literals (ast.literal_eval of an assembler string) ----
+
+class LiteralBytes(val ok: bool, val bytes: array<int>)
+
+private fun octalValue(c: int): int = if (c >= 48 && c <= 55) c - 48 else -1
+
+fun pythonStringLiteral(text: string): LiteralBytes {
+    val bad = LiteralBytes(false, [])
+    val out: array<int> = []
+    var index = 0
+    var literals = 0
+    while (index < text.size) {
+        while (index < text.size && isSpaceByte(text[index])) index = index + 1
+        if (index >= text.size) break
+        val quote = text[index]
+        if (quote != 34 && quote != 39) return bad
+        if (index + 2 < text.size && text[index + 1] == quote && text[index + 2] == quote) return bad
+        index = index + 1
+        var closed = false
+        while (index < text.size && !closed) {
+            val c = text[index]
+            if (c == quote) {
+                closed = true
+                index = index + 1
+            } else if (c == 10 || c == 13) {
+                return bad
+            } else if (c == 92) {
+                if (index + 1 >= text.size) return bad
+                val e = text[index + 1]
+                index = index + 2
+                if (e == 92 || e == 39 || e == 34) out.append(e)
+                else if (e == 110) out.append(10)
+                else if (e == 116) out.append(9)
+                else if (e == 114) out.append(13)
+                else if (e == 97) out.append(7)
+                else if (e == 98) out.append(8)
+                else if (e == 102) out.append(12)
+                else if (e == 118) out.append(11)
+                else if (octalValue(e) >= 0) {
+                    var value = octalValue(e)
+                    var digits = 1
+                    while (digits < 3 && index < text.size && octalValue(text[index]) >= 0) {
+                        value = value * 8 + octalValue(text[index])
+                        index = index + 1
+                        digits = digits + 1
+                    }
+                    if (value > 255) return bad
+                    out.append(value)
+                } else if (e == 120) {
+                    if (index + 1 >= text.size || !isHexByte(text[index]) || !isHexByte(text[index + 1])) return bad
+                    out.append(hexValue(text[index]) * 16 + hexValue(text[index + 1]))
+                    index = index + 2
+                } else if (e == 10 || e == 13 || e == 117 || e == 85 || e == 78) {
+                    return bad
+                } else {
+                    out.append(92)
+                    out.append(e)
+                }
+            } else if (c >= 128) {
+                // UTF-8 text decoded to code points, then encoded as latin-1
+                if ((c == 194 || c == 195) && index + 1 < text.size && (text[index + 1] & 192) == 128) {
+                    out.append(((c & 3) << 6) | (text[index + 1] & 63))
+                    index = index + 2
+                } else {
+                    return bad
+                }
+            } else {
+                out.append(c)
+                index = index + 1
+            }
+        }
+        if (!closed) return bad
+        literals = literals + 1
+    }
+    if (literals == 0) return bad
+    LiteralBytes(true, out)
+}
+
+// ---- data sections ----
+
+class ParsedData(
+    val error: string,
+    val labels: Map<string, int>,
+    val bytesAt: Map<int, int>,
+    val symbolOffsets: array<int>,
+    val symbolWidths: array<int>,
+    val symbolExpressions: array<string>,
+    val size: int,
+)
+
+private fun dataFailure(message: string): ParsedData =
+    ParsedData(message, Map<string, int>(), Map<int, int>(), [], [], [], 0)
+
+private fun isDataPrefix(line: string): bool = startsWithAny(line, [
+    ".local ", ".global ", ".hidden ", ".weak ", ".type ", ".size ",
+])
+
+// Expand `.rept N ... .endr`; returns the lines, or an error text in `error`.
+class Expansion(val lines: array<string>, val error: string)
+
+private fun expandRepetitions(sectionBody: string): Expansion {
+    val original = splitLines(sectionBody)
+    val expanded: array<string> = []
+    var lineIndex = 0
+    while (lineIndex < original.size) {
+        val line = original[lineIndex]
+        val stripped = line.trim()
+        if (stripped.startsWith(".rept ")) {
+            val count = immediate(afterFirstWord(stripped))
+            if (count == null || count < 0 || count > 4096) return Expansion([], "unsupported data repetition")
+            val repeated: array<string> = []
+            lineIndex = lineIndex + 1
+            while (lineIndex < original.size && original[lineIndex].trim() != ".endr") {
+                if (original[lineIndex].trim().startsWith(".rept ")) return Expansion([], "nested data repetition")
+                repeated.append(original[lineIndex])
+                lineIndex = lineIndex + 1
+            }
+            if (lineIndex >= original.size) return Expansion([], "unterminated data repetition")
+            var times = 0
+            while (times < count) {
+                for (item in repeated) expanded.append(item)
+                times = times + 1
+            }
+            lineIndex = lineIndex + 1
+            continue
+        }
+        if (stripped == ".endr") return Expansion([], "unmatched data repetition")
+        expanded.append(line)
+        lineIndex = lineIndex + 1
+    }
+    Expansion(expanded, "")
+}
+
+// Section name, labels, initialized bytes and symbolic stores of a data section.
+fun parseDataSection(header: string, sectionBody: string): ParsedData {
+    val expansion = expandRepetitions(sectionBody)
+    if (expansion.error != "") return dataFailure(expansion.error)
+    var offset = 0
+    val labels = Map<string, int>()
+    val bytesAt = Map<int, int>()
+    val symbolOffsets: array<int> = []
+    val symbolWidths: array<int> = []
+    val symbolExpressions: array<string> = []
+    val constants = Map<string, int>()
+    for (raw in expansion.lines) {
+        val line = raw.trim()
+        if (line.size == 0 || line[0] == 35) continue
+        if (isLabelLine(line)) {
+            labels.set(line.slice(0, line.size - 1), offset)
+            continue
+        }
+        if (isDataPrefix(line)) continue
+        if (line.startsWith(".set ")) {
+            val fields = splitOperands(line.slice(5, line.size))
+            if (fields.size != 2) return dataFailure("malformed data constant")
+            var value = immediate(fields[1])
+            if (value == null) {
+                val reference = constantReference(fields[1])
+                if (reference.size == 0 || !constants.has(reference[0])) return dataFailure("unsupported data constant")
+                var resolved = constants.get(reference[0]) ?? 0
+                if (reference[1] != "") {
+                    val amount = immediate(reference[2]) ?? 0
+                    resolved = if (reference[1] == "+") resolved + amount else resolved - amount
+                }
+                value = resolved
+            }
+            constants.set(fields[0], value ?? 0)
+            continue
+        }
+        if (line.startsWith(".p2align ")) {
+            val value = immediate(afterFirstWord(line).split(",")[0])
+            if (value == null || value < 0 || value > 12) return dataFailure("unsupported data alignment")
+            val amount = 1 << value
+            offset = floorDiv(offset + amount - 1, amount) * amount
+            continue
+        }
+        if (line.startsWith(".align ") || line.startsWith(".balign ")) {
+            val value = immediate(afterFirstWord(line).split(",")[0])
+            if (value == null) return dataFailure("unsupported data alignment")
+            if (value < 1 || value > 4096) return dataFailure("unsupported data alignment")
+            offset = floorDiv(offset + value - 1, value) * value
+            continue
+        }
+        if (line.startsWith(".zero ") || line.startsWith(".space ")) {
+            val value = immediate(afterFirstWord(line).split(",")[0])
+            if (value == null || value < 0) return dataFailure("unsupported zero fill")
+            offset = offset + value
+            continue
+        }
+        var directive = ""
+        var directiveWidth = 0
+        if (line == ".byte" || line.startsWith(".byte ")) { directive = ".byte"; directiveWidth = 1 }
+        else if (line == ".short" || line.startsWith(".short ")) { directive = ".short"; directiveWidth = 2 }
+        else if (line == ".word" || line.startsWith(".word ")) { directive = ".word"; directiveWidth = 4 }
+        else if (line == ".long" || line.startsWith(".long ")) { directive = ".long"; directiveWidth = 4 }
+        if (directiveWidth != 0) {
+            val values = splitOperands(line.slice(directive.size, line.size).trim())
+            if (values.size == 0 || (values.size == 1 && values[0] == "")) return dataFailure("empty data directive")
+            for (valueText in values) {
+                val fromConstant = constants.get(valueText)
+                val value = if (fromConstant != null) fromConstant else immediate(valueText)
+                if (value != null) {
+                    val encoded = value & ((1 << (directiveWidth * 8)) - 1)
+                    var byteIndex = 0
+                    while (byteIndex < directiveWidth) {
+                        bytesAt.set(offset + byteIndex, (encoded >> (byteIndex * 8)) & 255)
+                        byteIndex = byteIndex + 1
+                    }
+                } else {
+                    if (directiveWidth != 2 && directiveWidth != 4) return dataFailure("symbolic byte data")
+                    symbolValue(valueText)
+                    if (liftHasError()) {
+                        val message = liftErrorMessage()
+                        liftClearError()
+                        return dataFailure(message)
+                    }
+                    symbolOffsets.append(offset)
+                    symbolWidths.append(directiveWidth)
+                    symbolExpressions.append(valueText)
+                }
+                offset = offset + directiveWidth
+            }
+            continue
+        }
+        if (line.startsWith(".ascii ") || line.startsWith(".asciz ")) {
+            val literal = pythonStringLiteral(afterFirstWord(line))
+            if (!literal.ok) return dataFailure("unsupported assembler string")
+            for (byte in literal.bytes) {
+                bytesAt.set(offset, byte)
+                offset = offset + 1
+            }
+            if (line.startsWith(".asciz ")) {
+                bytesAt.set(offset, 0)
+                offset = offset + 1
+            }
+            continue
+        }
+        return dataFailure("data directive: " + firstWord(line))
+    }
+    if (labels.size == 0) return dataFailure("data section without a label")
+    if (offset < 1) offset = 1
+    ParsedData("", labels, bytesAt, symbolOffsets, symbolWidths, symbolExpressions, offset)
+}
+
+// `NAME` or `NAME +/- NUMBER`: [name, operator, number] or an empty array.
+private fun constantReference(text: string): array<string> {
+    val none: array<string> = []
+    if (text.size == 0 || !isSymbolStart(text[0])) return none
+    var index = 1
+    while (index < text.size && isSymbolByte(text[index])) index = index + 1
+    val name = text.slice(0, index)
+    var p = index
+    while (p < text.size && isSpaceByte(text[p])) p = p + 1
+    if (p == text.size) return [name, "", ""]
+    if (text[p] != 43 && text[p] != 45) return none
+    val operator = text.slice(p, p + 1)
+    p = p + 1
+    while (p < text.size && isSpaceByte(text[p])) p = p + 1
+    val rest = text.slice(p, text.size)
+    var ok = false
+    if (rest.size > 2 && rest[0] == 48 && (rest[1] == 120 || rest[1] == 88)) {
+        ok = true
+        var at = 2
+        while (at < rest.size) {
+            if (!isHexByte(rest[at])) ok = false
+            at = at + 1
+        }
+    }
+    if (!ok && isAllDigits(rest)) ok = true
+    if (!ok) return none
+    [name, operator, rest]
+}
+
+class ExtractedData(
+    val body: string,
+    val declarations: array<string>,
+    val addresses: Map<string, string>,
+    val count: int,
+)
+
+private fun isExecutableSectionHeader(header: string, sectionName: string): bool =
+    header.contains("\"ax\"") || startsWithAny(sectionName, [".text", ".iram", ".rtc.text"])
+
+// re.search(r'"[A-Za-z]*T[A-Za-z]*"', header): a quoted flag set holding T (TLS)
+private fun headerHasThreadLocalFlag(header: string): bool {
+    var open = header.indexOf("\"", 0)
+    while (open >= 0) {
+        var p = open + 1
+        var hasT = false
+        while (p < header.size && isAlphaByte(header[p])) {
+            if (header[p] == 84) hasT = true
+            p = p + 1
+        }
+        if (p < header.size && header[p] == 34 && hasT) return true
+        open = header.indexOf("\"", open + 1)
+    }
+    false
+}
+
+// (?m)^\.(?:global|weak)\s+SYMBOL\s*$
+private fun declaresGlobal(body: string, symbol: string): bool {
+    for (line in body.split("\n")) {
+        var index = -1
+        if (line.startsWith(".global")) index = 7
+        else if (line.startsWith(".weak")) index = 5
+        if (index < 0 || index >= line.size || !isSpaceByte(line[index])) continue
+        if (line.slice(index, line.size).trim() == symbol) return true
+    }
+    false
+}
+
+fun sectionNameOf(header: string): string {
+    val comma = header.indexOf(",", 0)
+    (if (comma < 0) header else header.slice(0, comma)).trim()
+}
+
+// `allowedCross` (when `useAllowed`) names labels other raw bodies may still reference.
+fun extractLiftableDataSections(
+    body: string,
+    rawBodies: array<string>,
+    allowedCross: NameSet,
+    useAllowed: bool,
+): ExtractedData {
+    val declarations: array<string> = []
+    val addresses = Map<string, string>()
+    var count = 0
+    val matches = findNestedSections(body)
+    var out = ""
+    var last = 0
+    for (match in matches) {
+        val header = match.header
+        val sectionName = sectionNameOf(header)
+        var keep = isExecutableSectionHeader(header, sectionName)
+        // TLS storage needs an LLVM thread-local global; Wi-Fi log formats stay in their
+        // `.rodata_wlog_<level>.N` sections.
+        if (!keep && headerHasThreadLocalFlag(header)) keep = true
+        if (!keep && sectionName.startsWith(".rodata_wlog_")) keep = true
+        var parsed = ParsedData("", Map<string, int>(), Map<int, int>(), [], [], [], 0)
+        if (!keep) {
+            parsed = parseDataSection(header, match.body)
+            if (parsed.error != "") keep = true
+        }
+        if (!keep && keepGlobalData) {
+            for (symbol in parsed.labels.keys()) {
+                if (declaresGlobal(body, symbol)) keep = true
+            }
+        }
+        if (!keep) {
+            // A raw body cannot consume a dynamic Abla address.
+            for (symbol in parsed.labels.keys()) {
+                var total = 0
+                for (candidate in rawBodies) total = total + countOccurrences(candidate, symbol)
+                if (total > countOccurrences(body, symbol) && (!useAllowed || !allowedCross.has(symbol))) keep = true
+            }
+        }
+        if (keep) continue
+        out = out + body.slice(last, match.start)
+        last = match.end
+
+        val labels = parsed.labels
+        val bytesAt = parsed.bytesAt
+        val firstSymbol = labels.keys()[0]
+        val baseName = dataIdentifier(firstSymbol)
+        val storageName = baseName + "Storage"
+        var size = if (parsed.size > 1) parsed.size else 1
+        if (bytesAt.size > 0) {
+            var maxByte = -1
+            for (position in bytesAt.keys()) if (position > maxByte) maxByte = position
+            if (maxByte + 1 > size) size = maxByte + 1
+        }
+        var symbolIndex = 0
+        while (symbolIndex < parsed.symbolOffsets.size) {
+            val end = parsed.symbolOffsets[symbolIndex] + parsed.symbolWidths[symbolIndex]
+            if (end > size) size = end
+            symbolIndex = symbolIndex + 1
+        }
+        var maxLabel = -1
+        for (symbol in labels.keys()) {
+            val value = labels.get(symbol) ?? 0
+            if (value > maxLabel) maxLabel = value
+        }
+        if (labels.size > 0 && maxLabel + 1 > size) size = maxLabel + 1
+        val stores: array<string> = []
+        val occupied = Map<int, int>()
+        symbolIndex = 0
+        while (symbolIndex < parsed.symbolOffsets.size) {
+            val position = parsed.symbolOffsets[symbolIndex]
+            val width = parsed.symbolWidths[symbolIndex]
+            val expression = parsed.symbolExpressions[symbolIndex]
+            var k = position
+            while (k < position + width) {
+                occupied.set(k, 1)
+                k = k + 1
+            }
+            val intrinsic = if (width == 2) "ablaUnsafeStoreU16" else "ablaUnsafeStoreU32"
+            stores.append("    " + intrinsic + "(nativePointerFromAddress(" + storageName + " + " + "${position}" +
+                "), int(" + symbolValue(expression) + "))")
+            symbolIndex = symbolIndex + 1
+        }
+        var position = 0
+        while (position < size) {
+            if (occupied.has(position)) {
+                position = position + 1
+                continue
+            }
+            var width = 0
+            if (position % 4 == 0 && wordPresent(bytesAt, occupied, position, 4)) width = 4
+            else if (position % 2 == 0 && wordPresent(bytesAt, occupied, position, 2)) width = 2
+            else if (bytesAt.has(position)) width = 1
+            if (width == 0) {
+                position = position + 1
+                continue
+            }
+            var value = 0
+            var byteIndex = 0
+            while (byteIndex < width) {
+                value = value + ((bytesAt.get(position + byteIndex) ?? 0) << (8 * byteIndex))
+                byteIndex = byteIndex + 1
+            }
+            if (value != 0) {
+                val intrinsic = if (width == 1) "ablaUnsafeStoreU8" else if (width == 2) "ablaUnsafeStoreU16" else "ablaUnsafeStoreU32"
+                stores.append("    " + intrinsic + "(nativePointerFromAddress(" + storageName + " + " + "${position}" +
+                    "), " + "${value}" + ")")
+            }
+            position = position + width
+        }
+
+        val lines: array<string> = ["val " + storageName + " = nativeStaticAllocate(" + "${size}" + ")"]
+        var addressBase = storageName
+        if (stores.size > 0) {
+            val initializeName = baseName + "Initialize"
+            val initializedName = baseName + "Initialized"
+            lines.append("trusted fun " + initializeName + "(): int {")
+            for (store in stores) lines.append(store)
+            lines.append("    " + storageName)
+            lines.append("}")
+            lines.append("val " + initializedName + " = " + initializeName + "()")
+            addressBase = initializedName
+        }
+        for (symbol in labels.keys()) {
+            val labelOffset = labels.get(symbol) ?? 0
+            val identifier = dataIdentifier(symbol)
+            var expression = "u32(" + addressBase + ")"
+            if (labelOffset != 0) expression = "u32(" + addressBase + " + " + "${labelOffset}" + ")"
+            lines.append("val " + identifier + " = " + expression)
+            addresses.set(symbol, identifier)
+        }
+        declarations.append(lines.join("\n"))
+        count = count + 1
+    }
+    out = out + body.slice(last, body.size)
+    ExtractedData(out.trim(), declarations, addresses, count)
+}
+
+private fun wordPresent(bytesAt: Map<int, int>, occupied: Map<int, int>, position: int, width: int): bool {
+    var index = 0
+    while (index < width) {
+        if (!bytesAt.has(position + index) || occupied.has(position + index)) return false
+        index = index + 1
+    }
+    true
+}
+
+class StrippedData(val body: string, val symbols: Map<string, int>)
+
+fun stripParseableDataSections(body: string): StrippedData {
+    val symbols = Map<string, int>()
+    var out = ""
+    var last = 0
+    for (match in findNestedSections(body)) {
+        val header = match.header
+        val sectionName = sectionNameOf(header)
+        if (isExecutableSectionHeader(header, sectionName)) continue
+        val parsed = parseDataSection(header, match.body)
+        if (parsed.error != "") continue
+        for (symbol in parsed.labels.keys()) symbols.set(symbol, 1)
+        out = out + body.slice(last, match.start)
+        last = match.end
+    }
+    out = out + body.slice(last, body.size)
+    StrippedData(out.trim(), symbols)
+}
+
+// ---- GNU .set aliases ----
+
+class AliasSplit(val body: string, val aliases: array<string>)
+
+fun extractFunctionAliases(body: string): AliasSplit {
+    var depth = 0
+    val aliases: array<string> = []
+    val declared = Map<string, int>()
+    val kept: array<string> = []
+    for (raw in splitLines(body)) {
+        val line = raw.trim()
+        if (line.startsWith(".pushsection ")) {
+            depth = depth + 1
+            kept.append(raw)
+            continue
+        }
+        if (line == ".popsection") {
+            depth = if (depth - 1 > 0) depth - 1 else 0
+            kept.append(raw)
+            continue
+        }
+        if (depth == 0 && startsWithAny(line, [".local ", ".global ", ".weak "])) {
+            declared.set(afterFirstWord(line).trim(), 1)
+            continue
+        }
+        if (depth == 0 && line.startsWith(".set ")) {
+            val values = splitOperands(line.slice(5, line.size))
+            if (values.size == 2 && declared.has(values[0])) {
+                aliases.append(values[0])
+                continue
+            }
+        }
+        kept.append(raw)
+    }
+    AliasSplit(kept.join("\n"), aliases)
+}
+
+// ---- local helper functions ----
+
+class ExtractedHelpers(
+    val body: string,
+    val declarations: array<string>,
+    val count: int,
+    val usesMemory: bool,
+    val reasons: array<string>,
+)
+
+// `.type SYMBOL, @function` at the start of a line: the symbol, or "".
+private fun functionTypeSymbol(sectionBody: string): string {
+    for (line in sectionBody.split("\n")) {
+        if (!line.startsWith(".type")) continue
+        var p = 5
+        if (p >= line.size || !isSpaceByte(line[p])) continue
+        while (p < line.size && isSpaceByte(line[p])) p = p + 1
+        val start = p
+        while (p < line.size && line[p] != 44 && !isSpaceByte(line[p])) p = p + 1
+        if (p == start) continue
+        val symbol = line.slice(start, p)
+        while (p < line.size && isSpaceByte(line[p])) p = p + 1
+        if (p >= line.size || line[p] != 44) continue
+        p = p + 1
+        while (p < line.size && isSpaceByte(line[p])) p = p + 1
+        if (line.slice(p, line.size).trim() == "@function") return symbol
+    }
+    ""
+}
+
+// Move assembler-owned local functions into ordinary Abla definitions.
+fun extractLiftableTextHelpers(owner: string, body: string): ExtractedHelpers {
+    val declarations: array<string> = []
+    var count = 0
+    var usesMemory = false
+    val reasons: array<string> = []
+    var out = ""
+    var last = 0
+    for (match in findNestedSections(body)) {
+        val header = match.header
+        val sectionName = sectionNameOf(header)
+        if (!isExecutableSectionHeader(header, sectionName)) continue
+        val sectionBody = match.body
+        val symbol = functionTypeSymbol(sectionBody)
+        if (symbol == "") {
+            reasons.append("nested executable section without function type")
+            continue
+        }
+        val helperName = internalHelperName(symbol)
+        val kept: array<string> = []
+        for (raw in splitLines(sectionBody)) {
+            val line = raw.trim()
+            if (startsWithAny(line, [".p2align ", ".align ", ".balign ", ".local ", ".global ", ".hidden ", ".type ", ".size "])) continue
+            if (line == symbol + ":") continue
+            kept.append(raw)
+        }
+        val helperBody = resolveSelfOffsetTables(kept.join("\n").trim())
+        val result = lift(helperName, helperBody)
+        if (result.error != "") {
+            reasons.append("nested helper: " + result.error)
+            continue
+        }
+        declarations.append(result.source + "\n\n" +
+            "val " + helperName + "Link = #internalFunction(\"" + helperName + "\", \"" + symbol + "\")")
+        count = count + 1
+        usesMemory = usesMemory || result.usesMemory
+        out = out + body.slice(last, match.start)
+        last = match.end
+    }
+    out = out + body.slice(last, body.size)
+    ExtractedHelpers(out.trim(), declarations, count, usesMemory, reasons)
+}
