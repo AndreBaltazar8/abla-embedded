@@ -1,0 +1,352 @@
+// A reader for the TOML subset the recovery profiles (tools/recovery/*.toml) use:
+// comments, `[table]` and `[[array of tables]]` headers (dotted), bare, dotted and
+// quoted keys, basic and literal strings, integers, booleans and (possibly
+// multi-line, nested) arrays of those. Inline tables, dates, floats and
+// multi-line strings are rejected with an error, not misread.
+//
+// The document is flat: every value is stored under its full dotted key, and the
+// entries of an array of tables are `path[0].key`, `path[1].key`, ... (see
+// tomlTableCount). Python's tomllib read these files before; the profile reader
+// of tools/recover-member.ab is the only user.
+import "abla/text"
+
+val TOML_STRING = 1
+val TOML_INT = 2
+val TOML_BOOL = 3
+val TOML_ARRAY = 4
+
+// `text` is the string (or the bool as "true"/"false"), `number` the integer;
+// `items` holds the elements of an array as text (strings unquoted).
+class TomlValue(val kind: int, val text: string, val number: int, val items: array<string>)
+
+class TomlDoc(
+    val error: string,
+    val values: Map<string, TomlValue>,
+    val keys: array<string>,
+    val counts: Map<string, int>
+)
+
+private class TomlCursor(val text: string, var pos: int, var error: string)
+
+private fun tomlIsSpace(c: int): bool = c == 32 || c == 9
+
+private fun tomlIsBareKeyByte(c: int): bool =
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45
+
+private fun TomlCursor.fail(message: string): void {
+    if (this.error == "") this.error = message
+}
+
+private fun TomlCursor.peek(): int = if (this.pos < this.text.size) this.text[this.pos] else -1
+
+// Skips blanks; with `lines`, also newlines and comments (inside arrays).
+private fun TomlCursor.skip(lines: bool): void {
+    while (this.pos < this.text.size) {
+        val c = this.text[this.pos]
+        if (tomlIsSpace(c)) {
+            this.pos = this.pos + 1
+        } else if (lines && (c == 10 || c == 13)) {
+            this.pos = this.pos + 1
+        } else if (lines && c == 35) {
+            while (this.pos < this.text.size && this.text[this.pos] != 10) this.pos = this.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+private fun tomlHexValue(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 65 && c <= 70) return c - 55
+    if (c >= 97 && c <= 102) return c - 87
+    -1
+}
+
+// A basic ("...") or literal ('...') string at the cursor.
+private fun TomlCursor.string(): string {
+    val quote = this.text[this.pos]
+    if (this.pos + 2 < this.text.size && this.text[this.pos + 1] == quote && this.text[this.pos + 2] == quote) {
+        this.fail("multi-line strings are not supported")
+        return ""
+    }
+    this.pos = this.pos + 1
+    val parts: array<string> = []
+    var start = this.pos
+    while (this.pos < this.text.size) {
+        val c = this.text[this.pos]
+        if (c == quote) {
+            parts.append(this.text.slice(start, this.pos))
+            this.pos = this.pos + 1
+            return parts.join("")
+        }
+        if (c == 10) break
+        if (c == 92 && quote == 34) {
+            parts.append(this.text.slice(start, this.pos))
+            this.pos = this.pos + 1
+            val e = this.peek()
+            if (e == 110) parts.append("\n")
+            else if (e == 116) parts.append("\t")
+            else if (e == 114) parts.append("\r")
+            else if (e == 34) parts.append("\"")
+            else if (e == 92) parts.append("\\")
+            else if (e == 117 || e == 85) {
+                val digits = if (e == 117) 4 else 8
+                var scalar = 0
+                var index = 0
+                while (index < digits) {
+                    val h = if (this.pos + 1 + index < this.text.size) tomlHexValue(this.text[this.pos + 1 + index]) else -1
+                    if (h < 0) {
+                        this.fail("bad unicode escape")
+                        return ""
+                    }
+                    scalar = scalar * 16 + h
+                    index = index + 1
+                }
+                parts.append(utf8Encode(scalar))
+                this.pos = this.pos + digits
+            } else {
+                this.fail("unsupported string escape")
+                return ""
+            }
+            this.pos = this.pos + 1
+            start = this.pos
+        } else {
+            this.pos = this.pos + 1
+        }
+    }
+    this.fail("unterminated string")
+    ""
+}
+
+private fun TomlCursor.bareKey(): string {
+    val start = this.pos
+    while (this.pos < this.text.size && tomlIsBareKeyByte(this.text[this.pos])) this.pos = this.pos + 1
+    this.text.slice(start, this.pos)
+}
+
+// A dotted key (`a.b."c d"`) at the cursor, as its parts.
+private fun TomlCursor.dottedKey(): array<string> {
+    val parts: array<string> = []
+    while (this.error == "") {
+        this.skip(false)
+        val c = this.peek()
+        if (c == 34 || c == 39) {
+            parts.append(this.string())
+        } else {
+            val part = this.bareKey()
+            if (part == "") {
+                this.fail("expected a key")
+                return parts
+            }
+            parts.append(part)
+        }
+        this.skip(false)
+        if (this.peek() == 46) {
+            this.pos = this.pos + 1
+        } else {
+            return parts
+        }
+    }
+    parts
+}
+
+private fun tomlParseInteger(word: string): TomlValue? {
+    var text = word.replace("_", "")
+    var sign = 1
+    if (text.startsWith("+")) {
+        text = text.slice(1, text.size)
+    } else if (text.startsWith("-")) {
+        sign = -1
+        text = text.slice(1, text.size)
+    }
+    if (text == "") return null
+    var base = 10
+    if (text.startsWith("0x")) {
+        base = 16
+        text = text.slice(2, text.size)
+    } else if (text.startsWith("0o")) {
+        base = 8
+        text = text.slice(2, text.size)
+    } else if (text.startsWith("0b")) {
+        base = 2
+        text = text.slice(2, text.size)
+    }
+    if (text == "") return null
+    var value = 0
+    for (c in text) {
+        val digit = tomlHexValue(c)
+        if (digit < 0 || digit >= base) return null
+        value = value * base + digit
+    }
+    TomlValue(TOML_INT, word, sign * value, [])
+}
+
+// A value at the cursor.
+private fun TomlCursor.value(): TomlValue {
+    this.skip(false)
+    val c = this.peek()
+    if (c == 34 || c == 39) {
+        val text = this.string()
+        return TomlValue(TOML_STRING, text, 0, [])
+    }
+    if (c == 91) {
+        this.pos = this.pos + 1
+        val items: array<string> = []
+        while (this.error == "") {
+            this.skip(true)
+            if (this.peek() == 93) {
+                this.pos = this.pos + 1
+                return TomlValue(TOML_ARRAY, "", items.size, items)
+            }
+            if (this.peek() < 0) {
+                this.fail("unterminated array")
+                break
+            }
+            val item = this.value()
+            if (item.kind == TOML_ARRAY) {
+                this.fail("nested arrays are not supported")
+                break
+            }
+            items.append(if (item.kind == TOML_INT) "${item.number}" else item.text)
+            this.skip(true)
+            if (this.peek() == 44) {
+                this.pos = this.pos + 1
+            } else if (this.peek() != 93) {
+                this.fail("expected , or ] in an array")
+                break
+            }
+        }
+        return TomlValue(TOML_ARRAY, "", 0, items)
+    }
+    if (c == 123) {
+        this.fail("inline tables are not supported")
+        return TomlValue(TOML_STRING, "", 0, [])
+    }
+    val start = this.pos
+    while (this.pos < this.text.size) {
+        val d = this.text[this.pos]
+        if (tomlIsSpace(d) || d == 10 || d == 13 || d == 35 || d == 44 || d == 93) break
+        this.pos = this.pos + 1
+    }
+    val word = this.text.slice(start, this.pos)
+    if (word == "true" || word == "false") return TomlValue(TOML_BOOL, word, if (word == "true") 1 else 0, [])
+    val number = tomlParseInteger(word)
+    if (number != null) return number
+    this.fail("unsupported value `$word`")
+    TomlValue(TOML_STRING, "", 0, [])
+}
+
+private fun tomlJoinKey(prefix: string, parts: array<string>): string {
+    var key = prefix
+    for (part in parts) key = if (key == "") part else key + "." + part
+    key
+}
+
+fun tomlParse(text: string): TomlDoc {
+    val values: Map<string, TomlValue> = Map()
+    val counts: Map<string, int> = Map()
+    val keys: array<string> = []
+    val cursor = TomlCursor(text, 0, "")
+    var prefix = ""
+    var line = 1
+    while (cursor.error == "") {
+        cursor.skip(true)
+        if (cursor.peek() < 0) break
+        line = 1
+        var scan = 0
+        while (scan < cursor.pos) {
+            if (text[scan] == 10) line = line + 1
+            scan = scan + 1
+        }
+        if (cursor.peek() == 91) {
+            cursor.pos = cursor.pos + 1
+            val array = cursor.peek() == 91
+            if (array) cursor.pos = cursor.pos + 1
+            val path = tomlJoinKey("", cursor.dottedKey())
+            cursor.skip(false)
+            if (cursor.peek() != 93 || (array && (cursor.pos + 1 >= text.size || text[cursor.pos + 1] != 93))) {
+                cursor.fail("bad table header")
+            } else {
+                cursor.pos = cursor.pos + (if (array) 2 else 1)
+                if (array) {
+                    val previous = counts.get(path)
+                    val index = if (previous == null) 0 else previous
+                    counts.set(path, index + 1)
+                    prefix = path + "[" + "$index" + "]"
+                } else {
+                    prefix = path
+                    if (!counts.has(path)) counts.set(path, 1)
+                }
+            }
+        } else {
+            val key = tomlJoinKey(prefix, cursor.dottedKey())
+            cursor.skip(false)
+            if (cursor.error == "" && cursor.peek() != 61) cursor.fail("expected =")
+            if (cursor.error == "") {
+                cursor.pos = cursor.pos + 1
+                val value = cursor.value()
+                if (cursor.error == "") {
+                    if (values.has(key)) cursor.fail("duplicate key `$key`")
+                    values.set(key, value)
+                    keys.append(key)
+                }
+            }
+        }
+        if (cursor.error == "") {
+            cursor.skip(false)
+            val c = cursor.peek()
+            if (c == 35) {
+                while (cursor.pos < text.size && text[cursor.pos] != 10) cursor.pos = cursor.pos + 1
+            } else if (c >= 0 && c != 10 && c != 13) {
+                cursor.fail("unexpected text after a value")
+            }
+        }
+    }
+    val error = if (cursor.error == "") "" else "line $line: ${cursor.error}"
+    TomlDoc(error, values, keys, counts)
+}
+
+fun TomlDoc.has(key: string): bool = this.values.has(key)
+
+fun TomlDoc.string(key: string, fallback: string = ""): string {
+    val value = this.values.get(key)
+    if (value == null || value.kind != TOML_STRING) fallback else value.text
+}
+
+fun TomlDoc.bool(key: string, fallback: bool = false): bool {
+    val value = this.values.get(key)
+    if (value == null || value.kind != TOML_BOOL) fallback else value.number != 0
+}
+
+fun TomlDoc.int(key: string, fallback: int = 0): int {
+    val value = this.values.get(key)
+    if (value == null || value.kind != TOML_INT) fallback else value.number
+}
+
+fun TomlDoc.strings(key: string): array<string> {
+    val value = this.values.get(key)
+    val copy: array<string> = []
+    if (value != null && value.kind == TOML_ARRAY) {
+        for (item in value.items) copy.append(item)
+    }
+    copy
+}
+
+// The direct child keys of table `path`, in file order.
+fun TomlDoc.childKeys(path: string): array<string> {
+    val found: array<string> = []
+    val prefix = path + "."
+    for (key in this.keys) {
+        if (key.startsWith(prefix)) {
+            val rest = key.slice(prefix.size, key.size)
+            if (rest.indexOf(".") < 0 && rest.indexOf("[") < 0) found.append(rest)
+        }
+    }
+    found
+}
+
+// How many `[[path]]` entries (1 for a plain `[path]` table, 0 when absent).
+fun TomlDoc.tableCount(path: string): int {
+    val count = this.counts.get(path)
+    if (count == null) 0 else count
+}

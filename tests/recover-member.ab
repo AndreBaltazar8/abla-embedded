@@ -1,0 +1,552 @@
+// Tests for the pure parts of tools/recover-member.ab. The expected values are what the
+// original Python driver (tools/recover-member before its removal; `git show py-removal:tools/recover-member`)
+// produced for the same fixtures.
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/time"
+import "../tools/recover-member.ab"
+
+var failures = 0
+
+fun expectText(label: string, actual: string, expected: string): void {
+    if (actual != expected) {
+        println("FAIL $label: expected")
+        println(expected)
+        println("got")
+        println(actual)
+        failures = failures + 1
+    }
+    return
+}
+
+val FIXTURE_ROM_SCRIPT = """
+/* comment PROVIDE(hidden = 0x1); */
+PROVIDE ( esp_rom_a = 0x40000010 );
+PROVIDE(b=0x2);
+foo = 0x40005358;
+  bar =
+    0x4000AB;
+ /* x */ notmatched = 0x1;
+baz = 0x2 /* c */ ;
+/* unclosed PROVIDE(late = 3);
+
+"""
+
+val FIXTURE_ROM_SCRIPT2 = """
+PROVIDE(first = 0x1);
+/* a
+   multi-line comment */ glued = 0x5;
+qux = 0X7F;
+  indented_name   =   0x10   ;
+not_a_name 1 = 0x3;
+9bad = 0x4;
+
+"""
+
+val FIXTURE_TABLE_JUMPS = """
+import "x"
+trusted fun jumpA(a2: u32): u32 {
+    var r10 = a2
+    r11 = (r10 << u32(2)) + r12
+    r13 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+    r14 = r13
+    return u32(ablaUnsafeCall(int(r13), r10))
+}
+trusted fun jumpPrefix(a2: u32): u32 {
+    r11 = (r10 << u32(2)) + r12
+    r1 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+    return u32(ablaUnsafeCallWide(int(r12), r10))
+}
+trusted fun jumpFar(a2: u32): u32 {
+    r11 = (r10 << u32(2)) + r12
+    r13 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+    r14 = 1
+    r14 = 2
+    r14 = 3
+    r14 = 4
+    r14 = 5
+    r14 = 6
+    r14 = 7
+    r14 = 8
+    r14 = 9
+    return u32(ablaUnsafeCall(int(r13), r10))
+}
+trusted fun jumpEightLines(a2: u32): u32 {
+    r11 = (r10 << u32(2)) + r12
+    r13 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+    r14 = 1
+    r14 = 2
+    r14 = 3
+    r14 = 4
+    r14 = 5
+    r14 = 6
+    r14 = 7
+    r14 = 8
+
+    return u32(ablaUnsafeCall(int(r13), r10))
+}
+trusted fun rawJump(): void = $xtensa instructions {
+    r11 = (r10 << u32(2)) + r12
+    r13 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11))))
+    return u32(ablaUnsafeCall(int(r13), r10))
+}
+trusted fun plain(a2: u32): u32 {
+    return a2
+}
+
+"""
+
+val FIXTURE_VOLATILE = """
+import "foo"
+trusted fun a(): u32 {
+    xtensaMemoryBarrier()
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11 + u32(4)))))
+    return r10
+}
+trusted fun b(): u32 {
+    xtensaMemoryBarrier()
+    var r12 = r11 + u32(8)
+    r13 = u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r12))))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r13)), u32(r14))
+}
+trusted fun c(): void {
+    xtensaMemoryBarrier()
+    r10 = foo(r11)
+    ablaUnsafeStoreU8(nativePointerFromAddress(int(r10 + u32(1))), u8(r12))
+}
+trusted fun d(): void {
+    xtensaMemoryBarrier()
+    r10 = u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(r11)))) + u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(r12))))
+}
+trusted fun e(): void {
+    xtensaMemoryBarrier()
+    if (r10 != u32(0)) {
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r10))))
+    } else {
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r12))))
+    }
+    xtensaMemoryBarrier()
+}
+trusted fun f(): void {
+    xtensaMemoryBarrier()
+    r11 = r10 + u32(3)
+    r12 = u64(r11)
+    r13 = u32(ablaUnsafeLoadU16(nativePointerFromAddress(int(r11))))
+}
+
+"""
+
+val FIXTURE_VOLATILE_NONE = """
+import "abla/unsafe/mmio"
+trusted fun a(): u32 {
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11 + u32(4)))))
+    return r10
+}
+
+"""
+
+val FIXTURE_ADDEND = """
+.text
+movi a2, foo+0x10
+movi a3,  bar.baz-0x4  
+  movi a4, notmatched+0x1
+.literal .LC0, sym$1+0xff
+.literal .LC1, sym+5
+l32r a2, .LC0
+movi a5, other
+
+"""
+
+val FIXTURE_CALLRES = """
+trusted fun a(): u32 {
+    val callResult1 = f(r10)
+    r10 = callResult1
+    val callResult1 = g(r10)
+    r11 = callResult1 + callResult12
+}
+@section(".x")
+trusted fun b(): u32 {
+    val callResult7 = f(r10)
+    r10 = callResult7 + callResult70
+    val callResult2 = h()
+}
+fun other(): void {
+    val callResult3 = 1
+    callResult3
+}
+
+"""
+
+val FIXTURE_FALLTHROUGH = """
+trusted fun a(): u32 {
+    return r2
+}
+trusted fun b(): u32 {
+    r2 = 1
+}
+trusted fun c(): void {
+    r2 = 1
+}
+trusted fun d(x: u32): u32 {
+    ablaRuntimeTrap()
+
+}
+trusted fun e(): u32 {
+    r2 = 3
+    if (r2 != 0) {
+        return r2
+    }
+}
+fun f(): : u32 {
+    r2 = 1
+}
+
+"""
+
+val FIXTURE_LINK = """
+import "abla/build"
+
+compile fun memberLink(): bool {
+    if (!exportFunction("esp32RecoveredFoo", "foo")) return false
+    if (!exportFunction("esp32RecoveredBar", "bar")) return false
+    if (!internalFunction("esp32RecoveredHelper", ".Labla_recovered_helper_local_1")) return false
+    if (!requiredInternalFunction("esp32RecoveredOther", ".Labla_recovered_other_local_2")) return false
+    if (!exportFunction("esp32RecoveredFoo2", "foo2")) return false
+    true
+}
+
+"""
+
+val FIXTURE_WEAK_MODULE = """
+import "x"
+trusted fun esp32RecoveredFoo(): u32 {
+    return esp32RecoveredHelper() + esp32RecoveredHelperX()
+}
+trusted fun esp32RecoveredHelper(): u32 {
+    return esp32RecoveredOther()
+}
+trusted fun esp32RecoveredOther(): u32 {
+    return 1
+}
+
+"""
+
+val SYMBOL_LINES = [
+    "00000000 g     F .text\t00000056 coex_rom_data_init",
+    "00000000 l    d  .text\t00000000 .text",
+    "00000004       O *COM*\t00000004 shared_counter",
+    "00000010  w    F .text.abc\t0000001c weak_fn",
+    "00000000 g     F .text\t00000010 .hidden hidden_fn",
+    "SYMBOL TABLE:",
+    "zz g     F .text\t00000010 bad",
+    "0000001c l     O .dram1.1\t00000004 local_data",
+    "00000000 g       *UND*\t00000000 undefined_fn",
+    "00000000 g     F .iram1\t0000002 short_size_ok"
+]
+
+val EXPECT_SYMBOLS = """
+g     F|.text|coex_rom_data_init
+l    d |.text|.text
+      O|*COM*|shared_counter
+ w    F|.text.abc|weak_fn
+None
+None
+None
+l     O|.dram1.1|local_data
+g      |*UND*|undefined_fn
+g     F|.iram1|short_size_ok
+"""
+
+val EXPECT_ROM1 = """
+b
+bar
+baz
+esp_rom_a
+foo
+late
+notmatched
+"""
+
+val EXPECT_ROM2 = """
+first
+glued
+indented_name
+"""
+
+val EXPECT_JUMPS = """
+jumpA,jumpEightLines
+"""
+
+val EXPECT_VOLATILE_CHANGED = """
+6
+"""
+
+val EXPECT_VOLATILE = """
+import "abla/unsafe/mmio"
+import "foo"
+trusted fun a(): u32 {
+    r10 = u32(ablaUnsafeVolatileLoadU32(int(r11 + u32(4))))
+    return r10
+}
+trusted fun b(): u32 {
+    var r12 = r11 + u32(8)
+    r13 = u32(ablaUnsafeVolatileLoadU16(int(r12)))
+    ablaUnsafeStoreU32(nativePointerFromAddress(int(r13)), u32(r14))
+}
+trusted fun c(): void {
+    xtensaMemoryBarrier()
+    r10 = foo(r11)
+    ablaUnsafeVolatileStoreU8(int(r10 + u32(1)), u8(r12))
+}
+trusted fun d(): void {
+    xtensaMemoryBarrier()
+    r10 = u32(ablaUnsafeVolatileLoadU8(int(r11))) + u32(ablaUnsafeLoadU8(nativePointerFromAddress(int(r12))))
+}
+trusted fun e(): void {
+    xtensaMemoryBarrier()
+    if (r10 != u32(0)) {
+        r11 = u32(ablaUnsafeVolatileLoadU32(int(r10)))
+    } else {
+        r11 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r12))))
+    }
+    xtensaMemoryBarrier()
+}
+trusted fun f(): void {
+    r11 = r10 + u32(3)
+    r12 = u64(r11)
+    r13 = u32(ablaUnsafeVolatileLoadU16(int(r11)))
+}
+
+"""
+
+val EXPECT_VOLATILENONE_CHANGED = """
+0
+"""
+
+val EXPECT_VOLATILENONE = """
+import "abla/unsafe/mmio"
+trusted fun a(): u32 {
+    r10 = u32(ablaUnsafeLoadU32(nativePointerFromAddress(int(r11 + u32(4)))))
+    return r10
+}
+
+"""
+
+val EXPECT_ADDEND = """
+.text
+.set .Labla_addend_NsX_0, foo+0x10
+movi a2, .Labla_addend_NsX_0
+.set .Labla_addend_NsX_1, bar.baz-0x4
+movi a3,  .Labla_addend_NsX_1
+  movi a4, notmatched+0x1
+.set .Labla_addend_NsX_2, sym$1+0xff
+.literal .LC0, .Labla_addend_NsX_2
+.literal .LC1, sym+5
+l32r a2, .LC0
+movi a5, other
+
+"""
+
+val EXPECT_CALLRES = """
+trusted fun a(): u32 {
+    val callResult1 = f(r10)
+    r10 = callResult1
+    val callResult2 = g(r10)
+    r11 = callResult2 + callResult12
+}
+@section(".x")
+trusted fun b(): u32 {
+    val callResult1 = f(r10)
+    r10 = callResult1 + callResult70
+    val callResult2 = h()
+}
+fun other(): void {
+    val callResult3 = 1
+    callResult3
+}
+
+"""
+
+val EXPECT_FALLTHROUGH = """
+trusted fun a(): u32 {
+    return r2
+}
+trusted fun b(): u32 {
+    r2 = 1
+    ablaRuntimeTrap()
+    return r2
+}
+trusted fun c(): void {
+    r2 = 1
+}
+trusted fun d(x: u32): u32 {
+    ablaRuntimeTrap()
+
+}
+trusted fun e(): u32 {
+    r2 = 3
+    if (r2 != 0) {
+        return r2
+    }
+    ablaRuntimeTrap()
+    return r2
+}
+fun f(): : u32 {
+    r2 = 1
+}
+
+"""
+
+val EXPECT_LOCAL_MODULE = """
+import "x"
+trusted fun esp32RecoveredFoo(): u32 {
+    return esp32RecoveredNsHelper() + esp32RecoveredHelperX()
+}
+trusted fun esp32RecoveredNsHelper(): u32 {
+    return esp32RecoveredNsOther()
+}
+trusted fun esp32RecoveredNsOther(): u32 {
+    return 1
+}
+
+"""
+
+val EXPECT_LOCAL_LINK = """
+import "abla/build"
+
+compile fun memberLink(): bool {
+    if (!exportFunction("esp32RecoveredFoo", "foo")) return false
+    if (!exportFunction("esp32RecoveredBar", "bar")) return false
+    if (!internalFunction("esp32RecoveredNsHelper", ".Labla_recovered_helper_local_1")) return false
+    if (!requiredInternalFunction("esp32RecoveredNsOther", ".Labla_recovered_other_local_2")) return false
+    if (!exportFunction("esp32RecoveredFoo2", "foo2")) return false
+    true
+}
+
+"""
+
+val EXPECT_WEAK_MODULE = """
+import "x"
+trusted fun esp32RecoveredFoo(): u32 {
+    return esp32RecoveredHelper() + esp32RecoveredHelperX()
+}
+trusted fun esp32RecoveredHelper(): u32 {
+    return esp32RecoveredOther()
+}
+trusted fun esp32RecoveredOther(): u32 {
+    return 1
+}
+
+// Weak ABI definitions; strong ESP-IDF definitions take precedence.
+@naked
+trusted fun esp32RecoveredNsWeakAliases(): void = $xtensa instructions {
+.weak foo
+.set foo, abla_weak_foo
+.weak foo2
+.set foo2, abla_weak_foo2
+ret.n
+}
+
+"""
+
+val EXPECT_WEAK_LINK = """
+import "abla/build"
+
+compile fun memberLink(): bool {
+    if (!requiredInternalFunction("esp32RecoveredFoo", "abla_weak_foo")) return false
+    if (!exportFunction("esp32RecoveredBar", "bar")) return false
+    if (!internalFunction("esp32RecoveredHelper", ".Labla_recovered_helper_local_1")) return false
+    if (!requiredInternalFunction("esp32RecoveredOther", ".Labla_recovered_other_local_2")) return false
+    if (!requiredInternalFunction("esp32RecoveredFoo2", "abla_weak_foo2")) return false
+    if (!requiredInternalFunction("esp32RecoveredNsWeakAliases", "abla_weak_aliases_Ns")) return false
+    true
+}
+
+"""
+
+val EXPECT_NAMES = """
+esp32RecoveredCoexRomDataInit
+esp32RecoveredABCD9z
+esp32RecoveredLower
+Wl_Chm2C
+Ieee80211_Action_Vendor
+A1B
+X_Y9Z
+Esp32s3
+WlChm2C
+Ieee80211ActionVendor
+A1BXY
+"""
+
+
+fun symbolSummary(line: string): string {
+    val m = parseSymbolLine(line)
+    if (!m.ok) return "None"
+    m.flags + "|" + m.section + "|" + m.name
+}
+
+fun romNames(script: string): string {
+    val text = stripLinkerComments(script)
+    val names: array<string> = []
+    val values: array<string> = []
+    romAssignments(text, names, values)
+    for (m in RM_ROM_PROVIDE.findAll(text)) names.append(m.group(1) ?? "")
+    sortedStrings(uniqueStrings(names)).join("\n")
+}
+
+fun transformed(directory: string, name: string, text: string): string {
+    Path(directory + "/" + name).writeText(text)
+    directory + "/" + name
+}
+
+fun main: int {
+    val directory = "/tmp/abla-recover-member-test-${realtimeNanoseconds()}"
+    Path(directory).createDirectories()
+    val symbols: array<string> = []
+    for (line in SYMBOL_LINES) symbols.append(symbolSummary(line))
+    expectText("symbols", symbols.join("\n"), EXPECT_SYMBOLS)
+    expectText("rom1", romNames(FIXTURE_ROM_SCRIPT), EXPECT_ROM1)
+    expectText("rom2", romNames(FIXTURE_ROM_SCRIPT2), EXPECT_ROM2)
+    expectText("jumps", unloweredTableJumps(transformed(directory, "jumps.ab", FIXTURE_TABLE_JUMPS)).join(","), EXPECT_JUMPS)
+
+    val volatile = transformed(directory, "volatile.ab", FIXTURE_VOLATILE)
+    expectText("volatile changed", "${volatileAfterMemoryBarriers(volatile)}", EXPECT_VOLATILE_CHANGED)
+    expectText("volatile", Path(volatile).readText(), EXPECT_VOLATILE)
+    val untouched = transformed(directory, "volatilenone.ab", FIXTURE_VOLATILE_NONE)
+    expectText("volatile none changed", "${volatileAfterMemoryBarriers(untouched)}", EXPECT_VOLATILENONE_CHANGED)
+    expectText("volatile none", Path(untouched).readText(), EXPECT_VOLATILENONE)
+
+    val addend = transformed(directory, "addend.ab", FIXTURE_ADDEND)
+    aliasSymbolAddends(addend, "NsX")
+    expectText("addend", Path(addend).readText(), EXPECT_ADDEND)
+    val callres = transformed(directory, "callres.ab", FIXTURE_CALLRES)
+    uniqueCallResults(callres)
+    expectText("callres", Path(callres).readText(), EXPECT_CALLRES)
+    val fall = transformed(directory, "fall.ab", FIXTURE_FALLTHROUGH)
+    terminateFallthrough(fall)
+    expectText("fallthrough", Path(fall).readText(), EXPECT_FALLTHROUGH)
+
+    val module = transformed(directory, "n.ab", FIXTURE_WEAK_MODULE)
+    val link = transformed(directory, "n_link.ab", FIXTURE_LINK)
+    namespaceLocalFunctions(module, link, "Ns")
+    expectText("local module", Path(module).readText(), EXPECT_LOCAL_MODULE)
+    expectText("local link", Path(link).readText(), EXPECT_LOCAL_LINK)
+    Path(module).writeText(FIXTURE_WEAK_MODULE)
+    Path(link).writeText(FIXTURE_LINK)
+    keepWeakFunctionsWeak(module, link, ["absent", "foo", "foo2"], "Ns")
+    expectText("weak module", Path(module).readText(), EXPECT_WEAK_MODULE)
+    expectText("weak link", Path(link).readText(), EXPECT_WEAK_LINK)
+
+    val names: array<string> = [
+        ablaFunctionName("coex_rom_data_init"), ablaFunctionName("__a.b\$c-D9z"), ablaFunctionName("lower"),
+        "Wl_Chm2C", "Ieee80211_Action_Vendor", "A1B", "X_Y9Z", capitalize("esp32s3"),
+        titleAlphanumeric("wl_chm2c"), titleAlphanumeric("ieee80211_action_vendor"), titleAlphanumeric("a1b__x.Y")]
+    expectText("names", names.join("\n"), EXPECT_NAMES)
+
+    Path(directory).removeTree()
+    if (failures != 0) return 1
+    println("PASS: recover-member text rewrites match the Python driver")
+    0
+}
