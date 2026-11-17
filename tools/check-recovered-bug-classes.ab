@@ -1,0 +1,398 @@
+// Scan Abla sources for bug classes seen while recovering ESP32-S3 Wi-Fi.
+//
+// class1  zero-argument calls to raw `(): void = $xtensa instructions` functions
+// class2  nativeFunctionAddress(F) + addend, or `$xtensa address {x} + addend`
+//         (section-entry offsets; see tools/repair-lifted-function-entry-offsets)
+// class3  `movi aN, label` + `addi aN, aN, K` in raw bodies of files that use
+//         mergeable (`"aM"`/`"aMS"`) sections
+// class4  `.long/.word rawfunc+N` code-address tables into raw functions
+// class7  entries `nativeFunctionAddress(F) + N` of a static u32 table: a switch
+//         jump table that was not lowered to Abla control flow (indirect call into
+//         the middle of a compiled function)
+// class8  calls to esp32UnloweredSwitchTrap(): a switch whose table is known to be
+//         unlowered and traps instead of mis-dispatching (still needs lowering)
+// class6  xtensaMemoryBarrier() followed by plain (non-volatile) loads/stores on
+//         constants that look like peripheral addresses
+//
+//     tools/abla-tool check-recovered-bug-classes [ROOT]
+
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/process/arguments"
+import "lib/recfiles.ab"
+
+// `fun\s+(\w+)\s*\(\s*\)\s*:\s*void\s*=\s*\$xtensa\s+instructions` names, in text order.
+fun bugRawNames(text: string, var names: array<string>): void {
+    var search = 0
+    while (true) {
+        val at = text.indexOf("fun", search)
+        if (at < 0) break
+        search = at + 1
+        var p = at + 3
+        if (p >= text.size || !recIsSpace(text[p])) continue
+        p = recSkipSpace(text, p)
+        val nameEnd = recIdentEndWord(text, p)
+        if (nameEnd == p) continue
+        val name = text.slice(p, nameEnd)
+        p = recSkipSpace(text, nameEnd)
+        if (!recAt(text, p, "(")) continue
+        p = recSkipSpace(text, p + 1)
+        if (!recAt(text, p, ")")) continue
+        p = recSkipSpace(text, p + 1)
+        if (!recAt(text, p, ":")) continue
+        p = recSkipSpace(text, p + 1)
+        if (!recAt(text, p, "void")) continue
+        p = recSkipSpace(text, p + 4)
+        if (!recAt(text, p, "=")) continue
+        p = recSkipSpace(text, p + 1)
+        if (!recAt(text, p, "\$xtensa")) continue
+        val q = recSkipSpace(text, p + 7)
+        if (q == p + 7 || !recAt(text, q, "instructions")) continue
+        names.append(name)
+    }
+}
+
+// End of the maximal run of word characters at `at` (digits allowed first), or `at`.
+fun recIdentEndWord(text: string, at: int): int {
+    var end = at
+    while (end < text.size && recIsWord(text[end])) end = end + 1
+    end
+}
+
+class BugState(var count: int)
+class BugAddr(val symbol: string, val close: int)
+
+fun bugOut(var state: BugState, cls: int, path: string, line: int, message: string): void {
+    state.count = state.count + 1
+    println("class$cls $path:$line: $message")
+}
+
+// INLINE_ADDEND at the `)` ending nativeFunctionAddress(F): `))? + u32(N)`; returns N text or "".
+fun bugInlineAddend(line: string, close: int): string {
+    var p = close + 1
+    if (recAt(line, p, ")")) p = p + 1
+    p = recSkipSpace(line, p)
+    if (!recAt(line, p, "+")) return ""
+    p = recSkipSpace(line, p + 1)
+    if (!recAt(line, p, "u32(")) return ""
+    val end = recDigitsEnd(line, p + 4)
+    if (end == p + 4 || !recAt(line, end, ")")) return ""
+    line.slice(p + 4, end)
+}
+
+fun bugNonZero(digits: string): bool {
+    for (b in digits) if (b != 48) return true
+    false
+}
+
+// `\s*(\w+) = u32\(nativeFunctionAddress\(\w+\)\)\s*$`
+fun bugAddrAssign(line: string): bool {
+    val p = recSkipSpace(line, 0)
+    val end = recIdentEndWord(line, p)
+    if (end == p || !recAt(line, end, " = u32(nativeFunctionAddress(")) return false
+    val symbolBegin = end + " = u32(nativeFunctionAddress(".size
+    val symbolEnd = recIdentEndWord(line, symbolBegin)
+    if (symbolEnd == symbolBegin || !recAt(line, symbolEnd, "))")) return false
+    recSkipSpace(line, symbolEnd + 2) == line.size
+}
+
+// `\s*(\w+) = \1 \+ u32\((\d+)\)\s*$`: the addend digits, or "".
+fun bugNextAddend(line: string): string {
+    val p = recSkipSpace(line, 0)
+    val end = recIdentEndWord(line, p)
+    if (end == p) return ""
+    val name = line.slice(p, end)
+    if (!recAt(line, end, " = ")) return ""
+    if (!recAt(line, end + 3, name) ) return ""
+    val after = end + 3 + name.size
+    if (!recAt(line, after, " + u32(")) return ""
+    val digits = after + 7
+    val digitsEnd = recDigitsEnd(line, digits)
+    if (digitsEnd == digits || !recAt(line, digitsEnd, ")")) return ""
+    if (recSkipSpace(line, digitsEnd + 1) != line.size) return ""
+    line.slice(digits, digitsEnd)
+}
+
+// nativeFunctionAddress(\w+) occurrences: (symbol, position of the closing paren).
+fun bugAddrCalls(line: string): array<BugAddr> {
+    val found: array<BugAddr> = []
+    val head = "nativeFunctionAddress("
+    var search = 0
+    while (true) {
+        val at = line.indexOf(head, search)
+        if (at < 0) break
+        val begin = at + head.size
+        val end = recIdentEndWord(line, begin)
+        if (end > begin && recAt(line, end, ")")) {
+            found.append(BugAddr(line.slice(begin, end), end))
+            search = end + 1
+        } else search = at + 1
+    }
+    found
+}
+
+// `\$xtensa\s+address\s*\{[^}]*\}\s*\+\s*u32\((\d+)\)` occurrences: the addend digits of each.
+fun bugAddrPlus(line: string): array<string> {
+    val found: array<string> = []
+    var search = 0
+    while (true) {
+        val at = line.indexOf("\$xtensa", search)
+        if (at < 0) break
+        search = at + 1
+        val q = recSkipSpace(line, at + 7)
+        if (q == at + 7 || !recAt(line, q, "address")) continue
+        val brace = recSkipSpace(line, q + 7)
+        if (!recAt(line, brace, "{")) continue
+        val close = line.indexOf("}", brace + 1)
+        if (close < 0) continue
+        var p = recSkipSpace(line, close + 1)
+        if (!recAt(line, p, "+")) continue
+        p = recSkipSpace(line, p + 1)
+        if (!recAt(line, p, "u32(")) continue
+        val end = recDigitsEnd(line, p + 4)
+        if (end == p + 4 || !recAt(line, end, ")")) continue
+        found.append(line.slice(p + 4, end))
+        search = end + 1
+    }
+    found
+}
+
+fun bugDigitsAt(line: string, at: int, count: int): bool {
+    var index = 0
+    while (index < count) {
+        if (at + index >= line.size || !recIsDigit(line[at + index])) return false
+        index = index + 1
+    }
+    true
+}
+
+fun bugHexAt(line: string, at: int, count: int): bool {
+    var index = 0
+    while (index < count) {
+        if (at + index >= line.size || !recIsHex(line[at + index])) return false
+        index = index + 1
+    }
+    true
+}
+
+// `\b(?:107[0-3]\d{6}|1610[67]\d{5}|0x3FF[0-9A-Fa-f]{5}|0x600[0-9A-Fa-f]{5})\b`
+fun bugMmioAt(line: string, i: int): bool {
+    if (i > 0 && recIsWord(line[i - 1])) return false
+    if (i + 10 > line.size) return false
+    if (i + 10 < line.size && recIsWord(line[i + 10])) return false
+    if (recAt(line, i, "107")) {
+        return line[i + 3] >= 48 && line[i + 3] <= 51 && bugDigitsAt(line, i + 4, 6)
+    }
+    if (recAt(line, i, "1610")) {
+        return (line[i + 4] == 54 || line[i + 4] == 55) && bugDigitsAt(line, i + 5, 5)
+    }
+    if (recAt(line, i, "0x3FF") || recAt(line, i, "0x600")) return bugHexAt(line, i + 5, 5)
+    false
+}
+
+fun bugHasMmio(line: string): bool {
+    var i = 0
+    while (i < line.size) {
+        if (bugMmioAt(line, i)) return true
+        i = i + 1
+    }
+    false
+}
+
+fun bugHasPlainAccess(line: string): bool {
+    for (name in ["ablaUnsafeLoadU8(", "ablaUnsafeLoadU16(", "ablaUnsafeLoadU32(",
+        "ablaUnsafeStoreU8(", "ablaUnsafeStoreU16(", "ablaUnsafeStoreU32("]) {
+        if (line.contains(name)) return true
+    }
+    false
+}
+
+// `pushsection\s+[^,\s\\]+\s*,\s*\\?"a[wx]?M`
+fun bugMergeable(text: string): bool {
+    var search = 0
+    while (true) {
+        val at = text.indexOf("pushsection", search)
+        if (at < 0) break
+        search = at + 1
+        val q = recSkipSpace(text, at + 11)
+        if (q == at + 11) continue
+        var r = q
+        while (r < text.size && text[r] != 44 && text[r] != 92 && !recIsSpace(text[r])) r = r + 1
+        if (r == q) continue
+        var s = recSkipSpace(text, r)
+        if (!recAt(text, s, ",")) continue
+        s = recSkipSpace(text, s + 1)
+        if (recAt(text, s, "\\")) s = s + 1
+        if (!recAt(text, s, "\"a")) continue
+        s = s + 2
+        if (s < text.size && (text[s] == 119 || text[s] == 120)) s = s + 1
+        if (recAt(text, s, "M")) return true
+    }
+    false
+}
+
+class MoviMatch(val label: string, val number: string, val end: int)
+
+// `movi\s+(a\d+),\s*([.\w]+)\s*(?:\\n|\n|;)\s*addi\s+\1,\s*\1,\s*(-?\d+)` at `at`; end -1 when absent.
+fun bugMoviAddi(text: string, at: int): MoviMatch {
+    val none = MoviMatch("", "", -1)
+    val q = recSkipSpace(text, at + 4)
+    if (q == at + 4 || !recAt(text, q, "a")) return none
+    val d = recDigitsEnd(text, q + 1)
+    if (d == q + 1 || !recAt(text, d, ",")) return none
+    val reg = text.slice(q, d)
+    val s = recSkipSpace(text, d + 1)
+    var e = s
+    while (e < text.size && (recIsWord(text[e]) || text[e] == 46)) e = e + 1
+    if (e == s) return none
+    val label = text.slice(s, e)
+    val w = recSkipSpace(text, e)
+    var addi = -1
+    var k = e
+    var newline = false
+    while (k < w) {
+        if (text[k] == 10) newline = true
+        k = k + 1
+    }
+    if (newline && recAt(text, w, "addi")) addi = w
+    else if (recAt(text, w, "\\n")) addi = recSkipSpace(text, w + 2)
+    else if (recAt(text, w, ";")) addi = recSkipSpace(text, w + 1)
+    if (addi < 0 || !recAt(text, addi, "addi")) return none
+    val t = recSkipSpace(text, addi + 4)
+    if (t == addi + 4 || !recAt(text, t, reg)) return none
+    var u = t + reg.size
+    if (!recAt(text, u, ",")) return none
+    u = recSkipSpace(text, u + 1)
+    if (!recAt(text, u, reg)) return none
+    u = u + reg.size
+    if (!recAt(text, u, ",")) return none
+    u = recSkipSpace(text, u + 1)
+    val numberBegin = u
+    if (recAt(text, u, "-")) u = u + 1
+    val digitsEnd = recDigitsEnd(text, u)
+    if (digitsEnd == u) return none
+    MoviMatch(label, text.slice(numberBegin, digitsEnd), digitsEnd)
+}
+
+fun main: int {
+    val root = if (processArgumentCount() >= 1) processArgument(0) else "src"
+    val files = recRglobAb(recNormalizePath(root))
+    val texts: array<string> = []
+    for (file in files) texts.append(recRead(file).text)
+    val raws = Map<string, bool>()
+    val rawList: array<string> = []
+    for (text in texts) bugRawNames(text, rawList)
+    for (name in rawList) raws.set(name, true)
+    val state = BugState(0)
+    var fileIndex = 0
+    while (fileIndex < files.size) {
+        val path = files[fileIndex]
+        val text = texts[fileIndex]
+        fileIndex = fileIndex + 1
+        val lines = recSplitLines(text)
+        if (raws.size > 0) {
+            var i = 0
+            while (i < text.size) {
+                if (recIsWord(text[i]) && (i == 0 || !recIsWord(text[i - 1]))) {
+                    val end = recIdentEndWord(text, i)
+                    if (end < text.size && text[end] == 40) {
+                        val close = recSkipSpace(text, end + 1)
+                        val name = text.slice(i, end)
+                        if (recAt(text, close, ")") && raws.has(name) && !(i >= 4 && recAt(text, i - 4, "fun "))) {
+                            bugOut(state, 1, path, recCountNewlines(text, i) + 1, "zero-argument call to raw $name")
+                        }
+                    }
+                    i = end
+                } else i = i + 1
+            }
+        }
+        var index = 0
+        while (index < lines.size) {
+            val line = lines[index]
+            if (line.contains("esp32UnloweredSwitchTrap()") && !line.contains("trusted fun")) {
+                bugOut(state, 8, path, index + 1, "switch left as a trap (unlowered table)")
+            }
+            val calls = bugAddrCalls(line)
+            var c = 0
+            while (c < calls.size) {
+                val symbol = calls[c].symbol
+                val close = calls[c].close
+                c = c + 1
+                val addend = bugInlineAddend(line, close)
+                if (addend != "" && bugNonZero(addend)) {
+                    if (recLstrip(line).startsWith("int(")) {
+                        bugOut(state, 7, path, index + 1, "unlowered switch-table entry $symbol + $addend")
+                    } else {
+                        bugOut(state, 2, path, index + 1, "$symbol + $addend")
+                    }
+                }
+            }
+            if (bugAddrAssign(line) && index + 1 < lines.size) {
+                val addend = bugNextAddend(lines[index + 1])
+                if (addend != "" && bugNonZero(addend)) {
+                    bugOut(state, 2, path, index + 1, "${calls[0].symbol} then + $addend")
+                }
+            }
+            for (addend in bugAddrPlus(line)) {
+                bugOut(state, 2, path, index + 1, "\$xtensa address + $addend")
+            }
+            if (line.contains("xtensaMemoryBarrier()")) {
+                var j = index + 1
+                val limit = if (index + 3 < lines.size) index + 3 else lines.size
+                while (j < limit) {
+                    if (bugHasPlainAccess(lines[j]) && bugHasMmio(lines[j])) {
+                        bugOut(state, 6, path, j + 1, "plain access after memory barrier on peripheral-looking address")
+                        break
+                    }
+                    j = j + 1
+                }
+            }
+            index = index + 1
+        }
+        if (bugMergeable(text)) {
+            var search = 0
+            while (true) {
+                val at = text.indexOf("movi", search)
+                if (at < 0) break
+                val match = bugMoviAddi(text, at)
+                if (match.end < 0) {
+                    search = at + 1
+                    continue
+                }
+                bugOut(state, 3, path, recCountNewlines(text, at) + 1,
+                    "movi ${match.label} + addi ${match.number} in file with mergeable sections")
+                search = match.end
+            }
+        }
+        var tableSearch = 0
+        while (true) {
+            val at = text.indexOf(".", tableSearch)
+            if (at < 0) break
+            tableSearch = at + 1
+            if (!recAt(text, at + 1, "long") && !recAt(text, at + 1, "word")) continue
+            val q = recSkipSpace(text, at + 5)
+            if (q == at + 5) continue
+            val identEnd = recIdentEndWord(text, q)
+            if (identEnd == q) continue
+            var p = recSkipSpace(text, identEnd)
+            if (!recAt(text, p, "+")) continue
+            p = recSkipSpace(text, p + 1)
+            var numberEnd = recDigitsEnd(text, p)
+            if (recAt(text, p, "0x")) {
+                var h = p + 2
+                while (h < text.size && recIsHex(text[h])) h = h + 1
+                if (h > p + 2) numberEnd = h
+            }
+            if (numberEnd == p) continue
+            tableSearch = numberEnd
+            val symbol = text.slice(q, identEnd)
+            if (raws.has(symbol)) {
+                bugOut(state, 4, path, recCountNewlines(text, at) + 1,
+                    "$symbol+${text.slice(p, numberEnd)} into raw function")
+            }
+        }
+    }
+    println("findings: ${state.count}")
+    if (state.count > 0) 1 else 0
+}
