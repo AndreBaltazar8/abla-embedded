@@ -30,19 +30,27 @@ can't import "whichever backend".
 4. The same shape applies to the other program-supplied names (`I2cBus`, the SPI/GPIO/clock backends): one
    interface module per family, remapped per program.
 
-## Blocker found while trying it (needs a compiler change)
+## Result of the first step (compiler fix #1025, branch remap-ext)
 
-A remap redirects a shared module's imports to the backend, and the shared module compiles against it. But an
-extension function the shared module declares on the remapped type is not found on the backend's type from the
-program: `Dev(40).twice(1)` is `method.unknown`, whether `Dev` is a class or `type Dev = int`, flat or strict.
-In abla-embedded that is `device.writeRegister16LittleEndian(...)` from `register_access.ab`. A repro with three
-files is in `~/archive/ablac-sweep-062/remap-ext-repro/` (`app/` is the program; `shared/` the shared module with
-`dev.ab` the stub). Until that works, steps 1-3 can't be shown on even one backend.
+A remap used to miss modules reached through `..` when the program was started by a relative path; with the fix
+(remap-ext at cf29482d) the design holds end to end on one backend. Branch `i2c-interface-cutover` (b5c73c5):
+`src/i2c/device.ab` (the interface module), `src/i2c/abla.toml` (strict), `register_access.ab` and
+`register_address16.ab` importing only `device.ab`, and `examples/i2c-c5-strict` (a manifest remapping
+`device.ab` to `i2c_esp32c5.ab`): it builds for `riscv32-esp-unknown-elf`, importing only the backend, with the
+backend still importing `register_access.ab` (the cycle through the remap is fine).
 
-If the compiler change isn't wanted, the other route is to repeat the shared helpers per backend (about 120 lines
-in each of six backends), which this plan does not recommend.
+The cost it shows: the cutover isn't per backend. `register_access.ab` now sees only the stub, so every program that
+reaches it, whatever its backend, needs a remap to that backend (a program without one gets a second `I2cDevice`:
+`tests/esp32c5-i2c-provider-target.ab` fails with `method.unknown` on `writeRegister16LittleEndian`). That is why
+the cutover branch isn't mergeable alone. The unit of migration is a shared module with all its programs:
+1. Programs get manifests first, grouped by backend (`examples/<name>/abla.toml` each, `tests/<backend>/abla.toml`
+   for the single files), each with the remap and `visibility = "flat"`. Before the shared modules change, the remap
+   to a backend while `device.ab` doesn't exist yet fails, so land `device.ab` (unused) with them.
+2. Then `register_access.ab` and `register_address16.ab` switch to `device.ab` in one commit.
+3. Each further shared module (drivers in `src/m5stack/`, ...) the same way: it imports `device.ab` and nothing
+   else for the device.
 
-## Order once the remap works
+## Remaining order
 
 1. `device.ab` and its remap for one backend, with `register_access.ab` strict (an example program per backend
    proves it: `examples/i2c-<backend>-strict/`).
