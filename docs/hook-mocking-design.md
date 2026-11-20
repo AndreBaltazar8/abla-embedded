@@ -91,3 +91,24 @@ class MockDelay(var bad: bool) : PeripheralDelay { ... }   // host test
 
 Recommendation: direction 1, starting with one family (the peripheral delays: 3 platform modules, 74 mocks) to measure
 code size and the signature script, then the rest by script.
+
+## State after the scripted families, and what is left (2026-11-20)
+
+Done: the scalar hooks (about 1,449 of 1,793 names: src/hal/*.ab declare them as `extern:"c"`, platforms and mocks `@export`
+them), `Pin` as one shared alias (src/hal/pin.ab), the I2C types through a remapped stub (src/i2c/device.ab, 56 tests moved to
+tests/fakes/), five duplicated aliases. A strict report of every program (761 (module, name) pairs in 310 src modules) shows
+what still depends on flat visibility:
+
+- the 21 `Pin` methods (number, valid, write, read, outputLevelOwned, ... about 230 pairs): each platform module (gpio_esp32s3,
+  gpio, the c5/c6/c61/p4 sequences, matrix_routes_esp32s3) declares a different subset and ~100 tests mock them;
+- the mock driver types (M5Ioe1, Es7210, M5Pm1, Es8311, Aw9523, ...: about 60 pairs, tests define type and methods whole);
+- about 40 test-defined functions whose signatures use test types (GDMA, SPI, I2S, p4 helpers).
+
+Why the I2C stub does not carry over to `Pin`: a remap target must declare everything the stub declares, and the platforms'
+subsets differ (S3: 20 methods, C6: 11 with `inputPullOwned`), so the stub would be the intersection, which the drivers exceed;
+splitting the stub per method fails because two stubs remapped to one importer's target are E_IMPORT_ALIAS_TARGET_DUPLICATE.
+
+Next design (not started): `Pin` methods become wrappers in src/hal/pin.ab over scalar hooks (`abla_pin_write(pin: int,
+level: bool)` ...), the platform modules and the mocks export the hooks (`@export`), the bodies rewritten from `this` to a
+`Pin(pinNumber)` parameter. The mock driver types and the functions follow the I2C pattern (a remap per mock, the mock
+declaring what the driver module declares).
