@@ -384,3 +384,28 @@ The intended replacement order is direct peripheral register access first,
 then open interrupt/DMA and protocol layers, while retaining vendor PHY/radio
 blobs where the silicon requires them. Target modules preserve the same public
 names as those boundaries move downward.
+
+### Bounded Xtensa stack scrubbing
+
+The classic ESP32 FreeRTOS port and the owned ESP32-S3 boot runtime export the
+compiler ABI `uint32_t abla_ct_stack_low(void)`. This enables the bounded
+`abla/ct/scrub` wipes without letting them run below the current stack.
+The FreeRTOS provider refuses ISR context and a missing current task, then
+uses the same stack-start implementation as `pxTaskGetStackStart(NULL)`.
+Its 64-byte margin preserves the overflow fill pattern and ESP-IDF's
+end-of-stack watchpoint. A zero or overflowing stack bound also disables a wipe.
+
+The owned S3 provider is imported by `boot_main_esp32s3.ab`; custom boot mains
+can explicitly import `esp32/ct_stack_esp32s3.ab`. It uses the linker symbols
+`__abla_boot_stack_low` and `__abla_boot_stack_top`, with the same margin, and
+returns zero outside that protected boot-stack range. The owned interrupt
+entries switch callbacks to dedicated per-core IRQ stacks, so those callbacks
+and other task stacks get no wipe from this boot-only provider.
+`ctScrubAvailable()` reports whether the image contains a provider; it does not
+promise a nonzero bound in every execution context. These are runtime ABI
+exports, not HAL hook declarations.
+
+`tools/check-ct-stack` checks host boundary behavior, Xtensa weak/strong symbol
+selection, availability folding and an S3 link. `tools/check-s3-boot` checks the
+composed boot images. These are host and target/link checks; physical stack
+watchpoint and overflow-hook behavior requires a device run.

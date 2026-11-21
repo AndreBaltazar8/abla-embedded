@@ -1,5 +1,8 @@
 # TODO
 
+- Current-compiler S3 boot cache-placement gate fails on retained legacy HAL @export alias bodies in ordinary .text (first: xtensaGuardMaskLocalHook, 10 bytes; 126 .text sections in the full runtime object). The same helper and section are present in pristine e595ec89 baseline object, before #743. Reproduce with tools/check-s3-boot using current ablac and the SDK assembler path; logs cx8-ct-stack-743/build/ct-stack/boot7.log and baseline5-s3.o. Correct hook ABI/local-export eligibility or section placement without weakening the cache gate. imports1 still leaves the first failing guard hook on @export; its effect on this gate is unverified.
+
+
 - Recovered radio unit: `llc` aborts once on each run of `tools/build-recovered-radio`
   (`tools/esp-llvm-bin/llc` line 164), and the object still comes out. Moved from NovaKind
   on 2026-11-03; the build scripts belong here. Recheck against the current wrapper.

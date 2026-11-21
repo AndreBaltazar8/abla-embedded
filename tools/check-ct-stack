@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+compiler_root=${ABLA_COMPILER_ROOT:-$root/../ablac}
+compiler=${ABLA_TOOL_COMPILER:-$compiler_root/build/ablac}
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$compiler_root}
+export PATH="$root/tools/esp-llvm-bin:$PATH"
+cd "$root"
+out="$root/build/tests/ct-stack"
+mkdir -p "$out"
+checks=0
+for mode in fast release; do
+    flags=()
+    [[ $mode == release ]] || flags+=(--fast)
+    "$compiler" build tests/ct-stack-bounds-native.ab -o "$out/bounds-$mode" --no-cache "${flags[@]}"
+    "$out/bounds-$mode"
+    checks=$((checks+1))
+done
+for runtime in absent s3 freertos; do
+    cpu=esp32s3
+    [[ $runtime != freertos ]] || cpu=esp32
+    ABLA_ESP_CPU=$cpu "$compiler" build "tests/ct-stack-$runtime-target.ab" -o "$out/$runtime.o" \
+        --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --no-cache
+    llvm-readelf -s "$out/$runtime.o" > "$out/$runtime.symbols"
+    if [[ $runtime == absent ]]; then
+        grep -E 'WEAK +DEFAULT +UND abla_ct_stack_low$' "$out/$runtime.symbols" >/dev/null
+    else
+        grep -E 'FUNC +GLOBAL +DEFAULT +[0-9]+ abla_ct_stack_low$' "$out/$runtime.symbols" >/dev/null
+        opt -S '-passes=default<O2>' "$out/$runtime.o.ll" -o "$out/$runtime.opt.ll"
+        awk '/^define .*@ct_stack_probe\(/ {body=1} body {print} body && /^}/ {body=0}' \
+            "$out/$runtime.opt.ll" > "$out/$runtime.probe.ll"
+        grep -E 'ret i(1 true|8 1)' "$out/$runtime.probe.ll" >/dev/null
+    fi
+    checks=$((checks+1))
+done
+llvm-nm -g --defined-only "$out/s3.o" | awk '{print $NF}' | sort > "$out/s3.exports"
+test "$(cat "$out/s3.exports")" = $'abla_ct_stack_low\nct_stack_probe'
+llvm_root=${ABLA_ESP_LLVM_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/abla-embedded/esp-clang-21.1.3}
+runner=()
+if command -v steam-run >/dev/null 2>&1; then runner=(steam-run); fi
+"${runner[@]}" "$llvm_root/bin/xtensa-esp32s3-elf-clang-ld" -T tests/ct-stack-s3.ld \
+    --no-undefined -o "$out/s3.link.elf" "$out/s3.o"
+llvm-nm -u "$out/s3.link.elf" > "$out/s3.undefined"
+test ! -s "$out/s3.undefined"
+checks=$((checks+1))
+printf 'ct-stack: %s focused checks passed; host/target/link only, no hardware claim\n' "$checks"
