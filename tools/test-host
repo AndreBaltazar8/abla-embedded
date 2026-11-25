@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Builds, and where it can run, every host test of abla-embedded with the installed `ablac` under strict imports:
+#   tests/*.ab and tests/fakes/<name>/<name>.ab (a fake has its own abla.toml; its raw_buffer.ab is a module of it, not a test).
+#   run     a program with a `main`: built --fast, run, must exit 0;
+#   object  a program that only exports its test entry (`abla_*_test`, which tools/check-native-buffer-host runs below 4 GiB): its x86-64 object is built,
+#           which is what that runner builds first (no opt/llc here, so the run itself stays with the runner);
+#   skip    a program for a firmware target (`*-target.ab`, built with the Xtensa/RISC-V companion toolchain): not built here.
+# tools/host-known-failures.txt lists the programs that fail today (each with the class and why it is not fixed). The test fails on a program that fails and is
+# not listed, and on a listed one that passes: the list only shrinks.
+#   tools/test-host [--shard K/N] [--jobs J] [--ablac PATH] [--out DIR] [--list]
+set -uo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+shard=1/1 jobs=${TEST_HOST_JOBS:-$(nproc)} compiler=ablac out=build/test-host list=0
+while (($#)); do
+    case $1 in
+        --shard) shard=$2; shift 2 ;;
+        --jobs) jobs=$2; shift 2 ;;
+        --ablac) compiler=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --list) list=1; shift ;;
+        *) echo "usage: tools/test-host [--shard K/N] [--jobs J] [--ablac PATH] [--out DIR] [--list]" >&2; exit 2 ;;
+    esac
+done
+k=${shard%/*} n=${shard#*/}
+export LC_ALL=C
+classify() { # classify <program>: run | object | skip
+    local p=$1
+    if [[ $p == *-target.ab ]]; then echo skip
+    elif grep -qE '^(trusted )?fun main\(?' "$p"; then echo run
+    else echo object; fi
+}
+programs=()
+for p in tests/*.ab tests/fakes/*/*.ab; do
+    [[ $p == */raw_buffer.ab ]] && continue
+    programs+=("$p")
+done
+selected=()
+for i in "${!programs[@]}"; do (( i % n == k - 1 )) && selected+=("${programs[$i]}"); done
+if ((list)); then for p in "${selected[@]}"; do echo "$(classify "$p") $p"; done; exit 0; fi
+rm -rf "$out"; mkdir -p "$out/log" "$out/bin"
+one() { # one <program>: prints "<class> <pass|fail> <program>"
+    local p=$1 c log name
+    c=$(classify "$p"); name=${p//\//_}; log=$out/log/$name.log
+    case $c in
+        skip) echo "skip pass $p"; return ;;
+        run) if "$compiler" build "$p" -o "$out/bin/$name" --fast --no-cache > "$log" 2>&1 && "$out/bin/$name" >> "$log" 2>&1; then echo "run pass $p"; else echo "run fail $p"; fi ;;
+        object) if "$compiler" build "$p" -o "$out/bin/$name.o" --target-triple x86_64-unknown-linux-gnu --object-format elf --emit object --no-cache > "$log" 2>&1; then echo "object pass $p"; else echo "object fail $p"; fi ;;
+    esac
+    rm -f "$out/bin/$name" "$out/bin/$name".*
+}
+export -f one classify; export compiler out
+printf '%s\n' "${selected[@]}" | xargs -P "$jobs" -I{} bash -c 'one {}' > "$out/results.txt"
+known=tools/host-known-failures.txt
+status=0
+newfail=$(awk '$2 == "fail" {print $3}' "$out/results.txt" | sort | grep -vxFf <(awk '{print $1}' "$known" 2>/dev/null | sort) || true)
+fixed=$(awk '$2 == "pass" {print $3}' "$out/results.txt" | sort | grep -xFf <(awk '{print $1}' "$known" 2>/dev/null | sort) || true)
+[[ -z $newfail ]] || { echo "test-host: these programs fail and are not in $known:"; echo "$newfail" | sed 's/^/  /'; status=1; }
+[[ -z $fixed ]] || { echo "test-host: these programs in $known pass now (remove them):"; echo "$fixed" | sed 's/^/  /'; status=1; }
+echo "test-host shard $shard: $(awk '{c[$1" "$2]++} END {for (k in c) printf "%s %d, ", k, c[k]}' "$out/results.txt" | sed 's/, $//')"
+exit $status
