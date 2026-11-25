@@ -20,6 +20,13 @@ void abla_platform_panic(const char *message, int64_t size) {
     (void)!write(2, "\n", 1);
     _exit(101);
 }
+/* The compiler puts a collector safe point (a call to abla_runtime_memory_pressure) at the start of a function that calls an extern "c" (a hook): a
+ * host-target object may materialize a returned heap value there. A fixture's hooks return scalars and the test allocates nothing, so there is nothing
+ * to collect: the safe points are no-ops here, as no runtime is linked into a firmware either. */
+void abla_runtime_memory_pressure(void);
+void abla_runtime_memory_pressure(void) {}
+void abla_runtime_memory_pressure_loop(void);
+void abla_runtime_memory_pressure_loop(void) {}
 static ucontext_t caller, test;
 static int result = 125;
 static void invoke(void) { result = ABLA_TEST_ENTRY(); }
