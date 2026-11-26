@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Calls from IRAM into flash in the sleep and wake code. A function placed in .iram1 can run while the flash cache is
+# off (light-sleep entry and wake, MSPI low power); a call from it to a function in .text then fetches code from flash
+# and crashes. This builds each program of tools/iram-check-programs.txt as a release object for its chip, lists every
+# relocation from an .iram1 section to a symbol defined in .text, names both by their Abla function (the abla.source
+# attribute of `ablac --emit-llvm`), and compares the list with tools/iram-calls-allowed.txt: a call not listed fails,
+# and so does a listed call that is gone (remove it). The allowed list only shrinks: each line is a call to check
+# against its cache-off window, then move into IRAM, inline, or keep with the reason it is safe.
+#
+#   tools/check-iram-calls [--ablac PATH] [--out DIR] [--update]
+#
+# Needs the Espressif LLVM (tools/setup, or ABLA_ESP_LLVM_ROOT). llvm-objdump and llvm-readelf come from that LLVM,
+# or from IRAM_LLVM_BIN when its binaries do not run on this host.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+compiler=ablac out=$root/build/check-iram-calls update=0
+while (($#)); do
+    case $1 in
+        --ablac) compiler=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --update) update=1; shift ;;
+        *) echo "usage: tools/check-iram-calls [--ablac PATH] [--out DIR] [--update]" >&2; exit 2 ;;
+    esac
+done
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+export ABLA_ESP_LLVM_ROOT=${ABLA_ESP_LLVM_ROOT:-$cache_root/abla-embedded/esp-clang-21.1.3}
+export PATH=$root/tools/esp-llvm-bin:$PATH
+bin=${IRAM_LLVM_BIN:-$ABLA_ESP_LLVM_ROOT/bin}
+"$bin/llvm-readelf" --version > /dev/null 2>&1 || { echo "check-iram-calls: $bin/llvm-readelf does not run here; set IRAM_LLVM_BIN" >&2; exit 2; }
+programs=$root/tools/iram-check-programs.txt allowed=$root/tools/iram-calls-allowed.txt
+rm -rf "$out"; mkdir -p "$out"
+cd "$root"
+: > "$out/calls.txt"
+while read -r program triple; do
+    [[ -z $program || $program == \#* ]] && continue
+    name=$(printf '%s' "$program" | tr '/' '_')
+    if ! "$compiler" build "$program" --target-triple "$triple" --object-format elf --emit object -o "$out/$name.o" --no-cache > "$out/$name.log" 2>&1; then
+        echo "check-iram-calls: $program does not build for $triple:" >&2; grep '^error' "$out/$name.log" | head -5 >&2; exit 1
+    fi
+    "$compiler" --emit-llvm "$program" > "$out/$name.ll" 2> /dev/null || { echo "check-iram-calls: --emit-llvm $program failed" >&2; exit 1; }
+    "$bin/llvm-readelf" -SW "$out/$name.o" | awk -F'[][]' '/^ *\[ *[0-9]+\]/ {split($3, a, " "); gsub(/ /, "", $2); print $2 + 0, a[1]}' > "$out/$name.sections"
+    "$bin/llvm-readelf" -sW "$out/$name.o" | awk 'NR > 3 && $8 != "" {print $8, $7}' > "$out/$name.symbols"
+    "$bin/llvm-objdump" -r "$out/$name.o" | awk '
+        /^RELOCATION RECORDS FOR \[/ {section = $4; gsub(/[\[\]:]/, "", section); next}
+        section ~ /^\.iram1/ && NF >= 3 {target = $3; sub(/[+-]0x[0-9a-f]+$/, "", target); print section, target}' | sort -u > "$out/$name.relocations"
+    # Abla names: a function symbol's attribute group carries "abla.source"; a .text.<symbol> section names its symbol.
+    awk -v program="$program" '
+        FILENAME == ARGV[1] && /^attributes #[0-9]+ = / && match($0, /"abla.source"="[^"]+"/) {
+            group = $2; sub(/^#/, "", group); value = substr($0, RSTART + 15, RLENGTH - 16)
+            sub(/^__abla_module_[0-9a-f]+__/, "", value); sub(/^extension_/, "", value); source[group] = value; next }
+        FILENAME == ARGV[1] && /^define / && match($0, /@[A-Za-z0-9_.$]+\(/) {
+            symbol = substr($0, RSTART + 1, RLENGTH - 2); n = split($0, words, " ")
+            for (i = n; i > 0; i--) if (words[i] ~ /^#[0-9]+$/) { sub(/^#/, "", words[i]); group_of[symbol] = words[i]; break }
+            next }
+        FILENAME == ARGV[1] { next }
+        FILENAME == ARGV[2] { section_name[$1] = $2; next }
+        FILENAME == ARGV[3] { defined_in[$1] = $2; next }
+        {
+            caller = $1; target = $2
+            if (target ~ /^\.text\./) { place = target; sub(/^\.text\./, "", target) }
+            else if (target in defined_in && defined_in[target] != "UND") place = section_name[defined_in[target]]
+            else next
+            if (place !~ /^\.(text|flash)/) next
+            sub(/\.literal$/, "", caller); sub(/^\.iram1\.(abla\.)?/, "", caller)
+            callee = target
+            if (target in group_of && group_of[target] in source) callee = source[group_of[target]]
+            print program, caller, "->", callee
+        }' "$out/$name.ll" "$out/$name.sections" "$out/$name.symbols" "$out/$name.relocations" >> "$out/calls.txt"
+done < "$programs"
+sort -u -o "$out/calls.txt" "$out/calls.txt"
+if ((update)); then
+    { sed -n '/^#/p' "$allowed" 2> /dev/null; cat "$out/calls.txt"; } > "$out/allowed.new"; mv "$out/allowed.new" "$allowed"
+    echo "check-iram-calls: $(wc -l < "$out/calls.txt") calls written to $allowed"; exit 0
+fi
+grep -v '^#' "$allowed" | sort -u > "$out/allowed.txt"
+new=$(comm -23 "$out/calls.txt" "$out/allowed.txt") gone=$(comm -13 "$out/calls.txt" "$out/allowed.txt")
+status=0
+[[ -z $new ]] || { echo "check-iram-calls: new calls from IRAM into flash (inline the callee, place it in .iram1, or show it never runs with the cache off):"; echo "$new" | sed 's/^/  /'; status=1; }
+[[ -z $gone ]] || { echo "check-iram-calls: these allowed calls are gone (remove them from $allowed):"; echo "$gone" | sed 's/^/  /'; status=1; }
+echo "check-iram-calls: $(grep -cv '^#' "$programs") programs, $(wc -l < "$out/calls.txt") calls from IRAM into flash, $(wc -l < "$out/allowed.txt") allowed"
+exit $status
